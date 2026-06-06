@@ -38,6 +38,24 @@ jobs:
             exit 1
           fi
 
+      - name: Validate changelog entry
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          version="${TAG_NAME#v}"
+          if ! awk -v version="${version}" '
+            /^##[[:space:]]+\[[0-9][^]]*\]/ {
+              pattern = "^##[[:space:]]+\\[" version "\\]([[:space:]-]|$)"
+              if ($0 ~ pattern) {
+                found = 1
+              }
+            }
+            END { exit found ? 0 : 1 }
+          ' CHANGELOG.md; then
+            echo "CHANGELOG.md does not contain a ${version} release section" >&2
+            exit 1
+          fi
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -59,14 +77,31 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Generate notes with git-cliff
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --tag ${{ github.ref_name }} --strip header
+      - name: Extract notes from changelog
         env:
-          OUTPUT: release-notes.md
-          GITHUB_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          version="${TAG_NAME#v}"
+          awk -v version="${version}" '
+            /^##[[:space:]]+\[[0-9][^]]*\]/ {
+              if (in_section) {
+                exit
+              }
+              pattern = "^##[[:space:]]+\\[" version "\\]([[:space:]-]|$)"
+              if ($0 ~ pattern) {
+                in_section = 1
+                next
+              }
+            }
+            in_section {
+              print
+            }
+          ' CHANGELOG.md > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+            echo "release notes for ${TAG_NAME} are empty" >&2
+            exit 1
+          fi
 
       - name: Upload release notes
         uses: actions/upload-artifact@v4

@@ -10,12 +10,29 @@ body = """
 {% else -%}
 ## [Unreleased]
 {% endif -%}
-{% for group, commits in commits | group_by(attribute="group") %}
 
-### {{ group | striptags | trim | upper_first }}
-{% for commit in commits %}
-- {% if commit.scope %}({{ commit.scope }}) {% endif %}{% if commit.breaking %}[breaking] {% endif %}{{ commit.message | upper_first }}
+## Release Notes
+{% set release_commits = commits | filter(attribute="group", value="release notes") -%}
+{% set fix_commits = commits | filter(attribute="group", value="fixes and improvements") -%}
+{% for commit in release_commits %}
+
+  * {% if commit.breaking %}[breaking] {% endif %}{{ commit.message | upper_first }}{% if commit.body %} {{ loop.index }}{% endif %}
 {%- endfor %}
+{% if fix_commits | length > 0 %}
+
+  * Fixes and improvements
+{% endif %}
+{% if release_commits | length == 0 and fix_commits | length == 0 %}
+
+  * No user-facing changes
+{% endif %}
+{% for commit in release_commits %}
+{% if commit.body %}
+
+{{ loop.index }}:
+
+{{ commit.body | trim }}
+{% endif %}
 {% endfor %}
 """
 trim = true
@@ -36,16 +53,16 @@ topo_order_commits = true
 sort_commits = "oldest"
 
 commit_parsers = [
-  { message = "^feat", group = "features" },
-  { message = "^fix", group = "fixes" },
-  { message = "^perf", group = "performance" },
-  { message = "^refactor", group = "refactoring" },
-  { message = "^docs", group = "documentation" },
-  { message = "^test", group = "tests" },
-  { message = "^ci", group = "ci" },
-  { message = "^build", group = "build" },
   { message = "^chore\\(release\\)", skip = true },
-  { message = "^chore", group = "chores" },
-  { body = ".*security", group = "security" },
-  { message = "^revert", group = "reverts" },
+  { body = ".*security", group = "release notes" },
+  { message = "^feat", group = "release notes" },
+  { message = "^perf", group = "release notes" },
+  { message = "^fix", group = "fixes and improvements" },
+  { message = "^refactor", group = "fixes and improvements" },
+  { message = "^build", group = "fixes and improvements" },
+  { message = "^ci", group = "fixes and improvements" },
+  { message = "^revert", group = "fixes and improvements" },
+  { message = "^docs", group = "fixes and improvements" },
+  { message = "^test", group = "fixes and improvements" },
+  { message = "^chore", group = "fixes and improvements" },
 ]
