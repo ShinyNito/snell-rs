@@ -24,6 +24,7 @@ enum Command {
         #[arg(long, value_name = "snell-client.conf")]
         config: PathBuf,
     },
+    Version,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -89,9 +90,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
+        Command::Version => {
+            println!("{}", version_text());
+        }
     }
 
     Ok(())
+}
+
+fn version_text() -> String {
+    format!(
+        "snell-rs {} (commit {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("SNELL_RS_GIT_COMMIT")
+    )
 }
 
 fn init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -113,7 +125,7 @@ mod tests {
 
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, version_text};
 
     #[test]
     fn parses_server_config_path() {
@@ -124,7 +136,7 @@ mod tests {
             Command::Server { config } => {
                 assert_eq!(config, PathBuf::from("snell-server.conf"));
             }
-            Command::Client { .. } => panic!("expected server command"),
+            Command::Client { .. } | Command::Version => panic!("expected server command"),
         }
     }
 
@@ -137,7 +149,7 @@ mod tests {
             Command::Client { config } => {
                 assert_eq!(config, PathBuf::from("snell-client.conf"));
             }
-            Command::Server { .. } => panic!("expected client command"),
+            Command::Server { .. } | Command::Version => panic!("expected client command"),
         }
     }
 
@@ -148,6 +160,7 @@ mod tests {
 
         assert!(help.contains("server"));
         assert!(help.contains("client"));
+        assert!(help.contains("version"));
 
         let mut command = Cli::command();
         let server_help = command
@@ -164,5 +177,23 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(client_help.contains("--config <snell-client.conf>"));
+    }
+
+    #[test]
+    fn parses_version_command() {
+        let cli = Cli::try_parse_from(["snell-rs", "version"]).unwrap();
+
+        match cli.command {
+            Command::Version => {}
+            Command::Server { .. } | Command::Client { .. } => panic!("expected version command"),
+        }
+    }
+
+    #[test]
+    fn version_text_contains_package_version_and_commit() {
+        let text = version_text();
+
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains(env!("SNELL_RS_GIT_COMMIT")));
     }
 }
