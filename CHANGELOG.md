@@ -2,6 +2,12 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.2.3] - 2026-06-08
+
+## Release Notes
+
+  * 修复服务端复用连接在上游先关闭时的释放
+
 ## [0.2.2] - 2026-06-08
 
 ## Release Notes
