@@ -94,7 +94,6 @@ fn apply_tcp_brutal_enabled(_stream: &TcpStream, _config: TcpBrutalConfig) -> io
 #[cfg(test)]
 mod tests {
     use super::validate_tcp_brutal_available;
-    use crate::service::runtime::config::TcpBrutalConfig;
 
     #[tokio::test]
     async fn disabled_tcp_brutal_validation_is_noop() {
@@ -104,11 +103,12 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn enabled_tcp_brutal_validation_fails_on_non_linux() {
-        let result = validate_tcp_brutal_available(Some(TcpBrutalConfig {
-            rate_bytes_per_sec: 1_000_000,
-            cwnd_gain: 20,
-        }))
-        .await;
+        let result =
+            validate_tcp_brutal_available(Some(crate::service::runtime::config::TcpBrutalConfig {
+                rate_bytes_per_sec: 1_000_000,
+                cwnd_gain: 20,
+            }))
+            .await;
 
         assert!(result.is_err());
     }
