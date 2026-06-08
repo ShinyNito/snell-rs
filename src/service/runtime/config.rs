@@ -10,6 +10,8 @@ use crate::{DEFAULT_VERSION, VERSION_5};
 
 const SNELL_SERVER_SECTION: &str = "snell-server";
 const SNELL_CLIENT_SECTION: &str = "snell-client";
+pub(crate) const TCP_BRUTAL_CWND_GAIN: u32 = 20;
+const TCP_BRUTAL_SEND_MBIT_TO_BYTES: u64 = 125_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerConfig {
@@ -19,12 +21,19 @@ pub struct ServerConfig {
     pub ipv6: bool,
     pub tcp_fast_open: bool,
     pub quic_proxy: bool,
+    pub tcp_brutal: Option<TcpBrutalConfig>,
     pub upstream_socks5: Option<UpstreamSocks5>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UpstreamSocks5 {
     pub addr: SocketAddr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpBrutalConfig {
+    pub rate_bytes_per_sec: u64,
+    pub cwnd_gain: u32,
 }
 
 impl ServerConfig {
@@ -62,6 +71,7 @@ impl ServerConfig {
             tcp_fast_open: optional_bool(section, SNELL_SERVER_SECTION, "tcp_fast_open")?
                 .unwrap_or(false),
             quic_proxy,
+            tcp_brutal: optional_tcp_brutal(section, SNELL_SERVER_SECTION)?,
             upstream_socks5: optional_socket_addr(
                 section,
                 SNELL_SERVER_SECTION,
@@ -112,6 +122,7 @@ impl ClientConfig {
                 "snell-client.quic_proxy requires version = 5".to_owned(),
             ));
         }
+        reject_client_tcp_brutal(section)?;
 
         Ok(Self {
             listen,
@@ -154,6 +165,52 @@ fn optional_u8(section: &ini::Properties, section_name: &str, key: &str) -> Resu
         .map_err(|err| Error::Config(format!("invalid integer for {section_name}.{key}: {err}")))
 }
 
+fn optional_u64(section: &ini::Properties, section_name: &str, key: &str) -> Result<Option<u64>> {
+    let Some(value) = section.get(key).map(str::trim) else {
+        return Ok(None);
+    };
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|err| Error::Config(format!("invalid integer for {section_name}.{key}: {err}")))
+}
+
+fn optional_tcp_brutal(
+    section: &ini::Properties,
+    section_name: &str,
+) -> Result<Option<TcpBrutalConfig>> {
+    if !optional_bool(section, section_name, "tcp_brutal")?.unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let send_mbps = optional_u64(section, section_name, "tcp_brutal_send_mbps")?
+        .ok_or_else(|| Error::Config(format!("missing {section_name}.tcp_brutal_send_mbps")))?;
+    if send_mbps == 0 {
+        return Err(Error::Config(format!(
+            "{section_name}.tcp_brutal_send_mbps must be greater than 0"
+        )));
+    }
+    let rate_bytes_per_sec = send_mbps
+        .checked_mul(TCP_BRUTAL_SEND_MBIT_TO_BYTES)
+        .ok_or_else(|| {
+            Error::Config(format!("{section_name}.tcp_brutal_send_mbps is too large"))
+        })?;
+
+    Ok(Some(TcpBrutalConfig {
+        rate_bytes_per_sec,
+        cwnd_gain: TCP_BRUTAL_CWND_GAIN,
+    }))
+}
+
+fn reject_client_tcp_brutal(section: &ini::Properties) -> Result<()> {
+    if section.contains_key("tcp_brutal") || section.contains_key("tcp_brutal_send_mbps") {
+        return Err(Error::Config(
+            "snell-client.tcp_brutal is only supported in [snell-server]".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn optional_socket_addr(
     section: &ini::Properties,
     section_name: &str,
@@ -187,7 +244,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr> {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-    use super::{ClientConfig, ServerConfig};
+    use super::{ClientConfig, ServerConfig, TcpBrutalConfig};
     use crate::error::Error;
 
     fn parse_server_config(input: &str) -> crate::error::Result<ServerConfig> {
@@ -224,6 +281,7 @@ tcp_fast_open = true
         assert!(config.tcp_fast_open);
         assert_eq!(config.version, crate::VERSION_5);
         assert!(config.quic_proxy);
+        assert_eq!(config.tcp_brutal, None);
         assert_eq!(config.upstream_socks5, None);
     }
 
@@ -244,7 +302,78 @@ psk = PSKMOCK
         );
         assert!(!config.ipv6);
         assert!(!config.tcp_fast_open);
+        assert_eq!(config.tcp_brutal, None);
         assert_eq!(config.upstream_socks5, None);
+    }
+
+    #[test]
+    fn parses_snell_server_tcp_brutal_config() {
+        let config = parse_server_config(
+            r#"
+[snell-server]
+listen = 0.0.0.0:29246
+psk = PSKMOCK
+tcp_brutal = true
+tcp_brutal_send_mbps = 100
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.tcp_brutal,
+            Some(TcpBrutalConfig {
+                rate_bytes_per_sec: 12_500_000,
+                cwnd_gain: super::TCP_BRUTAL_CWND_GAIN,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_server_tcp_brutal_without_send_rate() {
+        assert!(matches!(
+            parse_server_config(
+                r#"
+[snell-server]
+listen = 0.0.0.0:29246
+psk = PSKMOCK
+tcp_brutal = true
+"#
+            ),
+            Err(Error::Config(message)) if message.contains("missing snell-server.tcp_brutal_send_mbps")
+        ));
+    }
+
+    #[test]
+    fn rejects_snell_client_tcp_brutal_config() {
+        assert!(matches!(
+            parse_client_config(
+                r#"
+[snell-client]
+listen = 127.0.0.1:1080
+server = 127.0.0.1:29246
+psk = PSKMOCK
+tcp_brutal = true
+tcp_brutal_send_mbps = 8
+"#
+            ),
+            Err(Error::Config(message)) if message.contains("only supported in [snell-server]")
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_tcp_brutal_send_rate() {
+        assert!(matches!(
+            parse_server_config(
+                r#"
+[snell-server]
+listen = 0.0.0.0:29246
+psk = PSKMOCK
+tcp_brutal = true
+tcp_brutal_send_mbps = 0
+"#
+            ),
+            Err(Error::Config(message)) if message.contains("must be greater than 0")
+        ));
     }
 
     #[test]

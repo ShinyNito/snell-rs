@@ -8,10 +8,11 @@ use zeroize::Zeroizing;
 use crate::error::Result;
 use crate::service::inbound::snell::serve_server_connection;
 use crate::service::outbound::{RelayOptions, UpstreamRelay};
-use crate::service::runtime::config::ServerConfig;
+use crate::service::runtime::config::{ServerConfig, TcpBrutalConfig};
 use crate::service::runtime::lifecycle::{
     SHUTDOWN_DRAIN_TIMEOUT, bind_tcp_listener, drain_connection_tasks, log_connection_task_result,
 };
+use crate::service::runtime::tcp_brutal::{apply_tcp_brutal, validate_tcp_brutal_available};
 use crate::service::session::quic_proxy::{
     QUIC_PROXY_SESSION_IDLE_TIMEOUT, serve_quic_proxy_socket,
 };
@@ -25,11 +26,13 @@ pub async fn bind_configured_tcp_server_with_shutdown(
         upstream: UpstreamRelay::from(config.upstream_socks5),
     };
     let listener = bind_tcp_listener(config.listen, config.tcp_fast_open)?;
+    validate_tcp_brutal_available(config.tcp_brutal).await?;
     if !config.quic_proxy {
         return serve_tcp_listener_with_shutdown_and_timeout(
             listener,
             config.psk.to_vec(),
             options,
+            config.tcp_brutal,
             shutdown,
             SHUTDOWN_DRAIN_TIMEOUT,
         )
@@ -47,6 +50,7 @@ pub async fn bind_configured_tcp_server_with_shutdown(
         listener,
         config.psk.to_vec(),
         options,
+        config.tcp_brutal,
         shutdown.clone(),
         SHUTDOWN_DRAIN_TIMEOUT,
     );
@@ -61,6 +65,7 @@ pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
     listener: TcpListener,
     psk: Vec<u8>,
     options: RelayOptions,
+    tcp_brutal: Option<TcpBrutalConfig>,
     shutdown: CancellationToken,
     drain_timeout: Duration,
 ) -> Result<()> {
@@ -74,6 +79,10 @@ pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
                 let (client, peer_addr) = result?;
                 let psk = psk.clone();
                 tasks.spawn(async move {
+                    if let Err(err) = apply_tcp_brutal(&client, tcp_brutal) {
+                        tracing::warn!(%err, %peer_addr, "snell tcp_brutal could not be enabled");
+                        return;
+                    }
                     if let Err(err) = serve_server_connection(client, &psk, options).await {
                         tracing::debug!(%err, %peer_addr, "snell tcp server connection failed");
                     }
@@ -331,6 +340,7 @@ mod tests {
             listener,
             psk.to_vec(),
             RelayOptions::default(),
+            None,
             shutdown.clone(),
             Duration::from_millis(100),
         ));
@@ -362,6 +372,7 @@ mod tests {
                 ipv6: true,
                 ..RelayOptions::default()
             },
+            None,
             shutdown.clone(),
             Duration::from_secs(1),
         ));

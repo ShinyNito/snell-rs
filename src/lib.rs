@@ -26,6 +26,7 @@ pub mod service {
         pub(crate) mod lifecycle;
         pub(crate) mod net;
         pub mod server;
+        pub(crate) mod tcp_brutal;
     }
     pub(crate) mod session {
         pub(crate) mod quic_proxy;

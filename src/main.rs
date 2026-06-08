@@ -51,6 +51,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 quic_proxy = config.quic_proxy,
                 ipv6 = config.ipv6,
                 tcp_fast_open = config.tcp_fast_open,
+                tcp_brutal = config.tcp_brutal.is_some(),
+                tcp_brutal_rate = config.tcp_brutal.map(|config| config.rate_bytes_per_sec),
                 upstream_socks5 = ?config.upstream_socks5.map(|upstream| upstream.addr),
                 "starting snell server"
             );
