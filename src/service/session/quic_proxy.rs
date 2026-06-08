@@ -7,6 +7,7 @@ use bytes::BytesMut;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::MAX_PACKET_SIZE;
@@ -23,6 +24,7 @@ pub(crate) async fn serve_quic_proxy_socket(
     psk: Vec<u8>,
     options: RelayOptions,
     idle_timeout: Duration,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let psk = Zeroizing::new(psk);
     let socket = Arc::new(socket);
@@ -33,6 +35,7 @@ pub(crate) async fn serve_quic_proxy_socket(
 
     loop {
         tokio::select! {
+            () = shutdown.cancelled() => break,
             recv_result = socket.recv_buf_from(&mut buf) => {
                 let (n, client_addr) = recv_result?;
                 if n == 0 {
@@ -128,12 +131,33 @@ pub(crate) async fn serve_quic_proxy_socket(
             }
         }
     }
+
+    drain_quic_proxy_sessions(sessions).await;
+    Ok(())
 }
 
 struct QuicProxySession {
     relay: QuicProxyRelay,
     response_task: JoinHandle<Result<()>>,
     last_activity: Instant,
+}
+
+async fn drain_quic_proxy_sessions(sessions: HashMap<SocketAddr, QuicProxySession>) {
+    for session in sessions.values() {
+        session.response_task.abort();
+    }
+    for (client_addr, session) in sessions {
+        match session.response_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::debug!(%err, %client_addr, "quic proxy response task failed during shutdown");
+            }
+            Err(err) if err.is_cancelled() => {}
+            Err(err) => {
+                tracing::debug!(%err, %client_addr, "quic proxy response task ended unexpectedly");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +168,7 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, UdpSocket};
     use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
 
     use super::serve_quic_proxy_socket;
     use crate::protocol::quic_proxy::encode_init_datagram;
@@ -165,6 +190,7 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,
             psk.to_vec(),
@@ -173,6 +199,7 @@ mod tests {
                 ..RelayOptions::default()
             },
             Duration::from_secs(1),
+            shutdown.clone(),
         ));
 
         let mut plaintext = BytesMut::new();
@@ -208,7 +235,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&buf[..n], b"\x40reply");
-        task.abort();
+        shutdown.cancel();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -216,11 +248,13 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,
             b"test psk".to_vec(),
             RelayOptions::default(),
             Duration::from_secs(1),
+            shutdown.clone(),
         ));
 
         client.send_to(b"\xc0raw", server_addr).await.unwrap();
@@ -230,7 +264,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        task.abort();
+        shutdown.cancel();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -241,11 +280,13 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,
             psk.to_vec(),
             RelayOptions::default(),
             Duration::from_secs(1),
+            shutdown.clone(),
         ));
 
         let mut plaintext = BytesMut::new();
@@ -267,7 +308,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        task.abort();
+        shutdown.cancel();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -278,6 +324,7 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,
             psk.to_vec(),
@@ -286,6 +333,7 @@ mod tests {
                 ..RelayOptions::default()
             },
             Duration::from_millis(30),
+            shutdown.clone(),
         ));
 
         let mut plaintext = BytesMut::new();
@@ -318,7 +366,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        task.abort();
+        shutdown.cancel();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -331,6 +384,7 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,
             psk.to_vec(),
@@ -339,6 +393,7 @@ mod tests {
                 ..RelayOptions::default()
             },
             Duration::from_secs(1),
+            shutdown.clone(),
         ));
 
         let socks = async {
@@ -397,6 +452,11 @@ mod tests {
         };
 
         let ((), ()) = tokio::join!(socks, client_io);
-        task.abort();
+        shutdown.cancel();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

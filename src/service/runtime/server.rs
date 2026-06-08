@@ -45,6 +45,7 @@ pub async fn bind_configured_tcp_server_with_shutdown(
         config.psk.to_vec(),
         options,
         QUIC_PROXY_SESSION_IDLE_TIMEOUT,
+        shutdown.clone(),
     );
     let tcp = serve_tcp_listener_with_shutdown_and_timeout(
         listener,
@@ -54,10 +55,21 @@ pub async fn bind_configured_tcp_server_with_shutdown(
         shutdown.clone(),
         SHUTDOWN_DRAIN_TIMEOUT,
     );
+    tokio::pin!(udp);
+    tokio::pin!(tcp);
     tokio::select! {
-        result = udp => result,
-        result = tcp => result,
-        () = shutdown.cancelled() => Ok(()),
+        result = &mut udp => {
+            shutdown.cancel();
+            let tcp_result = tcp.await;
+            result?;
+            tcp_result
+        }
+        result = &mut tcp => {
+            shutdown.cancel();
+            let udp_result = udp.await;
+            result?;
+            udp_result
+        }
     }
 }
 

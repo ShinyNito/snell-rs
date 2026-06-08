@@ -1,8 +1,9 @@
 use std::net::{IpAddr, SocketAddr};
 
 use tokio::net::{TcpStream, lookup_host};
+use tokio::time::timeout;
 
-use crate::service::runtime::net::connect_tcp;
+use crate::service::runtime::net::{TCP_RESOLVE_TIMEOUT, connect_tcp, connect_tcp_any};
 
 pub(crate) async fn open_direct_tcp(
     host: &str,
@@ -17,24 +18,17 @@ pub(crate) async fn open_direct_tcp(
         return Ok(stream);
     }
 
-    let addrs = lookup_host((host, port)).await?;
-    let mut last_error = None;
-    for addr in addrs.filter(|addr| ipv6 || addr.is_ipv4()) {
-        match connect_tcp(addr).await {
-            Ok(stream) => {
-                stream.set_nodelay(true)?;
-                return Ok(stream);
-            }
-            Err(err) => last_error = Some(err),
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "no allowed target address",
-        )
-    }))
+    let addrs = timeout(TCP_RESOLVE_TIMEOUT, lookup_host((host, port)))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "tcp resolve timed out")
+        })??;
+    let addrs = addrs
+        .filter(|addr| ipv6 || addr.is_ipv4())
+        .collect::<Vec<_>>();
+    let stream = connect_tcp_any(addrs).await?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 pub(crate) fn reject_disabled_ipv6_literal(host: &str, ipv6: bool) -> std::io::Result<()> {

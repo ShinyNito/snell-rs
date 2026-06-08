@@ -161,6 +161,11 @@ where
         self.body = BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY);
     }
 
+    #[cfg(test)]
+    pub(crate) fn body_capacity(&self) -> usize {
+        self.body.capacity()
+    }
+
     async fn read_body(&mut self, body_len: usize) -> Result<()> {
         self.body.clear();
         self.payload_start = 0;
@@ -487,6 +492,11 @@ where
     pub(crate) fn compact_buffers_for_reuse(&mut self) {
         self.frame.clear();
         self.frame = BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_capacity(&self) -> usize {
+        self.frame.capacity()
     }
 
     async fn try_write_udp_response_from_socket(

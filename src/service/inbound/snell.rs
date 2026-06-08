@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::time::Instant;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -76,6 +77,7 @@ where
 
         match initial {
             InitialRequest::Tcp(target, pending) => {
+                let started = Instant::now();
                 let keep_alive = target.reuse;
                 let snell =
                     TcpServerStream::from_parts_with_pending(frame_reader, frame_writer, pending);
@@ -85,11 +87,32 @@ where
                         snell
                             .reject(CONNECT_FAILED_CODE, CONNECT_FAILED_MESSAGE)
                             .await?;
+                        tracing::debug!(
+                            %err,
+                            duration_ms = started.elapsed().as_millis(),
+                            "snell tcp server connect failed"
+                        );
                         return Err(err);
                     }
                 };
-                let (_, next_reader, next_writer) =
-                    relay_tcp_server_stream_reusable(snell, upstream).await?;
+                let (stats, next_reader, next_writer) =
+                    match relay_tcp_server_stream_reusable(snell, upstream).await {
+                        Ok(result) => result,
+                        Err(err) => {
+                            tracing::debug!(
+                                %err,
+                                duration_ms = started.elapsed().as_millis(),
+                                "snell tcp server relay failed"
+                            );
+                            return Err(err);
+                        }
+                    };
+                tracing::debug!(
+                    uploaded = stats.uploaded,
+                    downloaded = stats.downloaded,
+                    duration_ms = started.elapsed().as_millis(),
+                    "snell tcp server relay finished"
+                );
                 if !keep_alive {
                     return Ok(());
                 }
@@ -97,27 +120,57 @@ where
                 frame_writer = next_writer;
             }
             InitialRequest::Udp => {
+                let started = Instant::now();
                 let prepared = match open_udp(options).await {
                     Ok(prepared) => prepared,
                     Err(err) => {
                         frame_writer
                             .write_error_reply(CONNECT_FAILED_CODE, CONNECT_FAILED_MESSAGE)
                             .await?;
+                        tracing::debug!(
+                            %err,
+                            duration_ms = started.elapsed().as_millis(),
+                            "snell udp server open failed"
+                        );
                         return Err(err);
                     }
                 };
                 let udp = UdpServerStream::accept(frame_reader, frame_writer).await?;
-                relay_udp_server_stream_prepared(
+                let stats = match relay_udp_server_stream_prepared(
                     udp,
                     options,
                     UDP_ASSOCIATION_IDLE_TIMEOUT,
                     prepared,
                 )
-                .await?;
+                .await
+                {
+                    Ok(stats) => stats,
+                    Err(err) => {
+                        tracing::debug!(
+                            %err,
+                            duration_ms = started.elapsed().as_millis(),
+                            "snell udp server relay failed"
+                        );
+                        return Err(err);
+                    }
+                };
+                tracing::debug!(
+                    packets_sent = stats.packets_sent,
+                    packets_received = stats.packets_received,
+                    bytes_sent = stats.bytes_sent,
+                    bytes_received = stats.bytes_received,
+                    duration_ms = started.elapsed().as_millis(),
+                    "snell udp server relay finished"
+                );
                 return Ok(());
             }
             InitialRequest::Ping => {
+                let started = Instant::now();
                 frame_writer.write_pong_reply().await?;
+                tracing::debug!(
+                    duration_ms = started.elapsed().as_millis(),
+                    "snell ping handled"
+                );
                 return Ok(());
             }
         }
@@ -150,8 +203,10 @@ where
         relay_plain_to_server_writer(&mut upstream_reader, &mut snell_writer),
     )?;
 
-    let frame_reader = snell_reader.into_frame_reader();
-    let frame_writer = snell_writer.into_frame_writer();
+    let mut frame_reader = snell_reader.into_frame_reader();
+    let mut frame_writer = snell_writer.into_frame_writer();
+    frame_reader.compact_buffers_for_reuse();
+    frame_writer.compact_buffers_for_reuse();
     Ok((
         RelayStats {
             uploaded,
@@ -160,4 +215,77 @@ where
         frame_reader,
         frame_writer,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::relay_tcp_server_stream_reusable;
+    use crate::transport::tcp_stream::{TcpPayloadReader, TcpServerStream};
+    use crate::transport::tokio_io::{
+        STREAM_BUFFER_INITIAL_CAPACITY, V4StreamReader, V4StreamWriter,
+    };
+
+    #[tokio::test]
+    async fn reusable_relay_compacts_stream_buffers_after_request() {
+        let psk = b"test psk";
+        let upload = vec![0x51; STREAM_BUFFER_INITIAL_CAPACITY * 4];
+        let download = vec![0x52; STREAM_BUFFER_INITIAL_CAPACITY * 4];
+        let upload_len = upload.len();
+        let download_len = download.len();
+
+        let (client_upload, server_upload) = duplex(32 * 1024);
+        let (server_download, client_download) = duplex(32 * 1024);
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = TcpStream::connect(upstream_listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut target, _) = upstream_listener.accept().await.unwrap();
+
+        let client = async {
+            let mut writer = V4StreamWriter::new(client_upload, psk).unwrap();
+            writer.write_frame(&upload).await.unwrap();
+            writer.write_zero_chunk().await.unwrap();
+
+            let mut reader =
+                TcpPayloadReader::client(V4StreamReader::new(client_download, psk).unwrap());
+            reader.read_tunnel_reply().await.unwrap();
+
+            let mut received = Vec::new();
+            while let Some(payload) = reader.read_payload_chunk_strict().await.unwrap() {
+                received.extend_from_slice(payload);
+                let len = payload.len();
+                reader.consume_payload_chunk(len);
+            }
+            assert_eq!(received, download);
+        };
+
+        let target = async {
+            let mut received = Vec::new();
+            target.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, upload);
+            target.write_all(&download).await.unwrap();
+            target.shutdown().await.unwrap();
+        };
+
+        let server = async {
+            let reader = V4StreamReader::new(server_upload, psk).unwrap();
+            let writer = V4StreamWriter::new(server_download, psk).unwrap();
+            let snell = TcpServerStream::from_parts_with_pending(reader, writer, BytesMut::new());
+
+            let (stats, reader, writer) = relay_tcp_server_stream_reusable(snell, upstream)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.uploaded, upload_len as u64);
+            assert_eq!(stats.downloaded, download_len as u64);
+            assert_eq!(reader.body_capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
+            assert_eq!(writer.frame_capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
+        };
+
+        let ((), (), ()) = tokio::join!(client, target, server);
+    }
 }
