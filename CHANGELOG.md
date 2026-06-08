@@ -2,6 +2,12 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.2.2] - 2026-06-08
+
+## Release Notes
+
+  * 修复连接生命周期清理与复用连接关闭
+
 ## [0.2.1] - 2026-06-08
 
 ## Release Notes
