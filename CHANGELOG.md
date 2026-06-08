@@ -2,6 +2,12 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.2.1] - 2026-06-08
+
+## Release Notes
+
+  * Fixes and improvements
+
 ## [0.2.0] - 2026-06-08
 
 ## Release Notes
