@@ -72,5 +72,6 @@ async fn serve_socks5_listener(
     drop(listener);
 
     drain_connection_tasks(tasks, SHUTDOWN_DRAIN_TIMEOUT).await;
+    outbound.close_idle_pool().await;
     Ok(())
 }

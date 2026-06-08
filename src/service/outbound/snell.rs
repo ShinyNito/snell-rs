@@ -85,6 +85,12 @@ impl SnellClientOutbound {
     pub(crate) fn version(&self) -> u8 {
         self.version
     }
+
+    pub(crate) async fn close_idle_pool(&self) {
+        if let Some(pool) = &self.pool {
+            pool.close_idle().await;
+        }
+    }
 }
 
 pub(crate) struct ReusePool {
@@ -146,7 +152,7 @@ impl ReusePool {
     }
 
     pub(crate) async fn open(&self, host: &str, port: u16) -> Result<ReusedSnellTcp> {
-        let mut conn = match self.take() {
+        let mut conn = match self.take().await {
             Some(conn) => conn,
             None => {
                 let stream = connect_tcp(self.server_addr).await?;
@@ -163,7 +169,7 @@ impl ReusePool {
 
     pub(crate) async fn put(&self, mut conn: ReusedSnellTcp) {
         if !conn.can_reuse() {
-            conn.shutdown().await;
+            conn.close_whole_connection().await;
             return;
         }
 
@@ -178,19 +184,44 @@ impl ReusePool {
                 ));
             }
         }
-        if let Some(mut conn) = close_conn {
-            conn.shutdown().await;
+        if let Some(conn) = close_conn {
+            conn.close_whole_connection().await;
         }
     }
 
-    fn take(&self) -> Option<ReusedSnellTcp> {
-        let mut idle = self.idle.lock().expect("reuse pool mutex poisoned");
-        while let Some(idle_conn) = idle.pop_front() {
-            if !idle_conn.is_expired(self.max_idle_age) {
-                return Some(idle_conn.conn);
+    async fn take(&self) -> Option<ReusedSnellTcp> {
+        let mut expired = Vec::new();
+        let reusable = {
+            let mut idle = self.idle.lock().expect("reuse pool mutex poisoned");
+            let mut reusable = None;
+            while let Some(idle_conn) = idle.pop_front() {
+                if idle_conn.is_expired(self.max_idle_age) {
+                    expired.push(idle_conn.conn);
+                    continue;
+                }
+                reusable = Some(idle_conn.conn);
+                break;
             }
-        }
-        None
+            reusable
+        };
+        close_reuse_conns(expired).await;
+        reusable
+    }
+
+    pub(crate) async fn close_idle(&self) {
+        let conns = {
+            let mut idle = self.idle.lock().expect("reuse pool mutex poisoned");
+            idle.drain(..)
+                .map(|idle_conn| idle_conn.conn)
+                .collect::<Vec<_>>()
+        };
+        close_reuse_conns(conns).await;
+    }
+}
+
+async fn close_reuse_conns(conns: impl IntoIterator<Item = ReusedSnellTcp>) {
+    for conn in conns {
+        conn.close_whole_connection().await;
     }
 }
 
@@ -443,7 +474,19 @@ mod tests {
             idle.front_mut().unwrap().idle_since = Instant::now() - Duration::from_secs(61);
         }
 
-        assert!(pool.take().is_none());
+        assert!(pool.take().await.is_none());
+        assert_eq!(idle_len(&pool), 0);
+    }
+
+    #[tokio::test]
+    async fn reuse_pool_close_idle_drains_idle_connections() {
+        let psk = b"test psk";
+        let (pool, conn) = completed_pool_conn(psk).await;
+        pool.put(conn).await;
+        assert_eq!(idle_len(&pool), 1);
+
+        pool.close_idle().await;
+
         assert_eq!(idle_len(&pool), 0);
     }
 

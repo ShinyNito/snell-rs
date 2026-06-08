@@ -54,7 +54,7 @@ where
         self.writer.compact_buffers_for_reuse();
     }
 
-    pub(crate) async fn shutdown(&mut self) {
+    pub(crate) async fn close_whole_connection(mut self) {
         self.writer.shutdown().await;
     }
 
@@ -215,7 +215,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{AsyncWrite, duplex};
+    use tokio::io::{AsyncReadExt, AsyncWrite, duplex};
 
     use super::{ReuseClientConn, ReuseClientWriter};
     use crate::error::Error;
@@ -401,5 +401,21 @@ mod tests {
             write_reuse_payload(conn.writer_mut(), b"after close").await,
             Err(Error::WriteClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn close_whole_connection_drops_reader_and_writer_halves() {
+        let (client_upload, mut server_upload) = duplex(4096);
+        let (_server_download, client_download) = duplex(4096);
+        let psk = b"test psk";
+
+        let writer = V4StreamWriter::new(client_upload, psk).unwrap();
+        let reader = V4StreamReader::new(client_download, psk).unwrap();
+        let conn = ReuseClientConn::from_parts(reader, writer);
+
+        conn.close_whole_connection().await;
+
+        let mut buf = [0; 1];
+        assert_eq!(server_upload.read(&mut buf).await.unwrap(), 0);
     }
 }
