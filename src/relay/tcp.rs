@@ -1,7 +1,7 @@
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::error::Result;
-use crate::transport::tcp_stream::{TcpClientWriter, TcpReader, TcpServerWriter};
+use crate::transport::tcp_stream::{TcpClientWriter, TcpReader};
 
 pub(crate) async fn relay_tcp_reader_to_plain<R, W>(
     snell: &mut TcpReader<R>,
@@ -12,7 +12,19 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut total = 0;
+    relay_tcp_reader_to_plain_counted(snell, plain, &mut total).await?;
+    Ok(total)
+}
 
+pub(crate) async fn relay_tcp_reader_to_plain_counted<R, W>(
+    snell: &mut TcpReader<R>,
+    plain: &mut W,
+    total: &mut u64,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     loop {
         let n = match snell.read_payload_chunk().await? {
             Some(payload) => {
@@ -22,11 +34,11 @@ where
             }
             None => {
                 plain.shutdown().await?;
-                return Ok(total);
+                return Ok(());
             }
         };
         snell.consume_payload_chunk(n);
-        total += n as u64;
+        *total += n as u64;
     }
 }
 
@@ -52,5 +64,4 @@ macro_rules! define_plain_to_snell_writer_relay {
     };
 }
 
-define_plain_to_snell_writer_relay!(relay_plain_to_server_writer, TcpServerWriter);
 define_plain_to_snell_writer_relay!(relay_plain_to_client_writer, TcpClientWriter);

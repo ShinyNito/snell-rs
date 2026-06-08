@@ -7,12 +7,12 @@ use tokio::net::TcpStream;
 
 use crate::error::{Error, Result};
 use crate::protocol::request::ClientRequest;
-use crate::relay::tcp::{relay_plain_to_server_writer, relay_tcp_reader_to_plain};
+use crate::relay::tcp::relay_tcp_reader_to_plain_counted;
 use crate::service::outbound::{RelayOptions, RelayStats, open_udp};
 use crate::service::session::udp_association::{
     UDP_ASSOCIATION_IDLE_TIMEOUT, relay_udp_server_stream_prepared,
 };
-use crate::transport::tcp_stream::{TcpServerStream, TcpTarget};
+use crate::transport::tcp_stream::{TcpReader, TcpServerStream, TcpServerWriter, TcpTarget};
 use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
 use crate::transport::udp_stream::UdpServerStream;
 
@@ -96,7 +96,7 @@ where
                     }
                 };
                 let (stats, next_reader, next_writer) =
-                    match relay_tcp_server_stream_reusable(snell, upstream).await {
+                    match relay_tcp_server_stream_reusable(snell, upstream, keep_alive).await {
                         Ok(result) => result,
                         Err(err) => {
                             tracing::debug!(
@@ -190,6 +190,7 @@ async fn open_target_stream(target: TcpTarget, options: RelayOptions) -> Result<
 async fn relay_tcp_server_stream_reusable<R, W>(
     snell: TcpServerStream<R, W>,
     upstream: TcpStream,
+    keep_alive: bool,
 ) -> Result<(RelayStats, V4StreamReader<R>, V4StreamWriter<W>)>
 where
     R: AsyncRead + Unpin,
@@ -198,10 +199,42 @@ where
     let (mut snell_reader, mut snell_writer) = snell.into_split();
     let (mut upstream_reader, mut upstream_writer) = upstream.into_split();
 
-    let (uploaded, downloaded) = tokio::try_join!(
-        relay_tcp_reader_to_plain(&mut snell_reader, &mut upstream_writer),
-        relay_plain_to_server_writer(&mut upstream_reader, &mut snell_writer),
-    )?;
+    let mut uploaded = 0;
+    let mut downloaded = 0;
+    let end = {
+        let upload = relay_tcp_reader_to_plain_counted(
+            &mut snell_reader,
+            &mut upstream_writer,
+            &mut uploaded,
+        );
+        let download = relay_plain_to_server_writer_counted(
+            &mut upstream_reader,
+            &mut snell_writer,
+            &mut downloaded,
+        );
+        tokio::pin!(upload);
+        tokio::pin!(download);
+
+        tokio::select! {
+            result = &mut upload => {
+                result?;
+                download.await?;
+                ServerRelayEnd::SnellClosed
+            }
+            result = &mut download => {
+                result?;
+                ServerRelayEnd::UpstreamClosed
+            }
+        }
+    };
+
+    if end == ServerRelayEnd::UpstreamClosed {
+        drop(upstream_reader);
+        drop(upstream_writer);
+        if keep_alive {
+            drain_tcp_reader(&mut snell_reader).await?;
+        }
+    }
 
     let mut frame_reader = snell_reader.into_frame_reader();
     let mut frame_writer = snell_writer.into_frame_writer();
@@ -217,13 +250,57 @@ where
     ))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerRelayEnd {
+    SnellClosed,
+    UpstreamClosed,
+}
+
+async fn relay_plain_to_server_writer_counted<R, W>(
+    plain: &mut R,
+    snell: &mut TcpServerWriter<W>,
+    total: &mut u64,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        match snell.write_payload_from_reader(plain).await? {
+            Some(n) => *total += n as u64,
+            None => {
+                snell.close_write().await?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn drain_tcp_reader<R>(snell: &mut TcpReader<R>) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let n = match snell.read_payload_chunk().await? {
+            Some(payload) => payload.len(),
+            None => return Ok(()),
+        };
+        snell.consume_payload_chunk(n);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
 
     use super::relay_tcp_server_stream_reusable;
+    use crate::VERSION_4;
+    use crate::error::Error;
+    use crate::protocol::request::{ClientRequest, ServerReply};
     use crate::transport::tcp_stream::{TcpPayloadReader, TcpServerStream};
     use crate::transport::tokio_io::{
         STREAM_BUFFER_INITIAL_CAPACITY, V4StreamReader, V4StreamWriter,
@@ -276,7 +353,7 @@ mod tests {
             let writer = V4StreamWriter::new(server_download, psk).unwrap();
             let snell = TcpServerStream::from_parts_with_pending(reader, writer, BytesMut::new());
 
-            let (stats, reader, writer) = relay_tcp_server_stream_reusable(snell, upstream)
+            let (stats, reader, writer) = relay_tcp_server_stream_reusable(snell, upstream, true)
                 .await
                 .unwrap();
 
@@ -284,6 +361,83 @@ mod tests {
             assert_eq!(stats.downloaded, download_len as u64);
             assert_eq!(reader.body_capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
             assert_eq!(writer.frame_capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
+        };
+
+        let ((), (), ()) = tokio::join!(client, target, server);
+    }
+
+    #[tokio::test]
+    async fn reusable_relay_releases_upstream_when_upstream_closes_first() {
+        let psk = b"test psk";
+        let (client_upload, server_upload) = duplex(4096);
+        let (server_download, client_download) = duplex(4096);
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = TcpStream::connect(upstream_listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut target, _) = upstream_listener.accept().await.unwrap();
+        let (released_tx, released_rx) = oneshot::channel();
+
+        let target = async {
+            target.shutdown().await.unwrap();
+
+            let mut buf = [0; 1];
+            let n = timeout(Duration::from_secs(1), target.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(n, 0);
+            released_tx.send(()).unwrap();
+        };
+
+        let client = async {
+            let mut reader = V4StreamReader::new(client_download, psk).unwrap();
+            let mut writer = V4StreamWriter::new(client_upload, psk).unwrap();
+
+            assert!(matches!(
+                reader.read_server_reply().await,
+                Ok(ServerReply::Tunnel {
+                    payload_offset: 1,
+                    payload: []
+                })
+            ));
+            assert!(matches!(
+                reader.read_frame_payload().await,
+                Err(Error::ZeroChunk)
+            ));
+
+            timeout(Duration::from_secs(1), released_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            writer.write_zero_chunk().await.unwrap();
+            writer
+                .write_tcp_request("next.example", 443, VERSION_4, true)
+                .await
+                .unwrap();
+        };
+
+        let server = async {
+            let reader = V4StreamReader::new(server_upload, psk).unwrap();
+            let writer = V4StreamWriter::new(server_download, psk).unwrap();
+            let snell = TcpServerStream::from_parts_with_pending(reader, writer, BytesMut::new());
+
+            let (stats, mut reader, _) = relay_tcp_server_stream_reusable(snell, upstream, true)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.uploaded, 0);
+            assert_eq!(stats.downloaded, 0);
+            assert_eq!(
+                reader.read_client_request().await.unwrap(),
+                ClientRequest::Connect {
+                    reuse: true,
+                    host: "next.example",
+                    port: 443,
+                    rest_offset: 18,
+                    rest: b"",
+                }
+            );
         };
 
         let ((), (), ()) = tokio::join!(client, target, server);
