@@ -41,11 +41,12 @@ fn benchmark_crypto(c: &mut Criterion) {
                 || {
                     let mut payload = vec![0x42; size];
                     let tag = crypto.encrypt_detached(&nonce, &mut payload).unwrap();
-                    (payload, tag)
+                    payload.extend_from_slice(&tag);
+                    payload
                 },
-                |(mut payload, tag)| {
-                    crypto.decrypt_detached(&nonce, &mut payload, &tag).unwrap();
-                    black_box(payload);
+                |mut payload| {
+                    let plaintext = crypto.decrypt_within(&nonce, &mut payload, 0..).unwrap();
+                    black_box(plaintext.len());
                 },
                 BatchSize::SmallInput,
             );

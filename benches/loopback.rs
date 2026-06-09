@@ -127,7 +127,9 @@ fn spawn_echo_server(listener: TcpListener, shutdown: CancellationToken) -> Join
                         break;
                     };
                     tokio::spawn(async move {
-                        if let Err(err) = echo_connection(stream).await {
+                        if let Err(err) = echo_connection(stream).await
+                            && !is_closed_io_kind(err.kind())
+                        {
                             panic!("echo connection failed: {err}");
                         }
                     });
@@ -199,7 +201,15 @@ async fn transfer_once(
     let mut received = 0;
     let mut buf = vec![0; 64 * 1024];
     while received < payload.len() {
-        let n = stream.read(&mut buf).await?;
+        let n = stream.read(&mut buf).await.map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "read response failed after receiving {received} of {} bytes: {err}",
+                    payload.len()
+                ),
+            )
+        })?;
         if n == 0 {
             break;
         }
@@ -248,6 +258,13 @@ async fn write_socks5_connect(stream: &mut TcpStream, target_addr: SocketAddr) -
         ));
     }
     Ok(())
+}
+
+fn is_closed_io_kind(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+    )
 }
 
 async fn wait_for_tcp(addr: SocketAddr) -> io::Result<()> {

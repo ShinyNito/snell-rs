@@ -1,5 +1,6 @@
 use argon2::{Algorithm, Argon2, Params, Version};
-use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, Tag, UnboundKey};
+use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use std::ops::RangeFrom;
 use zeroize::Zeroize;
 
 use crate::error::{Argon2Error, Error, Result};
@@ -40,21 +41,19 @@ impl Aes128GcmCrypto {
         Ok(out)
     }
 
-    pub fn decrypt_detached(
+    pub fn decrypt_within<'a>(
         &self,
         nonce: &[u8; 12],
-        data: &mut [u8],
-        tag: &[u8; 16],
-    ) -> Result<()> {
+        data_and_tag: &'a mut [u8],
+        ciphertext_and_tag: RangeFrom<usize>,
+    ) -> Result<&'a mut [u8]> {
         self.key
-            .open_in_place_separate_tag(
+            .open_within(
                 Nonce::assume_unique_for_key(*nonce),
                 Aad::empty(),
-                Tag::from(*tag),
-                data,
-                0..,
+                data_and_tag,
+                ciphertext_and_tag,
             )
-            .map(|_| ())
             .map_err(|_| Error::AuthenticationFailed)
     }
 }
@@ -101,7 +100,29 @@ mod tests {
         let tag = crypto.encrypt_detached(&nonce, &mut data).unwrap();
         assert_ne!(&data, b"hello snell");
 
-        crypto.decrypt_detached(&nonce, &mut data, &tag).unwrap();
-        assert_eq!(&data, b"hello snell");
+        let mut data_and_tag = data.to_vec();
+        data_and_tag.extend_from_slice(&tag);
+
+        let plaintext = crypto
+            .decrypt_within(&nonce, &mut data_and_tag, 0..)
+            .unwrap();
+        assert_eq!(plaintext, b"hello snell");
+    }
+
+    #[test]
+    fn decrypts_within_shifted_payload_in_place() {
+        let salt = [9u8; SALT_SIZE];
+        let crypto = Aes128GcmCrypto::from_psk_and_salt(b"password", &salt).unwrap();
+        let nonce = [0u8; 12];
+        let mut data = b"hello snell".to_vec();
+
+        let tag = crypto.encrypt_detached(&nonce, &mut data).unwrap();
+        let mut shifted = vec![0xaa; 7];
+        shifted.extend_from_slice(&data);
+        shifted.extend_from_slice(&tag);
+
+        let plaintext = crypto.decrypt_within(&nonce, &mut shifted, 7..).unwrap();
+        assert_eq!(plaintext, b"hello snell");
+        assert_eq!(&shifted[..b"hello snell".len()], b"hello snell");
     }
 }

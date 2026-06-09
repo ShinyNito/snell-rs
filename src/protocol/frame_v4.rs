@@ -1,10 +1,10 @@
 use bytes::BytesMut;
-use getrandom::fill as fill_random;
 
 use crate::MAX_PACKET_SIZE;
 use crate::error::{Error, Result};
 use crate::protocol::crypto::{AEAD_TAG_SIZE, Aes128GcmCrypto, SALT_SIZE};
 use crate::protocol::nonce::Nonce12;
+use crate::protocol::random::fill_random;
 
 pub const V4_HEADER_PLAIN_SIZE: usize = 7;
 pub const V4_HEADER_CIPHER_SIZE: usize = V4_HEADER_PLAIN_SIZE + AEAD_TAG_SIZE;
@@ -50,6 +50,7 @@ impl V4FrameEncoder {
         )
     }
 
+    #[doc(hidden)]
     pub fn with_salt_and_initial_padding(
         psk: &[u8],
         salt: [u8; SALT_SIZE],
@@ -90,6 +91,7 @@ impl V4FrameEncoder {
         self.encode_frame_parts_with_padding(payload_parts, payload_len, padding_len, out)
     }
 
+    #[doc(hidden)]
     pub fn encode_frame_with_padding(
         &mut self,
         payload: &[u8],
@@ -346,22 +348,18 @@ impl V4FrameDecoder {
         &mut self,
         header_cipher: &mut [u8; V4_HEADER_CIPHER_SIZE],
     ) -> Result<DecodedHeader> {
-        let mut tag = [0; AEAD_TAG_SIZE];
-        tag.copy_from_slice(&header_cipher[V4_HEADER_PLAIN_SIZE..]);
-        let decrypt_result = self.crypto.decrypt_detached(
-            self.nonce.as_bytes(),
-            &mut header_cipher[..V4_HEADER_PLAIN_SIZE],
-            &tag,
-        );
+        let decrypt_result = self
+            .crypto
+            .decrypt_within(self.nonce.as_bytes(), header_cipher, 0..);
         self.nonce.increment();
-        decrypt_result?;
+        let header = decrypt_result?;
 
-        if header_cipher[0] != 4 {
+        if header[0] != 4 {
             return Err(Error::InvalidV4Header);
         }
 
-        let padding_len = u16::from_be_bytes([header_cipher[3], header_cipher[4]]) as usize;
-        let payload_len = u16::from_be_bytes([header_cipher[5], header_cipher[6]]) as usize;
+        let padding_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        let payload_len = u16::from_be_bytes([header[5], header[6]]) as usize;
         if padding_len > MAX_PACKET_SIZE || payload_len > MAX_PACKET_SIZE {
             return Err(Error::PayloadTooLarge);
         }
@@ -387,25 +385,22 @@ impl V4FrameDecoder {
             return Err(Error::FrameLengthMismatch);
         }
 
-        let (padding, payload_cipher) = body.split_at_mut(header.padding_len);
+        let (padding, payload_cipher_and_tag) = body.split_at_mut(header.padding_len);
         if !padding.is_empty() {
-            swap_padding(padding, payload_cipher);
+            swap_padding(padding, payload_cipher_and_tag);
         }
 
-        let (payload, tag_bytes) = payload_cipher.split_at_mut(header.payload_len);
-        let mut tag = [0; AEAD_TAG_SIZE];
-        tag.copy_from_slice(tag_bytes);
-
-        let decrypt_result = self
-            .crypto
-            .decrypt_detached(self.nonce.as_bytes(), payload, &tag);
+        let decrypt_result =
+            self.crypto
+                .decrypt_within(self.nonce.as_bytes(), body, header.padding_len..);
         self.nonce.increment();
-        decrypt_result?;
+        let payload = decrypt_result?;
 
         Ok(payload)
     }
 }
 
+#[doc(hidden)]
 pub fn split_salt(frame: &[u8]) -> Result<([u8; SALT_SIZE], &[u8])> {
     if frame.len() < SALT_SIZE {
         return Err(Error::FrameTooShort);
@@ -528,7 +523,21 @@ fn count_v4_payload_ones(payload_cipher: &[u8]) -> usize {
 }
 
 fn count_one_bits(bytes: &[u8]) -> usize {
-    bytes.iter().map(|byte| byte.count_ones() as usize).sum()
+    let mut chunks = bytes.chunks_exact(8);
+    let word_ones = chunks
+        .by_ref()
+        .map(|chunk| {
+            let word = u64::from_ne_bytes(chunk.try_into().expect("chunk length is 8"));
+            word.count_ones() as usize
+        })
+        .sum::<usize>();
+    let tail_ones = chunks
+        .remainder()
+        .iter()
+        .map(|byte| byte.count_ones() as usize)
+        .sum::<usize>();
+
+    word_ones + tail_ones
 }
 
 fn random_unit_f64() -> Result<f64> {
@@ -628,6 +637,15 @@ mod tests {
         let payload_cipher = [0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff];
 
         assert_eq!(count_v4_payload_ones(&payload_cipher), 8);
+    }
+
+    #[test]
+    fn counts_one_bits_with_word_chunks_and_tail() {
+        let bytes = [
+            0xff, 0x0f, 0x00, 0x80, 0x55, 0xaa, 0x33, 0xcc, 0x01, 0x03, 0x07,
+        ];
+
+        assert_eq!(count_one_bits(&bytes), 35);
     }
 
     #[test]

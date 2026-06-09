@@ -68,8 +68,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("blocking task failed: {0}")]
     TaskJoin(#[from] tokio::task::JoinError),
-    #[error("random source failed: {0}")]
-    Random(#[from] getrandom::Error),
+    #[error("random source failed")]
+    Random,
     #[error("argon2 failed: {0}")]
     Argon2(#[from] Argon2Error),
 }

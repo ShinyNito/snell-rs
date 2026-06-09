@@ -9,6 +9,7 @@ pub mod protocol {
     pub mod header;
     pub mod nonce;
     pub mod quic_proxy;
+    pub(crate) mod random;
     pub mod request;
     pub mod socks5;
     pub mod udp;

@@ -1,5 +1,4 @@
 use bytes::BytesMut;
-use getrandom::fill as fill_random;
 
 use crate::MAX_PACKET_SIZE;
 use crate::error::{Error, Result};
@@ -8,6 +7,7 @@ use crate::protocol::crypto::{AEAD_TAG_SIZE, Aes128GcmCrypto, SALT_SIZE};
 use crate::protocol::frame_v4::{V4_HEADER_CIPHER_SIZE, V4_HEADER_PLAIN_SIZE};
 use crate::protocol::header::PROTOCOL_VERSION;
 use crate::protocol::nonce::Nonce12;
+use crate::protocol::random::fill_random;
 
 pub const QUIC_PROXY_MAX_PAYLOAD: usize = 1417;
 
@@ -191,15 +191,11 @@ impl QuicProxyDecoder {
 
         let mut header = [0u8; V4_HEADER_CIPHER_SIZE];
         header.copy_from_slice(&frame[..V4_HEADER_CIPHER_SIZE]);
-        let mut header_tag = [0; AEAD_TAG_SIZE];
-        header_tag.copy_from_slice(&header[V4_HEADER_PLAIN_SIZE..]);
-        let decrypt_result = self.crypto.decrypt_detached(
-            self.nonce.as_bytes(),
-            &mut header[..V4_HEADER_PLAIN_SIZE],
-            &header_tag,
-        );
+        let decrypt_result = self
+            .crypto
+            .decrypt_within(self.nonce.as_bytes(), &mut header, 0..);
         self.nonce.increment();
-        decrypt_result?;
+        let header = decrypt_result?;
 
         if header[0] != 4 {
             return Err(Error::InvalidV4Header);
@@ -217,16 +213,12 @@ impl QuicProxyDecoder {
             return Err(Error::FrameLengthMismatch);
         }
 
-        let payload_start = V4_HEADER_CIPHER_SIZE;
-        let (payload, tag_bytes) = frame[payload_start..expected_len].split_at_mut(payload_len);
-        let mut payload_tag = [0; AEAD_TAG_SIZE];
-        payload_tag.copy_from_slice(tag_bytes);
-
+        let payload_and_tag = &mut frame[V4_HEADER_CIPHER_SIZE..expected_len];
         let decrypt_result =
             self.crypto
-                .decrypt_detached(self.nonce.as_bytes(), payload, &payload_tag);
+                .decrypt_within(self.nonce.as_bytes(), payload_and_tag, 0..);
         self.nonce.increment();
-        decrypt_result?;
+        let payload = decrypt_result?;
 
         Ok(payload)
     }

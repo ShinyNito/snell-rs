@@ -1,7 +1,7 @@
 use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
@@ -118,15 +118,13 @@ where
 
         self.read_body(body_len).await?;
         let payload_len = header.payload_len;
-        let payload_start = header.padding_len;
-        let payload_end = payload_start + payload_len;
         let payload = self
             .decoder
             .as_mut()
             .expect("decoder initialized before payload decode")
             .decode_payload_in_place(header, &mut self.body)?;
-        self.payload_start = payload_start;
-        self.payload_end = payload_end;
+        self.payload_start = 0;
+        self.payload_end = payload_len;
         tracing::trace!(payload_len, body_len, "read snell v4 frame");
         Ok(payload)
     }
@@ -355,35 +353,15 @@ where
                 self.frame.extend_from_slice(prefix);
             }
 
-            let spare_len = self.frame.chunk_mut().len();
-            if spare_len < read_limit {
-                self.frame.reserve(read_limit - spare_len);
-            }
-            let spare = self.frame.chunk_mut();
-            // Same boundary Tokio's read_buf uses: poll_read may initialize
-            // only the unfilled tail we hand to ReadBuf.
-            let spare = unsafe { spare.as_uninit_slice_mut() };
-            if spare.len() < read_limit {
-                self.frame.clear();
-                return Poll::Ready(Err(crate::error::Error::PayloadTooLarge));
-            }
-            let mut read_buf = ReadBuf::uninit(&mut spare[..read_limit]);
-
-            match Pin::new(&mut *plain).poll_read(cx, &mut read_buf) {
+            match poll_read_into_spare(plain, cx, &mut self.frame, read_limit) {
                 Poll::Pending => {
                     self.frame.clear();
                     Poll::Pending
                 }
-                Poll::Ready(Ok(())) => {
-                    let read_len = read_buf.filled().len();
+                Poll::Ready(Ok(read_len)) => {
                     if read_len == 0 {
                         self.frame.clear();
                         return Poll::Ready(Ok(None));
-                    }
-                    // ReadBuf reports exactly how many bytes poll_read
-                    // initialized in BytesMut's spare capacity.
-                    unsafe {
-                        self.frame.advance_mut(read_len);
                     }
                     Poll::Ready(Ok(Some(ReaderPayloadFrame {
                         payload_start,
@@ -395,7 +373,7 @@ where
                 }
                 Poll::Ready(Err(err)) => {
                     self.frame.clear();
-                    Poll::Ready(Err(err.into()))
+                    Poll::Ready(Err(err))
                 }
             }
         })
@@ -585,6 +563,45 @@ where
             "wrote snell v4 request frame"
         );
         Ok(())
+    }
+}
+
+fn poll_read_into_spare<R>(
+    reader: &mut R,
+    cx: &mut Context<'_>,
+    buffer: &mut BytesMut,
+    read_limit: usize,
+) -> Poll<Result<usize>>
+where
+    R: AsyncRead + Unpin,
+{
+    let spare_len = buffer.chunk_mut().len();
+    if spare_len < read_limit {
+        buffer.reserve(read_limit - spare_len);
+    }
+
+    let spare = buffer.chunk_mut();
+    if spare.len() < read_limit {
+        return Poll::Ready(Err(Error::PayloadTooLarge));
+    }
+
+    // Same boundary Tokio's read_buf uses: poll_read may initialize only the
+    // unfilled tail we hand to ReadBuf.
+    let spare = unsafe { spare.as_uninit_slice_mut() };
+    let mut read_buf = ReadBuf::uninit(&mut spare[..read_limit]);
+
+    match Pin::new(reader).poll_read(cx, &mut read_buf) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(())) => {
+            let read_len = read_buf.filled().len();
+            // ReadBuf reports exactly how many bytes poll_read initialized in
+            // BytesMut's spare capacity.
+            unsafe {
+                buffer.advance_mut(read_len);
+            }
+            Poll::Ready(Ok(read_len))
+        }
+        Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
     }
 }
 
