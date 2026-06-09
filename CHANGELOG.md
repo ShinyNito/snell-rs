@@ -2,6 +2,12 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.3.1] - 2026-06-09
+
+## Release Notes
+
+  * 修复 loopback benchmark 的 clippy 检查
+
 ## [0.3.0] - 2026-06-09
 
 ## Release Notes

@@ -161,10 +161,10 @@ fn spawn_snell_server(config: ServerConfig, shutdown: CancellationToken) -> Join
     let task_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let result = bind_configured_tcp_server_with_shutdown(config, task_shutdown.clone()).await;
-        if let Err(err) = result {
-            if !task_shutdown.is_cancelled() {
-                panic!("snell server failed: {err}");
-            }
+        if let Err(err) = result
+            && !task_shutdown.is_cancelled()
+        {
+            panic!("snell server failed: {err}");
         }
     })
 }
@@ -174,10 +174,10 @@ fn spawn_socks5_client(config: ClientConfig, shutdown: CancellationToken) -> Joi
     tokio::spawn(async move {
         let result =
             bind_configured_socks5_client_with_shutdown(config, task_shutdown.clone()).await;
-        if let Err(err) = result {
-            if !task_shutdown.is_cancelled() {
-                panic!("socks5 client failed: {err}");
-            }
+        if let Err(err) = result
+            && !task_shutdown.is_cancelled()
+        {
+            panic!("socks5 client failed: {err}");
         }
     })
 }
