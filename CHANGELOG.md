@@ -2,6 +2,12 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.3.3] - 2026-06-09
+
+## Release Notes
+
+  * 优化复用连接的流缓冲区保留策略，减少大流量场景下的重复扩容
+
 ## [0.3.2] - 2026-06-09
 
 ## Release Notes

@@ -27,6 +27,7 @@ pub const TCP_FIRST_RECORD_OVERHEAD: usize = 55;
 pub const TCP_STEADY_RECORD_OVERHEAD: usize = 39;
 pub const TCP_RECORD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const STREAM_BUFFER_INITIAL_CAPACITY: usize = 2048;
+pub(crate) const STREAM_BUFFER_RETAIN_CAPACITY: usize = MAX_PACKET_SIZE + 1024;
 const PLAIN_BUFFER_INITIAL_CAPACITY: usize = 256;
 
 pub struct RecordSizer {
@@ -155,10 +156,9 @@ where
     }
 
     pub(crate) fn compact_buffers_for_reuse(&mut self) {
-        self.body.clear();
+        compact_stream_buffer_for_reuse(&mut self.body);
         self.payload_start = 0;
         self.payload_end = 0;
-        self.body = BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY);
     }
 
     #[cfg(test)]
@@ -490,8 +490,7 @@ where
     }
 
     pub(crate) fn compact_buffers_for_reuse(&mut self) {
-        self.frame.clear();
-        self.frame = BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY);
+        compact_stream_buffer_for_reuse(&mut self.frame);
     }
 
     #[cfg(test)]
@@ -589,6 +588,13 @@ where
     }
 }
 
+fn compact_stream_buffer_for_reuse(buffer: &mut BytesMut) {
+    buffer.clear();
+    if buffer.capacity() > STREAM_BUFFER_RETAIN_CAPACITY {
+        *buffer = BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -601,8 +607,8 @@ mod tests {
 
     use super::{
         PLAIN_BUFFER_INITIAL_CAPACITY, RecordSizer, STREAM_BUFFER_INITIAL_CAPACITY,
-        TCP_FIRST_RECORD_OVERHEAD, TCP_RECORD_IDLE_TIMEOUT, TCP_RECORD_MSS,
-        TCP_STEADY_RECORD_OVERHEAD, V4StreamReader, V4StreamWriter,
+        STREAM_BUFFER_RETAIN_CAPACITY, TCP_FIRST_RECORD_OVERHEAD, TCP_RECORD_IDLE_TIMEOUT,
+        TCP_RECORD_MSS, TCP_STEADY_RECORD_OVERHEAD, V4StreamReader, V4StreamWriter,
     };
     use crate::error::{Error, Result};
     use crate::protocol::frame_v4::V4FrameEncoder;
@@ -735,7 +741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_for_reuse_resets_stream_buffers() {
+    async fn compact_for_reuse_retains_bounded_stream_buffers() {
         let psk = b"test psk";
         let large_payload = vec![0x51; 4096];
         let (writer_io, reader_io) = duplex(8192);
@@ -747,16 +753,36 @@ mod tests {
             assert_eq!(payload.len(), large_payload.len());
             assert!(reader.body.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
             reader.compact_buffers_for_reuse();
-            assert_eq!(reader.body.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
+            assert!(reader.body.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
+            assert!(reader.body.capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
         };
         let write = async {
             writer.write_frame(&large_payload).await.unwrap();
             assert!(writer.frame.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
             writer.compact_buffers_for_reuse();
-            assert_eq!(writer.frame.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
+            assert!(writer.frame.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
+            assert!(writer.frame.capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
         };
 
         let ((), ()) = tokio::join!(read, write);
+    }
+
+    #[test]
+    fn compact_for_reuse_resets_oversized_stream_buffers() {
+        let psk = b"test psk";
+        let mut reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
+        let mut writer = V4StreamWriter::new(sink(), psk).unwrap();
+
+        reader.body.reserve(STREAM_BUFFER_RETAIN_CAPACITY + 1);
+        writer.frame.reserve(STREAM_BUFFER_RETAIN_CAPACITY + 1);
+        assert!(reader.body.capacity() > STREAM_BUFFER_RETAIN_CAPACITY);
+        assert!(writer.frame.capacity() > STREAM_BUFFER_RETAIN_CAPACITY);
+
+        reader.compact_buffers_for_reuse();
+        writer.compact_buffers_for_reuse();
+
+        assert_eq!(reader.body.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
+        assert_eq!(writer.frame.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
     }
 
     #[tokio::test]

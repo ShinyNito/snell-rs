@@ -401,7 +401,8 @@ mod tests {
     use crate::protocol::request::{ClientRequest, ServerReply};
     use crate::transport::tcp_stream::{TcpPayloadReader, TcpServerStream};
     use crate::transport::tokio_io::{
-        STREAM_BUFFER_INITIAL_CAPACITY, V4StreamReader, V4StreamWriter,
+        STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY, V4StreamReader,
+        V4StreamWriter,
     };
     use crate::{MAX_PACKET_SIZE, VERSION_4};
 
@@ -458,8 +459,10 @@ mod tests {
 
             assert_eq!(stats.uploaded, upload_len as u64);
             assert_eq!(stats.downloaded, download_len as u64);
-            assert_eq!(reader.body_capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
-            assert_eq!(writer.frame_capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
+            assert!(reader.body_capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
+            assert!(reader.body_capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
+            assert!(writer.frame_capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
+            assert!(writer.frame_capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
         };
 
         let ((), (), ()) = tokio::join!(client, target, server);
