@@ -1,6 +1,5 @@
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes128Gcm, Nonce, Tag};
 use argon2::{Algorithm, Argon2, Params, Version};
+use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, Tag, UnboundKey};
 use zeroize::Zeroize;
 
 use crate::error::{Argon2Error, Error, Result};
@@ -15,14 +14,16 @@ const SNELL_ARGON2_ITERATIONS: u32 = 3;
 const SNELL_ARGON2_PARALLELISM: u32 = 1;
 
 pub struct Aes128GcmCrypto {
-    cipher: Aes128Gcm,
+    key: LessSafeKey,
 }
 
 impl Aes128GcmCrypto {
     pub fn new(key: [u8; AES_128_KEY_SIZE]) -> Self {
-        let cipher = Aes128Gcm::new_from_slice(&key)
+        let key = UnboundKey::new(&AES_128_GCM, &key)
             .expect("Aes128GcmCrypto::new received a fixed-size AES-128 key");
-        Self { cipher }
+        Self {
+            key: LessSafeKey::new(key),
+        }
     }
 
     pub fn from_psk_and_salt(psk: &[u8], salt: &[u8; SALT_SIZE]) -> Result<Self> {
@@ -31,11 +32,11 @@ impl Aes128GcmCrypto {
 
     pub fn encrypt_detached(&self, nonce: &[u8; 12], data: &mut [u8]) -> Result<[u8; 16]> {
         let tag = self
-            .cipher
-            .encrypt_in_place_detached(Nonce::from_slice(nonce), b"", data)
+            .key
+            .seal_in_place_separate_tag(Nonce::assume_unique_for_key(*nonce), Aad::empty(), data)
             .map_err(|_| Error::AuthenticationFailed)?;
         let mut out = [0; AEAD_TAG_SIZE];
-        out.copy_from_slice(tag.as_slice());
+        out.copy_from_slice(tag.as_ref());
         Ok(out)
     }
 
@@ -45,8 +46,15 @@ impl Aes128GcmCrypto {
         data: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<()> {
-        self.cipher
-            .decrypt_in_place_detached(Nonce::from_slice(nonce), b"", data, Tag::from_slice(tag))
+        self.key
+            .open_in_place_separate_tag(
+                Nonce::assume_unique_for_key(*nonce),
+                Aad::empty(),
+                Tag::from(*tag),
+                data,
+                0..,
+            )
+            .map(|_| ())
             .map_err(|_| Error::AuthenticationFailed)
     }
 }
