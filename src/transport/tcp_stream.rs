@@ -266,6 +266,11 @@ where
         }
     }
 
+    pub(crate) async fn accept(&mut self) -> Result<()> {
+        self.writer.open_tunnel().await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn reject(self, code: u8, message: &str) -> Result<()> {
         self.writer.reject(code, message).await
     }
@@ -301,6 +306,7 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     async fn reject(mut self, code: u8, message: &str) -> Result<()> {
         if !self.tunnel_open && !self.write_closed {
             self.frame_writer.write_error_reply(code, message).await?;

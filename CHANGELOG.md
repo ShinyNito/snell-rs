@@ -2,6 +2,13 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.3.0] - 2026-06-09
+
+## Release Notes
+
+  * 添加服务端 server-side fast-open，在上游连接完成前先返回 Tunnel OK 并缓存早到 TCP payload
+  * 添加协议和 loopback benchmark
+
 ## [0.2.3] - 2026-06-08
 
 ## Release Notes

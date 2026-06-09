@@ -1,6 +1,6 @@
 [package]
 name = "snell-rs"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ShinyNito/snell-rs"
@@ -31,4 +31,12 @@ winnow = "1"
 zeroize = "1"
 
 [dev-dependencies]
-criterion = "0.8"
+criterion = { version = "0.8", features = ["async_tokio"] }
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "loopback"
+harness = false

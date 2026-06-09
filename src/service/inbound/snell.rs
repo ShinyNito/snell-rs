@@ -2,9 +2,10 @@ use std::future::Future;
 use std::time::Instant;
 
 use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::MAX_PACKET_SIZE;
 use crate::error::{Error, Result};
 use crate::protocol::request::ClientRequest;
 use crate::relay::tcp::relay_tcp_reader_to_plain_counted;
@@ -18,6 +19,7 @@ use crate::transport::udp_stream::UdpServerStream;
 
 pub(crate) const CONNECT_FAILED_CODE: u8 = 1;
 pub(crate) const CONNECT_FAILED_MESSAGE: &str = "connect failed";
+const SERVER_FAST_OPEN_BUFFER_LIMIT: usize = 64 * 1024;
 
 pub(crate) async fn serve_server_connection(
     client: TcpStream,
@@ -81,22 +83,9 @@ where
                 let keep_alive = target.reuse;
                 let snell =
                     TcpServerStream::from_parts_with_pending(frame_reader, frame_writer, pending);
-                let upstream = match open_target(target, options).await {
-                    Ok(upstream) => upstream,
-                    Err(err) => {
-                        snell
-                            .reject(CONNECT_FAILED_CODE, CONNECT_FAILED_MESSAGE)
-                            .await?;
-                        tracing::debug!(
-                            %err,
-                            duration_ms = started.elapsed().as_millis(),
-                            "snell tcp server connect failed"
-                        );
-                        return Err(err);
-                    }
-                };
+                let connect = open_target(target, options);
                 let (stats, next_reader, next_writer) =
-                    match relay_tcp_server_stream_reusable(snell, upstream, keep_alive).await {
+                    match relay_tcp_server_stream_fast_open(snell, connect, keep_alive).await {
                         Ok(result) => result,
                         Err(err) => {
                             tracing::debug!(
@@ -187,6 +176,74 @@ async fn open_target_stream(target: TcpTarget, options: RelayOptions) -> Result<
     crate::service::outbound::open_tcp(&target.host, target.port, options).await
 }
 
+async fn relay_tcp_server_stream_fast_open<R, W, Fut>(
+    mut snell: TcpServerStream<R, W>,
+    connect: Fut,
+    keep_alive: bool,
+) -> Result<(RelayStats, V4StreamReader<R>, V4StreamWriter<W>)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    Fut: Future<Output = Result<TcpStream>>,
+{
+    snell.accept().await?;
+    let (mut snell_reader, snell_writer) = snell.into_split();
+    let mut early_payload = BytesMut::new();
+    let upstream =
+        buffer_fast_open_payload_until_connected(&mut snell_reader, connect, &mut early_payload)
+            .await?;
+
+    relay_tcp_server_split_reusable(
+        snell_reader,
+        snell_writer,
+        upstream,
+        keep_alive,
+        early_payload,
+    )
+    .await
+}
+
+async fn buffer_fast_open_payload_until_connected<R, Fut, T>(
+    snell: &mut TcpReader<R>,
+    connect: Fut,
+    early_payload: &mut BytesMut,
+) -> Result<T>
+where
+    R: AsyncRead + Unpin,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut upload_done = false;
+    tokio::pin!(connect);
+
+    loop {
+        if upload_done || !can_buffer_more_fast_open_payload(early_payload.len()) {
+            return connect.await;
+        }
+
+        tokio::select! {
+            biased;
+            result = &mut connect => return result,
+            result = snell.read_payload_chunk() => {
+                let Some(payload) = result? else {
+                    upload_done = true;
+                    continue;
+                };
+                let n = payload.len();
+                if early_payload.len().saturating_add(n) > SERVER_FAST_OPEN_BUFFER_LIMIT {
+                    return Err(Error::PayloadTooLarge);
+                }
+                early_payload.extend_from_slice(payload);
+                snell.consume_payload_chunk(n);
+            }
+        }
+    }
+}
+
+fn can_buffer_more_fast_open_payload(buffered: usize) -> bool {
+    buffered.saturating_add(MAX_PACKET_SIZE) <= SERVER_FAST_OPEN_BUFFER_LIMIT
+}
+
+#[cfg(test)]
 async fn relay_tcp_server_stream_reusable<R, W>(
     snell: TcpServerStream<R, W>,
     upstream: TcpStream,
@@ -196,16 +253,38 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let (mut snell_reader, mut snell_writer) = snell.into_split();
+    let (snell_reader, snell_writer) = snell.into_split();
+    relay_tcp_server_split_reusable(
+        snell_reader,
+        snell_writer,
+        upstream,
+        keep_alive,
+        BytesMut::new(),
+    )
+    .await
+}
+
+async fn relay_tcp_server_split_reusable<R, W>(
+    mut snell_reader: TcpReader<R>,
+    mut snell_writer: TcpServerWriter<W>,
+    upstream: TcpStream,
+    keep_alive: bool,
+    early_payload: BytesMut,
+) -> Result<(RelayStats, V4StreamReader<R>, V4StreamWriter<W>)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let (mut upstream_reader, mut upstream_writer) = upstream.into_split();
 
     let mut uploaded = 0;
     let mut downloaded = 0;
     let end = {
-        let upload = relay_tcp_reader_to_plain_counted(
+        let upload = relay_tcp_reader_to_plain_counted_with_initial(
             &mut snell_reader,
             &mut upstream_writer,
             &mut uploaded,
+            early_payload,
         );
         let download = relay_plain_to_server_writer_counted(
             &mut upstream_reader,
@@ -248,6 +327,23 @@ where
         frame_reader,
         frame_writer,
     ))
+}
+
+async fn relay_tcp_reader_to_plain_counted_with_initial<R, W>(
+    snell: &mut TcpReader<R>,
+    plain: &mut W,
+    total: &mut u64,
+    early_payload: BytesMut,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    if !early_payload.is_empty() {
+        plain.write_all(&early_payload).await?;
+        *total += early_payload.len() as u64;
+    }
+    relay_tcp_reader_to_plain_counted(snell, plain, total).await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -297,14 +393,17 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
 
-    use super::relay_tcp_server_stream_reusable;
-    use crate::VERSION_4;
+    use super::{
+        SERVER_FAST_OPEN_BUFFER_LIMIT, buffer_fast_open_payload_until_connected,
+        relay_tcp_server_stream_reusable,
+    };
     use crate::error::Error;
     use crate::protocol::request::{ClientRequest, ServerReply};
     use crate::transport::tcp_stream::{TcpPayloadReader, TcpServerStream};
     use crate::transport::tokio_io::{
         STREAM_BUFFER_INITIAL_CAPACITY, V4StreamReader, V4StreamWriter,
     };
+    use crate::{MAX_PACKET_SIZE, VERSION_4};
 
     #[tokio::test]
     async fn reusable_relay_compacts_stream_buffers_after_request() {
@@ -364,6 +463,46 @@ mod tests {
         };
 
         let ((), (), ()) = tokio::join!(client, target, server);
+    }
+
+    #[tokio::test]
+    async fn fast_open_buffer_stops_before_next_frame_could_exceed_limit() {
+        let psk = b"test psk";
+        let (client_upload, server_upload) = duplex(4096);
+
+        let mut writer = V4StreamWriter::new(client_upload, psk).unwrap();
+        writer.write_frame(b"held").await.unwrap();
+
+        let reader = V4StreamReader::new(server_upload, psk).unwrap();
+        let writer = V4StreamWriter::new(tokio::io::sink(), psk).unwrap();
+        let snell = TcpServerStream::from_parts_with_pending(reader, writer, BytesMut::new());
+        let (mut snell_reader, _) = snell.into_split();
+        let mut early_payload = BytesMut::new();
+        let initial_len = SERVER_FAST_OPEN_BUFFER_LIMIT - MAX_PACKET_SIZE + 1;
+        early_payload.resize(initial_len, 0);
+
+        let (connect_tx, connect_rx) = oneshot::channel();
+        let connect = async {
+            connect_rx.await.unwrap();
+            Ok::<_, Error>(())
+        };
+        {
+            let fast_open = buffer_fast_open_payload_until_connected(
+                &mut snell_reader,
+                connect,
+                &mut early_payload,
+            );
+            tokio::pin!(fast_open);
+
+            assert!(
+                timeout(Duration::from_millis(50), &mut fast_open)
+                    .await
+                    .is_err()
+            );
+            connect_tx.send(()).unwrap();
+            fast_open.await.unwrap();
+        }
+        assert_eq!(early_payload.len(), initial_len);
     }
 
     #[tokio::test]

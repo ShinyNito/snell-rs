@@ -127,8 +127,7 @@ mod tests {
     use crate::protocol::request::ServerReply;
     use crate::protocol::socks5::{SocksReply, SocksRequest, SocksTarget};
     use crate::service::inbound::snell::{
-        CONNECT_FAILED_CODE, CONNECT_FAILED_MESSAGE, serve_server_connection,
-        serve_server_connection_with_target_opener,
+        serve_server_connection, serve_server_connection_with_target_opener,
     };
     use crate::service::inbound::socks5::{read_client_request, write_reply_with_bind};
     use crate::service::outbound::{RelayOptions, UpstreamRelay};
@@ -288,7 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_server_connection_returns_connect_failed_when_upstream_socks5_rejects() {
+    async fn serve_server_connection_closes_when_upstream_socks5_rejects_after_fast_open() {
         let psk = b"test psk";
         let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socks_addr = socks_listener.local_addr().unwrap();
@@ -329,17 +328,92 @@ mod tests {
                     .await
                     .unwrap();
             let (mut snell_reader, _) = snell.into_split();
-            assert!(matches!(
-                snell_reader.read_payload_chunk().await,
-                Err(Error::Server {
-                    code: CONNECT_FAILED_CODE,
-                    message,
-                }) if message == CONNECT_FAILED_MESSAGE
-            ));
+            assert!(
+                timeout(Duration::from_secs(1), snell_reader.read_payload_chunk())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
         };
 
         let ((), server_result, ()) = tokio::join!(socks, server, client);
         assert!(matches!(server_result, Err(Error::Socks5Reply(1))));
+    }
+
+    #[tokio::test]
+    async fn serve_server_connection_fast_open_accepts_before_target_connects() {
+        let psk = b"test psk";
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let snell_addr = snell_listener.local_addr().unwrap();
+        let (connect_tx, connect_rx) = oneshot::channel();
+
+        let echo = async {
+            let (mut stream, _) = echo_listener.accept().await.unwrap();
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input).await.unwrap();
+            assert_eq!(input, b"early");
+            stream.write_all(b"pong").await.unwrap();
+            stream.shutdown().await.unwrap();
+        };
+
+        let server = async {
+            let (client, _) = snell_listener.accept().await.unwrap();
+            let mut connect_rx = Some(connect_rx);
+            serve_server_connection_with_target_opener(
+                client,
+                psk,
+                RelayOptions::default(),
+                move |target, _options| {
+                    let connect_rx = connect_rx.take().unwrap();
+                    async move {
+                        assert_eq!(target.host, "example.com");
+                        assert_eq!(target.port, 443);
+                        connect_rx.await.unwrap();
+                        Ok(TcpStream::connect(echo_addr).await?)
+                    }
+                },
+            )
+            .await
+            .unwrap()
+        };
+
+        let client = async {
+            let stream = TcpStream::connect(snell_addr).await.unwrap();
+            let (snell_reader_io, snell_writer_io) = stream.into_split();
+            let mut snell_reader = V4StreamReader::new(snell_reader_io, psk).unwrap();
+            let mut snell_writer = V4StreamWriter::new(snell_writer_io, psk).unwrap();
+            snell_writer
+                .write_tcp_request("example.com", 443, VERSION_4, false)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                timeout(Duration::from_millis(200), snell_reader.read_server_reply())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                ServerReply::Tunnel {
+                    payload_offset: 1,
+                    payload: b"",
+                }
+            );
+
+            snell_writer.write_frame(b"early").await.unwrap();
+            snell_writer.write_zero_chunk().await.unwrap();
+            connect_tx.send(()).unwrap();
+
+            let payload = snell_reader.read_frame_payload().await.unwrap();
+            assert_eq!(payload, b"pong");
+            assert!(matches!(
+                snell_reader.read_frame_payload().await,
+                Err(Error::ZeroChunk)
+            ));
+        };
+
+        let ((), (), ()) = tokio::join!(echo, server, client);
     }
 
     #[tokio::test]
@@ -503,7 +577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_server_connection_rejects_connect_failure() {
+    async fn serve_server_connection_closes_after_fast_open_connect_failure() {
         let psk = b"test psk";
         let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let snell_addr = snell_listener.local_addr().unwrap();
@@ -534,13 +608,15 @@ mod tests {
                 .unwrap();
 
             let mut snell_reader = V4StreamReader::new(snell_reader_io, psk).unwrap();
-            assert!(matches!(
-                snell_reader.read_server_reply().await,
-                Ok(ServerReply::Error {
-                    code: CONNECT_FAILED_CODE,
-                    message: CONNECT_FAILED_MESSAGE
-                })
-            ));
+            assert_eq!(
+                snell_reader.read_server_reply().await.unwrap(),
+                ServerReply::Tunnel {
+                    payload_offset: 1,
+                    payload: b"",
+                }
+            );
+            let err = snell_reader.read_frame_payload().await.unwrap_err();
+            assert!(err.is_closed_io(), "{err:?}");
         };
 
         let (server_result, ()) = tokio::join!(server, client);
