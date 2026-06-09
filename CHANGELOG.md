@@ -2,6 +2,12 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.3.2] - 2026-06-09
+
+## Release Notes
+
+  * 使用 ring 加速 AES-GCM
+
 ## [0.3.1] - 2026-06-09
 
 ## Release Notes
