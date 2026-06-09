@@ -2,6 +2,12 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.3.4] - 2026-06-09
+
+## Release Notes
+
+  * 优化 v4 解密、随机源和缓冲区热路径
+
 ## [0.3.3] - 2026-06-09
 
 ## Release Notes
