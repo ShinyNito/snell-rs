@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::BufMut;
@@ -6,11 +6,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::error::{Error, Result};
-use crate::parse::{read_array, read_be_u16, take_bytes};
 use crate::protocol::socks5::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, COMMAND_CONNECT, COMMAND_UDP_ASSOCIATE,
-    METHOD_NO_ACCEPTABLE, METHOD_NO_AUTH, SOCKS_VERSION, SocksAddress, SocksReply, SocksRequest,
-    SocksTarget, write_address,
+    METHOD_NO_ACCEPTABLE, METHOD_NO_AUTH, SOCKS_VERSION, SocksAddress, SocksAddressContext,
+    SocksReply, SocksRequest, SocksTarget, read_address_port, write_address,
 };
 use crate::protocol::udp::AddressRef;
 use crate::relay::snell_tcp::relay_tcp_connect;
@@ -33,7 +32,7 @@ pub(crate) async fn relay_socks5_connection(
     };
     match request {
         SocksRequest::Connect(target) => {
-            let connect = outbound.open_tcp(target.host, target.port).await;
+            let connect = outbound.open_tcp(&target.host, target.port).await;
             let connect = match connect {
                 Ok(connect) => connect,
                 Err(err) => {
@@ -93,7 +92,7 @@ pub(crate) async fn write_reply_with_bind<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let mut out = Vec::with_capacity(22);
+    let mut out = Vec::with_capacity(262);
     out.put_u8(SOCKS_VERSION);
     out.put_u8(reply as u8);
     out.put_u8(0);
@@ -143,7 +142,9 @@ where
         return Err(Error::InvalidSocksRequest);
     }
     let (address, port) = match header[3] {
-        ATYP_IPV4 | ATYP_DOMAIN | ATYP_IPV6 => read_address_port(stream, header[3]).await?,
+        ATYP_IPV4 | ATYP_DOMAIN | ATYP_IPV6 => {
+            read_address_port(stream, header[3], SocksAddressContext::Request).await?
+        }
         _ => {
             write_reply(stream, SocksReply::AddressTypeNotSupported).await?;
             return Err(Error::InvalidSocksRequest);
@@ -164,51 +165,9 @@ where
     }
 }
 
-async fn read_address_port<S>(stream: &mut S, atyp: u8) -> Result<(SocksAddress, u16)>
-where
-    S: AsyncRead + Unpin,
-{
-    match atyp {
-        ATYP_IPV4 => {
-            let mut raw = [0; 6];
-            stream.read_exact(&mut raw).await?;
-            let mut input = &raw[..];
-            let octets = read_array::<4>(&mut input, Error::InvalidSocksRequest)?;
-            let port = read_be_u16(&mut input, Error::InvalidSocksRequest)?;
-            Ok((SocksAddress::Ip(IpAddr::V4(Ipv4Addr::from(octets))), port))
-        }
-        ATYP_DOMAIN => {
-            let mut len = [0; 1];
-            stream.read_exact(&mut len).await?;
-            let host_len = len[0] as usize;
-            if host_len == 0 {
-                return Err(Error::EmptyHost);
-            }
-
-            let mut raw = [0; u8::MAX as usize + 2];
-            stream.read_exact(&mut raw[..host_len + 2]).await?;
-            let mut input = &raw[..host_len + 2];
-            let host = take_bytes(&mut input, host_len, Error::InvalidSocksRequest)?;
-            let port = read_be_u16(&mut input, Error::InvalidSocksRequest)?;
-            Ok((
-                SocksAddress::Domain(std::str::from_utf8(host)?.to_owned()),
-                port,
-            ))
-        }
-        ATYP_IPV6 => {
-            let mut raw = [0; 18];
-            stream.read_exact(&mut raw).await?;
-            let mut input = &raw[..];
-            let octets = read_array::<16>(&mut input, Error::InvalidSocksRequest)?;
-            let port = read_be_u16(&mut input, Error::InvalidSocksRequest)?;
-            Ok((SocksAddress::Ip(IpAddr::V6(Ipv6Addr::from(octets))), port))
-        }
-        _ => Err(Error::InvalidSocksRequest),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use core::range::Range;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
@@ -354,7 +313,7 @@ mod tests {
                     reuse: false,
                     host: "1.1.1.1",
                     port: 80,
-                    rest_offset: 13,
+                    rest_span: Range { start: 13, end: 13 },
                     rest: b"",
                 }
             );
@@ -712,10 +671,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(matches!(
-                reader.read_frame_payload().await,
-                Err(Error::ZeroChunk)
-            ));
+            std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
         };
 
         let socks_server = async {
@@ -788,10 +744,7 @@ mod tests {
                 .write_udp_response(AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)), 443, b"ok")
                 .await
                 .unwrap();
-            assert!(matches!(
-                reader.read_frame_payload().await,
-                Err(Error::ZeroChunk)
-            ));
+            std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
         };
 
         let socks_server = async {
@@ -1081,10 +1034,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(matches!(
-                reader.read_frame_payload().await,
-                Err(Error::ZeroChunk)
-            ));
+            std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
         };
 
         let socks_server = async {

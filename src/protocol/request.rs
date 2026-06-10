@@ -1,4 +1,5 @@
 use bytes::BufMut;
+use core::range::Range;
 
 use crate::error::{Error, Result};
 use crate::parse::{read_be_u16, read_u8, take_bytes};
@@ -14,11 +15,11 @@ pub enum ClientRequest<'a> {
         reuse: bool,
         host: &'a str,
         port: u16,
-        rest_offset: usize,
+        rest_span: Range<usize>,
         rest: &'a [u8],
     },
     Udp {
-        rest_offset: usize,
+        rest_span: Range<usize>,
         rest: &'a [u8],
     },
 }
@@ -26,7 +27,7 @@ pub enum ClientRequest<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerReply<'a> {
     Tunnel {
-        payload_offset: usize,
+        payload_span: Range<usize>,
         payload: &'a [u8],
     },
     Pong,
@@ -38,7 +39,7 @@ pub enum ServerReply<'a> {
 
 /// Parses a client request as a borrowed view into `input`.
 ///
-/// `host`, `rest`, and offsets refer to the original frame payload. Convert the
+/// `host`, `rest`, and spans refer to the original frame payload. Convert the
 /// fields that must survive another read or await boundary to owned values at
 /// the runtime edge.
 pub fn parse_client_request(input: &[u8]) -> Result<ClientRequest<'_>> {
@@ -66,19 +67,25 @@ pub fn parse_client_request(input: &[u8]) -> Result<ClientRequest<'_>> {
             let host =
                 std::str::from_utf8(take_bytes(&mut input, host_len, Error::TruncatedRequest)?)?;
             let port = read_be_u16(&mut input, Error::TruncatedRequest)?;
-            let rest_offset = original_len - input.len();
+            let rest_start = original_len - input.len();
             Ok(ClientRequest::Connect {
                 reuse: command == COMMAND_CONNECT_V2,
                 host,
                 port,
-                rest_offset,
+                rest_span: Range {
+                    start: rest_start,
+                    end: original_len,
+                },
                 rest: input,
             })
         }
         COMMAND_UDP => {
-            let rest_offset = original_len - input.len();
+            let rest_start = original_len - input.len();
             Ok(ClientRequest::Udp {
-                rest_offset,
+                rest_span: Range {
+                    start: rest_start,
+                    end: original_len,
+                },
                 rest: input,
             })
         }
@@ -90,11 +97,15 @@ pub fn parse_client_request(input: &[u8]) -> Result<ClientRequest<'_>> {
 ///
 /// `payload` and `message` borrow from the original frame payload.
 pub fn parse_server_reply(input: &[u8]) -> Result<ServerReply<'_>> {
+    let original_len = input.len();
     let mut input = input;
 
     match read_u8(&mut input, Error::TruncatedServerReply)? {
         COMMAND_TUNNEL => Ok(ServerReply::Tunnel {
-            payload_offset: 1,
+            payload_span: Range {
+                start: 1,
+                end: original_len,
+            },
             payload: input,
         }),
         COMMAND_PONG => Ok(ServerReply::Pong),
@@ -131,6 +142,8 @@ pub fn write_error_reply(out: &mut impl BufMut, code: u8, message: &str) {
 
 #[cfg(test)]
 mod tests {
+    use core::range::Range;
+
     use bytes::BytesMut;
 
     use super::{
@@ -156,7 +169,7 @@ mod tests {
                 reuse: true,
                 host: "example.com",
                 port: 443,
-                rest_offset: 17,
+                rest_span: Range { start: 17, end: 27 },
                 rest: b"early-data",
             }
         );
@@ -171,7 +184,7 @@ mod tests {
         assert_eq!(
             parse_client_request(&input).unwrap(),
             ClientRequest::Udp {
-                rest_offset: 3,
+                rest_span: Range { start: 3, end: 9 },
                 rest: b"packet"
             }
         );
@@ -184,7 +197,7 @@ mod tests {
         assert_eq!(
             parse_server_reply(&input).unwrap(),
             ServerReply::Tunnel {
-                payload_offset: 1,
+                payload_span: Range { start: 1, end: 6 },
                 payload: b"hello"
             }
         );

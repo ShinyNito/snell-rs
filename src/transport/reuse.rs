@@ -215,6 +215,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use core::range::Range;
+
     use tokio::io::{AsyncReadExt, AsyncWrite, duplex};
 
     use super::{ReuseClientConn, ReuseClientWriter};
@@ -291,7 +293,7 @@ mod tests {
                     reuse: true,
                     host: "example.com",
                     port: 443,
-                    rest_offset: 17,
+                    rest_span: Range { start: 17, end: 17 },
                     rest: b"",
                 }
             );

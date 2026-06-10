@@ -13,7 +13,7 @@ use crate::protocol::socks5::{
 };
 
 use super::socks5::open_udp_associate_via_socks5;
-use super::udp::send_udp_payload;
+use super::udp::{resolve_socks5_udp_relay_addr, send_udp_payload};
 use super::{RelayOptions, UpstreamRelay, address_ref_from_host};
 
 pub(crate) struct QuicProxyRelay {
@@ -57,7 +57,8 @@ pub(crate) async fn open_quic_udp(
                 return Err(Error::Ipv6Disabled);
             }
             let association = open_udp_associate_via_socks5(proxy_addr).await?;
-            let relay_addr = association.relay_addr;
+            let relay_addr =
+                resolve_socks5_udp_relay_addr(proxy_addr, association.relay_endpoint).await?;
             let outbound = UdpSocket::bind(SocketAddr::new(relay_bind_ip(relay_addr), 0)).await?;
             Ok(QuicProxyRelay {
                 outbound: Arc::new(outbound),

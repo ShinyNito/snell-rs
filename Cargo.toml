@@ -39,3 +39,9 @@ harness = false
 [[bench]]
 name = "loopback"
 harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

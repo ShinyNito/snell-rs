@@ -1,35 +1,12 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpSocket, ToSocketAddrs, lookup_host};
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-pub(crate) const SERVER_LISTEN_BACKLOG: u32 = 1024;
+pub(crate) const SERVER_LISTEN_BACKLOG: u32 = 4096;
 pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-
-pub(crate) async fn bind_tcp_listener_resolved<A>(
-    listen_addr: A,
-    tcp_fast_open: bool,
-) -> std::io::Result<TcpListener>
-where
-    A: ToSocketAddrs,
-{
-    let mut last_error = None;
-    for addr in lookup_host(listen_addr).await? {
-        match bind_tcp_listener(addr, tcp_fast_open) {
-            Ok(listener) => return Ok(listener),
-            Err(err) => last_error = Some(err),
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "no listener address resolved",
-        )
-    }))
-}
 
 pub(crate) fn bind_tcp_listener(
     listen_addr: SocketAddr,

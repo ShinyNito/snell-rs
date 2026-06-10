@@ -50,7 +50,7 @@ where
                 reuse,
                 host,
                 port,
-                rest_offset,
+                rest_span,
                 ..
             }) => {
                 let target = TcpTarget {
@@ -58,7 +58,7 @@ where
                     port,
                     reuse,
                 };
-                let pending = frame_reader.take_payload_from(rest_offset);
+                let pending = frame_reader.take_payload_from(rest_span.start);
                 InitialRequest::Tcp(target, pending)
             }
             Ok(ClientRequest::Udp { rest: [], .. }) => InitialRequest::Udp,
@@ -387,6 +387,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use core::range::Range;
+
     use bytes::BytesMut;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::net::{TcpListener, TcpStream};
@@ -539,7 +541,7 @@ mod tests {
             assert!(matches!(
                 reader.read_server_reply().await,
                 Ok(ServerReply::Tunnel {
-                    payload_offset: 1,
+                    payload_span: Range { start: 1, end: 1 },
                     payload: []
                 })
             ));
@@ -576,7 +578,7 @@ mod tests {
                     reuse: true,
                     host: "next.example",
                     port: 443,
-                    rest_offset: 18,
+                    rest_span: Range { start: 18, end: 18 },
                     rest: b"",
                 }
             );

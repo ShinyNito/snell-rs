@@ -54,16 +54,15 @@ pub(crate) async fn serve_quic_proxy_socket(
                     let send_result = if is_quic_looking(first_byte) {
                         session.relay.send_payload(&buf[..n]).await
                     } else {
-                        let (payload_start, payload_len) = match decode_init_datagram(&psk, &mut buf[..n]) {
-                            Ok(init) => (init.payload_offset, init.payload.len()),
+                        let payload_span = match decode_init_datagram(&psk, &mut buf[..n]) {
+                            Ok(init) => init.payload_span,
                             Err(err) => {
                                 tracing::debug!(%err, %client_addr, "ignored invalid quic proxy datagram");
                                 buf.clear();
                                 continue;
                             }
                         };
-                        let payload_end = payload_start + payload_len;
-                        session.relay.send_payload(&buf[payload_start..payload_end]).await
+                        session.relay.send_payload(&buf[payload_span.start..payload_span.end]).await
                     };
                     buf.clear();
                     if let Err(err) = send_result {
@@ -80,7 +79,7 @@ pub(crate) async fn serve_quic_proxy_socket(
                     continue;
                 }
 
-                let (host, port, payload_start, payload_len) = {
+                let (host, port, payload_span) = {
                     let init = match decode_init_datagram(&psk, &mut buf[..n]) {
                         Ok(init) => init,
                         Err(err) => {
@@ -92,12 +91,11 @@ pub(crate) async fn serve_quic_proxy_socket(
                     (
                         init.host.to_owned(),
                         init.port,
-                        init.payload_offset,
-                        init.payload.len(),
+                        init.payload_span,
                     )
                 };
-                let mut first_payload = buf.split_off(payload_start);
-                first_payload.truncate(payload_len);
+                let mut first_payload = buf.split_off(payload_span.start);
+                first_payload.truncate(payload_span.end - payload_span.start);
                 let first_payload = first_payload.freeze();
                 buf.clear();
                 let mut relay = open_quic_udp(host, port, options).await?;

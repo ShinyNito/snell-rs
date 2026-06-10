@@ -170,11 +170,10 @@ where
         self.payload_end = 0;
         self.body.reserve(body_len);
         while self.body.len() < body_len {
-            let remaining = body_len - self.body.len();
-            let n = (&mut self.inner)
-                .take(remaining as u64)
-                .read_buf(&mut self.body)
-                .await?;
+            let read_limit = body_len - self.body.len();
+            let n =
+                poll_fn(|cx| poll_read_into_spare(&mut self.inner, cx, &mut self.body, read_limit))
+                    .await?;
             if n == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -614,6 +613,7 @@ fn compact_stream_buffer_for_reuse(buffer: &mut BytesMut) {
 
 #[cfg(test)]
 mod tests {
+    use core::range::Range;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr};
     use std::pin::Pin;
@@ -821,7 +821,10 @@ mod tests {
             assert_eq!(
                 reply,
                 ServerReply::Tunnel {
-                    payload_offset: 1,
+                    payload_span: Range {
+                        start: 1,
+                        end: first_limit,
+                    },
                     payload: &payload[..first_limit - 1],
                 }
             );
@@ -1222,7 +1225,7 @@ mod tests {
                     reuse: true,
                     host: "example.com",
                     port: 443,
-                    rest_offset: 17,
+                    rest_span: Range { start: 17, end: 17 },
                     rest: b"",
                 }
             );
@@ -1250,7 +1253,10 @@ mod tests {
             assert_eq!(
                 reply,
                 ServerReply::Tunnel {
-                    payload_offset: 1,
+                    payload_span: Range {
+                        start: 1,
+                        end: 1 + payload.len(),
+                    },
                     payload: &payload[..]
                 }
             );
@@ -1272,22 +1278,25 @@ mod tests {
 
         let read = async {
             let mut reader = V4StreamReader::new(client, psk).unwrap();
-            let payload_offset = {
+            let payload_start = {
                 let reply = reader.read_server_reply().await.unwrap();
                 assert_eq!(
                     reply,
                     ServerReply::Tunnel {
-                        payload_offset: 1,
+                        payload_span: Range {
+                            start: 1,
+                            end: 1 + payload.len(),
+                        },
                         payload: &payload[..]
                     }
                 );
                 match reply {
-                    ServerReply::Tunnel { payload_offset, .. } => payload_offset,
+                    ServerReply::Tunnel { payload_span, .. } => payload_span.start,
                     ServerReply::Pong | ServerReply::Error { .. } => unreachable!(),
                 }
             };
 
-            let pending = reader.take_payload_from(payload_offset);
+            let pending = reader.take_payload_from(payload_start);
             assert_eq!(&pending[..], payload);
         };
         let write = async {

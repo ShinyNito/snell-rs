@@ -1,6 +1,8 @@
+use core::range::Range;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use bytes::BufMut;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::{Error, Result};
 use crate::parse::{read_array, read_be_u16, read_u8, take_bytes};
@@ -40,10 +42,32 @@ pub struct SocksBoundAddr {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SocksAddressContext {
+    Request,
+    Response,
+}
+
+impl SocksAddressContext {
+    const fn invalid_error(self) -> Error {
+        match self {
+            Self::Request => Error::InvalidSocksRequest,
+            Self::Response => Error::InvalidSocksResponse,
+        }
+    }
+
+    const fn empty_domain_error(self) -> Error {
+        match self {
+            Self::Request => Error::EmptyHost,
+            Self::Response => Error::InvalidSocksResponse,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SocksUdpPacketRef<'a> {
     pub address: AddressRef<'a>,
     pub port: u16,
-    pub payload_offset: usize,
+    pub payload_span: Range<usize>,
     pub payload: &'a [u8],
 }
 
@@ -58,7 +82,7 @@ pub enum SocksReply {
 /// Parses a SOCKS5 UDP packet as a borrowed view into `packet`.
 ///
 /// Domain names and payload slices borrow from the original datagram.
-/// `payload_offset` is the payload start index in that datagram.
+/// `payload_span` is the payload range in that datagram.
 pub fn parse_udp_packet(packet: &[u8]) -> Result<SocksUdpPacketRef<'_>> {
     let mut input = packet;
     let header = take_bytes(&mut input, 3, Error::InvalidSocksRequest)?;
@@ -81,18 +105,68 @@ pub fn write_udp_packet(
     Ok(())
 }
 
+pub(crate) async fn read_address_port<S>(
+    stream: &mut S,
+    atyp: u8,
+    context: SocksAddressContext,
+) -> Result<(SocksAddress, u16)>
+where
+    S: AsyncRead + Unpin,
+{
+    match atyp {
+        ATYP_IPV4 => {
+            let mut raw = [0; 6];
+            stream.read_exact(&mut raw).await?;
+            let mut input = &raw[..];
+            let octets = read_array::<4>(&mut input, context.invalid_error())?;
+            let port = read_be_u16(&mut input, context.invalid_error())?;
+            Ok((SocksAddress::Ip(IpAddr::V4(Ipv4Addr::from(octets))), port))
+        }
+        ATYP_DOMAIN => {
+            let mut len = [0; 1];
+            stream.read_exact(&mut len).await?;
+            let host_len = len[0] as usize;
+            if host_len == 0 {
+                return Err(context.empty_domain_error());
+            }
+
+            let mut raw = [0; u8::MAX as usize + 2];
+            stream.read_exact(&mut raw[..host_len + 2]).await?;
+            let mut input = &raw[..host_len + 2];
+            let host = take_bytes(&mut input, host_len, context.invalid_error())?;
+            let port = read_be_u16(&mut input, context.invalid_error())?;
+            Ok((
+                SocksAddress::Domain(std::str::from_utf8(host)?.to_owned()),
+                port,
+            ))
+        }
+        ATYP_IPV6 => {
+            let mut raw = [0; 18];
+            stream.read_exact(&mut raw).await?;
+            let mut input = &raw[..];
+            let octets = read_array::<16>(&mut input, context.invalid_error())?;
+            let port = read_be_u16(&mut input, context.invalid_error())?;
+            Ok((SocksAddress::Ip(IpAddr::V6(Ipv6Addr::from(octets))), port))
+        }
+        _ => Err(context.invalid_error()),
+    }
+}
+
 fn parse_address<'a>(input: &mut &'a [u8], base_offset: usize) -> Result<SocksUdpPacketRef<'a>> {
     let original_len = input.len();
     match read_u8(input, Error::InvalidSocksRequest)? {
         ATYP_IPV4 => {
             let octets = read_array::<4>(input, Error::InvalidSocksRequest)?;
             let port = read_be_u16(input, Error::InvalidSocksRequest)?;
-            let payload_offset = base_offset + original_len - input.len();
+            let payload_start = base_offset + original_len - input.len();
             let payload: &'a [u8] = input;
             Ok(SocksUdpPacketRef {
                 address: AddressRef::Ip(IpAddr::V4(Ipv4Addr::from(octets))),
                 port,
-                payload_offset,
+                payload_span: Range {
+                    start: payload_start,
+                    end: payload_start + payload.len(),
+                },
                 payload,
             })
         }
@@ -103,24 +177,30 @@ fn parse_address<'a>(input: &mut &'a [u8], base_offset: usize) -> Result<SocksUd
             }
             let host = take_bytes(input, host_len, Error::InvalidSocksRequest)?;
             let port = read_be_u16(input, Error::InvalidSocksRequest)?;
-            let payload_offset = base_offset + original_len - input.len();
+            let payload_start = base_offset + original_len - input.len();
             let payload: &'a [u8] = input;
             Ok(SocksUdpPacketRef {
                 address: AddressRef::Domain(std::str::from_utf8(host)?),
                 port,
-                payload_offset,
+                payload_span: Range {
+                    start: payload_start,
+                    end: payload_start + payload.len(),
+                },
                 payload,
             })
         }
         ATYP_IPV6 => {
             let octets = read_array::<16>(input, Error::InvalidSocksRequest)?;
             let port = read_be_u16(input, Error::InvalidSocksRequest)?;
-            let payload_offset = base_offset + original_len - input.len();
+            let payload_start = base_offset + original_len - input.len();
             let payload: &'a [u8] = input;
             Ok(SocksUdpPacketRef {
                 address: AddressRef::Ip(IpAddr::V6(Ipv6Addr::from(octets))),
                 port,
-                payload_offset,
+                payload_span: Range {
+                    start: payload_start,
+                    end: payload_start + payload.len(),
+                },
                 payload,
             })
         }
@@ -160,6 +240,8 @@ pub(crate) fn write_address(
 
 #[cfg(test)]
 mod tests {
+    use core::range::Range;
+
     use bytes::BytesMut;
 
     use super::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, parse_udp_packet, write_udp_packet};
@@ -175,7 +257,7 @@ mod tests {
 
         assert_eq!(parsed.address, AddressRef::Domain("example.com"));
         assert_eq!(parsed.port, 53);
-        assert_eq!(parsed.payload_offset, 18);
+        assert_eq!(parsed.payload_span, Range { start: 18, end: 23 });
         assert_eq!(parsed.payload, b"query");
     }
 

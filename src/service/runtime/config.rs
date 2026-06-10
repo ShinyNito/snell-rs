@@ -45,7 +45,7 @@ impl ServerConfig {
     fn from_ini(config: &Ini) -> Result<Self> {
         let section = config
             .section(Some(SNELL_SERVER_SECTION))
-            .ok_or_else(|| Error::Config(format!("missing [{SNELL_SERVER_SECTION}] section")))?;
+            .ok_or_else(|| missing_section(SNELL_SERVER_SECTION))?;
 
         let listen = required(section, SNELL_SERVER_SECTION, "listen").and_then(parse_listen)?;
         let psk = required(section, SNELL_SERVER_SECTION, "psk")?;
@@ -101,7 +101,7 @@ impl ClientConfig {
     fn from_ini(config: &Ini) -> Result<Self> {
         let section = config
             .section(Some(SNELL_CLIENT_SECTION))
-            .ok_or_else(|| Error::Config(format!("missing [{SNELL_CLIENT_SECTION}] section")))?;
+            .ok_or_else(|| missing_section(SNELL_CLIENT_SECTION))?;
 
         let listen = required(section, SNELL_CLIENT_SECTION, "listen").and_then(parse_listen)?;
         let server = required(section, SNELL_CLIENT_SECTION, "server")?
@@ -139,7 +139,15 @@ fn required<'a>(section: &'a ini::Properties, section_name: &str, key: &str) -> 
     section
         .get(key)
         .map(str::trim)
-        .ok_or_else(|| Error::Config(format!("missing {section_name}.{key}")))
+        .ok_or_else(|| missing_key(section_name, key))
+}
+
+fn missing_section(section_name: &str) -> Error {
+    Error::Config(format!("missing [{section_name}] section"))
+}
+
+fn missing_key(section_name: &str, key: &str) -> Error {
+    Error::Config(format!("missing {section_name}.{key}"))
 }
 
 fn optional_bool(section: &ini::Properties, section_name: &str, key: &str) -> Result<Option<bool>> {
@@ -184,7 +192,7 @@ fn optional_tcp_brutal(
     }
 
     let send_mbps = optional_u64(section, section_name, "tcp_brutal_send_mbps")?
-        .ok_or_else(|| Error::Config(format!("missing {section_name}.tcp_brutal_send_mbps")))?;
+        .ok_or_else(|| missing_key(section_name, "tcp_brutal_send_mbps"))?;
     if send_mbps == 0 {
         return Err(Error::Config(format!(
             "{section_name}.tcp_brutal_send_mbps must be greater than 0"

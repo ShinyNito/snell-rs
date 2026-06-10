@@ -523,16 +523,12 @@ fn count_v4_payload_ones(payload_cipher: &[u8]) -> usize {
 }
 
 fn count_one_bits(bytes: &[u8]) -> usize {
-    let mut chunks = bytes.chunks_exact(8);
+    let (chunks, tail) = bytes.as_chunks::<8>();
     let word_ones = chunks
-        .by_ref()
-        .map(|chunk| {
-            let word = u64::from_ne_bytes(chunk.try_into().expect("chunk length is 8"));
-            word.count_ones() as usize
-        })
+        .iter()
+        .map(|chunk| u64::from_ne_bytes(*chunk).count_ones() as usize)
         .sum::<usize>();
-    let tail_ones = chunks
-        .remainder()
+    let tail_ones = tail
         .iter()
         .map(|byte| byte.count_ones() as usize)
         .sum::<usize>();

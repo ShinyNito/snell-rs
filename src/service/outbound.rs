@@ -37,8 +37,9 @@ impl Default for RelayOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum UpstreamRelay {
+    #[default]
     Direct,
     Socks5(SocketAddr),
 }

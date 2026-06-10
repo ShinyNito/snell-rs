@@ -1,45 +1,47 @@
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::error::Result;
+use crate::transport::reuse::{ReuseClientReader, ReuseClientWriter};
 use crate::transport::tcp_stream::{TcpClientWriter, TcpReader};
 
-pub(crate) async fn relay_tcp_reader_to_plain<R, W>(
-    snell: &mut TcpReader<R>,
-    plain: &mut W,
-) -> Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut total = 0;
-    relay_tcp_reader_to_plain_counted(snell, plain, &mut total).await?;
-    Ok(total)
-}
+macro_rules! define_snell_reader_to_plain_relay {
+    ($fn_vis:vis $fn_name:ident, $counted_vis:vis $counted_fn_name:ident, $reader:ident) => {
+        $fn_vis async fn $fn_name<R, W>(snell: &mut $reader<R>, plain: &mut W) -> Result<u64>
+        where
+            R: AsyncRead + Unpin,
+            W: AsyncWrite + Unpin,
+        {
+            let mut total = 0;
+            $counted_fn_name(snell, plain, &mut total).await?;
+            Ok(total)
+        }
 
-pub(crate) async fn relay_tcp_reader_to_plain_counted<R, W>(
-    snell: &mut TcpReader<R>,
-    plain: &mut W,
-    total: &mut u64,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    loop {
-        let n = match snell.read_payload_chunk().await? {
-            Some(payload) => {
-                let n = payload.len();
-                plain.write_all(payload).await?;
-                n
+        $counted_vis async fn $counted_fn_name<R, W>(
+            snell: &mut $reader<R>,
+            plain: &mut W,
+            total: &mut u64,
+        ) -> Result<()>
+        where
+            R: AsyncRead + Unpin,
+            W: AsyncWrite + Unpin,
+        {
+            loop {
+                let n = match snell.read_payload_chunk().await? {
+                    Some(payload) => {
+                        let n = payload.len();
+                        plain.write_all(payload).await?;
+                        n
+                    }
+                    None => {
+                        plain.shutdown().await?;
+                        return Ok(());
+                    }
+                };
+                snell.consume_payload_chunk(n);
+                *total += n as u64;
             }
-            None => {
-                plain.shutdown().await?;
-                return Ok(());
-            }
-        };
-        snell.consume_payload_chunk(n);
-        *total += n as u64;
-    }
+        }
+    };
 }
 
 macro_rules! define_plain_to_snell_writer_relay {
@@ -64,4 +66,15 @@ macro_rules! define_plain_to_snell_writer_relay {
     };
 }
 
+define_snell_reader_to_plain_relay!(
+    pub(crate) relay_tcp_reader_to_plain,
+    pub(crate) relay_tcp_reader_to_plain_counted,
+    TcpReader
+);
+define_snell_reader_to_plain_relay!(
+    pub(crate) relay_reuse_client_reader_to_plain,
+    relay_reuse_client_reader_to_plain_counted,
+    ReuseClientReader
+);
 define_plain_to_snell_writer_relay!(relay_plain_to_client_writer, TcpClientWriter);
+define_plain_to_snell_writer_relay!(relay_plain_to_reuse_client_writer, ReuseClientWriter);

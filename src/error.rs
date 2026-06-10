@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -40,6 +41,12 @@ pub enum Error {
     InvalidUdpPacket,
     #[error("invalid socks5 request")]
     InvalidSocksRequest,
+    #[error("invalid socks5 response")]
+    InvalidSocksResponse,
+    #[error("socks5 proxy accepted no authentication methods")]
+    Socks5NoAcceptableAuthMethod,
+    #[error("socks5 proxy selected unsupported authentication method {0}")]
+    UnsupportedSocks5AuthMethod(u8),
     #[error("socks5 proxy returned reply {0}")]
     Socks5Reply(u8),
     #[error("truncated udp packet")]
@@ -95,10 +102,11 @@ impl Error {
     pub fn is_closed_io_kind(kind: std::io::ErrorKind) -> bool {
         matches!(
             kind,
-            std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::WriteZero
+            ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionReset
+                | ErrorKind::NotConnected
+                | ErrorKind::UnexpectedEof
         )
     }
 }

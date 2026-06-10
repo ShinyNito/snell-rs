@@ -17,6 +17,7 @@ use crate::protocol::udp::{AddressRef, UdpPacketRef, parse_udp_response};
 use crate::service::inbound::socks5::{write_reply_and_shutdown, write_reply_with_bind};
 use crate::service::outbound::RelayStats;
 use crate::service::runtime::net::connect_tcp;
+use crate::service::session::udp_outbound::write_zero_chunk;
 use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
 use crate::transport::udp_stream::UdpClientStream;
 use crate::{MAX_PACKET_SIZE, VERSION_5};
@@ -118,7 +119,7 @@ pub(crate) async fn relay_socks5_udp_association(
         }
     }
 
-    close_snell_udp_writer(&mut snell_writer).await?;
+    write_zero_chunk(&mut snell_writer).await?;
     Ok(RelayStats {
         uploaded,
         downloaded,
@@ -153,7 +154,7 @@ async fn relay_socks5_udp_association_lazy_quic(
                     first_socks_in.clear();
                     continue;
                 }
-                let payload_offset = {
+                let payload_start = {
                     let packet = match parse_udp_packet(&first_socks_in[..n]) {
                         Ok(packet) => packet,
                         Err(err) => {
@@ -162,9 +163,9 @@ async fn relay_socks5_udp_association_lazy_quic(
                             continue;
                         }
                     };
-                    packet.payload_offset
+                    packet.payload_span.start
                 };
-                let payload = first_socks_in.split_off(payload_offset).freeze();
+                let payload = first_socks_in.split_off(payload_start).freeze();
                 let packet = parse_udp_packet(&first_socks_in)?;
                 break (
                     peer,
@@ -251,7 +252,7 @@ async fn relay_socks5_udp_association_lazy_quic(
             }
         }
 
-        close_snell_udp_writer(&mut snell_writer).await?;
+        write_zero_chunk(&mut snell_writer).await?;
         return Ok(RelayStats {
             uploaded,
             downloaded,
@@ -501,17 +502,6 @@ where
     match reader.read_frame_payload().await {
         Ok(payload) => Ok(Some(parse_udp_response(payload)?)),
         Err(Error::ZeroChunk) => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-async fn close_snell_udp_writer<W>(writer: &mut V4StreamWriter<W>) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    match writer.write_zero_chunk().await {
-        Ok(()) => Ok(()),
-        Err(err) if err.is_closed_io() => Ok(()),
         Err(err) => Err(err),
     }
 }

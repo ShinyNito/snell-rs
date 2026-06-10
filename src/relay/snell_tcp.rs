@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::error::Result;
-use crate::relay::tcp::{relay_plain_to_client_writer, relay_tcp_reader_to_plain};
+use crate::relay::tcp::{
+    relay_plain_to_client_writer, relay_plain_to_reuse_client_writer,
+    relay_reuse_client_reader_to_plain, relay_tcp_reader_to_plain,
+};
 use crate::service::outbound::RelayStats;
 use crate::service::outbound::snell::{ReusePool, ReusedSnellTcp, SnellTcpConnect};
-use crate::transport::reuse::{ReuseClientConn, ReuseClientReader, ReuseClientWriter};
+use crate::transport::reuse::ReuseClientConn;
 
 pub(crate) async fn relay_tcp_connect(
     local: TcpStream,
@@ -57,53 +59,5 @@ async fn relay_reuse_client_connection(
             })
         }
         Err(err) => Err(err),
-    }
-}
-
-async fn relay_reuse_client_reader_to_plain<R, W>(
-    snell: &mut ReuseClientReader<R>,
-    plain: &mut W,
-) -> Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut total = 0;
-
-    loop {
-        let n = match snell.read_payload_chunk().await? {
-            Some(payload) => {
-                let n = payload.len();
-                plain.write_all(payload).await?;
-                n
-            }
-            None => {
-                plain.shutdown().await?;
-                return Ok(total);
-            }
-        };
-        snell.consume_payload_chunk(n);
-        total += n as u64;
-    }
-}
-
-async fn relay_plain_to_reuse_client_writer<R, W>(
-    plain: &mut R,
-    snell: &mut ReuseClientWriter<W>,
-) -> Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut total = 0;
-
-    loop {
-        match snell.write_payload_from_reader(plain).await? {
-            Some(n) => total += n as u64,
-            None => {
-                snell.close_write().await?;
-                return Ok(total);
-            }
-        }
     }
 }

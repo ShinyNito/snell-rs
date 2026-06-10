@@ -113,6 +113,7 @@ pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
 
 #[cfg(test)]
 mod tests {
+    use core::range::Range;
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -131,7 +132,7 @@ mod tests {
     };
     use crate::service::inbound::socks5::{read_client_request, write_reply_with_bind};
     use crate::service::outbound::{RelayOptions, UpstreamRelay};
-    use crate::service::runtime::lifecycle::{bind_tcp_listener, bind_tcp_listener_resolved};
+    use crate::service::runtime::lifecycle::bind_tcp_listener;
     use crate::transport::tcp_stream::{TcpClientStream, TcpClientWriter};
     use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
 
@@ -396,7 +397,7 @@ mod tests {
                     .unwrap()
                     .unwrap(),
                 ServerReply::Tunnel {
-                    payload_offset: 1,
+                    payload_span: Range { start: 1, end: 1 },
                     payload: b"",
                 }
             );
@@ -540,33 +541,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_tcp_listener_resolved_binds_with_shared_socket_options() {
-        let listener = bind_tcp_listener_resolved("127.0.0.1:0", false)
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = async {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut input = [0; 4];
-            stream.read_exact(&mut input).await.unwrap();
-            assert_eq!(&input, b"ping");
-            stream.write_all(b"pong").await.unwrap();
-        };
-
-        let client = async {
-            let mut stream = TcpStream::connect(addr).await.unwrap();
-            stream.write_all(b"ping").await.unwrap();
-
-            let mut output = [0; 4];
-            stream.read_exact(&mut output).await.unwrap();
-            assert_eq!(&output, b"pong");
-        };
-
-        let ((), ()) = tokio::join!(server, client);
-    }
-
-    #[tokio::test]
     async fn connect_target_rejects_ipv6_literal_when_disabled() {
         let result = crate::service::outbound::direct::open_direct_tcp("::1", 443, false).await;
 
@@ -611,7 +585,7 @@ mod tests {
             assert_eq!(
                 snell_reader.read_server_reply().await.unwrap(),
                 ServerReply::Tunnel {
-                    payload_offset: 1,
+                    payload_span: Range { start: 1, end: 1 },
                     payload: b"",
                 }
             );

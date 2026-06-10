@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use core::range::Range;
 
 use crate::MAX_PACKET_SIZE;
 use crate::error::{Error, Result};
@@ -15,7 +16,7 @@ pub const QUIC_PROXY_MAX_PAYLOAD: usize = 1417;
 pub struct QuicProxyInitRef<'a> {
     pub host: &'a str,
     pub port: u16,
-    pub payload_offset: usize,
+    pub payload_span: Range<usize>,
     pub payload: &'a [u8],
 }
 
@@ -83,12 +84,15 @@ fn parse_init_plaintext(input: &[u8]) -> Result<QuicProxyInitRef<'_>> {
     }
     let host = std::str::from_utf8(take_bytes(&mut input, host_len, Error::TruncatedRequest)?)?;
     let port = read_be_u16(&mut input, Error::TruncatedRequest)?;
-    let payload_offset = original_len - input.len();
+    let payload_start = original_len - input.len();
 
     Ok(QuicProxyInitRef {
         host,
         port,
-        payload_offset,
+        payload_span: Range {
+            start: payload_start,
+            end: original_len,
+        },
         payload: input,
     })
 }
@@ -256,7 +260,8 @@ pub fn decode_init_datagram<'a>(
     let mut decoder = QuicProxyDecoder::new(psk, salt)?;
     let plaintext = decoder.decode_frame_payload_in_place(&mut datagram[SALT_SIZE..])?;
     let mut init = parse_init_plaintext(plaintext)?;
-    init.payload_offset += SALT_SIZE + V4_HEADER_CIPHER_SIZE;
+    init.payload_span.start += SALT_SIZE + V4_HEADER_CIPHER_SIZE;
+    init.payload_span.end += SALT_SIZE + V4_HEADER_CIPHER_SIZE;
     Ok(init)
 }
 

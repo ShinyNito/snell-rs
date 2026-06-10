@@ -76,6 +76,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use core::range::Range;
+
     use tokio::io::duplex;
 
     use super::{UdpClientStream, UdpServerStream};
@@ -101,7 +103,7 @@ mod tests {
             assert_eq!(
                 request,
                 ClientRequest::Udp {
-                    rest_offset: 3,
+                    rest_span: Range { start: 3, end: 3 },
                     rest: b"",
                 }
             );
@@ -159,7 +161,7 @@ mod tests {
             assert_eq!(
                 reader.read_server_reply().await.unwrap(),
                 ServerReply::Tunnel {
-                    payload_offset: 1,
+                    payload_span: Range { start: 1, end: 1 },
                     payload: b"",
                 }
             );

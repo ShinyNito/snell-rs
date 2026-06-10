@@ -10,14 +10,14 @@ use crate::service::inbound::socks5::relay_socks5_connection;
 use crate::service::outbound::snell::SnellClientOutbound;
 use crate::service::runtime::config::ClientConfig;
 use crate::service::runtime::lifecycle::{
-    SHUTDOWN_DRAIN_TIMEOUT, bind_tcp_listener_resolved, drain_connection_tasks,
+    SHUTDOWN_DRAIN_TIMEOUT, bind_tcp_listener, drain_connection_tasks,
 };
 
 pub async fn bind_configured_socks5_client_with_shutdown(
     config: ClientConfig,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let listener = bind_tcp_listener_resolved(config.listen, false).await?;
+    let listener = bind_tcp_listener(config.listen, false)?;
     serve_socks5_listener(
         listener,
         config.server,
@@ -72,6 +72,6 @@ async fn serve_socks5_listener(
     drop(listener);
 
     drain_connection_tasks(tasks, SHUTDOWN_DRAIN_TIMEOUT).await;
-    outbound.close_idle_pool().await;
+    outbound.close_idle_connections().await;
     Ok(())
 }
