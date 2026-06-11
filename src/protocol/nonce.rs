@@ -10,6 +10,7 @@ impl Nonce12 {
         &self.0
     }
 
+    #[inline]
     pub fn increment(&mut self) {
         for byte in &mut self.0 {
             *byte = byte.wrapping_add(1);

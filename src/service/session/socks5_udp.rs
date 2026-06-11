@@ -276,7 +276,6 @@ async fn relay_socks5_udp_association_lazy_quic(
     let mut quic_handshake_done = first_payload
         .first()
         .is_some_and(|first| is_quic_short_header(*first));
-
     encode_init_datagram(
         psk,
         target.quic_init_host(&mut quic_host_scratch),

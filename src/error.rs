@@ -71,6 +71,10 @@ pub enum Error {
     ShortUdpWrite { sent: usize, expected: usize },
     #[error("{0} timed out")]
     Timeout(&'static str),
+    #[error("dns resolver is unavailable")]
+    DnsUnavailable,
+    #[error("dns resolution failed: {0}")]
+    Dns(#[from] hickory_resolver::net::NetError),
     #[error("io failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("blocking task failed: {0}")]

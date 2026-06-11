@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use tokio::net::{UdpSocket, lookup_host};
+use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use crate::MAX_PACKET_SIZE;
@@ -40,7 +40,7 @@ pub(crate) async fn open_quic_udp(
 ) -> Result<QuicProxyRelay> {
     match options.upstream {
         UpstreamRelay::Direct => {
-            let target = resolve_udp_target(&host, port, options.ipv6).await?;
+            let target = resolve_udp_target(&host, port, options.ipv6, &options.resolver).await?;
             let outbound = UdpSocket::bind(SocketAddr::new(relay_bind_ip(target), 0)).await?;
             Ok(QuicProxyRelay {
                 outbound: Arc::new(outbound),
@@ -57,8 +57,12 @@ pub(crate) async fn open_quic_udp(
                 return Err(Error::Ipv6Disabled);
             }
             let association = open_udp_associate_via_socks5(proxy_addr).await?;
-            let relay_addr =
-                resolve_socks5_udp_relay_addr(proxy_addr, association.relay_endpoint).await?;
+            let relay_addr = resolve_socks5_udp_relay_addr(
+                proxy_addr,
+                association.relay_endpoint,
+                &options.resolver,
+            )
+            .await?;
             let outbound = UdpSocket::bind(SocketAddr::new(relay_bind_ip(relay_addr), 0)).await?;
             Ok(QuicProxyRelay {
                 outbound: Arc::new(outbound),
@@ -145,7 +149,12 @@ pub(crate) async fn run_quic_proxy_response_session(
     }
 }
 
-async fn resolve_udp_target(host: &str, port: u16, ipv6: bool) -> Result<SocketAddr> {
+async fn resolve_udp_target(
+    host: &str,
+    port: u16,
+    ipv6: bool,
+    resolver: &crate::service::dns::DnsResolver,
+) -> Result<SocketAddr> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         if !ipv6 && ip.is_ipv6() {
             return Err(Error::Ipv6Disabled);
@@ -153,9 +162,12 @@ async fn resolve_udp_target(host: &str, port: u16, ipv6: bool) -> Result<SocketA
         return Ok(SocketAddr::new(ip, port));
     }
 
-    let addrs = timeout(Duration::from_secs(5), lookup_host((host, port)))
-        .await
-        .map_err(|_| Error::Timeout("udp target resolution"))??;
+    let addrs = timeout(
+        Duration::from_secs(5),
+        resolver.lookup_socket_addrs(host, port),
+    )
+    .await
+    .map_err(|_| Error::Timeout("udp target resolution"))??;
     select_udp_target(addrs, ipv6)
 }
 

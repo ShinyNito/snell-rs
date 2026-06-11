@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::Notify;
 use tokio::time::sleep;
 
 use crate::error::Result;
@@ -37,7 +36,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let prepared = crate::service::outbound::open_udp(options).await?;
+    let prepared = crate::service::outbound::open_udp(options.clone()).await?;
     relay_udp_server_stream_prepared(stream, options, idle_timeout, prepared).await
 }
 
@@ -165,29 +164,22 @@ where
     Ok(state.stats())
 }
 
+// Polls the activity generation once per timeout window instead of waking on
+// every datagram, so the effective idle cutoff lands in [timeout, 2*timeout).
 async fn wait_udp_association_idle(state: Arc<UdpAssociationState>, timeout: Duration) {
     let mut observed = state.generation.load(Ordering::Relaxed);
     loop {
-        let idle = sleep(timeout);
-        tokio::pin!(idle);
-        tokio::select! {
-            _ = &mut idle => {
-                let current = state.generation.load(Ordering::Relaxed);
-                if current == observed {
-                    return;
-                }
-                observed = current;
-            }
-            _ = state.activity.notified() => {
-                observed = state.generation.load(Ordering::Relaxed);
-            }
+        sleep(timeout).await;
+        let current = state.generation.load(Ordering::Relaxed);
+        if current == observed {
+            return;
         }
+        observed = current;
     }
 }
 
 #[derive(Default)]
 pub(super) struct UdpAssociationState {
-    activity: Notify,
     generation: AtomicU64,
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
@@ -216,9 +208,8 @@ impl UdpAssociationState {
         self.mark_active();
     }
 
-    pub(super) fn mark_active(&self) {
+    fn mark_active(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
-        self.activity.notify_one();
     }
 
     fn stats(&self) -> UdpRelayStats {
@@ -247,13 +238,22 @@ mod tests {
         write_udp_packet as write_socks_udp_packet,
     };
     use crate::protocol::udp::AddressRef;
+    use crate::service::dns::DnsResolver;
     use crate::service::inbound::snell::serve_server_connection;
     use crate::service::inbound::socks5::{
         read_client_request as read_socks_client_request, write_reply_with_bind,
     };
-    use crate::service::outbound::{RelayOptions, UpstreamRelay};
+    use crate::service::outbound::RelayOptions;
     use crate::service::test_support::{accept_udp_server_stream, read_udp_response_frame};
     use crate::transport::udp_stream::UdpClientStream;
+
+    fn direct_options(ipv6: bool) -> RelayOptions {
+        RelayOptions::direct(ipv6, DnsResolver::system())
+    }
+
+    fn socks5_options(ipv6: bool, proxy_addr: std::net::SocketAddr) -> RelayOptions {
+        RelayOptions::socks5(ipv6, proxy_addr, DnsResolver::system())
+    }
 
     #[tokio::test]
     async fn udp_server_stream_relays_one_datagram_response() {
@@ -274,16 +274,9 @@ mod tests {
             let stream = accept_udp_server_stream(server_upload, server_download, psk)
                 .await
                 .unwrap();
-            relay_udp_server_stream(
-                stream,
-                RelayOptions {
-                    ipv6: false,
-                    ..RelayOptions::default()
-                },
-                Duration::from_secs(1),
-            )
-            .await
-            .unwrap()
+            relay_udp_server_stream(stream, direct_options(false), Duration::from_secs(1))
+                .await
+                .unwrap()
         };
 
         let client = async {
@@ -341,16 +334,9 @@ mod tests {
             let stream = accept_udp_server_stream(server_upload, server_download, psk)
                 .await
                 .unwrap();
-            relay_udp_server_stream(
-                stream,
-                RelayOptions {
-                    ipv6: false,
-                    ..RelayOptions::default()
-                },
-                Duration::from_secs(2),
-            )
-            .await
-            .unwrap()
+            relay_udp_server_stream(stream, direct_options(false), Duration::from_secs(2))
+                .await
+                .unwrap()
         };
 
         let client = async {
@@ -459,16 +445,9 @@ mod tests {
 
         let server = async {
             let (client, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(
-                client,
-                psk,
-                RelayOptions {
-                    ipv6: false,
-                    upstream: UpstreamRelay::Socks5(socks_addr),
-                },
-            )
-            .await
-            .unwrap()
+            serve_server_connection(client, psk, socks5_options(false, socks_addr))
+                .await
+                .unwrap()
         };
 
         let client = async {
@@ -512,15 +491,7 @@ mod tests {
 
         let server = async {
             let (client, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(
-                client,
-                psk,
-                RelayOptions {
-                    ipv6: false,
-                    upstream: UpstreamRelay::Socks5(socks_addr),
-                },
-            )
-            .await
+            serve_server_connection(client, psk, socks5_options(false, socks_addr)).await
         };
 
         let client = async {
@@ -560,16 +531,9 @@ mod tests {
 
         let server = async {
             let (client, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(
-                client,
-                psk,
-                RelayOptions {
-                    ipv6: false,
-                    upstream: UpstreamRelay::Socks5(socks_addr),
-                },
-            )
-            .await
-            .unwrap()
+            serve_server_connection(client, psk, socks5_options(false, socks_addr))
+                .await
+                .unwrap()
         };
 
         let client = async {
@@ -604,16 +568,9 @@ mod tests {
             let stream = accept_udp_server_stream(server_upload, server_download, psk)
                 .await
                 .unwrap();
-            relay_udp_server_stream(
-                stream,
-                RelayOptions {
-                    ipv6: false,
-                    ..RelayOptions::default()
-                },
-                Duration::from_millis(20),
-            )
-            .await
-            .unwrap()
+            relay_udp_server_stream(stream, direct_options(false), Duration::from_millis(20))
+                .await
+                .unwrap()
         };
 
         let client = async {
@@ -651,14 +608,7 @@ mod tests {
                 .unwrap();
             timeout(
                 Duration::from_millis(200),
-                relay_udp_server_stream(
-                    stream,
-                    RelayOptions {
-                        ipv6: false,
-                        ..RelayOptions::default()
-                    },
-                    Duration::from_secs(60),
-                ),
+                relay_udp_server_stream(stream, direct_options(false), Duration::from_secs(60)),
             )
             .await
             .unwrap()
@@ -700,14 +650,7 @@ mod tests {
                 .unwrap();
             timeout(
                 Duration::from_millis(500),
-                relay_udp_server_stream(
-                    stream,
-                    RelayOptions {
-                        ipv6: false,
-                        ..RelayOptions::default()
-                    },
-                    Duration::from_secs(60),
-                ),
+                relay_udp_server_stream(stream, direct_options(false), Duration::from_secs(60)),
             )
             .await
             .unwrap()
@@ -748,15 +691,7 @@ mod tests {
 
         let server = async {
             let (client, _) = listener.accept().await.unwrap();
-            serve_server_connection(
-                client,
-                psk,
-                RelayOptions {
-                    ipv6: false,
-                    ..RelayOptions::default()
-                },
-            )
-            .await
+            serve_server_connection(client, psk, direct_options(false)).await
         };
 
         let client = async {

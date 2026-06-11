@@ -4,8 +4,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use bytes::{BufMut, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::UdpSocket;
 use zeroize::Zeroizing;
 
@@ -81,8 +81,15 @@ pub struct V4StreamReader<R> {
     inner: R,
     psk: Zeroizing<Vec<u8>>,
     decoder: Option<V4FrameDecoder>,
-    header: [u8; V4_HEADER_CIPHER_SIZE],
+    /// Raw ciphertext accumulation buffer. Reads pull as much as the spare
+    /// capacity allows, so several frames can be parsed per syscall.
     body: BytesMut,
+    /// Wire length of the frame currently borrowed out of `body`; discarded
+    /// at the start of the next read.
+    consumed: usize,
+    /// Header decoded for a frame whose body has not fully arrived yet. Keeps
+    /// `read_frame_payload` cancel-safe: the header nonce is only spent once.
+    pending_header: Option<DecodedHeader>,
     payload_start: usize,
     payload_end: usize,
 }
@@ -100,8 +107,9 @@ where
             inner,
             psk: Zeroizing::new(psk.to_vec()),
             decoder: None,
-            header: [0; V4_HEADER_CIPHER_SIZE],
             body: BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY),
+            consumed: 0,
+            pending_header: None,
             payload_start: 0,
             payload_end: 0,
         })
@@ -113,20 +121,49 @@ where
     /// `take_payload_from` call on the same reader. A zero chunk is returned as
     /// `Error::ZeroChunk`.
     pub async fn read_frame_payload(&mut self) -> Result<&[u8]> {
-        let header = self.read_header().await?;
-        let body_len = header.body_len()?;
+        self.discard_consumed();
+        if self.decoder.is_none() {
+            self.fill_to(SALT_SIZE).await?;
+            let mut salt = [0; SALT_SIZE];
+            salt.copy_from_slice(&self.body[..SALT_SIZE]);
+            self.body.advance(SALT_SIZE);
+            self.decoder = Some(V4FrameDecoder::new(&self.psk, salt)?);
+            self.psk.clear();
+        }
 
-        self.read_body(body_len).await?;
+        let header = match self.pending_header {
+            Some(header) => header,
+            None => {
+                self.fill_to(V4_HEADER_CIPHER_SIZE).await?;
+                let header_bytes: &mut [u8; V4_HEADER_CIPHER_SIZE] = (&mut self.body
+                    [..V4_HEADER_CIPHER_SIZE])
+                    .try_into()
+                    .expect("header slice has cipher header length");
+                let header = self
+                    .decoder
+                    .as_mut()
+                    .expect("decoder initialized before header decode")
+                    .decode_header(header_bytes)?;
+                self.pending_header = Some(header);
+                header
+            }
+        };
+
+        let body_len = header.body_len()?;
+        let frame_len = V4_HEADER_CIPHER_SIZE + body_len;
+        self.fill_to(frame_len).await?;
+        self.pending_header = None;
+        self.consumed = frame_len;
+
         let payload_len = header.payload_len;
-        let payload = self
-            .decoder
+        self.decoder
             .as_mut()
             .expect("decoder initialized before payload decode")
-            .decode_payload_in_place(header, &mut self.body)?;
-        self.payload_start = 0;
-        self.payload_end = payload_len;
+            .decode_payload_in_place(header, &mut self.body[V4_HEADER_CIPHER_SIZE..frame_len])?;
+        self.payload_start = V4_HEADER_CIPHER_SIZE;
+        self.payload_end = V4_HEADER_CIPHER_SIZE + payload_len;
         tracing::trace!(payload_len, body_len, "read snell v4 frame");
-        Ok(payload)
+        Ok(&self.body[self.payload_start..self.payload_end])
     }
 
     /// Reads and parses one client request as a borrowed view into the frame payload.
@@ -141,22 +178,38 @@ where
         parse_server_reply(payload)
     }
 
-    pub(crate) fn take_payload_from(&mut self, offset: usize) -> BytesMut {
+    pub(crate) fn take_payload_from(&mut self, offset: usize) -> Bytes {
         let payload_len = self.payload_end - self.payload_start;
         assert!(offset <= payload_len);
-        let split_at = self.payload_start + offset;
-        let pending_len = payload_len - offset;
-        let mut pending = self.body.split_off(split_at);
-        pending.truncate(pending_len);
+        if offset == payload_len {
+            self.payload_start = 0;
+            self.payload_end = 0;
+            return Bytes::new();
+        }
+
+        let start = self.payload_start + offset;
+        let end = self.payload_end;
+        let consumed = self.consumed;
+        debug_assert!(consumed >= end);
+        let pending = self.body.split_to(consumed).freeze().slice(start..end);
+        self.consumed = 0;
         self.payload_start = 0;
         self.payload_end = 0;
         pending
     }
 
     pub(crate) fn compact_buffers_for_reuse(&mut self) {
-        compact_stream_buffer_for_reuse(&mut self.body);
-        self.payload_start = 0;
-        self.payload_end = 0;
+        self.discard_consumed();
+        if self.body.is_empty() {
+            compact_stream_buffer_for_reuse(&mut self.body);
+        } else if self.body.capacity() > STREAM_BUFFER_RETAIN_CAPACITY {
+            // Keep buffered bytes (e.g. a pipelined next request); only shed
+            // the oversized allocation.
+            let mut fresh =
+                BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY.max(self.body.len()));
+            fresh.extend_from_slice(&self.body);
+            self.body = fresh;
+        }
     }
 
     #[cfg(test)]
@@ -164,39 +217,31 @@ where
         self.body.capacity()
     }
 
-    async fn read_body(&mut self, body_len: usize) -> Result<()> {
-        self.body.clear();
+    fn discard_consumed(&mut self) {
+        if self.consumed != 0 {
+            self.body.advance(self.consumed);
+            self.consumed = 0;
+        }
         self.payload_start = 0;
         self.payload_end = 0;
-        self.body.reserve(body_len);
-        while self.body.len() < body_len {
-            let read_limit = body_len - self.body.len();
-            let n =
-                poll_fn(|cx| poll_read_into_spare(&mut self.inner, cx, &mut self.body, read_limit))
-                    .await?;
+    }
+
+    async fn fill_to(&mut self, needed: usize) -> Result<()> {
+        while self.body.len() < needed {
+            let min_spare = needed - self.body.len();
+            let n = poll_fn(|cx| {
+                poll_read_ahead_into_spare(&mut self.inner, cx, &mut self.body, min_spare)
+            })
+            .await?;
             if n == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "early eof reading snell frame body",
+                    "early eof reading snell frame",
                 )
                 .into());
             }
         }
         Ok(())
-    }
-
-    async fn read_header(&mut self) -> Result<DecodedHeader> {
-        if self.decoder.is_none() {
-            let mut salt = [0; SALT_SIZE];
-            self.inner.read_exact(&mut salt).await?;
-            self.decoder = Some(V4FrameDecoder::new(&self.psk, salt)?);
-            self.psk.clear();
-        }
-        self.inner.read_exact(&mut self.header).await?;
-        self.decoder
-            .as_mut()
-            .expect("decoder initialized before header decode")
-            .decode_header(&mut self.header)
     }
 }
 
@@ -604,6 +649,43 @@ where
     }
 }
 
+/// Like `poll_read_into_spare`, but offers the reader the whole spare capacity
+/// (at least `min_spare`) instead of an exact byte count, so one syscall can
+/// pull in bytes of several frames.
+fn poll_read_ahead_into_spare<R>(
+    reader: &mut R,
+    cx: &mut Context<'_>,
+    buffer: &mut BytesMut,
+    min_spare: usize,
+) -> Poll<Result<usize>>
+where
+    R: AsyncRead + Unpin,
+{
+    let spare_len = buffer.chunk_mut().len();
+    if spare_len < min_spare {
+        buffer.reserve(min_spare - spare_len);
+    }
+
+    // Same boundary Tokio's read_buf uses: poll_read may initialize only the
+    // unfilled tail we hand to ReadBuf.
+    let spare = unsafe { buffer.chunk_mut().as_uninit_slice_mut() };
+    let mut read_buf = ReadBuf::uninit(spare);
+
+    match Pin::new(reader).poll_read(cx, &mut read_buf) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(())) => {
+            let read_len = read_buf.filled().len();
+            // ReadBuf reports exactly how many bytes poll_read initialized in
+            // BytesMut's spare capacity.
+            unsafe {
+                buffer.advance_mut(read_len);
+            }
+            Poll::Ready(Ok(read_len))
+        }
+        Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
+    }
+}
+
 fn compact_stream_buffer_for_reuse(buffer: &mut BytesMut) {
     buffer.clear();
     if buffer.capacity() > STREAM_BUFFER_RETAIN_CAPACITY {
@@ -613,8 +695,9 @@ fn compact_stream_buffer_for_reuse(buffer: &mut BytesMut) {
 
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
     use core::range::Range;
-    use std::io;
+    use std::io::{self, Cursor};
     use std::net::{IpAddr, Ipv4Addr};
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -1308,6 +1391,32 @@ mod tests {
 
         let ((), write_result) = tokio::join!(read, write);
         assert_eq!(write_result.unwrap(), payload.len());
+    }
+
+    #[tokio::test]
+    async fn taking_payload_keeps_prefetched_next_frame() {
+        const PSK: &[u8] = b"test psk";
+        const SALT: [u8; 16] = [0x31; 16];
+
+        let mut wire = BytesMut::new();
+        let mut encoder = V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, 0).unwrap();
+        let mut reply = BytesMut::new();
+        crate::protocol::request::write_tunnel_reply(&mut reply, b"early");
+        encoder.encode_frame(&reply, &mut wire).unwrap();
+        encoder.encode_frame(b"next frame", &mut wire).unwrap();
+
+        let mut reader = V4StreamReader::new(Cursor::new(wire), PSK).unwrap();
+        let payload_start = match reader.read_server_reply().await.unwrap() {
+            ServerReply::Tunnel { payload_span, .. } => payload_span.start,
+            ServerReply::Pong | ServerReply::Error { .. } => unreachable!(),
+        };
+
+        let pending = reader.take_payload_from(payload_start);
+        assert_eq!(&pending[..], b"early");
+        assert!(!reader.body.is_empty());
+
+        let next = reader.read_frame_payload().await.unwrap();
+        assert_eq!(next, b"next frame");
     }
 
     #[tokio::test]

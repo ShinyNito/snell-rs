@@ -1,6 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use crate::protocol::udp::AddressRef;
+use crate::service::dns::DnsResolver;
 use crate::service::runtime::config::UpstreamSocks5;
 
 pub(crate) mod direct;
@@ -10,7 +11,7 @@ pub(crate) mod socks5;
 pub(crate) mod tcp;
 pub(crate) mod udp;
 
-pub(crate) use quic::{QuicProxyRelay, open_quic_udp, run_quic_proxy_response_session};
+pub(crate) use quic::{open_quic_udp, run_quic_proxy_response_session};
 pub(crate) use tcp::open_tcp;
 pub(crate) use udp::{
     PreparedUdpProxy, PreparedUdpRelay, open_udp, send_udp_payload, validate_proxy_udp_target,
@@ -22,17 +23,29 @@ pub struct RelayStats {
     pub downloaded: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct RelayOptions {
     pub ipv6: bool,
     pub upstream: UpstreamRelay,
+    pub resolver: DnsResolver,
 }
 
-impl Default for RelayOptions {
-    fn default() -> Self {
+impl RelayOptions {
+    #[cfg(test)]
+    pub(crate) fn direct(ipv6: bool, resolver: DnsResolver) -> Self {
         Self {
-            ipv6: true,
+            ipv6,
             upstream: UpstreamRelay::Direct,
+            resolver,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn socks5(ipv6: bool, proxy_addr: SocketAddr, resolver: DnsResolver) -> Self {
+        Self {
+            ipv6,
+            upstream: UpstreamRelay::Socks5(proxy_addr),
+            resolver,
         }
     }
 }

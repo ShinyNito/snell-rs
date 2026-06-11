@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
 
-use tokio::net::{TcpStream, UdpSocket, lookup_host};
+use tokio::net::{TcpStream, UdpSocket};
 
 use crate::error::{Error, Result};
 use crate::protocol::udp::{AddressRef, UdpPacketRef};
+use crate::service::dns::DnsResolver;
 
 use super::socks5::{Socks5UdpRelayEndpoint, open_udp_associate_via_socks5};
 use super::{RelayOptions, UpstreamRelay};
@@ -23,8 +24,12 @@ pub(crate) async fn open_udp(options: RelayOptions) -> Result<PreparedUdpRelay> 
         UpstreamRelay::Direct => Ok(PreparedUdpRelay::Direct),
         UpstreamRelay::Socks5(proxy_addr) => {
             let association = open_udp_associate_via_socks5(proxy_addr).await?;
-            let relay_addr =
-                resolve_socks5_udp_relay_addr(proxy_addr, association.relay_endpoint).await?;
+            let relay_addr = resolve_socks5_udp_relay_addr(
+                proxy_addr,
+                association.relay_endpoint,
+                &options.resolver,
+            )
+            .await?;
             Ok(PreparedUdpRelay::Proxy(PreparedUdpProxy {
                 control: association.control,
                 relay_addr,
@@ -36,11 +41,12 @@ pub(crate) async fn open_udp(options: RelayOptions) -> Result<PreparedUdpRelay> 
 pub(crate) async fn resolve_socks5_udp_relay_addr(
     proxy_addr: SocketAddr,
     endpoint: Socks5UdpRelayEndpoint,
+    resolver: &DnsResolver,
 ) -> Result<SocketAddr> {
     match endpoint {
         Socks5UdpRelayEndpoint::Ip(addr) => Ok(addr),
         Socks5UdpRelayEndpoint::Domain { host, port } => {
-            let addrs = lookup_host((host.as_str(), port)).await?;
+            let addrs = resolver.lookup_socket_addrs(host.as_str(), port).await?;
             select_socks5_udp_relay_addr(proxy_addr, addrs)
         }
     }

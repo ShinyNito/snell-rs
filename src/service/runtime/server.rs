@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::error::Result;
+use crate::service::dns::DnsResolver;
 use crate::service::inbound::snell::serve_server_connection;
 use crate::service::outbound::{RelayOptions, UpstreamRelay};
 use crate::service::runtime::config::{ServerConfig, TcpBrutalConfig};
@@ -24,6 +25,7 @@ pub async fn bind_configured_tcp_server_with_shutdown(
     let options = RelayOptions {
         ipv6: config.ipv6,
         upstream: UpstreamRelay::from(config.upstream_socks5),
+        resolver: DnsResolver::from_config(config.dns)?,
     };
     let listener = bind_tcp_listener(config.listen, config.tcp_fast_open)?;
     validate_tcp_brutal_available(config.tcp_brutal).await?;
@@ -43,7 +45,7 @@ pub async fn bind_configured_tcp_server_with_shutdown(
     let udp = serve_quic_proxy_socket(
         udp_socket,
         config.psk.to_vec(),
-        options,
+        options.clone(),
         QUIC_PROXY_SESSION_IDLE_TIMEOUT,
         shutdown.clone(),
     );
@@ -81,7 +83,7 @@ pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
     shutdown: CancellationToken,
     drain_timeout: Duration,
 ) -> Result<()> {
-    let psk = Zeroizing::new(psk);
+    let psk = std::sync::Arc::new(Zeroizing::new(psk));
     let mut tasks = JoinSet::new();
 
     loop {
@@ -90,6 +92,7 @@ pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
             result = listener.accept() => {
                 let (client, peer_addr) = result?;
                 let psk = psk.clone();
+                let options = options.clone();
                 tasks.spawn(async move {
                     if let Err(err) = apply_tcp_brutal(&client, tcp_brutal) {
                         tracing::warn!(%err, %peer_addr, "snell tcp_brutal could not be enabled");
@@ -127,14 +130,23 @@ mod tests {
     use crate::error::Error;
     use crate::protocol::request::ServerReply;
     use crate::protocol::socks5::{SocksReply, SocksRequest, SocksTarget};
+    use crate::service::dns::DnsResolver;
     use crate::service::inbound::snell::{
         serve_server_connection, serve_server_connection_with_target_opener,
     };
     use crate::service::inbound::socks5::{read_client_request, write_reply_with_bind};
-    use crate::service::outbound::{RelayOptions, UpstreamRelay};
+    use crate::service::outbound::RelayOptions;
     use crate::service::runtime::lifecycle::bind_tcp_listener;
     use crate::transport::tcp_stream::{TcpClientStream, TcpClientWriter};
     use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
+
+    fn direct_options(ipv6: bool) -> RelayOptions {
+        RelayOptions::direct(ipv6, DnsResolver::system())
+    }
+
+    fn socks5_options(ipv6: bool, proxy_addr: std::net::SocketAddr) -> RelayOptions {
+        RelayOptions::socks5(ipv6, proxy_addr, DnsResolver::system())
+    }
 
     async fn write_client_payload<W>(
         writer: &mut TcpClientWriter<W>,
@@ -172,7 +184,7 @@ mod tests {
             serve_server_connection_with_target_opener(
                 client,
                 psk,
-                RelayOptions::default(),
+                direct_options(true),
                 move |target, _options| async move {
                     assert_eq!(target.host, "example.com");
                     assert_eq!(target.port, 443);
@@ -251,16 +263,9 @@ mod tests {
 
         let server = async {
             let (client, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(
-                client,
-                psk,
-                RelayOptions {
-                    ipv6: true,
-                    upstream: UpstreamRelay::Socks5(socks_addr),
-                },
-            )
-            .await
-            .unwrap()
+            serve_server_connection(client, psk, socks5_options(true, socks_addr))
+                .await
+                .unwrap()
         };
 
         let client = async {
@@ -310,15 +315,7 @@ mod tests {
 
         let server = async {
             let (client, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(
-                client,
-                psk,
-                RelayOptions {
-                    ipv6: true,
-                    upstream: UpstreamRelay::Socks5(socks_addr),
-                },
-            )
-            .await
+            serve_server_connection(client, psk, socks5_options(true, socks_addr)).await
         };
 
         let client = async {
@@ -366,7 +363,7 @@ mod tests {
             serve_server_connection_with_target_opener(
                 client,
                 psk,
-                RelayOptions::default(),
+                direct_options(true),
                 move |target, _options| {
                     let connect_rx = connect_rx.take().unwrap();
                     async move {
@@ -426,7 +423,7 @@ mod tests {
         let server = tokio::spawn(serve_tcp_listener_with_shutdown_and_timeout(
             listener,
             psk.to_vec(),
-            RelayOptions::default(),
+            direct_options(true),
             None,
             shutdown.clone(),
             Duration::from_millis(100),
@@ -455,10 +452,7 @@ mod tests {
         let server = tokio::spawn(serve_tcp_listener_with_shutdown_and_timeout(
             snell_listener,
             psk.to_vec(),
-            RelayOptions {
-                ipv6: true,
-                ..RelayOptions::default()
-            },
+            direct_options(true),
             None,
             shutdown.clone(),
             Duration::from_secs(1),
@@ -542,7 +536,9 @@ mod tests {
 
     #[tokio::test]
     async fn connect_target_rejects_ipv6_literal_when_disabled() {
-        let result = crate::service::outbound::direct::open_direct_tcp("::1", 443, false).await;
+        let resolver = crate::service::dns::DnsResolver::system();
+        let result =
+            crate::service::outbound::direct::open_direct_tcp("::1", 443, false, &resolver).await;
 
         assert!(matches!(
             result,
@@ -561,7 +557,7 @@ mod tests {
             serve_server_connection_with_target_opener(
                 client,
                 psk,
-                RelayOptions::default(),
+                direct_options(true),
                 |_target, _options| async move {
                     Err(Error::Io(std::io::Error::new(
                         std::io::ErrorKind::ConnectionRefused,

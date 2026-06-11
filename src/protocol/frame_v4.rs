@@ -410,6 +410,7 @@ pub fn split_salt(frame: &[u8]) -> Result<([u8; SALT_SIZE], &[u8])> {
     Ok((salt, &frame[SALT_SIZE..]))
 }
 
+#[inline]
 fn swap_padding(padding: &mut [u8], payload_cipher: &mut [u8]) {
     let limit = padding.len().min(payload_cipher.len());
     for index in (0..limit).step_by(2) {

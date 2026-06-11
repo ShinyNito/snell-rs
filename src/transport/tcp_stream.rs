@@ -1,9 +1,9 @@
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{Error, Result};
 use crate::protocol::request::ServerReply;
-use crate::transport::tokio_io::{STREAM_BUFFER_RETAIN_CAPACITY, V4StreamReader, V4StreamWriter};
+use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TcpTarget {
@@ -53,7 +53,7 @@ where
 
 pub(crate) struct TcpPayloadReader<R> {
     reader: V4StreamReader<R>,
-    pending: BytesMut,
+    pending: Bytes,
     done: bool,
 }
 
@@ -62,10 +62,10 @@ where
     R: AsyncRead + Unpin,
 {
     pub(crate) fn client(reader: V4StreamReader<R>) -> Self {
-        Self::new(reader, BytesMut::new())
+        Self::new(reader, Bytes::new())
     }
 
-    fn new(reader: V4StreamReader<R>, pending: BytesMut) -> Self {
+    fn new(reader: V4StreamReader<R>, pending: Bytes) -> Self {
         Self {
             reader,
             pending,
@@ -129,16 +129,13 @@ where
     }
 
     pub(crate) fn reset(&mut self) {
-        self.pending.clear();
+        self.pending = Bytes::new();
         self.done = false;
     }
 
     pub(crate) fn compact_buffers_for_reuse(&mut self) {
         self.reader.compact_buffers_for_reuse();
-        self.pending.clear();
-        if self.pending.capacity() > STREAM_BUFFER_RETAIN_CAPACITY {
-            self.pending = BytesMut::new();
-        }
+        self.pending = Bytes::new();
     }
 
     pub(crate) fn has_pending(&self) -> bool {
@@ -176,7 +173,7 @@ where
         }
     }
 
-    fn server(reader: V4StreamReader<R>, pending: BytesMut) -> Self {
+    fn server(reader: V4StreamReader<R>, pending: Bytes) -> Self {
         Self {
             payload: TcpPayloadReader::new(reader, pending),
             phase: TcpReaderPhase::Payload,
@@ -260,7 +257,7 @@ where
     pub(crate) fn from_parts_with_pending(
         reader: V4StreamReader<R>,
         writer: V4StreamWriter<W>,
-        pending: BytesMut,
+        pending: Bytes,
     ) -> Self {
         Self {
             reader: TcpReader::server(reader, pending),
@@ -358,7 +355,7 @@ where
 mod tests {
     use core::range::Range;
 
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
     use tokio::io::{AsyncRead, AsyncWrite, duplex};
 
     use super::{TcpClientStream, TcpServerStream, TcpTarget};
@@ -366,9 +363,7 @@ mod tests {
     use crate::error::Error;
     use crate::protocol::header::write_tcp_request_header;
     use crate::protocol::request::{ClientRequest, ServerReply};
-    use crate::transport::tokio_io::{
-        STREAM_BUFFER_RETAIN_CAPACITY, V4StreamReader, V4StreamWriter,
-    };
+    use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
 
     async fn write_client_payload<W>(
         writer: &mut super::TcpClientWriter<W>,
@@ -441,37 +436,19 @@ mod tests {
         let reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
         let payload = super::TcpPayloadReader::client(reader);
 
-        assert_eq!(payload.pending.capacity(), 0);
+        assert!(payload.pending.is_empty());
     }
 
     #[test]
-    fn compact_for_reuse_retains_bounded_pending_buffer() {
+    fn compact_for_reuse_clears_pending_slice() {
         let psk = b"test psk";
         let reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
-        let mut pending = BytesMut::with_capacity(128);
-        pending.extend_from_slice(b"early");
+        let pending = Bytes::from_static(b"early");
         let mut payload = super::TcpPayloadReader::new(reader, pending);
 
         payload.compact_buffers_for_reuse();
 
         assert!(payload.pending.is_empty());
-        assert!(payload.pending.capacity() >= 128);
-        assert!(payload.pending.capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
-    }
-
-    #[test]
-    fn compact_for_reuse_drops_oversized_pending_buffer() {
-        let psk = b"test psk";
-        let reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
-        let mut pending = BytesMut::with_capacity(STREAM_BUFFER_RETAIN_CAPACITY + 1);
-        pending.extend_from_slice(b"early");
-        assert!(pending.capacity() > STREAM_BUFFER_RETAIN_CAPACITY);
-        let mut payload = super::TcpPayloadReader::new(reader, pending);
-
-        payload.compact_buffers_for_reuse();
-
-        assert!(payload.pending.is_empty());
-        assert_eq!(payload.pending.capacity(), 0);
     }
 
     #[tokio::test]
@@ -545,7 +522,7 @@ mod tests {
         drop(client_upload);
 
         let frame_reader = V4StreamReader::new(server_upload, psk).unwrap();
-        let mut reader = super::TcpReader::server(frame_reader, BytesMut::new());
+        let mut reader = super::TcpReader::server(frame_reader, Bytes::new());
         assert!(reader.read_payload_chunk().await.unwrap().is_none());
     }
 
@@ -735,7 +712,7 @@ mod tests {
         let reject = async {
             let reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
             let writer = V4StreamWriter::new(server_download, psk).unwrap();
-            let stream = TcpServerStream::from_parts_with_pending(reader, writer, BytesMut::new());
+            let stream = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
             stream.reject(9, "blocked").await.unwrap();
         };
 

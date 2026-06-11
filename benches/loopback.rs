@@ -78,6 +78,7 @@ impl LoopbackHarness {
             psk: Zeroizing::new(PSK.to_vec()),
             version: snell_rs::VERSION_4,
             ipv6: false,
+            dns: None,
             tcp_fast_open: false,
             quic_proxy: false,
             tcp_brutal: None,

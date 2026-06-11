@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::time::Instant;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -83,7 +83,7 @@ where
                 let keep_alive = target.reuse;
                 let snell =
                     TcpServerStream::from_parts_with_pending(frame_reader, frame_writer, pending);
-                let connect = open_target(target, options);
+                let connect = open_target(target, options.clone());
                 let (stats, next_reader, next_writer) =
                     match relay_tcp_server_stream_fast_open(snell, connect, keep_alive).await {
                         Ok(result) => result,
@@ -110,7 +110,7 @@ where
             }
             InitialRequest::Udp => {
                 let started = Instant::now();
-                let prepared = match open_udp(options).await {
+                let prepared = match open_udp(options.clone()).await {
                     Ok(prepared) => prepared,
                     Err(err) => {
                         frame_writer
@@ -167,7 +167,7 @@ where
 }
 
 enum InitialRequest {
-    Tcp(TcpTarget, BytesMut),
+    Tcp(TcpTarget, Bytes),
     Udp,
     Ping,
 }
@@ -389,7 +389,7 @@ where
 mod tests {
     use core::range::Range;
 
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
@@ -453,7 +453,7 @@ mod tests {
         let server = async {
             let reader = V4StreamReader::new(server_upload, psk).unwrap();
             let writer = V4StreamWriter::new(server_download, psk).unwrap();
-            let snell = TcpServerStream::from_parts_with_pending(reader, writer, BytesMut::new());
+            let snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
 
             let (stats, reader, writer) = relay_tcp_server_stream_reusable(snell, upstream, true)
                 .await
@@ -480,7 +480,7 @@ mod tests {
 
         let reader = V4StreamReader::new(server_upload, psk).unwrap();
         let writer = V4StreamWriter::new(tokio::io::sink(), psk).unwrap();
-        let snell = TcpServerStream::from_parts_with_pending(reader, writer, BytesMut::new());
+        let snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
         let (mut snell_reader, _) = snell.into_split();
         let mut early_payload = BytesMut::new();
         let initial_len = SERVER_FAST_OPEN_BUFFER_LIMIT - MAX_PACKET_SIZE + 1;
@@ -564,7 +564,7 @@ mod tests {
         let server = async {
             let reader = V4StreamReader::new(server_upload, psk).unwrap();
             let writer = V4StreamWriter::new(server_download, psk).unwrap();
-            let snell = TcpServerStream::from_parts_with_pending(reader, writer, BytesMut::new());
+            let snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
 
             let (stats, mut reader, _) = relay_tcp_server_stream_reusable(snell, upstream, true)
                 .await

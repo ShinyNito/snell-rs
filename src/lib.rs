@@ -16,6 +16,7 @@ pub mod protocol {
 }
 
 pub mod service {
+    pub(crate) mod dns;
     pub mod inbound {
         pub(crate) mod snell;
         pub mod socks5;

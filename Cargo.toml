@@ -10,6 +10,7 @@ publish = false
 argon2 = "0.5.3"
 bytes = "1"
 clap = { version = "4.6", features = ["derive"] }
+hickory-resolver = "0.26.1"
 libc = "0.2"
 ring = "0.17.14"
 rust-ini = "0.21.1"
@@ -38,6 +39,10 @@ harness = false
 
 [[bench]]
 name = "loopback"
+harness = false
+
+[[bench]]
+name = "udp_loopback"
 harness = false
 
 [profile.release]

@@ -19,6 +19,7 @@ pub struct ServerConfig {
     pub psk: Zeroizing<Vec<u8>>,
     pub version: u8,
     pub ipv6: bool,
+    pub dns: Option<SocketAddr>,
     pub tcp_fast_open: bool,
     pub quic_proxy: bool,
     pub tcp_brutal: Option<TcpBrutalConfig>,
@@ -68,6 +69,7 @@ impl ServerConfig {
             psk: Zeroizing::new(psk.as_bytes().to_vec()),
             version,
             ipv6: optional_bool(section, SNELL_SERVER_SECTION, "ipv6")?.unwrap_or(false),
+            dns: optional_dns_addr(section, SNELL_SERVER_SECTION, "dns")?,
             tcp_fast_open: optional_bool(section, SNELL_SERVER_SECTION, "tcp_fast_open")?
                 .unwrap_or(false),
             quic_proxy,
@@ -233,6 +235,23 @@ fn optional_socket_addr(
         .map_err(|err| Error::Config(format!("invalid {section_name}.{key}: {err}")))
 }
 
+fn optional_dns_addr(
+    section: &ini::Properties,
+    section_name: &str,
+    key: &str,
+) -> Result<Option<SocketAddr>> {
+    let Some(value) = section.get(key).map(str::trim) else {
+        return Ok(None);
+    };
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(Some(addr));
+    }
+    value
+        .parse::<IpAddr>()
+        .map(|ip| Some(SocketAddr::new(ip, 53)))
+        .map_err(|err| Error::Config(format!("invalid {section_name}.{key}: {err}")))
+}
+
 fn parse_listen(value: &str) -> Result<SocketAddr> {
     if let Ok(addr) = value.parse::<SocketAddr>() {
         return Ok(addr);
@@ -286,6 +305,7 @@ tcp_fast_open = true
         );
         assert_eq!(&config.psk[..], b"PSKMOCK");
         assert!(config.ipv6);
+        assert_eq!(config.dns, None);
         assert!(config.tcp_fast_open);
         assert_eq!(config.version, crate::VERSION_5);
         assert!(config.quic_proxy);
@@ -309,6 +329,7 @@ psk = PSKMOCK
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 11807)
         );
         assert!(!config.ipv6);
+        assert_eq!(config.dns, None);
         assert!(!config.tcp_fast_open);
         assert_eq!(config.tcp_brutal, None);
         assert_eq!(config.upstream_socks5, None);
@@ -401,6 +422,42 @@ upstream_socks5 = 127.0.0.1:1080
             Some(super::UpstreamSocks5 {
                 addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1080)
             })
+        );
+    }
+
+    #[test]
+    fn parses_snell_server_dns_addr() {
+        let config = parse_server_config(
+            r#"
+[snell-server]
+listen = 0.0.0.0:29246
+psk = PSKMOCK
+dns = 1.1.1.1
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.dns,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53))
+        );
+    }
+
+    #[test]
+    fn parses_snell_server_dns_addr_with_port() {
+        let config = parse_server_config(
+            r#"
+[snell-server]
+listen = 0.0.0.0:29246
+psk = PSKMOCK
+dns = 1.1.1.1:5353
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.dns,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 5353))
         );
     }
 

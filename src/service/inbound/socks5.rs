@@ -183,6 +183,7 @@ mod tests {
     use crate::protocol::request::ClientRequest;
     use crate::protocol::socks5::{parse_udp_packet, write_udp_packet};
     use crate::protocol::udp::AddressRef;
+    use crate::service::dns::DnsResolver;
     use crate::service::inbound::snell::serve_server_connection;
     use crate::service::outbound::RelayOptions;
     use crate::service::outbound::snell::SnellClientOutbound;
@@ -190,6 +191,10 @@ mod tests {
     use crate::service::test_support::{accept_udp_server_stream, read_udp_request_frame};
     use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
     use crate::{VERSION_4, VERSION_5};
+
+    fn direct_options(ipv6: bool) -> RelayOptions {
+        RelayOptions::direct(ipv6, DnsResolver::system())
+    }
 
     async fn relay_socks5_connection(
         local: TcpStream,
@@ -246,16 +251,9 @@ mod tests {
 
         let snell_server = async {
             let (stream, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(
-                stream,
-                psk,
-                RelayOptions {
-                    ipv6: false,
-                    ..RelayOptions::default()
-                },
-            )
-            .await
-            .unwrap()
+            serve_server_connection(stream, psk, direct_options(false))
+                .await
+                .unwrap()
         };
 
         let socks_server = async {
@@ -433,16 +431,9 @@ mod tests {
 
         let snell_server = async {
             let (stream, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(
-                stream,
-                psk,
-                RelayOptions {
-                    ipv6: false,
-                    ..RelayOptions::default()
-                },
-            )
-            .await
-            .unwrap();
+            serve_server_connection(stream, psk, direct_options(false))
+                .await
+                .unwrap();
         };
 
         let socks_server = async {
@@ -817,16 +808,9 @@ mod tests {
 
         let snell_server = async {
             let (stream, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(
-                stream,
-                psk,
-                RelayOptions {
-                    ipv6: false,
-                    ..RelayOptions::default()
-                },
-            )
-            .await
-            .unwrap();
+            serve_server_connection(stream, psk, direct_options(false))
+                .await
+                .unwrap();
         };
 
         let socks_server = async {
@@ -937,16 +921,9 @@ mod tests {
 
         let snell_server = async {
             let (stream, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(
-                stream,
-                psk,
-                RelayOptions {
-                    ipv6: false,
-                    ..RelayOptions::default()
-                },
-            )
-            .await
-            .unwrap();
+            serve_server_connection(stream, psk, direct_options(false))
+                .await
+                .unwrap();
         };
 
         let socks_server = async {

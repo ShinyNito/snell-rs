@@ -2,11 +2,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::{UdpSocket, lookup_host};
+use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use crate::error::{Error, Result};
 use crate::protocol::udp::{AddressRef, UdpPacketRef};
+use crate::service::dns::DnsResolver;
 
 pub(super) const UDP_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -39,7 +40,11 @@ impl UdpSockets {
     }
 }
 
-pub(super) async fn resolve_udp_target(packet: UdpPacketRef<'_>, ipv6: bool) -> Result<SocketAddr> {
+pub(super) async fn resolve_udp_target(
+    packet: UdpPacketRef<'_>,
+    ipv6: bool,
+    resolver: &DnsResolver,
+) -> Result<SocketAddr> {
     match packet.address {
         AddressRef::Ip(ip) => {
             if !ipv6 && ip.is_ipv6() {
@@ -48,9 +53,12 @@ pub(super) async fn resolve_udp_target(packet: UdpPacketRef<'_>, ipv6: bool) -> 
             Ok(SocketAddr::new(ip, packet.port))
         }
         AddressRef::Domain(host) => {
-            let addrs = timeout(UDP_RESOLVE_TIMEOUT, lookup_host((host, packet.port)))
-                .await
-                .map_err(|_| Error::Timeout("udp target resolution"))??;
+            let addrs = timeout(
+                UDP_RESOLVE_TIMEOUT,
+                resolver.lookup_socket_addrs(host, packet.port),
+            )
+            .await
+            .map_err(|_| Error::Timeout("udp target resolution"))??;
             select_udp_target(addrs, ipv6)
         }
     }

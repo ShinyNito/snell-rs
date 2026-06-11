@@ -26,9 +26,9 @@ pub(super) async fn relay_snell_to_udp<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let resolver = options.resolver.clone();
     while let Some(packet) = read_udp_request_frame(reader).await? {
-        state.mark_active();
-        let target = resolve_udp_target(packet, options.ipv6).await?;
+        let target = resolve_udp_target(packet, options.ipv6, &resolver).await?;
         let socket = sockets.socket_for(target)?;
         send_udp_payload(&socket, packet.payload, target).await?;
         state.add_sent(packet.payload.len() as u64);
@@ -50,7 +50,6 @@ where
     let mut proxy_packet = BytesMut::with_capacity(MAX_PACKET_SIZE + 512);
 
     while let Some(packet) = read_udp_request_frame(reader).await? {
-        state.mark_active();
         validate_proxy_udp_target(packet, options.ipv6)?;
         proxy_packet.clear();
         write_socks_udp_packet(
