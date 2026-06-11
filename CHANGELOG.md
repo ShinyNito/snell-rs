@@ -2,6 +2,14 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.3.6] - 2026-06-11
+
+## Release Notes
+
+  * 添加实例级 DNS 解析器，支持服务端配置独立 DNS 并避免全局解析状态互相覆盖
+  * 优化 UDP 与 QUIC proxy 热路径，降低阻塞与重复解析开销
+  * 添加 UDP loopback benchmark 和 DNS 实例隔离回归测试
+
 ## [0.3.5] - 2026-06-10
 
 ## Release Notes
