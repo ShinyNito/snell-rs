@@ -2,6 +2,16 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.3.7] - 2026-06-11
+
+## Release Notes
+
+  * 全链路 payload 零拷贝重构：UDP 收包→就地 reframing→就地加密→scatter-gather 发送
+  * V4FrameEncoder 改为 head/payload 分离的就地加密 API，移除冗余拷贝路径
+  * V4StreamWriter 使用 poll_write_vectored scatter-gather 写入
+  * 新增 udp_io 模块，SOCKS5→Snell 协议就地头部重构
+  * Padding 算法优化为 O(target_bits) 的直接采样插入
+
 ## [0.3.6] - 2026-06-11
 
 ## Release Notes
