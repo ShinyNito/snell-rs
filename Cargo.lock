@@ -1455,6 +1455,7 @@ dependencies = [
  "criterion",
  "hickory-resolver",
  "libc",
+ "rand",
  "ring",
  "rust-ini",
  "thiserror",

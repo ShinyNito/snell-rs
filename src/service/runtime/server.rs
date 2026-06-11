@@ -399,7 +399,7 @@ mod tests {
                 }
             );
 
-            snell_writer.write_frame(b"early").await.unwrap();
+            snell_writer.write_test_frame(b"early").await.unwrap();
             snell_writer.write_zero_chunk().await.unwrap();
             connect_tx.send(()).unwrap();
 

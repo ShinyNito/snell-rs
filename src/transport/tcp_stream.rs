@@ -299,7 +299,7 @@ where
 
     async fn open_tunnel(&mut self) -> Result<()> {
         if !self.tunnel_open {
-            self.frame_writer.write_tunnel_reply(&[]).await?;
+            self.frame_writer.write_empty_tunnel_reply().await?;
             self.tunnel_open = true;
         }
         Ok(())
@@ -508,7 +508,10 @@ mod tests {
 
         let server = async {
             let mut server_writer = V4StreamWriter::new(server_download, psk).unwrap();
-            server_writer.write_tunnel_reply(b"accepted").await.unwrap();
+            server_writer
+                .write_test_tunnel_reply(b"accepted")
+                .await
+                .unwrap();
             server_writer.shutdown().await.unwrap();
         };
 
@@ -538,7 +541,7 @@ mod tests {
             plain.extend_from_slice(b"early");
 
             let mut writer = V4StreamWriter::new(client_upload, psk).unwrap();
-            writer.write_frame(&plain).await.unwrap();
+            writer.write_test_frame(&plain).await.unwrap();
 
             let mut reader = V4StreamReader::new(client_download, psk).unwrap();
             let reply = reader.read_server_reply().await.unwrap();

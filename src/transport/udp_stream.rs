@@ -61,7 +61,7 @@ where
         reader: V4StreamReader<R>,
         mut frame_writer: V4StreamWriter<W>,
     ) -> Result<Self> {
-        frame_writer.write_tunnel_reply(&[]).await?;
+        frame_writer.write_empty_tunnel_reply().await?;
         Ok(Self::from_parts(reader, frame_writer))
     }
 
@@ -136,7 +136,7 @@ mod tests {
 
             let mut server_writer = V4StreamWriter::new(server_download, psk).unwrap();
             server_writer
-                .write_tunnel_reply(b"unexpected")
+                .write_test_tunnel_reply(b"unexpected")
                 .await
                 .unwrap();
         };

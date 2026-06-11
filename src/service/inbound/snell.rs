@@ -426,7 +426,7 @@ mod tests {
 
         let client = async {
             let mut writer = V4StreamWriter::new(client_upload, psk).unwrap();
-            writer.write_frame(&upload).await.unwrap();
+            writer.write_test_frame(&upload).await.unwrap();
             writer.write_zero_chunk().await.unwrap();
 
             let mut reader =
@@ -476,7 +476,7 @@ mod tests {
         let (client_upload, server_upload) = duplex(4096);
 
         let mut writer = V4StreamWriter::new(client_upload, psk).unwrap();
-        writer.write_frame(b"held").await.unwrap();
+        writer.write_test_frame(b"held").await.unwrap();
 
         let reader = V4StreamReader::new(server_upload, psk).unwrap();
         let writer = V4StreamWriter::new(tokio::io::sink(), psk).unwrap();

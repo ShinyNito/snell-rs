@@ -385,9 +385,13 @@ mod tests {
         let mut padded_encoder =
             V4FrameEncoder::with_salt_and_initial_padding(psk, salt, 4).unwrap();
         let mut wire = BytesMut::new();
+        let mut head = BytesMut::new();
+        let payload_len = payload.len();
         padded_encoder
-            .encode_frame_with_padding(&payload, 4, &mut wire)
+            .encode_payload_in_place(&mut payload, payload_len, &mut head)
             .unwrap();
+        wire.extend_from_slice(&head);
+        wire.extend_from_slice(&payload);
         let (_, frame) = split_salt(&wire).unwrap();
         let mut frame = BytesMut::from(frame);
 

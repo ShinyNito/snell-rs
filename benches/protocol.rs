@@ -14,6 +14,27 @@ const SALT: [u8; SALT_SIZE] = [7; SALT_SIZE];
 const INITIAL_PADDING_LEN: usize = 0x100;
 const PAYLOAD_SIZES: [usize; 4] = [64, 1024, 8192, MAX_PACKET_SIZE];
 
+fn encode_frame_in_place(
+    encoder: &mut V4FrameEncoder,
+    payload: &[u8],
+    out: &mut BytesMut,
+) -> usize {
+    let start_len = out.len();
+    let mut head = BytesMut::new();
+    if payload.is_empty() {
+        encoder.encode_empty_frame(&mut head).unwrap();
+        out.extend_from_slice(&head);
+    } else {
+        let mut body = BytesMut::from(payload);
+        encoder
+            .encode_payload_in_place(&mut body, payload.len(), &mut head)
+            .unwrap();
+        out.extend_from_slice(&head);
+        out.extend_from_slice(&body);
+    }
+    out.len() - start_len
+}
+
 fn benchmark_crypto(c: &mut Criterion) {
     c.bench_function("crypto/derive_aes128_key", |b| {
         b.iter(|| derive_aes128_key(black_box(PSK), black_box(&SALT)).unwrap());
@@ -72,13 +93,18 @@ fn benchmark_v4_frame_encode(c: &mut Criterion) {
                             INITIAL_PADDING_LEN,
                         )
                         .unwrap(),
-                        BytesMut::with_capacity(MAX_PACKET_SIZE + 512),
+                        BytesMut::with_capacity(512),
+                        BytesMut::from(payload.as_slice()),
                     )
                 },
-                |(mut encoder, mut out)| {
-                    let written = encoder.encode_frame(black_box(&payload), &mut out).unwrap();
+                |(mut encoder, mut head, mut body)| {
+                    let payload_len = body.len();
+                    let written = encoder
+                        .encode_payload_in_place(black_box(&mut body), payload_len, &mut head)
+                        .unwrap();
                     black_box(written);
-                    black_box(out);
+                    black_box(head);
+                    black_box(body);
                 },
                 BatchSize::SmallInput,
             );
@@ -88,14 +114,21 @@ fn benchmark_v4_frame_encode(c: &mut Criterion) {
             let mut encoder =
                 V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, INITIAL_PADDING_LEN)
                     .unwrap();
-            let mut out = BytesMut::with_capacity(MAX_PACKET_SIZE + 512);
-            encoder.encode_frame(&[], &mut out).unwrap();
-            b.iter(|| {
-                out.clear();
-                let written = encoder.encode_frame(black_box(&payload), &mut out).unwrap();
-                black_box(written);
-                black_box(out.len());
-            });
+            let mut head = BytesMut::with_capacity(512);
+            encoder.encode_empty_frame(&mut head).unwrap();
+            b.iter_batched(
+                || BytesMut::from(payload.as_slice()),
+                |mut body| {
+                    head.clear();
+                    let payload_len = body.len();
+                    let written = encoder
+                        .encode_payload_in_place(black_box(&mut body), payload_len, &mut head)
+                        .unwrap();
+                    black_box(written);
+                    black_box(head.len() + body.len());
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
     group.finish();
@@ -171,7 +204,7 @@ fn first_frame(payload: &[u8]) -> FrameParts {
     let mut encoder =
         V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, INITIAL_PADDING_LEN).unwrap();
     let mut wire = BytesMut::new();
-    encoder.encode_frame(payload, &mut wire).unwrap();
+    encode_frame_in_place(&mut encoder, payload, &mut wire);
 
     let (salt, frame) = split_salt(&wire).unwrap();
     let (header, body) = split_frame(frame);
@@ -182,12 +215,12 @@ fn steady_frame(payload: &[u8]) -> SteadyFrame {
     let mut encoder =
         V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, INITIAL_PADDING_LEN).unwrap();
     let mut warmup_wire = BytesMut::new();
-    encoder.encode_frame(payload, &mut warmup_wire).unwrap();
+    encode_frame_in_place(&mut encoder, payload, &mut warmup_wire);
     let (salt, warmup_frame) = split_salt(&warmup_wire).unwrap();
     let (warmup_header, warmup_body) = split_frame(warmup_frame);
 
     let mut measured_wire = BytesMut::new();
-    encoder.encode_frame(payload, &mut measured_wire).unwrap();
+    encode_frame_in_place(&mut encoder, payload, &mut measured_wire);
     let (measured_header, measured_body) = split_frame(&measured_wire);
 
     SteadyFrame {

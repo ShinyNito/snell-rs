@@ -34,6 +34,7 @@ pub mod service {
         pub(crate) mod quic_proxy;
         pub(crate) mod socks5_udp;
         pub(crate) mod udp_association;
+        pub(crate) mod udp_io;
         pub(crate) mod udp_outbound;
         pub(crate) mod udp_socket;
     }

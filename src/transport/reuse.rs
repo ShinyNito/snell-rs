@@ -299,7 +299,10 @@ mod tests {
             );
 
             let mut server_writer = V4StreamWriter::new(server_download, psk).unwrap();
-            server_writer.write_tunnel_reply(b"pong").await.unwrap();
+            server_writer
+                .write_test_tunnel_reply(b"pong")
+                .await
+                .unwrap();
             server_writer.write_zero_chunk().await.unwrap();
 
             assert!(matches!(
@@ -335,7 +338,10 @@ mod tests {
 
         let server = async {
             let mut server_writer = V4StreamWriter::new(server_download, psk).unwrap();
-            server_writer.write_tunnel_reply(b"pong").await.unwrap();
+            server_writer
+                .write_test_tunnel_reply(b"pong")
+                .await
+                .unwrap();
             server_writer.write_zero_chunk().await.unwrap();
         };
 

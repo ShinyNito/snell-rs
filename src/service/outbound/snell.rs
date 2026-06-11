@@ -344,7 +344,7 @@ mod tests {
                 }
             );
 
-            server_writer.write_tunnel_reply(reply).await.unwrap();
+            server_writer.write_test_tunnel_reply(reply).await.unwrap();
             if send_server_zero {
                 server_writer.write_zero_chunk().await.unwrap();
             }
@@ -441,7 +441,7 @@ mod tests {
                         rest: b"",
                     }
                 );
-                server_writer.write_tunnel_reply(reply).await.unwrap();
+                server_writer.write_test_tunnel_reply(reply).await.unwrap();
                 server_writer.write_zero_chunk().await.unwrap();
 
                 std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
@@ -518,7 +518,7 @@ mod tests {
                         rest: b"",
                     }
                 );
-                server_writer.write_tunnel_reply(b"ok").await.unwrap();
+                server_writer.write_test_tunnel_reply(b"ok").await.unwrap();
                 server_writer.write_zero_chunk().await.unwrap();
                 std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
             }
@@ -611,7 +611,7 @@ mod tests {
                         rest: b"",
                     }
                 );
-                server_writer.write_tunnel_reply(b"ok").await.unwrap();
+                server_writer.write_test_tunnel_reply(b"ok").await.unwrap();
                 server_writer.write_zero_chunk().await.unwrap();
                 std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
             }

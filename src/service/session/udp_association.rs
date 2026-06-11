@@ -286,7 +286,7 @@ mod tests {
                     .unwrap()
                     .into_parts();
             writer
-                .write_udp_packet(
+                .write_test_udp_packet(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                     target_addr.port(),
                     b"query",
@@ -346,7 +346,7 @@ mod tests {
                     .unwrap()
                     .into_parts();
             writer
-                .write_udp_packet(
+                .write_test_udp_packet(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                     no_reply_addr.port(),
                     b"lost",
@@ -354,7 +354,7 @@ mod tests {
                 .await
                 .unwrap();
             writer
-                .write_udp_packet(
+                .write_test_udp_packet(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                     reply_addr.port(),
                     b"query",
@@ -459,7 +459,7 @@ mod tests {
                     .unwrap()
                     .into_parts();
             writer
-                .write_udp_packet(
+                .write_test_udp_packet(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                     target_addr.port(),
                     b"query",
@@ -664,7 +664,7 @@ mod tests {
                     .unwrap()
                     .into_parts();
             writer
-                .write_udp_packet(
+                .write_test_udp_packet(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                     target_addr.port(),
                     b"query",
@@ -702,7 +702,7 @@ mod tests {
                 .unwrap()
                 .into_parts();
             writer
-                .write_udp_packet(
+                .write_test_udp_packet(
                     AddressRef::Ip(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
                     53,
                     b"query",

@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::UdpSocket;
 
-use crate::MAX_PACKET_SIZE;
 use crate::error::{Error, Result};
-use crate::protocol::socks5::{
-    SocksUdpPacketRef, parse_udp_packet as parse_socks_udp_packet,
-    write_udp_packet as write_socks_udp_packet,
-};
+use crate::protocol::socks5::write_udp_packet as write_socks_udp_packet;
 use crate::protocol::udp::{UdpPacketRef, parse_udp_request};
 use crate::service::outbound::{RelayOptions, send_udp_payload, validate_proxy_udp_target};
+use crate::service::session::udp_io::{
+    MAX_SOCKS_UDP_HEADER, MAX_VALID_SOCKS_UDP_DATAGRAM, SnellUdpPacketKind, parse_socks_udp_header,
+    recv_socks_udp_datagram_into, reframe_socks_udp_packet, send_udp_parts,
+};
 use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
 
 use super::udp_association::UdpAssociationState;
@@ -47,18 +47,22 @@ pub(super) async fn relay_snell_to_proxy_udp<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut proxy_packet = BytesMut::with_capacity(MAX_PACKET_SIZE + 512);
+    let mut proxy_header = BytesMut::with_capacity(MAX_SOCKS_UDP_HEADER);
+    let mut proxy_packet = BytesMut::new();
 
     while let Some(packet) = read_udp_request_frame(reader).await? {
         validate_proxy_udp_target(packet, options.ipv6)?;
-        proxy_packet.clear();
-        write_socks_udp_packet(
-            &mut proxy_packet,
-            packet.address,
-            packet.port,
+        proxy_header.clear();
+        write_socks_udp_packet(&mut proxy_header, packet.address, packet.port, &[])?;
+        send_udp_parts(
+            &socket,
+            &proxy_header,
             packet.payload,
-        )?;
-        send_udp_payload(&socket, &proxy_packet, relay_addr).await?;
+            relay_addr,
+            MAX_VALID_SOCKS_UDP_DATAGRAM,
+            &mut proxy_packet,
+        )
+        .await?;
         state.add_sent(packet.payload.len() as u64);
     }
 
@@ -74,23 +78,8 @@ pub(super) async fn relay_proxy_udp_to_snell<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut response = [0; MAX_PACKET_SIZE + 512];
-
     loop {
-        let (n, peer) = socket.recv_from(&mut response).await?;
-        if peer != relay_addr {
-            tracing::debug!(%peer, %relay_addr, "ignored udp packet from unexpected proxy peer");
-            continue;
-        }
-
-        let packet = match parse_socks_udp_packet(&response[..n]) {
-            Ok(packet) => packet,
-            Err(err) => {
-                tracing::debug!(%err, "ignored invalid proxy udp response");
-                continue;
-            }
-        };
-        match write_proxy_udp_packet_response(writer, packet).await? {
+        match write_proxy_udp_packet_response(writer, &socket, relay_addr).await? {
             WriteBackStatus::Written(n) => state.add_received(n as u64),
             WriteBackStatus::Closed => return Ok(()),
             WriteBackStatus::Dropped => {}
@@ -211,21 +200,55 @@ where
 
 async fn write_proxy_udp_packet_response<W>(
     writer: &mut V4StreamWriter<W>,
-    packet: SocksUdpPacketRef<'_>,
+    socket: &UdpSocket,
+    relay_addr: std::net::SocketAddr,
 ) -> Result<WriteBackStatus>
 where
     W: AsyncWrite + Unpin,
 {
-    match writer
-        .write_udp_response(packet.address, packet.port, packet.payload)
-        .await
+    let frame_len;
+    let payload_len;
     {
-        Ok(_) => Ok(WriteBackStatus::Written(packet.payload.len())),
+        let frame = writer.start_payload_frame();
+        let (datagram_len, peer) = match recv_socks_udp_datagram_into(socket, frame).await {
+            Ok(result) => result,
+            Err(Error::PayloadTooLarge) => {
+                tracing::debug!("dropped oversized proxy udp response");
+                return Ok(WriteBackStatus::Dropped);
+            }
+            Err(err) if err.is_closed_io() => return Ok(WriteBackStatus::Closed),
+            Err(err) => return Err(err),
+        };
+        if peer != relay_addr {
+            tracing::debug!(%peer, %relay_addr, "ignored udp packet from unexpected proxy peer");
+            return Ok(WriteBackStatus::Dropped);
+        }
+
+        let header = match parse_socks_udp_header(&frame[..datagram_len]) {
+            Ok(header) => header,
+            Err(err) => {
+                tracing::debug!(%err, "ignored invalid proxy udp response");
+                return Ok(WriteBackStatus::Dropped);
+            }
+        };
+        payload_len = header.payload_len();
+        let prefix_start =
+            match reframe_socks_udp_packet(frame, &header, SnellUdpPacketKind::Response) {
+                Ok(prefix_start) => prefix_start,
+                Err(Error::PayloadTooLarge) => {
+                    tracing::debug!(payload_len, "dropped oversized proxy udp response");
+                    return Ok(WriteBackStatus::Dropped);
+                }
+                Err(err) => return Err(err),
+            };
+        frame.advance(prefix_start);
+        frame_len = frame.len();
+    }
+
+    match writer.finish_payload_frame(frame_len).await {
+        Ok(_) => Ok(WriteBackStatus::Written(payload_len)),
         Err(Error::PayloadTooLarge) => {
-            tracing::debug!(
-                payload_len = packet.payload.len(),
-                "dropped oversized proxy udp response"
-            );
+            tracing::debug!(payload_len, "dropped oversized proxy udp response");
             Ok(WriteBackStatus::Dropped)
         }
         Err(err) if err.is_closed_io() => Ok(WriteBackStatus::Closed),
@@ -273,7 +296,7 @@ mod tests {
             let (writer_io, reader_io) = tokio::io::duplex(crate::MAX_PACKET_SIZE + 2048);
             let mut reader = V4StreamReader::new(reader_io, psk).unwrap();
             let mut writer = V4StreamWriter::new(writer_io, psk).unwrap();
-            let write = writer.write_udp_response(
+            let write = writer.write_test_udp_response(
                 AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 53,
                 &v4_payload,
@@ -294,7 +317,7 @@ mod tests {
             let (writer_io, reader_io) = tokio::io::duplex(crate::MAX_PACKET_SIZE + 2048);
             let mut reader = V4StreamReader::new(reader_io, psk).unwrap();
             let mut writer = V4StreamWriter::new(writer_io, psk).unwrap();
-            let write = writer.write_udp_response(
+            let write = writer.write_test_udp_response(
                 AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
                 53,
                 &v6_payload,
@@ -324,7 +347,7 @@ mod tests {
 
         assert!(matches!(
             v4_writer
-                .write_udp_response(
+                .write_test_udp_response(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                     53,
                     &v4_payload,
@@ -334,7 +357,7 @@ mod tests {
         ));
         assert!(matches!(
             v6_writer
-                .write_udp_response(
+                .write_test_udp_response(
                     AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
                     53,
                     &v6_payload,

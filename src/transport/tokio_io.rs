@@ -1,4 +1,5 @@
 use std::future::poll_fn;
+use std::io::IoSlice;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -20,7 +21,9 @@ use crate::protocol::request::{
     ClientRequest, ServerReply, parse_client_request, parse_server_reply, write_error_reply,
     write_pong_reply, write_tunnel_reply,
 };
-use crate::protocol::udp::{AddressRef, write_udp_request_prefix, write_udp_response_prefix};
+#[cfg(test)]
+use crate::protocol::udp::write_udp_request_prefix;
+use crate::protocol::udp::{AddressRef, write_udp_response_prefix};
 
 pub const TCP_RECORD_MSS: usize = 1460;
 pub const TCP_FIRST_RECORD_OVERHEAD: usize = 55;
@@ -28,7 +31,7 @@ pub const TCP_STEADY_RECORD_OVERHEAD: usize = 39;
 pub const TCP_RECORD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const STREAM_BUFFER_INITIAL_CAPACITY: usize = 2048;
 pub(crate) const STREAM_BUFFER_RETAIN_CAPACITY: usize = MAX_PACKET_SIZE + 1024;
-const PLAIN_BUFFER_INITIAL_CAPACITY: usize = 256;
+const FRAME_HEAD_INITIAL_CAPACITY: usize = 512;
 
 pub struct RecordSizer {
     initial_padding_len: usize,
@@ -249,13 +252,11 @@ pub struct V4StreamWriter<W> {
     inner: W,
     encoder: V4FrameEncoder,
     record_sizer: RecordSizer,
-    frame: BytesMut,
-    plain: BytesMut,
+    head: BytesMut,
+    payload: BytesMut,
 }
 
 struct ReaderPayloadFrame {
-    payload_start: usize,
-    padding_len: usize,
     payload_len: usize,
     read_len: usize,
     limit: usize,
@@ -298,21 +299,58 @@ where
             inner,
             encoder,
             record_sizer,
-            frame: BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY),
-            plain: BytesMut::with_capacity(PLAIN_BUFFER_INITIAL_CAPACITY),
+            head: BytesMut::with_capacity(FRAME_HEAD_INITIAL_CAPACITY),
+            payload: BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY),
         }
     }
 
-    pub(crate) async fn write_frame(&mut self, payload: &[u8]) -> Result<usize> {
-        self.frame.clear();
-        self.encoder.encode_frame(payload, &mut self.frame)?;
-        self.inner.write_all(&self.frame).await?;
+    #[cfg(test)]
+    pub(crate) async fn write_test_frame(&mut self, payload: &[u8]) -> Result<usize> {
+        if payload.is_empty() {
+            self.write_empty_frame().await?;
+            return Ok(0);
+        }
+
+        self.payload.clear();
+        self.payload.extend_from_slice(payload);
+        self.write_payload_buffer(payload.len(), false).await?;
         tracing::trace!(
             payload_len = payload.len(),
-            wire_len = self.frame.len(),
+            wire_len = self.head.len() + self.payload.len(),
             "wrote snell v4 frame"
         );
         Ok(payload.len())
+    }
+
+    async fn write_empty_frame(&mut self) -> Result<()> {
+        self.head.clear();
+        self.payload.clear();
+        self.encoder.encode_empty_frame(&mut self.head)?;
+        let Self { inner, head, .. } = self;
+        write_all_vectored(inner, head, &[]).await?;
+        Ok(())
+    }
+
+    async fn write_payload_buffer(
+        &mut self,
+        payload_len: usize,
+        advance_record_sizer: bool,
+    ) -> Result<usize> {
+        self.head.clear();
+        let wire_len =
+            self.encoder
+                .encode_payload_in_place(&mut self.payload, payload_len, &mut self.head)?;
+        let Self {
+            inner,
+            head,
+            payload,
+            ..
+        } = self;
+        write_all_vectored(inner, head, payload).await?;
+        if advance_record_sizer && payload_len != 0 {
+            self.record_sizer.next_limit(Instant::now());
+        }
+        Ok(wire_len)
     }
 
     pub async fn write_payload_from_reader<R>(&mut self, plain: &mut R) -> Result<Option<usize>>
@@ -323,17 +361,11 @@ where
             return Ok(None);
         };
 
-        self.encoder.finish_frame_payload_buffer(
-            frame.payload_start,
-            frame.padding_len,
-            frame.payload_len,
-            &mut self.frame,
-        )?;
-        self.inner.write_all(&self.frame).await?;
+        let wire_len = self.write_payload_buffer(frame.payload_len, false).await?;
         self.record_sizer.commit_limit(Instant::now(), frame.limit);
         tracing::trace!(
             payload_len = frame.read_len,
-            wire_len = self.frame.len(),
+            wire_len,
             "wrote snell v4 payload frame"
         );
         Ok(Some(frame.read_len))
@@ -352,17 +384,11 @@ where
             return Ok(None);
         };
 
-        self.encoder.finish_frame_payload_buffer(
-            frame.payload_start,
-            frame.padding_len,
-            frame.payload_len,
-            &mut self.frame,
-        )?;
-        self.inner.write_all(&self.frame).await?;
+        let wire_len = self.write_payload_buffer(frame.payload_len, false).await?;
         self.record_sizer.commit_limit(Instant::now(), frame.limit);
         tracing::trace!(
             payload_len = frame.read_len,
-            wire_len = self.frame.len(),
+            wire_len,
             "wrote snell v4 tunnel payload frame"
         );
         Ok(Some(frame.read_len))
@@ -381,42 +407,35 @@ where
             let limit = self.record_sizer.peek_limit(now);
             let prefix_len = prefix.len();
             let Some(read_limit) = limit.checked_sub(prefix_len).filter(|limit| *limit != 0) else {
-                self.frame.clear();
+                self.payload.clear();
                 return Poll::Ready(Err(crate::error::Error::PayloadTooLarge));
             };
 
-            self.frame.clear();
-            let (payload_start, padding_len) = match self
-                .encoder
-                .start_frame_payload_buffer(limit, &mut self.frame)
-            {
-                Ok(parts) => parts,
-                Err(err) => return Poll::Ready(Err(err)),
-            };
+            self.payload.clear();
+            self.payload
+                .reserve(limit + crate::protocol::crypto::AEAD_TAG_SIZE);
             if !prefix.is_empty() {
-                self.frame.extend_from_slice(prefix);
+                self.payload.extend_from_slice(prefix);
             }
 
-            match poll_read_into_spare(plain, cx, &mut self.frame, read_limit) {
+            match poll_read_into_spare(plain, cx, &mut self.payload, read_limit) {
                 Poll::Pending => {
-                    self.frame.clear();
+                    self.payload.clear();
                     Poll::Pending
                 }
                 Poll::Ready(Ok(read_len)) => {
                     if read_len == 0 {
-                        self.frame.clear();
+                        self.payload.clear();
                         return Poll::Ready(Ok(None));
                     }
                     Poll::Ready(Ok(Some(ReaderPayloadFrame {
-                        payload_start,
-                        padding_len,
                         payload_len: prefix_len + read_len,
                         read_len,
                         limit,
                     })))
                 }
                 Poll::Ready(Err(err)) => {
-                    self.frame.clear();
+                    self.payload.clear();
                     Poll::Ready(Err(err))
                 }
             }
@@ -431,38 +450,42 @@ where
         snell_version: u8,
         reuse: bool,
     ) -> Result<()> {
-        self.plain.clear();
-        write_tcp_request_header(&mut self.plain, host, port, snell_version, reuse)?;
+        self.payload.clear();
+        write_tcp_request_header(&mut self.payload, host, port, snell_version, reuse)?;
         self.write_control_scratch().await
     }
 
     pub async fn write_udp_request(&mut self, snell_version: u8) -> Result<()> {
-        self.plain.clear();
-        write_udp_request_header(&mut self.plain, snell_version)?;
+        self.payload.clear();
+        write_udp_request_header(&mut self.payload, snell_version)?;
         self.write_control_scratch().await
     }
 
-    pub async fn write_udp_packet(
+    #[cfg(test)]
+    pub(crate) async fn write_test_udp_packet(
         &mut self,
         address: AddressRef<'_>,
         port: u16,
         payload: &[u8],
     ) -> Result<usize> {
-        self.plain.clear();
-        write_udp_request_prefix(&mut self.plain, address, port)?;
-        self.write_plain_parts_scratch(false, payload).await?;
+        self.payload.clear();
+        write_udp_request_prefix(&mut self.payload, address, port)?;
+        self.payload.extend_from_slice(payload);
+        self.write_payload_buffer(self.payload.len(), false).await?;
         Ok(payload.len())
     }
 
-    pub async fn write_udp_response(
+    #[cfg(test)]
+    pub(crate) async fn write_test_udp_response(
         &mut self,
         address: AddressRef<'_>,
         port: u16,
         payload: &[u8],
     ) -> Result<usize> {
-        self.plain.clear();
-        write_udp_response_prefix(&mut self.plain, address, port)?;
-        self.write_plain_parts_scratch(false, payload).await?;
+        self.payload.clear();
+        write_udp_response_prefix(&mut self.payload, address, port)?;
+        self.payload.extend_from_slice(payload);
+        self.write_payload_buffer(self.payload.len(), false).await?;
         Ok(payload.len())
     }
 
@@ -482,27 +505,54 @@ where
             .await
     }
 
-    pub async fn write_tunnel_reply(&mut self, payload: &[u8]) -> Result<usize> {
-        self.plain.clear();
-        write_tunnel_reply(&mut self.plain, &[]);
-        self.write_plain_parts_scratch(true, payload).await?;
+    pub(crate) fn start_payload_frame(&mut self) -> &mut BytesMut {
+        self.payload.clear();
+        &mut self.payload
+    }
+
+    pub(crate) async fn finish_payload_frame(&mut self, payload_len: usize) -> Result<usize> {
+        self.write_payload_buffer(payload_len, false).await
+    }
+
+    pub(crate) async fn write_owned_payload_frame(
+        &mut self,
+        mut payload: BytesMut,
+    ) -> Result<usize> {
+        let payload_len = payload.len();
+        std::mem::swap(&mut self.payload, &mut payload);
+        self.write_payload_buffer(payload_len, false).await
+    }
+
+    pub async fn write_empty_tunnel_reply(&mut self) -> Result<()> {
+        self.payload.clear();
+        write_tunnel_reply(&mut self.payload, &[]);
+        self.write_payload_buffer(self.payload.len(), true).await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn write_test_tunnel_reply(&mut self, payload: &[u8]) -> Result<usize> {
+        self.payload.clear();
+        write_tunnel_reply(&mut self.payload, &[]);
+        self.payload.extend_from_slice(payload);
+        self.write_payload_buffer(self.payload.len(), true).await?;
         Ok(payload.len())
     }
 
     pub async fn write_pong_reply(&mut self) -> Result<()> {
-        self.plain.clear();
-        write_pong_reply(&mut self.plain);
+        self.payload.clear();
+        write_pong_reply(&mut self.payload);
         self.write_control_scratch().await
     }
 
     pub async fn write_error_reply(&mut self, code: u8, message: &str) -> Result<()> {
-        self.plain.clear();
-        write_error_reply(&mut self.plain, code, message);
+        self.payload.clear();
+        write_error_reply(&mut self.payload, code, message);
         self.write_control_scratch().await
     }
 
     pub async fn write_zero_chunk(&mut self) -> Result<()> {
-        self.write_frame(&[]).await?;
+        self.write_empty_frame().await?;
         Ok(())
     }
 
@@ -512,12 +562,16 @@ where
     }
 
     pub(crate) fn compact_buffers_for_reuse(&mut self) {
-        compact_stream_buffer_for_reuse(&mut self.frame);
+        compact_stream_buffer_for_reuse(&mut self.payload);
+        self.head.clear();
+        if self.head.capacity() > STREAM_BUFFER_RETAIN_CAPACITY {
+            self.head = BytesMut::with_capacity(FRAME_HEAD_INITIAL_CAPACITY);
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn frame_capacity(&self) -> usize {
-        self.frame.capacity()
+        self.payload.capacity()
     }
 
     async fn try_write_udp_response_from_socket(
@@ -525,57 +579,48 @@ where
         socket: &UdpSocket,
         ip_version: UdpResponseIpVersion,
     ) -> Result<Option<(usize, SocketAddr)>> {
-        self.frame.clear();
+        self.payload.clear();
         let prefix_len = ip_version.prefix_len();
         let payload_limit = MAX_PACKET_SIZE - prefix_len;
-        let (payload_start, padding_len) = self
-            .encoder
-            .start_frame_payload_buffer(MAX_PACKET_SIZE, &mut self.frame)?;
-        self.frame.resize(payload_start + prefix_len, 0);
+        self.payload
+            .reserve(MAX_PACKET_SIZE + crate::protocol::crypto::AEAD_TAG_SIZE);
+        self.payload.resize(prefix_len, 0);
 
         let min_spare = payload_limit + 1;
-        let spare_len = self.frame.chunk_mut().len();
+        let spare_len = self.payload.chunk_mut().len();
         if spare_len < min_spare {
-            self.frame.reserve(min_spare - spare_len);
+            self.payload.reserve(min_spare);
         }
 
-        let (payload_len, peer) = match socket.try_recv_buf_from(&mut self.frame) {
+        let (payload_len, peer) = match socket.try_recv_buf_from(&mut self.payload) {
             Ok(result) => result,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                self.frame.clear();
+                self.payload.clear();
                 return Ok(None);
             }
             Err(err) => {
-                self.frame.clear();
+                self.payload.clear();
                 return Err(err.into());
             }
         };
 
         if payload_len > payload_limit {
-            self.frame.clear();
+            self.payload.clear();
             return Err(Error::PayloadTooLarge);
         }
         if !ip_version.matches(peer.ip()) {
-            self.frame.clear();
+            self.payload.clear();
             return Err(Error::InvalidAddressType);
         }
 
-        let mut prefix = &mut self.frame[payload_start..payload_start + prefix_len];
+        let mut prefix = &mut self.payload[..prefix_len];
         write_udp_response_prefix(&mut prefix, AddressRef::Ip(peer.ip()), peer.port())?;
         debug_assert!(prefix.is_empty());
 
-        self.encoder.finish_frame_payload_buffer(
-            payload_start,
-            padding_len,
-            prefix_len + payload_len,
-            &mut self.frame,
-        )?;
-        self.inner.write_all(&self.frame).await?;
-        tracing::trace!(
-            payload_len,
-            wire_len = self.frame.len(),
-            "wrote snell v4 udp response frame"
-        );
+        let wire_len = self
+            .write_payload_buffer(prefix_len + payload_len, false)
+            .await?;
+        tracing::trace!(payload_len, wire_len, "wrote snell v4 udp response frame");
         Ok(Some((payload_len, peer)))
     }
 
@@ -584,30 +629,61 @@ where
     }
 
     async fn write_plain_scratch(&mut self, advance_record_sizer: bool) -> Result<()> {
-        self.write_plain_parts_scratch(advance_record_sizer, &[])
-            .await
-    }
-
-    async fn write_plain_parts_scratch(
-        &mut self,
-        advance_record_sizer: bool,
-        payload_tail: &[u8],
-    ) -> Result<()> {
-        self.frame.clear();
-        let payload_len = self.plain.len() + payload_tail.len();
-        self.encoder
-            .encode_frame_parts(&[&self.plain, payload_tail], &mut self.frame)?;
-        self.inner.write_all(&self.frame).await?;
-        if advance_record_sizer && payload_len != 0 {
-            self.record_sizer.next_limit(Instant::now());
-        }
-        tracing::trace!(
-            payload_len,
-            wire_len = self.frame.len(),
-            "wrote snell v4 request frame"
-        );
+        let payload_len = self.payload.len();
+        let wire_len = self
+            .write_payload_buffer(payload_len, advance_record_sizer)
+            .await?;
+        tracing::trace!(payload_len, wire_len, "wrote snell v4 request frame");
         Ok(())
     }
+}
+
+async fn write_all_vectored<W>(writer: &mut W, mut first: &[u8], mut second: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    poll_fn(|cx| {
+        while !first.is_empty() || !second.is_empty() {
+            let n = if first.is_empty() {
+                let bufs = [IoSlice::new(second)];
+                match Pin::new(&mut *writer).poll_write_vectored(cx, &bufs) {
+                    Poll::Ready(result) => result?,
+                    Poll::Pending => return Poll::Pending,
+                }
+            } else if second.is_empty() {
+                let bufs = [IoSlice::new(first)];
+                match Pin::new(&mut *writer).poll_write_vectored(cx, &bufs) {
+                    Poll::Ready(result) => result?,
+                    Poll::Pending => return Poll::Pending,
+                }
+            } else {
+                let bufs = [IoSlice::new(first), IoSlice::new(second)];
+                match Pin::new(&mut *writer).poll_write_vectored(cx, &bufs) {
+                    Poll::Ready(result) => result?,
+                    Poll::Pending => return Poll::Pending,
+                }
+            };
+
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write snell frame",
+                )
+                .into()));
+            }
+
+            if n < first.len() {
+                first = &first[n..];
+            } else {
+                let rest = n - first.len();
+                first = &[];
+                second = &second[rest.min(second.len())..];
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    })
+    .await
 }
 
 fn poll_read_into_spare<R>(
@@ -621,7 +697,7 @@ where
 {
     let spare_len = buffer.chunk_mut().len();
     if spare_len < read_limit {
-        buffer.reserve(read_limit - spare_len);
+        buffer.reserve(read_limit);
     }
 
     let spare = buffer.chunk_mut();
@@ -663,7 +739,7 @@ where
 {
     let spare_len = buffer.chunk_mut().len();
     if spare_len < min_spare {
-        buffer.reserve(min_spare - spare_len);
+        buffer.reserve(min_spare);
     }
 
     // Same boundary Tokio's read_buf uses: poll_read may initialize only the
@@ -706,7 +782,7 @@ mod tests {
     use tokio::net::UdpSocket;
 
     use super::{
-        PLAIN_BUFFER_INITIAL_CAPACITY, RecordSizer, STREAM_BUFFER_INITIAL_CAPACITY,
+        FRAME_HEAD_INITIAL_CAPACITY, RecordSizer, STREAM_BUFFER_INITIAL_CAPACITY,
         STREAM_BUFFER_RETAIN_CAPACITY, TCP_FIRST_RECORD_OVERHEAD, TCP_RECORD_IDLE_TIMEOUT,
         TCP_RECORD_MSS, TCP_STEADY_RECORD_OVERHEAD, V4StreamReader, V4StreamWriter,
     };
@@ -760,10 +836,28 @@ mod tests {
             let chunk_len = payload
                 .len()
                 .min(writer.record_sizer.next_limit(Instant::now()));
-            writer.write_frame(&payload[..chunk_len]).await?;
+            let slot = writer.start_payload_frame();
+            slot.extend_from_slice(&payload[..chunk_len]);
+            writer.finish_payload_frame(chunk_len).await?;
             payload = &payload[chunk_len..];
         }
         Ok(total)
+    }
+
+    fn encode_test_frame(encoder: &mut V4FrameEncoder, payload: &[u8], wire: &mut BytesMut) {
+        let mut head = BytesMut::new();
+        if payload.is_empty() {
+            encoder.encode_empty_frame(&mut head).unwrap();
+            wire.extend_from_slice(&head);
+            return;
+        }
+
+        let mut body = BytesMut::from(payload);
+        encoder
+            .encode_payload_in_place(&mut body, payload.len(), &mut head)
+            .unwrap();
+        wire.extend_from_slice(&head);
+        wire.extend_from_slice(&body);
     }
 
     struct PendingThenReadyReader {
@@ -836,8 +930,8 @@ mod tests {
         let writer = V4StreamWriter::new(sink(), psk).unwrap();
 
         assert_eq!(reader.body.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
-        assert_eq!(writer.frame.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
-        assert_eq!(writer.plain.capacity(), PLAIN_BUFFER_INITIAL_CAPACITY);
+        assert_eq!(writer.payload.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
+        assert_eq!(writer.head.capacity(), FRAME_HEAD_INITIAL_CAPACITY);
     }
 
     #[tokio::test]
@@ -857,11 +951,16 @@ mod tests {
             assert!(reader.body.capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
         };
         let write = async {
-            writer.write_frame(&large_payload).await.unwrap();
-            assert!(writer.frame.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
+            let slot = writer.start_payload_frame();
+            slot.extend_from_slice(&large_payload);
+            writer
+                .finish_payload_frame(large_payload.len())
+                .await
+                .unwrap();
+            assert!(writer.payload.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
             writer.compact_buffers_for_reuse();
-            assert!(writer.frame.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
-            assert!(writer.frame.capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
+            assert!(writer.payload.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
+            assert!(writer.payload.capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
         };
 
         let ((), ()) = tokio::join!(read, write);
@@ -874,15 +973,15 @@ mod tests {
         let mut writer = V4StreamWriter::new(sink(), psk).unwrap();
 
         reader.body.reserve(STREAM_BUFFER_RETAIN_CAPACITY + 1);
-        writer.frame.reserve(STREAM_BUFFER_RETAIN_CAPACITY + 1);
+        writer.payload.reserve(STREAM_BUFFER_RETAIN_CAPACITY + 1);
         assert!(reader.body.capacity() > STREAM_BUFFER_RETAIN_CAPACITY);
-        assert!(writer.frame.capacity() > STREAM_BUFFER_RETAIN_CAPACITY);
+        assert!(writer.payload.capacity() > STREAM_BUFFER_RETAIN_CAPACITY);
 
         reader.compact_buffers_for_reuse();
         writer.compact_buffers_for_reuse();
 
         assert_eq!(reader.body.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
-        assert_eq!(writer.frame.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
+        assert_eq!(writer.payload.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
     }
 
     #[tokio::test]
@@ -946,7 +1045,7 @@ mod tests {
         assert_first_record_sized(&writer, first_limit);
 
         let mut writer = writer_with_initial_padding(initial_padding_len);
-        writer.write_tunnel_reply(&[]).await.unwrap();
+        writer.write_test_tunnel_reply(&[]).await.unwrap();
         assert_first_record_sized(&writer, first_limit);
 
         let mut writer = writer_with_initial_padding(initial_padding_len);
@@ -964,7 +1063,7 @@ mod tests {
 
         let mut writer = writer_with_initial_padding(initial_padding_len);
         writer
-            .write_udp_packet(
+            .write_test_udp_packet(
                 AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
                 53,
                 b"query",
@@ -976,7 +1075,7 @@ mod tests {
 
         let mut writer = writer_with_initial_padding(initial_padding_len);
         writer
-            .write_udp_response(
+            .write_test_udp_response(
                 AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
                 53,
                 b"answer",
@@ -1001,7 +1100,7 @@ mod tests {
         };
         let write = async {
             let mut writer = V4StreamWriter::new(client, psk).unwrap();
-            writer.write_frame(payload).await
+            writer.write_test_frame(payload).await
         };
 
         let (read_result, write_result) = tokio::join!(read, write);
@@ -1024,7 +1123,7 @@ mod tests {
         };
         let write = async {
             let mut writer = V4StreamWriter::new(client, psk).unwrap();
-            writer.write_frame(payload).await
+            writer.write_test_frame(payload).await
         };
 
         let (read_result, write_result) = tokio::join!(read, write);
@@ -1047,7 +1146,7 @@ mod tests {
         };
         let write = async {
             let mut writer = V4StreamWriter::new(client, psk).unwrap();
-            writer.write_frame(payload).await
+            writer.write_test_frame(payload).await
         };
 
         let ((), write_result) = tokio::join!(read, write);
@@ -1195,7 +1294,7 @@ mod tests {
         let write = async {
             let mut writer = V4StreamWriter::new(client, psk).unwrap();
             writer
-                .write_udp_packet(
+                .write_test_udp_packet(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
                     53,
                     payload,
@@ -1225,7 +1324,7 @@ mod tests {
         let write = async {
             let mut writer = V4StreamWriter::new(client, psk).unwrap();
             writer
-                .write_udp_packet(
+                .write_test_udp_packet(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
                     53,
                     &payload,
@@ -1284,7 +1383,7 @@ mod tests {
         let mut writer = V4StreamWriter::new(client, psk).unwrap();
         assert!(matches!(
             writer
-                .write_udp_packet(
+                .write_test_udp_packet(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
                     53,
                     &payload,
@@ -1346,7 +1445,7 @@ mod tests {
         };
         let write = async {
             let mut writer = V4StreamWriter::new(server, psk).unwrap();
-            writer.write_tunnel_reply(payload).await
+            writer.write_test_tunnel_reply(payload).await
         };
 
         let ((), write_result) = tokio::join!(read, write);
@@ -1386,7 +1485,7 @@ mod tests {
             let encoder =
                 V4FrameEncoder::with_salt_and_initial_padding(psk, [0x31; 16], 128).unwrap();
             let mut writer = V4StreamWriter::from_parts(server, encoder);
-            writer.write_tunnel_reply(payload).await
+            writer.write_test_tunnel_reply(payload).await
         };
 
         let ((), write_result) = tokio::join!(read, write);
@@ -1402,8 +1501,8 @@ mod tests {
         let mut encoder = V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, 0).unwrap();
         let mut reply = BytesMut::new();
         crate::protocol::request::write_tunnel_reply(&mut reply, b"early");
-        encoder.encode_frame(&reply, &mut wire).unwrap();
-        encoder.encode_frame(b"next frame", &mut wire).unwrap();
+        encode_test_frame(&mut encoder, &reply, &mut wire);
+        encode_test_frame(&mut encoder, b"next frame", &mut wire);
 
         let mut reader = V4StreamReader::new(Cursor::new(wire), PSK).unwrap();
         let payload_start = match reader.read_server_reply().await.unwrap() {

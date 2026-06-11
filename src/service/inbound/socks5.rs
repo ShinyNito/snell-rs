@@ -321,7 +321,7 @@ mod tests {
 
             let mut server_writer = V4StreamWriter::new(server_write, psk).unwrap();
             server_writer
-                .write_tunnel_reply(response_payload)
+                .write_test_tunnel_reply(response_payload)
                 .await
                 .unwrap();
             server_writer.write_zero_chunk().await.unwrap();
@@ -655,7 +655,7 @@ mod tests {
             assert_eq!(request.payload, b"query");
             assert_eq!(request.port, 53);
             writer
-                .write_udp_response(
+                .write_test_udp_response(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                     53,
                     b"answer",
@@ -732,7 +732,11 @@ mod tests {
             assert_eq!(request.payload, b"\xc0still-over-tcp");
             assert_eq!(request.port, 443);
             writer
-                .write_udp_response(AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)), 443, b"ok")
+                .write_test_udp_response(
+                    AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                    443,
+                    b"ok",
+                )
                 .await
                 .unwrap();
             std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
@@ -1001,9 +1005,9 @@ mod tests {
             assert_eq!(request.payload, b"query");
             assert_eq!(request.port, 53);
 
-            writer.write_frame(&[0xff]).await.unwrap();
+            writer.write_test_frame(&[0xff]).await.unwrap();
             writer
-                .write_udp_response(
+                .write_test_udp_response(
                     AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                     53,
                     b"answer",

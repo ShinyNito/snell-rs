@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use rand::RngExt;
 
 use crate::MAX_PACKET_SIZE;
 use crate::error::{Error, Result};
@@ -76,162 +77,60 @@ impl V4FrameEncoder {
         self.initial_padding_len
     }
 
-    pub fn encode_frame(&mut self, payload: &[u8], out: &mut BytesMut) -> Result<usize> {
-        let padding_len = self.next_padding_len(payload.len());
-        self.encode_frame_with_padding(payload, padding_len, out)
-    }
-
-    pub fn encode_frame_parts(
-        &mut self,
-        payload_parts: &[&[u8]],
-        out: &mut BytesMut,
-    ) -> Result<usize> {
-        let payload_len = payload_parts.iter().map(|part| part.len()).sum();
-        let padding_len = self.next_padding_len(payload_len);
-        self.encode_frame_parts_with_padding(payload_parts, payload_len, padding_len, out)
-    }
-
-    #[doc(hidden)]
-    pub fn encode_frame_with_padding(
-        &mut self,
-        payload: &[u8],
-        padding_len: usize,
-        out: &mut BytesMut,
-    ) -> Result<usize> {
-        if payload.len() > MAX_PACKET_SIZE || padding_len > MAX_PACKET_SIZE {
-            return Err(Error::PayloadTooLarge);
-        }
-        if payload.is_empty() && padding_len != 0 {
-            return Err(Error::ZeroChunkWithPadding);
-        }
-
-        let start_len = out.len();
+    pub fn encode_empty_frame(&mut self, head: &mut BytesMut) -> Result<usize> {
+        let start_len = head.len();
         let salt_len = if self.salt_sent { 0 } else { SALT_SIZE };
-        let body_len = if payload.is_empty() {
-            0
-        } else {
-            padding_len + payload.len() + AEAD_TAG_SIZE
-        };
-        out.reserve(salt_len + V4_HEADER_CIPHER_SIZE + body_len);
+        head.reserve(salt_len + V4_HEADER_CIPHER_SIZE);
 
         if !self.salt_sent {
-            out.extend_from_slice(&self.salt);
+            head.extend_from_slice(&self.salt);
             self.salt_sent = true;
         }
 
-        self.write_encrypted_header(padding_len, payload.len(), out)?;
-        if !payload.is_empty() {
-            self.write_encrypted_payload(payload, padding_len, out)?;
-        }
-        Ok(out.len() - start_len)
+        self.write_encrypted_header(0, 0, head)?;
+        Ok(head.len() - start_len)
     }
 
-    pub(crate) fn start_frame_payload_buffer(
-        &self,
-        payload_limit: usize,
-        out: &mut BytesMut,
-    ) -> Result<(usize, usize)> {
-        if payload_limit == 0 || payload_limit > MAX_PACKET_SIZE {
-            return Err(Error::PayloadTooLarge);
-        }
-
-        let start_len = out.len();
-        let salt_len = if self.salt_sent { 0 } else { SALT_SIZE };
-        let padding_len = self.next_padding_len(payload_limit);
-        let payload_start = start_len + salt_len + V4_HEADER_CIPHER_SIZE + padding_len;
-        out.reserve(salt_len + V4_HEADER_CIPHER_SIZE + padding_len + payload_limit + AEAD_TAG_SIZE);
-        out.resize(payload_start, 0);
-        Ok((payload_start, padding_len))
-    }
-
-    pub(crate) fn finish_frame_payload_buffer(
+    pub fn encode_payload_in_place(
         &mut self,
-        payload_start: usize,
-        padding_len: usize,
+        payload: &mut BytesMut,
         payload_len: usize,
-        out: &mut BytesMut,
+        head: &mut BytesMut,
     ) -> Result<usize> {
+        let padding_len = self.next_padding_len(payload_len);
         if payload_len == 0 || payload_len > MAX_PACKET_SIZE || padding_len > MAX_PACKET_SIZE {
             return Err(Error::PayloadTooLarge);
         }
+        if payload.len() != payload_len {
+            return Err(Error::FrameLengthMismatch);
+        }
 
+        let start_len = head.len();
         let salt_len = if self.salt_sent { 0 } else { SALT_SIZE };
-        let frame_prefix_len = salt_len + V4_HEADER_CIPHER_SIZE + padding_len;
-        if payload_start < frame_prefix_len {
-            return Err(Error::FrameLengthMismatch);
-        }
-        let start_len = payload_start - frame_prefix_len;
-        if out.len() != payload_start + payload_len {
-            return Err(Error::FrameLengthMismatch);
-        }
+        head.reserve(salt_len + V4_HEADER_CIPHER_SIZE + padding_len);
 
         if !self.salt_sent {
-            out[start_len..start_len + SALT_SIZE].copy_from_slice(&self.salt);
+            head.extend_from_slice(&self.salt);
             self.salt_sent = true;
         }
 
-        let header_start = start_len + salt_len;
-        self.write_encrypted_header_into(
-            padding_len,
-            payload_len,
-            &mut out[header_start..header_start + V4_HEADER_CIPHER_SIZE],
-        )?;
+        self.write_encrypted_header(padding_len, payload_len, head)?;
+        let padding_start = head.len();
+        head.resize(padding_start + padding_len, 0);
 
-        let payload_end = payload_start + payload_len;
         let tag = self
             .crypto
-            .encrypt_detached(self.nonce.as_bytes(), &mut out[payload_start..payload_end])?;
+            .encrypt_detached(self.nonce.as_bytes(), &mut payload[..payload_len])?;
         self.nonce.increment();
-        out.extend_from_slice(&tag);
+        payload.extend_from_slice(&tag);
 
         if padding_len > 0 {
-            let body = &mut out[header_start + V4_HEADER_CIPHER_SIZE..];
-            let (padding, payload_cipher) = body.split_at_mut(padding_len);
-            make_v4_padding(padding, payload_cipher)?;
-            swap_padding(padding, payload_cipher);
+            let padding = &mut head[padding_start..];
+            make_v4_padding(padding, payload)?;
+            swap_padding(padding, payload);
         }
 
-        Ok(out.len() - start_len)
-    }
-
-    fn encode_frame_parts_with_padding(
-        &mut self,
-        payload_parts: &[&[u8]],
-        payload_len: usize,
-        padding_len: usize,
-        out: &mut BytesMut,
-    ) -> Result<usize> {
-        if payload_len > MAX_PACKET_SIZE || padding_len > MAX_PACKET_SIZE {
-            return Err(Error::PayloadTooLarge);
-        }
-        if payload_len == 0 && padding_len != 0 {
-            return Err(Error::ZeroChunkWithPadding);
-        }
-
-        let start_len = out.len();
-        let salt_len = if self.salt_sent { 0 } else { SALT_SIZE };
-        let body_len = if payload_len == 0 {
-            0
-        } else {
-            padding_len + payload_len + AEAD_TAG_SIZE
-        };
-        out.reserve(salt_len + V4_HEADER_CIPHER_SIZE + body_len);
-
-        if !self.salt_sent {
-            out.extend_from_slice(&self.salt);
-            self.salt_sent = true;
-        }
-
-        self.write_encrypted_header(padding_len, payload_len, out)?;
-        if payload_len != 0 {
-            self.write_encrypted_payload_with(payload_len, padding_len, out, |out| {
-                for part in payload_parts {
-                    out.extend_from_slice(part);
-                }
-                Ok(())
-            })?;
-        }
-        Ok(out.len() - start_len)
+        Ok(head.len() - start_len + payload.len())
     }
 
     fn next_padding_len(&self, payload_len: usize) -> usize {
@@ -259,74 +158,6 @@ impl V4FrameEncoder {
         self.nonce.increment();
         out.extend_from_slice(&header);
         out.extend_from_slice(&tag);
-        Ok(())
-    }
-
-    fn write_encrypted_header_into(
-        &mut self,
-        padding_len: usize,
-        payload_len: usize,
-        out: &mut [u8],
-    ) -> Result<()> {
-        if out.len() != V4_HEADER_CIPHER_SIZE {
-            return Err(Error::FrameLengthMismatch);
-        }
-
-        let mut header = [0u8; V4_HEADER_PLAIN_SIZE];
-        header[0] = 4;
-        header[3..5].copy_from_slice(&(padding_len as u16).to_be_bytes());
-        header[5..7].copy_from_slice(&(payload_len as u16).to_be_bytes());
-
-        let tag = self
-            .crypto
-            .encrypt_detached(self.nonce.as_bytes(), &mut header)?;
-        self.nonce.increment();
-        out[..V4_HEADER_PLAIN_SIZE].copy_from_slice(&header);
-        out[V4_HEADER_PLAIN_SIZE..].copy_from_slice(&tag);
-        Ok(())
-    }
-
-    fn write_encrypted_payload(
-        &mut self,
-        payload: &[u8],
-        padding_len: usize,
-        out: &mut BytesMut,
-    ) -> Result<()> {
-        self.write_encrypted_payload_with(payload.len(), padding_len, out, |out| {
-            out.extend_from_slice(payload);
-            Ok(())
-        })
-    }
-
-    fn write_encrypted_payload_with(
-        &mut self,
-        payload_len: usize,
-        padding_len: usize,
-        out: &mut BytesMut,
-        write_payload: impl FnOnce(&mut BytesMut) -> Result<()>,
-    ) -> Result<()> {
-        let body_start = out.len();
-        out.resize(body_start + padding_len, 0);
-
-        let payload_start = out.len();
-        write_payload(out)?;
-        let tag = {
-            let payload_end = payload_start + payload_len;
-            if out.len() != payload_end {
-                return Err(Error::FrameLengthMismatch);
-            }
-            self.crypto
-                .encrypt_detached(self.nonce.as_bytes(), &mut out[payload_start..payload_end])?
-        };
-        self.nonce.increment();
-        out.extend_from_slice(&tag);
-
-        if padding_len > 0 {
-            let body = &mut out[body_start..];
-            let (padding, payload_cipher) = body.split_at_mut(padding_len);
-            make_v4_padding(padding, payload_cipher)?;
-            swap_padding(padding, payload_cipher);
-        }
         Ok(())
     }
 }
@@ -435,7 +266,7 @@ fn make_v4_padding(padding: &mut [u8], payload_cipher: &[u8]) -> Result<V4Paddin
         return Ok(V4PaddingMode::Random);
     };
 
-    fill_padding_with_shuffled_bits(padding, target_ones)?;
+    fill_padding_with_sampled_bits(padding, target_ones)?;
     Ok(V4PaddingMode::BitRatio)
 }
 
@@ -491,7 +322,7 @@ fn v4_padding_target_ones_for_ratio(
     Some(target_ones)
 }
 
-fn fill_padding_with_shuffled_bits(padding: &mut [u8], target_ones: usize) -> Result<()> {
+fn fill_padding_with_sampled_bits(padding: &mut [u8], target_ones: usize) -> Result<()> {
     let padding_bits = padding.len() * 8;
     debug_assert!(target_ones <= padding_bits);
 
@@ -499,23 +330,39 @@ fn fill_padding_with_shuffled_bits(padding: &mut [u8], target_ones: usize) -> Re
         padding.fill(0);
         return Ok(());
     }
+
     if target_ones == padding_bits {
         padding.fill(0xff);
         return Ok(());
     }
 
-    padding.fill(0);
-    for bit_index in 0..target_ones {
-        set_bit(padding, bit_index, true);
-    }
+    let target_zeros = padding_bits - target_ones;
+    let mut rng = rand::rng();
 
-    let mut random = RandomU64Pool::new();
-    for bit_index in (1..padding_bits).rev() {
-        let swap_index = random.next_index(bit_index + 1)?;
-        if bit_index != swap_index {
-            swap_bits(padding, bit_index, swap_index);
+    if target_ones <= target_zeros {
+        padding.fill(0);
+
+        for j in padding_bits - target_ones..padding_bits {
+            let candidate = rng.random_range(0..j + 1);
+            let candidate_mask = 1u8 << (candidate & 7);
+            let candidate_is_selected = padding[candidate >> 3] & candidate_mask != 0;
+
+            let index = if candidate_is_selected { j } else { candidate };
+            padding[index >> 3] |= 1u8 << (index & 7);
+        }
+    } else {
+        padding.fill(0xff);
+
+        for j in padding_bits - target_zeros..padding_bits {
+            let candidate = rng.random_range(0..j + 1);
+            let candidate_mask = 1u8 << (candidate & 7);
+            let candidate_is_selected = padding[candidate >> 3] & candidate_mask == 0;
+
+            let index = if candidate_is_selected { j } else { candidate };
+            padding[index >> 3] &= !(1u8 << (index & 7));
         }
     }
+
     Ok(())
 }
 
@@ -544,81 +391,37 @@ fn random_unit_f64() -> Result<f64> {
     Ok(value as f64 / ((1u64 << 53) as f64))
 }
 
-fn set_bit(bytes: &mut [u8], bit_index: usize, value: bool) {
-    let byte_index = bit_index / 8;
-    let mask = 1u8 << (bit_index % 8);
-    if value {
-        bytes[byte_index] |= mask;
-    } else {
-        bytes[byte_index] &= !mask;
-    }
-}
-
-fn bit(bytes: &[u8], bit_index: usize) -> bool {
-    bytes[bit_index / 8] & (1u8 << (bit_index % 8)) != 0
-}
-
-fn swap_bits(bytes: &mut [u8], left: usize, right: usize) {
-    let left_bit = bit(bytes, left);
-    let right_bit = bit(bytes, right);
-    if left_bit != right_bit {
-        set_bit(bytes, left, right_bit);
-        set_bit(bytes, right, left_bit);
-    }
-}
-
-struct RandomU64Pool {
-    bytes: [u8; 256],
-    offset: usize,
-}
-
-impl RandomU64Pool {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; 256],
-            offset: 256,
-        }
-    }
-
-    fn next_index(&mut self, upper: usize) -> Result<usize> {
-        debug_assert!(upper > 0);
-        if upper == 1 {
-            return Ok(0);
-        }
-
-        let upper = upper as u64;
-        let zone = u64::MAX - (u64::MAX % upper);
-        loop {
-            let value = self.next_u64()?;
-            if value < zone {
-                return Ok((value % upper) as usize);
-            }
-        }
-    }
-
-    fn next_u64(&mut self) -> Result<u64> {
-        if self.offset + 8 > self.bytes.len() {
-            fill_random(&mut self.bytes)?;
-            self.offset = 0;
-        }
-
-        let mut bytes = [0; 8];
-        bytes.copy_from_slice(&self.bytes[self.offset..self.offset + 8]);
-        self.offset += 8;
-        Ok(u64::from_le_bytes(bytes))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
 
     use super::{
         V4_HEADER_CIPHER_SIZE, V4FrameDecoder, V4FrameEncoder, V4PaddingMode, count_one_bits,
-        count_v4_payload_ones, fill_padding_with_shuffled_bits, make_v4_padding, split_salt,
+        count_v4_payload_ones, fill_padding_with_sampled_bits, make_v4_padding, split_salt,
         swap_padding, v4_padding_target_ones_for_ratio,
     };
     use crate::error::Error;
+
+    fn encode_test_frame(
+        encoder: &mut V4FrameEncoder,
+        payload: &[u8],
+        wire: &mut BytesMut,
+    ) -> usize {
+        let start_len = wire.len();
+        let mut head = BytesMut::new();
+        if payload.is_empty() {
+            encoder.encode_empty_frame(&mut head).unwrap();
+            wire.extend_from_slice(&head);
+        } else {
+            let mut body = BytesMut::from(payload);
+            encoder
+                .encode_payload_in_place(&mut body, payload.len(), &mut head)
+                .unwrap();
+            wire.extend_from_slice(&head);
+            wire.extend_from_slice(&body);
+        }
+        wire.len() - start_len
+    }
 
     #[test]
     fn swaps_every_other_byte_until_shorter_side() {
@@ -660,10 +463,10 @@ mod tests {
     }
 
     #[test]
-    fn shuffled_padding_has_exact_target_ones() {
+    fn sampled_padding_has_exact_target_ones() {
         let mut padding = [0; 32];
 
-        fill_padding_with_shuffled_bits(&mut padding, 101).unwrap();
+        fill_padding_with_sampled_bits(&mut padding, 101).unwrap();
 
         assert_eq!(count_one_bits(&padding), 101);
     }
@@ -703,7 +506,7 @@ mod tests {
         let mut encoder = V4FrameEncoder::with_salt_and_initial_padding(psk, salt, 8).unwrap();
         let mut wire = BytesMut::with_capacity(128);
 
-        let written = encoder.encode_frame(payload, &mut wire).unwrap();
+        let written = encode_test_frame(&mut encoder, payload, &mut wire);
         assert_eq!(written, wire.len());
         assert_eq!(&wire[..16], &salt);
         assert!(wire.len() > 16 + V4_HEADER_CIPHER_SIZE + payload.len());
@@ -731,7 +534,7 @@ mod tests {
             V4FrameEncoder::with_salt_and_initial_padding(psk, salt, initial_padding_len).unwrap();
         let mut wire = BytesMut::with_capacity(512);
 
-        encoder.encode_frame(&payload, &mut wire).unwrap();
+        encode_test_frame(&mut encoder, &payload, &mut wire);
 
         let (decoded_salt, frame) = split_salt(&wire).unwrap();
         let mut header_cipher = [0; V4_HEADER_CIPHER_SIZE];
@@ -764,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_buffer_path_appends_to_non_empty_output() {
+    fn payload_in_place_path_appends_to_non_empty_output() {
         let psk = b"test psk";
         let salt = [9u8; 16];
         let payload = b"streamed payload";
@@ -772,13 +575,13 @@ mod tests {
         let mut wire = BytesMut::from(&b"prefix"[..]);
 
         let start_len = wire.len();
-        let (payload_start, padding_len) = encoder
-            .start_frame_payload_buffer(payload.len(), &mut wire)
-            .unwrap();
-        wire.extend_from_slice(payload);
+        let mut head = BytesMut::new();
+        let mut body = BytesMut::from(&payload[..]);
         let written = encoder
-            .finish_frame_payload_buffer(payload_start, padding_len, payload.len(), &mut wire)
+            .encode_payload_in_place(&mut body, payload.len(), &mut head)
             .unwrap();
+        wire.extend_from_slice(&head);
+        wire.extend_from_slice(&body);
 
         assert_eq!(written, wire.len() - start_len);
         assert_eq!(&wire[..start_len], b"prefix");
@@ -803,7 +606,7 @@ mod tests {
         let mut encoder = V4FrameEncoder::with_salt_and_initial_padding(psk, salt, 8).unwrap();
         let mut wire = BytesMut::new();
 
-        encoder.encode_frame(&[], &mut wire).unwrap();
+        encode_test_frame(&mut encoder, &[], &mut wire);
         let (decoded_salt, frame) = split_salt(&wire).unwrap();
         let mut frame = BytesMut::from(frame);
         let mut decoder = V4FrameDecoder::new(psk, decoded_salt).unwrap();
