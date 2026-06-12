@@ -2,6 +2,14 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.4.0] - 2026-06-12
+
+## Release Notes
+
+  * 支持 Snell v6 协议
+  * 重组协议、代理、会话和服务端模块，拆分配置与帧读写逻辑
+  * 增加跨平台编译检查，并上传编译产物供下载
+
 ## [0.3.7] - 2026-06-11
 
 ## Release Notes
