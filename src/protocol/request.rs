@@ -150,7 +150,7 @@ mod tests {
         ClientRequest, ServerReply, parse_client_request, parse_server_reply, write_error_reply,
         write_pong_reply, write_tunnel_reply,
     };
-    use crate::VERSION_4;
+    use crate::ProtocolVersion;
     use crate::error::Error;
     use crate::protocol::header::{
         PROTOCOL_VERSION, write_tcp_request_header, write_udp_request_header,
@@ -159,7 +159,8 @@ mod tests {
     #[test]
     fn parses_tcp_request_as_borrowed_view() {
         let mut input = BytesMut::new();
-        write_tcp_request_header(&mut input, "example.com", 443, VERSION_4, true).unwrap();
+        write_tcp_request_header(&mut input, "example.com", 443, ProtocolVersion::V4, true)
+            .unwrap();
         input.extend_from_slice(b"early-data");
 
         let parsed = parse_client_request(&input).unwrap();
@@ -178,7 +179,7 @@ mod tests {
     #[test]
     fn parses_udp_request_header() {
         let mut input = BytesMut::new();
-        write_udp_request_header(&mut input, VERSION_4).unwrap();
+        write_udp_request_header(&mut input, ProtocolVersion::V4).unwrap();
         input.extend_from_slice(b"packet");
 
         assert_eq!(

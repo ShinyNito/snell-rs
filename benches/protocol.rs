@@ -5,7 +5,7 @@ use bytes::BytesMut;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use snell_rs::MAX_PACKET_SIZE;
 use snell_rs::protocol::crypto::{AES_128_KEY_SIZE, Aes128GcmCrypto, SALT_SIZE, derive_aes128_key};
-use snell_rs::protocol::frame_v4::{
+use snell_rs::protocol::v4::frame::{
     V4_HEADER_CIPHER_SIZE, V4FrameDecoder, V4FrameEncoder, split_salt,
 };
 

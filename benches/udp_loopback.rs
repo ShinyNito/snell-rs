@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use snell_rs::service::runtime::client::bind_configured_socks5_client_with_shutdown;
-use snell_rs::service::runtime::config::{ClientConfig, ServerConfig};
-use snell_rs::service::runtime::server::bind_configured_tcp_server_with_shutdown;
+use snell_rs::client::bind_configured_socks5_client_with_shutdown;
+use snell_rs::config::{ClientConfig, ServerConfig};
+use snell_rs::server::bind_configured_tcp_server_with_shutdown;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::runtime::Runtime;
@@ -77,7 +77,6 @@ impl UdpLoopbackHarness {
         let snell_config = ServerConfig {
             listen: vec![snell_addr],
             psk: Zeroizing::new(PSK.to_vec()),
-            version: snell_rs::VERSION_4,
             ipv6: false,
             dns: None,
             dns_ip_preference: Default::default(),
@@ -95,7 +94,7 @@ impl UdpLoopbackHarness {
             listen: socks_addr,
             server: snell_addr,
             psk: Zeroizing::new(PSK.to_vec()),
-            version: snell_rs::VERSION_4,
+            version: snell_rs::ProtocolVersion::V4,
             reuse: false,
             quic_proxy: false,
         };

@@ -1,7 +1,7 @@
 use bytes::BufMut;
 
 use crate::error::{Error, Result};
-use crate::{VERSION_1, VERSION_2, VERSION_3, VERSION_4, VERSION_5, VERSION_6};
+use crate::protocol::version::ProtocolVersion;
 
 pub const COMMAND_PING: u8 = 0;
 pub const COMMAND_CONNECT: u8 = 1;
@@ -19,10 +19,9 @@ pub fn write_tcp_request_header(
     out: &mut impl BufMut,
     host: &str,
     port: u16,
-    snell_version: u8,
+    snell_version: ProtocolVersion,
     reuse: bool,
 ) -> Result<()> {
-    validate_version(snell_version)?;
     if host.is_empty() {
         return Err(Error::EmptyHost);
     }
@@ -31,7 +30,7 @@ pub fn write_tcp_request_header(
     }
 
     out.put_u8(PROTOCOL_VERSION);
-    if snell_version == VERSION_2 || reuse {
+    if snell_version == ProtocolVersion::V2 || reuse {
         out.put_u8(COMMAND_CONNECT_V2);
     } else {
         out.put_u8(COMMAND_CONNECT);
@@ -43,20 +42,15 @@ pub fn write_tcp_request_header(
     Ok(())
 }
 
-pub fn write_udp_request_header(out: &mut impl BufMut, snell_version: u8) -> Result<()> {
-    validate_version(snell_version)?;
-    if snell_version < VERSION_3 {
-        return Err(Error::UnsupportedVersion(snell_version));
+pub fn write_udp_request_header(
+    out: &mut impl BufMut,
+    snell_version: ProtocolVersion,
+) -> Result<()> {
+    if !snell_version.supports_udp() {
+        return Err(Error::UnsupportedVersion(snell_version.as_u8()));
     }
     out.put_slice(&[PROTOCOL_VERSION, COMMAND_UDP, 0]);
     Ok(())
-}
-
-pub fn validate_version(version: u8) -> Result<()> {
-    match version {
-        VERSION_1 | VERSION_2 | VERSION_3 | VERSION_4 | VERSION_5 | VERSION_6 => Ok(()),
-        other => Err(Error::UnsupportedVersion(other)),
-    }
 }
 
 #[cfg(test)]
@@ -65,12 +59,12 @@ mod tests {
         COMMAND_CONNECT, COMMAND_CONNECT_V2, COMMAND_UDP, PROTOCOL_VERSION,
         write_tcp_request_header, write_udp_request_header,
     };
-    use crate::{VERSION_1, VERSION_4, VERSION_6};
+    use crate::ProtocolVersion;
 
     #[test]
     fn writes_tcp_connect_header() {
         let mut out = Vec::new();
-        write_tcp_request_header(&mut out, "example.com", 443, VERSION_4, false).unwrap();
+        write_tcp_request_header(&mut out, "example.com", 443, ProtocolVersion::V4, false).unwrap();
         assert_eq!(out[0], PROTOCOL_VERSION);
         assert_eq!(out[1], COMMAND_CONNECT);
         assert_eq!(out[2], 0);
@@ -82,26 +76,26 @@ mod tests {
     #[test]
     fn writes_reuse_header() {
         let mut out = Vec::new();
-        write_tcp_request_header(&mut out, "example.com", 443, VERSION_4, true).unwrap();
+        write_tcp_request_header(&mut out, "example.com", 443, ProtocolVersion::V4, true).unwrap();
         assert_eq!(out[1], COMMAND_CONNECT_V2);
     }
 
     #[test]
     fn writes_udp_header_for_v3_plus() {
         let mut out = Vec::new();
-        write_udp_request_header(&mut out, VERSION_4).unwrap();
+        write_udp_request_header(&mut out, ProtocolVersion::V4).unwrap();
         assert_eq!(out, [PROTOCOL_VERSION, COMMAND_UDP, 0]);
-        assert!(write_udp_request_header(&mut out, VERSION_1).is_err());
+        assert!(write_udp_request_header(&mut out, ProtocolVersion::V1).is_err());
     }
 
     #[test]
     fn accepts_version_6_headers() {
         let mut tcp = Vec::new();
-        write_tcp_request_header(&mut tcp, "example.com", 443, VERSION_6, false).unwrap();
+        write_tcp_request_header(&mut tcp, "example.com", 443, ProtocolVersion::V6, false).unwrap();
         assert_eq!(tcp[1], COMMAND_CONNECT);
 
         let mut udp = Vec::new();
-        write_udp_request_header(&mut udp, VERSION_6).unwrap();
+        write_udp_request_header(&mut udp, ProtocolVersion::V6).unwrap();
         assert_eq!(udp, [PROTOCOL_VERSION, COMMAND_UDP, 0]);
     }
 }

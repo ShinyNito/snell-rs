@@ -63,7 +63,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --locked
+        run: cargo test --locked --lib --bins
 
   release-notes:
     name: Generate release notes

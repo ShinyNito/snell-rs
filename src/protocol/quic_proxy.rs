@@ -5,10 +5,10 @@ use crate::MAX_PACKET_SIZE;
 use crate::error::{Error, Result};
 use crate::parse::{read_be_u16, read_u8, take_bytes};
 use crate::protocol::crypto::{AEAD_TAG_SIZE, Aes128GcmCrypto, SALT_SIZE};
-use crate::protocol::frame_v4::{V4_HEADER_CIPHER_SIZE, V4_HEADER_PLAIN_SIZE};
 use crate::protocol::header::PROTOCOL_VERSION;
 use crate::protocol::nonce::Nonce12;
 use crate::protocol::random::fill_random;
+use crate::protocol::v4::frame::{V4_HEADER_CIPHER_SIZE, V4_HEADER_PLAIN_SIZE};
 
 pub const QUIC_PROXY_MAX_PAYLOAD: usize = 1417;
 
@@ -275,8 +275,8 @@ mod tests {
         is_quic_short_header, parse_init_plaintext, write_init_prefix,
     };
     use crate::error::Error;
-    use crate::protocol::frame_v4::{V4FrameEncoder, split_salt};
     use crate::protocol::header::PROTOCOL_VERSION;
+    use crate::protocol::v4::frame::{V4FrameEncoder, split_salt};
 
     #[test]
     fn classifies_quic_looking_packets() {

@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use snell_rs::service::runtime::client::bind_configured_socks5_client_with_shutdown;
-use snell_rs::service::runtime::config::{ClientConfig, ServerConfig};
-use snell_rs::service::runtime::server::bind_configured_tcp_server_with_shutdown;
+use snell_rs::client::bind_configured_socks5_client_with_shutdown;
+use snell_rs::config::{ClientConfig, ServerConfig};
+use snell_rs::server::bind_configured_tcp_server_with_shutdown;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -47,7 +47,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let config = ServerConfig::load_from_file(config)?;
             tracing::info!(
                 listen = ?config.listen,
-                version = config.version,
                 quic_proxy = config.quic_proxy,
                 ipv6 = config.ipv6,
                 tcp_fast_open = config.tcp_fast_open,
@@ -74,7 +73,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tracing::info!(
                 listen = %config.listen,
                 server = %config.server,
-                version = config.version,
+                version = ?config.version,
                 reuse = config.reuse,
                 quic_proxy = config.quic_proxy,
                 "starting snell client"
