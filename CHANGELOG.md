@@ -2,6 +2,13 @@
 
 All notable changes to this project are generated from Conventional Commits.
 
+## [0.4.1] - 2026-06-13
+
+## Release Notes
+
+  * 对齐当前 b2 版本协议派生、填充和 chunk/write 目标行为
+  * 补充协议 golden 与 target padding cap 回归测试
+
 ## [0.4.0] - 2026-06-12
 
 ## Release Notes
