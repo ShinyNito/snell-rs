@@ -42,12 +42,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            binary: snell-rs
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            binary: snell-rs
           - os: macos-latest
             target: aarch64-apple-darwin
+            binary: snell-rs
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            binary: snell-rs.exe
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -58,4 +62,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: snell-rs-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
