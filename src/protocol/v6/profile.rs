@@ -1,8 +1,65 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug)]
+struct V6Namespaces {
+    profile: u64,
+    prefix: u64,
+    motif: u64,
+    salt: u64,
+    mix: u64,
+    chunk: u64,
+    write: u64,
+}
+
+impl V6Namespaces {
+    fn derive(profile_secret: &[u8; 32]) -> Self {
+        Self {
+            profile: derive_namespace(profile_secret, LABEL_PROFILE_ID, NS_SEED_PROFILE),
+            prefix: derive_namespace(profile_secret, 0, NS_SEED_PREFIX),
+            motif: derive_namespace(profile_secret, LABEL_MOTIF, NS_SEED_MOTIF),
+            salt: derive_namespace(profile_secret, 3, NS_SEED_SALT),
+            mix: derive_namespace(profile_secret, 0x10, NS_SEED_MIX),
+            chunk: derive_namespace(profile_secret, 0x15, NS_SEED_CHUNK),
+            write: derive_namespace(profile_secret, 0x1c, NS_SEED_WRITE),
+        }
+    }
+
+    fn for_label(self, label: u32) -> u64 {
+        match label {
+            0 | 1 | 14 | 15 | 33 | 34 => self.prefix,
+            2 => self.motif,
+            3 | 16..=20 => self.mix,
+            4..=13 | 27 => self.profile,
+            21..=26 | 38 | 39 => self.chunk,
+            28..=32 | 35..=37 => self.write,
+            _ => self.profile,
+        }
+    }
+
+    fn prf32(self, label: u32, a: u32, b: u32) -> u32 {
+        prf32_mix(self.for_label(label), label, a, b)
+    }
+
+    fn prf_static(self, label: u32, domain: u32) -> u32 {
+        self.prf32(label, 0, domain)
+    }
+
+    fn expand_into(self, label: u32, seq: u32, len: usize, out: &mut BytesMut) {
+        expand_stream(self.for_label(label), label, seq, len, out);
+    }
+
+    fn expand_array<const N: usize>(self, label: u32, seq: u32) -> [u8; N] {
+        let mut out = BytesMut::with_capacity(N);
+        self.expand_into(label, seq, N, &mut out);
+        let mut array = [0; N];
+        array.copy_from_slice(&out);
+        array
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct V6Profile {
-    profile_secret: [u8; 32],
+    namespaces: V6Namespaces,
     pub profile_id: u32,
     generator: u32,
     pad_min: usize,
@@ -45,232 +102,142 @@ pub struct V6Profile {
 
 impl V6Profile {
     pub fn derive(psk: &[u8]) -> Self {
-        let mut input = Vec::with_capacity(V6_SHAPE_LABEL.len() + psk.len());
-        input.extend_from_slice(V6_SHAPE_LABEL);
+        let mut input = Vec::with_capacity(PROFILE_SEED.len() + psk.len());
+        input.extend_from_slice(PROFILE_SEED);
         input.extend_from_slice(psk);
         let profile_secret = blake2b_256(&input);
+        let namespaces = V6Namespaces::derive(&profile_secret);
 
-        let profile_id = prf32_with_secret(&profile_secret, "profile-id", 0, 0);
-        let generator = prf32_with_secret(&profile_secret, "generator", 0, 0) & 3;
-        let pad_min = pick_usize(
-            prf32_with_secret(&profile_secret, "pad-min", 0, 0),
-            0x18,
-            0xa0,
-        );
-        let pad_max = (pad_min
-            + pick_usize(
-                prf32_with_secret(&profile_secret, "pad-max", 0, 0),
-                0xa0,
-                0x3c0,
-            ))
-        .min(MAX_EXTRA_TARGET_PADDING);
-        let pad_count = pick_u32(prf32_with_secret(&profile_secret, "pad-count", 0, 0), 2, 8);
-        let pad_interval = pick_u32(
-            prf32_with_secret(&profile_secret, "pad-interval", 0, 0),
-            2,
-            0x0b,
-        );
-        let small_limit = pick_usize(
-            prf32_with_secret(&profile_secret, "small-limit", 0, 0),
-            0x60,
-            0x300,
-        );
-        let bit_min = pick_u32(
-            prf32_with_secret(&profile_secret, "bit-min", 0, 0),
-            0x18,
-            0x29,
-        );
-        let bit_max = pick_u32(
-            prf32_with_secret(&profile_secret, "bit-max", 0, 0),
-            0x3a,
-            0x4c,
-        );
+        let profile_id = namespaces.prf_static(LABEL_PROFILE_ID, 0);
+        let generator = namespaces.prf_static(LABEL_GENERATOR, 0) & 3;
+        let pad_min = pick_usize(namespaces.prf_static(LABEL_PAD_MIN, 0), 0x18, 0xa0);
+        let pad_max = (pad_min + pick_usize(namespaces.prf_static(LABEL_PAD_MAX, 0), 0xa0, 0x3c0))
+            .min(MAX_EXTRA_TARGET_PADDING);
+        let pad_count = pick_u32(namespaces.prf_static(LABEL_PAD_COUNT, 0), 2, 8);
+        let pad_interval = pick_u32(namespaces.prf_static(LABEL_PAD_INTERVAL, 0), 2, 0x0b);
+        let small_limit = pick_usize(namespaces.prf_static(LABEL_SMALL_LIMIT, 0), 0x60, 0x300);
+        let bit_min = pick_u32(namespaces.prf_static(LABEL_BIT_MIN, 0), 0x18, 0x29);
+        let bit_max = pick_u32(namespaces.prf_static(LABEL_BIT_MAX, 0), 0x3a, 0x4c);
 
         let prefix_min_handshake = pick_usize(
-            prf32_with_secret(&profile_secret, "prefix-min", 0, HANDSHAKE_DOMAIN),
+            namespaces.prf_static(LABEL_PREFIX_MIN, HANDSHAKE_DOMAIN),
             0x10,
             0x60,
         );
         let mut prefix_max_handshake = prefix_min_handshake
             + pick_usize(
-                prf32_with_secret(&profile_secret, "prefix-max", 0, HANDSHAKE_DOMAIN),
+                namespaces.prf_static(LABEL_PREFIX_MAX, HANDSHAKE_DOMAIN),
                 0x10,
                 0xa0,
             );
         prefix_max_handshake = prefix_max_handshake.min(0x80);
         let prefix_min_handshake = prefix_min_handshake.min(prefix_max_handshake);
         let salt_prefix_len = pick_usize(
-            prf32_with_secret(&profile_secret, "header-prefix", 0, HANDSHAKE_DOMAIN),
+            namespaces.prf_static(LABEL_RECORD_PREFIX, HANDSHAKE_DOMAIN),
             prefix_min_handshake,
             prefix_max_handshake,
         );
         let salt_block_len = SALT_SIZE + salt_prefix_len;
         let mix_rounds_handshake = pick_u32(
-            prf32_with_secret(&profile_secret, "mix-rounds", 0, MIX_HANDSHAKE_DOMAIN),
+            namespaces.prf_static(LABEL_MIX_ROUNDS, MIX_HANDSHAKE_DOMAIN),
             1,
             4,
         );
         let mix_stride_handshake = pick_usize(
-            prf32_with_secret(&profile_secret, "mix-stride", 0, MIX_HANDSHAKE_DOMAIN),
+            namespaces.prf_static(LABEL_MIX_STRIDE, MIX_HANDSHAKE_DOMAIN),
             0x11,
             0xfb,
         );
-        let salt_positions = salt_positions(&profile_secret, salt_block_len, mix_rounds_handshake);
+        let salt_positions = salt_positions(namespaces.salt, salt_block_len, mix_rounds_handshake);
 
-        let prefix_min_record = pick_usize(
-            prf32_with_secret(&profile_secret, "prefix-min", 0, 0),
-            0x08,
-            0x50,
-        );
-        let mut prefix_max_record = prefix_min_record
-            + pick_usize(
-                prf32_with_secret(&profile_secret, "prefix-max", 0, 0),
-                0x10,
-                0xa0,
-            );
+        let prefix_min_record = pick_usize(namespaces.prf_static(LABEL_PREFIX_MIN, 0), 0x08, 0x50);
+        let mut prefix_max_record =
+            prefix_min_record + pick_usize(namespaces.prf_static(LABEL_PREFIX_MAX, 0), 0x10, 0xa0);
         prefix_max_record = prefix_max_record.min(0x80);
         let prefix_min_record = prefix_min_record.min(prefix_max_record);
 
-        let mix_mode = prf32_with_secret(&profile_secret, "mix-mode", 0, 0) % 3;
-        let mix_rounds = pick_u32(prf32_with_secret(&profile_secret, "mix-rounds", 0, 0), 1, 3);
-        let mix_stride = pick_usize(
-            prf32_with_secret(&profile_secret, "mix-stride", 0, 0),
-            2,
-            13,
-        );
-        let mix_offset_base = pick_usize(
-            prf32_with_secret(&profile_secret, "mix-offset-base", 0, 0),
-            0,
-            15,
-        );
-        let mix_block = pick_usize(
-            prf32_with_secret(&profile_secret, "mix-block", 0, 0),
-            8,
-            0x40,
-        );
+        let mix_mode = namespaces.prf_static(LABEL_MIX_MODE, 0) % 3;
+        let mix_rounds = pick_u32(namespaces.prf_static(LABEL_MIX_ROUNDS, 0), 1, 3);
+        let mix_stride = pick_usize(namespaces.prf_static(LABEL_MIX_STRIDE, 0), 2, 13);
+        let mix_offset_base = pick_usize(namespaces.prf_static(LABEL_MIX_OFFSET_BASE, 0), 0, 15);
+        let mix_block = pick_usize(namespaces.prf_static(LABEL_MIX_BLOCK, 0), 8, 0x40);
 
-        let chunk_policy = prf32_with_secret(&profile_secret, "chunk-policy", 0, 0) % 3;
+        let chunk_policy = namespaces.prf_static(LABEL_CHUNK_POLICY, 0) % 3;
         let chunk_initial = clamp_usize(
             pick_usize(
-                prf32_with_secret(&profile_secret, "chunk-initial", 0, 0),
-                0xa0,
-                0x3c0,
+                namespaces.prf_static(LABEL_CHUNK_INITIAL, 0),
+                0x200,
+                V6_TRAFFIC_SHAPING_MTU_CAP,
             ),
             0x60,
             V6_TRAFFIC_SHAPING_MTU_CAP,
         );
-        let chunk_max = clamp_usize(
-            pick_usize(
-                prf32_with_secret(&profile_secret, "chunk-max", 0, 0),
-                0x0800,
-                V6_CHUNK_MAX_RAW_BOUND,
-            ),
-            0x60,
-            V6_TRAFFIC_SHAPING_MTU_CAP,
-        );
-        let chunk_step = clamp_usize(
-            pick_usize(
-                prf32_with_secret(&profile_secret, "chunk-step", 0, 0),
-                0x60,
-                0x500,
-            ),
-            0x60,
-            V6_TRAFFIC_SHAPING_MTU_CAP,
-        );
-        let chunk_jitter = pick_usize(
-            prf32_with_secret(&profile_secret, "chunk-jitter", 0, 0),
-            0x10,
-            0xc0,
-        );
-        let idle_reset = Duration::from_secs(pick_usize(
-            prf32_with_secret(&profile_secret, "idle-reset", 0, 0),
-            0x0c,
-            0x5a,
-        ) as u64);
-        let write_policy = prf32_with_secret(&profile_secret, "write-policy", 0, 0) % 3;
-        let write_first = pick_u32(
-            prf32_with_secret(&profile_secret, "write-first", 0, 0),
-            4,
-            8,
-        );
+        let chunk_max = pick_usize(
+            namespaces.prf_static(LABEL_CHUNK_MAX, 0),
+            0x2000,
+            V6_CHUNK_MAX_RAW_BOUND,
+        )
+        .max(chunk_initial);
+        let chunk_step =
+            pick_usize(namespaces.prf_static(LABEL_CHUNK_STEP, 0), 0x400, 0x1000).min(0x0b68);
+        let chunk_jitter =
+            pick_usize(namespaces.prf_static(LABEL_CHUNK_JITTER, 0), 0x10, 0xc0).min(0x0b6);
+        let idle_reset =
+            Duration::from_secs(
+                pick_usize(namespaces.prf_static(LABEL_IDLE_RESET, 0), 0x0c, 0x5a) as u64,
+            );
+        let write_policy = namespaces.prf_static(LABEL_WRITE_POLICY, 0) % 3;
+        let write_first = pick_u32(namespaces.prf_static(LABEL_WRITE_FIRST, 0), 4, 8);
 
         let mut chunk_buckets = [0; 8];
         let mut write_buckets = [0; 8];
         let mut write_seq = [0; 8];
         for i in 0..8 {
-            chunk_buckets[i] = clamp_usize(
-                pick_usize(
-                    prf32_with_secret(&profile_secret, "chunk-bucket", 0, i as u32),
-                    0x140,
-                    V6_TRAFFIC_SHAPING_MTU_CAP,
-                ),
-                0x60,
-                V6_TRAFFIC_SHAPING_MTU_CAP,
+            let chunk_bucket = pick_usize(
+                namespaces.prf_static(LABEL_CHUNK_BUCKET, i as u32),
+                0x1000,
+                chunk_max,
             );
+            chunk_buckets[i] = if chunk_bucket > chunk_max {
+                chunk_max
+            } else if chunk_bucket <= 0x0fff {
+                0x1000
+            } else {
+                chunk_bucket
+            };
             write_buckets[i] = clamp_usize(
                 pick_usize(
-                    prf32_with_secret(&profile_secret, "write-bucket", 0, i as u32),
+                    namespaces.prf_static(LABEL_WRITE_BUCKET, i as u32),
                     0x140,
                     V6_TRAFFIC_SHAPING_MTU_CAP,
                 ),
-                0x60,
+                0x100,
                 V6_TRAFFIC_SHAPING_MTU_CAP,
             );
             write_seq[i] = clamp_usize(
                 pick_usize(
-                    prf32_with_secret(&profile_secret, "write-seq", 0, i as u32),
+                    namespaces.prf_static(LABEL_WRITE_SEQ, i as u32),
                     0x168,
                     V6_TRAFFIC_SHAPING_MTU_CAP,
                 ),
-                0x60,
+                0x100,
                 V6_TRAFFIC_SHAPING_MTU_CAP,
             );
         }
 
-        let write_jitter = pick_usize(
-            prf32_with_secret(&profile_secret, "write-jitter", 0, 0),
-            0x08,
-            0x60,
-        );
-        let write_jitter_percent = pick_usize(
-            prf32_with_secret(&profile_secret, "write-policy", 0, 0x504c),
-            8,
-            0x30,
-        );
+        let write_jitter = pick_usize(namespaces.prf_static(LABEL_WRITE_JITTER, 0), 0x08, 0x60);
+        let write_jitter_percent =
+            pick_usize(namespaces.prf_static(LABEL_WRITE_POLICY, 0x504c), 8, 0x30);
 
-        let g1 = pick_usize(
-            prf32_with_secret(&profile_secret, "generator", 0, 1),
-            0x18,
-            0x80,
-        );
-        let g2 = pick_usize(
-            prf32_with_secret(&profile_secret, "generator", 0, 2),
-            0x10,
-            0x60,
-        );
-        let g3 = pick_usize(
-            prf32_with_secret(&profile_secret, "generator", 0, 3),
-            0x10,
-            0x60,
-        );
-        let g4 = pick_usize(
-            prf32_with_secret(&profile_secret, "generator", 0, 4),
-            0x00,
-            0x09,
-        );
-        let g5 = pick_usize(
-            prf32_with_secret(&profile_secret, "generator", 0, 5),
-            0x01,
-            0x08,
-        );
-        let g6 = pick_usize(
-            prf32_with_secret(&profile_secret, "generator", 0, 6),
-            0x07,
-            0x17,
-        );
+        let g1 = pick_usize(namespaces.prf_static(LABEL_GENERATOR, 1), 0x18, 0x80);
+        let g2 = pick_usize(namespaces.prf_static(LABEL_GENERATOR, 2), 0x10, 0x60);
+        let g3 = pick_usize(namespaces.prf_static(LABEL_GENERATOR, 3), 0x10, 0x60);
+        let g4 = pick_usize(namespaces.prf_static(LABEL_GENERATOR, 4), 0x00, 0x09);
+        let g5 = pick_usize(namespaces.prf_static(LABEL_GENERATOR, 5), 0x01, 0x08);
+        let g6 = pick_usize(namespaces.prf_static(LABEL_GENERATOR, 6), 0x07, 0x17);
 
         Self {
-            profile_secret,
+            namespaces,
             profile_id,
             generator,
             pad_min,
@@ -318,7 +285,7 @@ impl V6Profile {
 
     pub fn record_prefix_len(&self, seq: u32) -> usize {
         self.pick(
-            "header-prefix",
+            LABEL_RECORD_PREFIX,
             seq,
             0,
             self.prefix_min_record,
@@ -356,7 +323,7 @@ impl V6Profile {
         out: &mut BytesMut,
     ) -> Range<usize> {
         let start = out.len();
-        self.expand_into("padding", seq, len, out);
+        self.namespaces.expand_into(LABEL_PADDING, seq, len, out);
         let end = out.len();
         let fill = &mut out[start..end];
         match self.generator {
@@ -377,7 +344,7 @@ impl V6Profile {
             || seq.is_multiple_of(self.pad_interval)
         {
             base_pad = self.pick(
-                "payload-padding",
+                LABEL_PAYLOAD_PADDING,
                 seq,
                 payload_len as u32,
                 self.pad_min,
@@ -397,39 +364,12 @@ impl V6Profile {
             current_len += self.salt_block_len;
         }
 
-        let mut target = if seq < self.write_first {
-            self.write_seq[seq as usize]
-        } else {
-            self.write_buckets[(self.prf32("write-target", seq, current_len as u32) as usize) % 8]
-        };
-
-        if self.write_policy == 2 {
-            let span = 2 * self.write_jitter + 1;
-            let j = (self.prf32("write-jitter-value", seq, 0) as usize % span) as isize
-                - self.write_jitter as isize;
-            target = (target as isize + j).max(1) as usize;
+        let target = self.write_target_len(seq, current_len);
+        if current_len < target {
+            let delta = target - current_len;
+            base_pad += MAX_EXTRA_TARGET_PADDING.min(delta);
         }
-
-        let jitter_bound =
-            MAX_EXTRA_TARGET_PADDING.min(self.write_jitter_percent * current_len / 100);
-        if self.prf32("write-target", seq, jitter_bound as u32) & 1 == 0 {
-            target = target.saturating_add(jitter_bound);
-        } else if target > jitter_bound / 2 {
-            target -= jitter_bound / 2;
-        }
-
-        while current_len > target {
-            let cand =
-                self.write_buckets[(self.prf32("write-next", seq, target as u32) as usize) % 8];
-            if target < cand {
-                target = cand;
-            } else {
-                target = target.saturating_add(self.pad_max);
-            }
-        }
-
-        let extra_pad = MAX_EXTRA_TARGET_PADDING.min(target.saturating_sub(current_len));
-        base_pad + extra_pad
+        base_pad
     }
 
     pub fn chunk_limit(&self, seq: u32, current_chunk_size: usize) -> usize {
@@ -440,11 +380,12 @@ impl V6Profile {
         };
         match self.chunk_policy {
             1 => {
-                cur = self.chunk_buckets[(self.prf32("chunk-size", seq, cur as u32) as usize) % 8];
+                cur = self.chunk_buckets[(self.prf32(LABEL_CHUNK_SIZE, seq, cur as u32) as usize)
+                    % self.chunk_buckets.len()];
             }
             2 => {
                 let span = 2 * self.chunk_jitter + 1;
-                let j = (self.prf32("chunk-jitter-value", seq, cur as u32) as usize % span)
+                let j = (self.prf32(LABEL_CHUNK_JITTER_VALUE, seq, cur as u32) as usize % span)
                     as isize
                     - self.chunk_jitter as isize;
                 cur = (cur as isize + j).max(0x40) as usize;
@@ -452,56 +393,78 @@ impl V6Profile {
             _ => {}
         }
 
-        let worst_overhead = self.pad_max + self.prefix_max_record + V6_STEADY_OVERHEAD;
-        if cur + worst_overhead > V6_TRAFFIC_SHAPING_MTU_CAP
-            && worst_overhead <= V6_MTU_OVERHEAD_LIMIT
-        {
-            cur = V6_TRAFFIC_SHAPING_MTU_CAP - worst_overhead;
-        }
         cur.clamp(0x40, self.chunk_max)
     }
 
     pub(in crate::protocol::v6) fn next_chunk_size(&self, current_chunk_size: usize) -> usize {
         if current_chunk_size == 0 {
             self.chunk_initial
-        } else if self.chunk_policy == 0 {
-            (current_chunk_size + self.chunk_step).min(self.chunk_max)
         } else {
             current_chunk_size
+                .saturating_add(self.chunk_step)
+                .min(self.chunk_max)
         }
     }
 
-    pub(in crate::protocol::v6) fn prf32(&self, label: &str, a: u32, b: u32) -> u32 {
-        prf32_with_secret(&self.profile_secret, label, a, b)
+    pub(in crate::protocol::v6) fn prf32(&self, label: u32, a: u32, b: u32) -> u32 {
+        self.namespaces.prf32(label, a, b)
     }
 
-    fn pick(&self, label: &str, a: u32, b: u32, lo: usize, hi: usize) -> usize {
+    fn pick(&self, label: u32, a: u32, b: u32, lo: usize, hi: usize) -> usize {
         pick_usize(self.prf32(label, a, b), lo, hi)
     }
 
-    fn expand_into(&self, label: &str, seq: u32, len: usize, out: &mut BytesMut) {
-        out.reserve(len);
-        let target_len = out.len() + len;
-        let mut counter = 0u32;
-        while out.len() < target_len {
-            let digest = self.expand_block(label, seq, counter, len);
-            let remaining = target_len - out.len();
-            out.extend_from_slice(&digest[..remaining.min(digest.len())]);
-            counter = counter.wrapping_add(1);
+    fn write_target_len(&self, seq: u32, current_len: usize) -> usize {
+        if current_len > V6_TARGET_DIRECT_LIMIT {
+            return if current_len <= V6_TARGET_U16_LIMIT {
+                current_len
+            } else {
+                u32::MAX as usize
+            };
         }
-    }
 
-    fn expand_block(&self, label: &str, seq: u32, counter: u32, len: usize) -> [u8; 32] {
-        let seq = seq.to_be_bytes();
-        let counter = counter.to_be_bytes();
-        let len = (len as u32).to_be_bytes();
-        let parts: [&[u8]; 4] = [label.as_bytes(), &seq, &counter, &len];
-        blake2b_256_keyed_parts(&self.profile_secret, &parts)
+        let mut target = if seq < self.write_first {
+            self.write_seq[seq as usize]
+        } else {
+            self.write_buckets[(self.prf32(LABEL_WRITE_TARGET, seq, current_len as u32) as usize)
+                % self.write_buckets.len()]
+        };
+
+        if self.write_policy == 2 {
+            let span = 2 * self.write_jitter + 1;
+            let j = (self.prf32(LABEL_WRITE_JITTER_VALUE, seq, 0) as usize % span) as isize
+                - self.write_jitter as isize;
+            target = (target as isize + j).max(1) as usize;
+        }
+
+        let jitter_bound =
+            MAX_EXTRA_TARGET_PADDING.min(self.write_jitter_percent * current_len / 100);
+        if self.prf32(LABEL_WRITE_TARGET, seq, jitter_bound as u32) & 1 == 0 {
+            target = target.saturating_add(jitter_bound);
+        } else if target > jitter_bound / 2 {
+            target -= jitter_bound / 2;
+        }
+
+        while current_len > target {
+            let cand = self.write_buckets[(self.prf32(LABEL_WRITE_NEXT, seq, target as u32)
+                as usize)
+                % self.write_buckets.len()];
+            if target < cand {
+                target = cand;
+            } else {
+                target = target.saturating_add(self.pad_max);
+                if target > u16::MAX as usize {
+                    return u32::MAX as usize;
+                }
+            }
+        }
+
+        target
     }
 
     fn apply_generator_0(&self, seq: u32, out: &mut [u8]) {
         let percent = self.pick(
-            "bit-percent",
+            LABEL_BIT_PERCENT,
             seq,
             0,
             self.bit_min as usize,
@@ -559,8 +522,8 @@ impl V6Profile {
     }
 
     fn apply_generator_3(&self, seq: u32, out: &mut [u8]) {
-        let motif = self.expand_block("padding-motif", seq, 0, 32);
-        let motif_len = self.g5 * 4;
+        let motif = self.namespaces.expand_array::<32>(LABEL_MOTIF, seq);
+        let motif_len = (self.g5 * 4).min(motif.len());
         let interval = self.g6;
         for (i, byte) in out.iter_mut().enumerate() {
             let b = *byte;
@@ -576,7 +539,161 @@ impl V6Profile {
     }
 
     fn salt_mask(&self, i: usize) -> u8 {
-        ((i * self.mix_stride_handshake) as u32
-            ^ self.prf32("padding-motif", MIX_HANDSHAKE_DOMAIN, i as u32)) as u8
+        let raw = prf32_mix(
+            self.namespaces.salt,
+            LABEL_MOTIF,
+            MIX_HANDSHAKE_DOMAIN,
+            i as u32,
+        );
+        (i as u8).wrapping_mul(self.mix_stride_handshake as u8) ^ raw as u8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_derivation_matches_reversed_constants() {
+        let profile = V6Profile::derive(b"test psk");
+
+        assert_eq!(profile.namespaces.profile, 0x0f8a_72f8_718e_3d8b);
+        assert_eq!(profile.namespaces.prefix, 0xff24_1509_13b4_c0fe);
+        assert_eq!(profile.namespaces.motif, 0xb29c_2bd0_d53d_60b1);
+        assert_eq!(profile.namespaces.salt, 0xe515_cadf_c530_bec6);
+        assert_eq!(profile.namespaces.mix, 0x5192_75b5_59af_5b64);
+        assert_eq!(profile.namespaces.chunk, 0x2434_d6b4_2325_f973);
+        assert_eq!(profile.namespaces.write, 0xf731_7535_404e_e993);
+
+        assert_eq!(profile.profile_id, 2_951_777_511);
+        assert_eq!(profile.generator, 0);
+        assert_eq!(profile.pad_min, 139);
+        assert_eq!(profile.pad_max, 397);
+        assert_eq!(profile.pad_count, 7);
+        assert_eq!(profile.pad_interval, 10);
+        assert_eq!(profile.small_limit, 597);
+        assert_eq!(profile.bit_min, 37);
+        assert_eq!(profile.bit_max, 71);
+        assert_eq!(profile.salt_block_len, 135);
+        assert_eq!(profile.mix_stride_handshake, 189);
+        assert_eq!(profile.prefix_min_record, 20);
+        assert_eq!(profile.prefix_max_record, 128);
+        assert_eq!(profile.mix_mode, 2);
+        assert_eq!(profile.mix_rounds, 1);
+        assert_eq!(profile.mix_stride, 7);
+        assert_eq!(profile.mix_offset_base, 2);
+        assert_eq!(profile.mix_block, 52);
+        assert_eq!(profile.chunk_policy, 1);
+        assert_eq!(profile.chunk_initial, 711);
+        assert_eq!(profile.chunk_max, 12_887);
+        assert_eq!(profile.chunk_step, 2_920);
+        assert_eq!(profile.chunk_jitter, 156);
+        assert_eq!(profile.idle_reset, Duration::from_secs(32));
+        assert_eq!(profile.write_policy, 0);
+        assert_eq!(profile.write_first, 6);
+        assert_eq!(profile.write_jitter, 46);
+        assert_eq!(profile.write_jitter_percent, 14);
+        assert_eq!(
+            profile.salt_positions,
+            [
+                99, 132, 33, 35, 0, 56, 44, 6, 29, 26, 98, 31, 76, 18, 80, 86
+            ]
+        );
+        assert_eq!(
+            (0..SALT_SIZE)
+                .map(|i| profile.salt_mask(i))
+                .collect::<Vec<_>>(),
+            [
+                80, 44, 193, 191, 14, 154, 209, 39, 0, 61, 47, 128, 242, 232, 128, 184
+            ]
+        );
+        assert_eq!(
+            profile.chunk_buckets,
+            [6636, 8677, 11013, 5579, 9822, 7434, 12267, 4943]
+        );
+        assert_eq!(
+            profile.write_buckets,
+            [1390, 1437, 1249, 1339, 326, 865, 708, 868]
+        );
+        assert_eq!(
+            profile.write_seq,
+            [1331, 528, 711, 1001, 422, 1040, 880, 690]
+        );
+        assert_eq!(
+            [
+                profile.g1, profile.g2, profile.g3, profile.g4, profile.g5, profile.g6
+            ],
+            [63, 19, 53, 0, 6, 14]
+        );
+    }
+
+    #[test]
+    fn runtime_prf_and_fill_match_reversed_constants() {
+        let profile = V6Profile::derive(b"test psk");
+        let mut fill = BytesMut::new();
+        let mut salt_fill = BytesMut::new();
+
+        profile.append_official_fill(7, 32, &mut fill);
+        profile.append_official_fill(u32::MAX, 32, &mut salt_fill);
+
+        assert_eq!(
+            &fill[..],
+            &[
+                0x59, 0x66, 0x4d, 0xd2, 0xd2, 0x99, 0x78, 0x96, 0x4b, 0xca, 0x36, 0xf0, 0x4b, 0xc9,
+                0x17, 0x65, 0xd4, 0x6a, 0xb4, 0x4d, 0xaa, 0x4b, 0xe2, 0xf0, 0xb4, 0x3a, 0xcc, 0xac,
+                0x5a, 0x59, 0xa9, 0xa5,
+            ]
+        );
+        assert_eq!(
+            &salt_fill[..],
+            &[
+                0x53, 0xd2, 0x2d, 0x93, 0x4e, 0x96, 0x96, 0xd2, 0xf0, 0x2b, 0xca, 0xd1, 0x33, 0xac,
+                0xa5, 0x87, 0xb2, 0xa5, 0x65, 0xb4, 0x59, 0xd8, 0x96, 0x93, 0x53, 0x27, 0xc5, 0x6a,
+                0x69, 0xca, 0x95, 0x4e,
+            ]
+        );
+        assert_eq!(
+            (0..8)
+                .map(|seq| profile.record_prefix_len(seq))
+                .collect::<Vec<_>>(),
+            [49, 122, 90, 125, 118, 47, 102, 88]
+        );
+        assert_eq!(
+            [
+                profile.prf32(LABEL_MIX_OFFSET, 7, 2),
+                profile.prf32(LABEL_RECORD_PREFIX, 0, 0),
+                profile.prf32(LABEL_PAYLOAD_PADDING, 1, 120),
+                profile.prf32(LABEL_CHUNK_SIZE, 2, 512),
+                profile.prf32(LABEL_CHUNK_JITTER_VALUE, 2, 512),
+            ],
+            [
+                1_074_551_323,
+                351_646_673,
+                107_949_104,
+                859_498_871,
+                3_087_932_833
+            ]
+        );
+        assert_eq!(
+            [
+                profile.final_padding_len(0, 0, true),
+                profile.final_padding_len(0, 18, true),
+                profile.final_padding_len(1, 120, false),
+                profile.final_padding_len(7, 1024, false),
+            ],
+            [974, 893, 1104, 188]
+        );
+        assert_eq!(
+            V6Profile::derive(b"cap-search-262").final_padding_len(6, 0, false),
+            MAX_EXTRA_TARGET_PADDING
+        );
+        assert_eq!(
+            [
+                profile.chunk_limit(0, 0),
+                profile.chunk_limit(1, profile.chunk_initial),
+                profile.chunk_limit(2, 512),
+            ],
+            [12267, 7434, 4943]
+        );
     }
 }

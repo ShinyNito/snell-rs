@@ -14,19 +14,14 @@ pub fn split_salt_block<'a>(
 }
 
 pub(in crate::protocol::v6) fn salt_positions(
-    profile_secret: &[u8; 32],
+    ns_salt: u64,
     salt_block_len: usize,
     mix_rounds_handshake: u32,
 ) -> [usize; SALT_SIZE] {
     let mut arr = (0..salt_block_len).collect::<Vec<_>>();
     for round in 0..mix_rounds_handshake {
         for i in 0..salt_block_len {
-            let raw = prf32_with_secret(
-                profile_secret,
-                "mix-offset",
-                MIX_HANDSHAKE_DOMAIN + round,
-                i as u32,
-            );
+            let raw = salt_shuffle_prf(ns_salt, MIX_HANDSHAKE_DOMAIN + round, i as u32);
             let j = i + raw as usize % (salt_block_len - i);
             arr.swap(i, j);
         }
