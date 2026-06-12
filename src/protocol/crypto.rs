@@ -32,9 +32,18 @@ impl Aes128GcmCrypto {
     }
 
     pub fn encrypt_detached(&self, nonce: &[u8; 12], data: &mut [u8]) -> Result<[u8; 16]> {
+        self.encrypt_detached_with_aad(nonce, data, &[])
+    }
+
+    pub fn encrypt_detached_with_aad(
+        &self,
+        nonce: &[u8; 12],
+        data: &mut [u8],
+        aad: &[u8],
+    ) -> Result<[u8; 16]> {
         let tag = self
             .key
-            .seal_in_place_separate_tag(Nonce::assume_unique_for_key(*nonce), Aad::empty(), data)
+            .seal_in_place_separate_tag(Nonce::assume_unique_for_key(*nonce), Aad::from(aad), data)
             .map_err(|_| Error::AuthenticationFailed)?;
         let mut out = [0; AEAD_TAG_SIZE];
         out.copy_from_slice(tag.as_ref());
@@ -47,10 +56,20 @@ impl Aes128GcmCrypto {
         data_and_tag: &'a mut [u8],
         ciphertext_and_tag: RangeFrom<usize>,
     ) -> Result<&'a mut [u8]> {
+        self.decrypt_within_with_aad(nonce, data_and_tag, ciphertext_and_tag, &[])
+    }
+
+    pub fn decrypt_within_with_aad<'a>(
+        &self,
+        nonce: &[u8; 12],
+        data_and_tag: &'a mut [u8],
+        ciphertext_and_tag: RangeFrom<usize>,
+        aad: &[u8],
+    ) -> Result<&'a mut [u8]> {
         self.key
             .open_within(
                 Nonce::assume_unique_for_key(*nonce),
-                Aad::empty(),
+                Aad::from(aad),
                 data_and_tag,
                 ciphertext_and_tag,
             )

@@ -6,6 +6,7 @@ pub(crate) mod parse;
 pub mod protocol {
     pub mod crypto;
     pub mod frame_v4;
+    pub mod frame_v6;
     pub mod header;
     pub mod nonce;
     pub mod quic_proxy;
@@ -60,6 +61,7 @@ pub const VERSION_2: u8 = 2;
 pub const VERSION_3: u8 = 3;
 pub const VERSION_4: u8 = 4;
 pub const VERSION_5: u8 = 5;
+pub const VERSION_6: u8 = 6;
 
 pub const DEFAULT_VERSION: u8 = VERSION_4;
 pub const MAX_PACKET_SIZE: usize = 0x3fff;

@@ -24,7 +24,7 @@ use crate::service::session::udp_io::{
     recv_socks_udp_datagram_into, reframe_socks_udp_packet, send_udp_parts,
 };
 use crate::service::session::udp_outbound::write_zero_chunk;
-use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
+use crate::transport::tokio_io::{SnellStreamReader, SnellStreamWriter};
 use crate::transport::udp_stream::UdpClientStream;
 use crate::{MAX_PACKET_SIZE, VERSION_5};
 
@@ -475,7 +475,7 @@ pub(crate) fn is_allowed_socks_udp_peer(control_peer_ip: IpAddr, udp_peer: Socke
 }
 
 async fn forward_socks_udp_socket_packet<W>(
-    snell_writer: &mut V4StreamWriter<W>,
+    snell_writer: &mut SnellStreamWriter<W>,
     udp_socket: &UdpSocket,
     control_peer_ip: IpAddr,
 ) -> Result<Option<(usize, SocketAddr)>>
@@ -565,7 +565,7 @@ where
 }
 
 async fn read_snell_udp_response<R>(
-    reader: &mut V4StreamReader<R>,
+    reader: &mut SnellStreamReader<R>,
 ) -> Result<Option<UdpPacketRef<'_>>>
 where
     R: AsyncRead + Unpin,

@@ -65,12 +65,16 @@ pub enum Error {
     ZeroChunkWithPadding,
     #[error("authentication failed")]
     AuthenticationFailed,
+    #[error("salt replay")]
+    SaltReplay,
     #[error("write side is closed")]
     WriteClosed,
     #[error("short udp datagram write: sent {sent} of {expected} bytes")]
     ShortUdpWrite { sent: usize, expected: usize },
     #[error("{0} timed out")]
     Timeout(&'static str),
+    #[error("dns resolution timed out")]
+    DnsTimeout,
     #[error("dns resolver is unavailable")]
     DnsUnavailable,
     #[error("dns resolution failed: {0}")]

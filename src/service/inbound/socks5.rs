@@ -189,7 +189,7 @@ mod tests {
     use crate::service::outbound::snell::SnellClientOutbound;
     use crate::service::session::socks5_udp::is_allowed_socks_udp_peer;
     use crate::service::test_support::{accept_udp_server_stream, read_udp_request_frame};
-    use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
+    use crate::transport::tokio_io::{SnellStreamReader, SnellStreamWriter};
     use crate::{VERSION_4, VERSION_5};
 
     fn direct_options(ipv6: bool) -> RelayOptions {
@@ -251,7 +251,7 @@ mod tests {
 
         let snell_server = async {
             let (stream, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(stream, psk, direct_options(false))
+            serve_server_connection(stream, psk, VERSION_4, direct_options(false))
                 .await
                 .unwrap()
         };
@@ -303,7 +303,7 @@ mod tests {
         let snell_server = async {
             let (stream, _) = snell_listener.accept().await.unwrap();
             let (server_read, server_write) = stream.into_split();
-            let mut reader = V4StreamReader::new(server_read, psk).unwrap();
+            let mut reader = SnellStreamReader::new(server_read, psk, VERSION_4).unwrap();
             let request = reader.read_client_request().await.unwrap();
             assert_eq!(
                 request,
@@ -319,7 +319,7 @@ mod tests {
             let payload = reader.read_frame_payload().await.unwrap();
             assert_eq!(payload, request_payload);
 
-            let mut server_writer = V4StreamWriter::new(server_write, psk).unwrap();
+            let mut server_writer = SnellStreamWriter::new(server_write, psk, VERSION_4).unwrap();
             server_writer
                 .write_test_tunnel_reply(response_payload)
                 .await
@@ -431,7 +431,7 @@ mod tests {
 
         let snell_server = async {
             let (stream, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(stream, psk, direct_options(false))
+            serve_server_connection(stream, psk, VERSION_4, direct_options(false))
                 .await
                 .unwrap();
         };
@@ -812,7 +812,7 @@ mod tests {
 
         let snell_server = async {
             let (stream, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(stream, psk, direct_options(false))
+            serve_server_connection(stream, psk, VERSION_4, direct_options(false))
                 .await
                 .unwrap();
         };
@@ -925,7 +925,7 @@ mod tests {
 
         let snell_server = async {
             let (stream, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(stream, psk, direct_options(false))
+            serve_server_connection(stream, psk, VERSION_4, direct_options(false))
                 .await
                 .unwrap();
         };

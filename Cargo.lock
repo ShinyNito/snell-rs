@@ -1450,6 +1450,7 @@ name = "snell-rs"
 version = "0.3.7"
 dependencies = [
  "argon2",
+ "blake2",
  "bytes",
  "clap",
  "criterion",

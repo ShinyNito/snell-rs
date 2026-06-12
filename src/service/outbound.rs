@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use crate::protocol::udp::AddressRef;
-use crate::service::dns::DnsResolver;
+use crate::service::dns::{DnsIpPreference, DnsResolver};
 use crate::service::runtime::config::UpstreamSocks5;
 
 pub(crate) mod direct;
@@ -26,6 +26,7 @@ pub struct RelayStats {
 #[derive(Clone, Debug)]
 pub struct RelayOptions {
     pub ipv6: bool,
+    pub dns_ip_preference: DnsIpPreference,
     pub upstream: UpstreamRelay,
     pub resolver: DnsResolver,
 }
@@ -35,6 +36,7 @@ impl RelayOptions {
     pub(crate) fn direct(ipv6: bool, resolver: DnsResolver) -> Self {
         Self {
             ipv6,
+            dns_ip_preference: DnsIpPreference::Default,
             upstream: UpstreamRelay::Direct,
             resolver,
         }
@@ -44,6 +46,7 @@ impl RelayOptions {
     pub(crate) fn socks5(ipv6: bool, proxy_addr: SocketAddr, resolver: DnsResolver) -> Self {
         Self {
             ipv6,
+            dns_ip_preference: DnsIpPreference::Default,
             upstream: UpstreamRelay::Socks5(proxy_addr),
             resolver,
         }

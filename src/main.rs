@@ -46,7 +46,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Server { config } => {
             let config = ServerConfig::load_from_file(config)?;
             tracing::info!(
-                listen = %config.listen,
+                listen = ?config.listen,
                 version = config.version,
                 quic_proxy = config.quic_proxy,
                 ipv6 = config.ipv6,

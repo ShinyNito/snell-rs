@@ -3,7 +3,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{Error, Result};
 use crate::protocol::request::ServerReply;
-use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
+use crate::transport::tokio_io::{SnellStreamReader, SnellStreamWriter};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TcpTarget {
@@ -31,15 +31,13 @@ where
         snell_version: u8,
         reuse: bool,
     ) -> Result<Self> {
-        let mut writer = V4StreamWriter::new(writer_io, psk)?;
-        writer
-            .write_tcp_request(host, port, snell_version, reuse)
-            .await?;
-        let reader = V4StreamReader::new(reader_io, psk)?;
+        let mut writer = SnellStreamWriter::new(writer_io, psk, snell_version)?;
+        writer.write_tcp_request(host, port, reuse).await?;
+        let reader = SnellStreamReader::new(reader_io, psk, snell_version)?;
         Ok(Self::from_parts(reader, writer))
     }
 
-    fn from_parts(reader: V4StreamReader<R>, writer: V4StreamWriter<W>) -> Self {
+    fn from_parts(reader: SnellStreamReader<R>, writer: SnellStreamWriter<W>) -> Self {
         Self {
             reader: TcpReader::client(reader),
             writer: TcpClientWriter::new(writer),
@@ -52,7 +50,7 @@ where
 }
 
 pub(crate) struct TcpPayloadReader<R> {
-    reader: V4StreamReader<R>,
+    reader: SnellStreamReader<R>,
     pending: Bytes,
     done: bool,
 }
@@ -61,13 +59,13 @@ impl<R> TcpPayloadReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    pub(crate) fn client(reader: V4StreamReader<R>) -> Self {
+    pub(crate) fn client(reader: impl Into<SnellStreamReader<R>>) -> Self {
         Self::new(reader, Bytes::new())
     }
 
-    fn new(reader: V4StreamReader<R>, pending: Bytes) -> Self {
+    fn new(reader: impl Into<SnellStreamReader<R>>, pending: Bytes) -> Self {
         Self {
-            reader,
+            reader: reader.into(),
             pending,
             done: false,
         }
@@ -146,7 +144,7 @@ where
         self.done
     }
 
-    fn into_frame_reader(self) -> V4StreamReader<R> {
+    fn into_frame_reader(self) -> SnellStreamReader<R> {
         self.reader
     }
 }
@@ -166,14 +164,14 @@ impl<R> TcpReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    fn client(reader: V4StreamReader<R>) -> Self {
+    fn client(reader: impl Into<SnellStreamReader<R>>) -> Self {
         Self {
             payload: TcpPayloadReader::client(reader),
             phase: TcpReaderPhase::ServerReply,
         }
     }
 
-    fn server(reader: V4StreamReader<R>, pending: Bytes) -> Self {
+    fn server(reader: impl Into<SnellStreamReader<R>>, pending: Bytes) -> Self {
         Self {
             payload: TcpPayloadReader::new(reader, pending),
             phase: TcpReaderPhase::Payload,
@@ -201,13 +199,13 @@ where
         self.payload.consume_payload_chunk(len);
     }
 
-    pub(crate) fn into_frame_reader(self) -> V4StreamReader<R> {
+    pub(crate) fn into_frame_reader(self) -> SnellStreamReader<R> {
         self.payload.into_frame_reader()
     }
 }
 
 pub(crate) struct TcpClientWriter<W> {
-    frame_writer: V4StreamWriter<W>,
+    frame_writer: SnellStreamWriter<W>,
     write_closed: bool,
 }
 
@@ -215,9 +213,9 @@ impl<W> TcpClientWriter<W>
 where
     W: AsyncWrite + Unpin,
 {
-    fn new(writer: V4StreamWriter<W>) -> Self {
+    fn new(writer: impl Into<SnellStreamWriter<W>>) -> Self {
         Self {
-            frame_writer: writer,
+            frame_writer: writer.into(),
             write_closed: false,
         }
     }
@@ -255,8 +253,8 @@ where
     W: AsyncWrite + Unpin,
 {
     pub(crate) fn from_parts_with_pending(
-        reader: V4StreamReader<R>,
-        writer: V4StreamWriter<W>,
+        reader: impl Into<SnellStreamReader<R>>,
+        writer: impl Into<SnellStreamWriter<W>>,
         pending: Bytes,
     ) -> Self {
         Self {
@@ -270,7 +268,7 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) async fn reject(self, code: u8, message: &str) -> Result<()> {
+    pub(crate) async fn reject(mut self, code: u8, message: &str) -> Result<()> {
         self.writer.reject(code, message).await
     }
 
@@ -280,7 +278,7 @@ where
 }
 
 pub(crate) struct TcpServerWriter<W> {
-    frame_writer: V4StreamWriter<W>,
+    frame_writer: SnellStreamWriter<W>,
     tunnel_open: bool,
     write_closed: bool,
 }
@@ -289,15 +287,15 @@ impl<W> TcpServerWriter<W>
 where
     W: AsyncWrite + Unpin,
 {
-    fn new(writer: V4StreamWriter<W>) -> Self {
+    fn new(writer: impl Into<SnellStreamWriter<W>>) -> Self {
         Self {
-            frame_writer: writer,
+            frame_writer: writer.into(),
             tunnel_open: false,
             write_closed: false,
         }
     }
 
-    async fn open_tunnel(&mut self) -> Result<()> {
+    pub(crate) async fn open_tunnel(&mut self) -> Result<()> {
         if !self.tunnel_open {
             self.frame_writer.write_empty_tunnel_reply().await?;
             self.tunnel_open = true;
@@ -305,8 +303,7 @@ where
         Ok(())
     }
 
-    #[cfg(test)]
-    async fn reject(mut self, code: u8, message: &str) -> Result<()> {
+    pub(crate) async fn reject(&mut self, code: u8, message: &str) -> Result<()> {
         if !self.tunnel_open && !self.write_closed {
             self.frame_writer.write_error_reply(code, message).await?;
             self.write_closed = true;
@@ -346,7 +343,7 @@ where
         Ok(())
     }
 
-    pub(crate) fn into_frame_writer(self) -> V4StreamWriter<W> {
+    pub(crate) fn into_frame_writer(self) -> SnellStreamWriter<W> {
         self.frame_writer
     }
 }
@@ -363,7 +360,7 @@ mod tests {
     use crate::error::Error;
     use crate::protocol::header::write_tcp_request_header;
     use crate::protocol::request::{ClientRequest, ServerReply};
-    use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
+    use crate::transport::tokio_io::{SnellStreamReader, SnellStreamWriter};
 
     async fn write_client_payload<W>(
         writer: &mut super::TcpClientWriter<W>,
@@ -402,7 +399,7 @@ mod tests {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let mut reader = V4StreamReader::new(reader_io, psk)?;
+        let mut reader = SnellStreamReader::new(reader_io, psk, VERSION_4)?;
         let (target, rest_start) = match reader.read_client_request().await? {
             ClientRequest::Connect {
                 reuse,
@@ -423,7 +420,7 @@ mod tests {
             }
         };
         let pending = reader.take_payload_from(rest_start);
-        let writer = V4StreamWriter::new(writer_io, psk)?;
+        let writer = SnellStreamWriter::new(writer_io, psk, VERSION_4)?;
         Ok((
             target,
             TcpServerStream::from_parts_with_pending(reader, writer, pending),
@@ -433,7 +430,7 @@ mod tests {
     #[test]
     fn client_payload_reader_starts_without_pending_allocation() {
         let psk = b"test psk";
-        let reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
+        let reader = SnellStreamReader::new(tokio::io::empty(), psk, VERSION_4).unwrap();
         let payload = super::TcpPayloadReader::client(reader);
 
         assert!(payload.pending.is_empty());
@@ -442,7 +439,7 @@ mod tests {
     #[test]
     fn compact_for_reuse_clears_pending_slice() {
         let psk = b"test psk";
-        let reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
+        let reader = SnellStreamReader::new(tokio::io::empty(), psk, VERSION_4).unwrap();
         let pending = Bytes::from_static(b"early");
         let mut payload = super::TcpPayloadReader::new(reader, pending);
 
@@ -472,7 +469,7 @@ mod tests {
         };
 
         let server = async {
-            let mut reader = V4StreamReader::new(server_upload, psk).unwrap();
+            let mut reader = SnellStreamReader::new(server_upload, psk, VERSION_4).unwrap();
             let request = reader.read_client_request().await.unwrap();
             assert_eq!(
                 request,
@@ -495,7 +492,7 @@ mod tests {
         let psk = b"test psk";
 
         let client = async {
-            let frame_reader = V4StreamReader::new(client_download, psk).unwrap();
+            let frame_reader = SnellStreamReader::new(client_download, psk, VERSION_4).unwrap();
             let mut reader = super::TcpReader::client(frame_reader);
 
             let reply = reader.read_payload_chunk().await.unwrap().unwrap();
@@ -507,7 +504,8 @@ mod tests {
         };
 
         let server = async {
-            let mut server_writer = V4StreamWriter::new(server_download, psk).unwrap();
+            let mut server_writer =
+                SnellStreamWriter::new(server_download, psk, VERSION_4).unwrap();
             server_writer
                 .write_test_tunnel_reply(b"accepted")
                 .await
@@ -524,7 +522,7 @@ mod tests {
         let psk = b"test psk";
         drop(client_upload);
 
-        let frame_reader = V4StreamReader::new(server_upload, psk).unwrap();
+        let frame_reader = SnellStreamReader::new(server_upload, psk, VERSION_4).unwrap();
         let mut reader = super::TcpReader::server(frame_reader, Bytes::new());
         assert!(reader.read_payload_chunk().await.unwrap().is_none());
     }
@@ -540,10 +538,10 @@ mod tests {
             write_tcp_request_header(&mut plain, "example.com", 443, VERSION_4, true).unwrap();
             plain.extend_from_slice(b"early");
 
-            let mut writer = V4StreamWriter::new(client_upload, psk).unwrap();
+            let mut writer = SnellStreamWriter::new(client_upload, psk, VERSION_4).unwrap();
             writer.write_test_frame(&plain).await.unwrap();
 
-            let mut reader = V4StreamReader::new(client_download, psk).unwrap();
+            let mut reader = SnellStreamReader::new(client_download, psk, VERSION_4).unwrap();
             let reply = reader.read_server_reply().await.unwrap();
             assert_eq!(
                 reply,
@@ -588,7 +586,7 @@ mod tests {
         let psk = b"test psk";
 
         let server = async {
-            let writer = V4StreamWriter::new(server_download, psk).unwrap();
+            let writer = SnellStreamWriter::new(server_download, psk, VERSION_4).unwrap();
             let mut writer = super::TcpServerWriter::new(writer);
             assert_eq!(
                 write_server_payload(&mut writer, b"first").await.unwrap(),
@@ -597,7 +595,7 @@ mod tests {
         };
 
         let client = async {
-            let mut reader = V4StreamReader::new(client_download, psk).unwrap();
+            let mut reader = SnellStreamReader::new(client_download, psk, VERSION_4).unwrap();
             let reply = reader.read_server_reply().await.unwrap();
 
             assert_eq!(
@@ -673,7 +671,7 @@ mod tests {
     #[tokio::test]
     async fn client_writer_rejects_write_after_close() {
         let psk = b"test psk";
-        let frame_writer = V4StreamWriter::new(tokio::io::sink(), psk).unwrap();
+        let frame_writer = SnellStreamWriter::new(tokio::io::sink(), psk, VERSION_4).unwrap();
         let mut writer = super::TcpClientWriter::new(frame_writer);
 
         writer.close_write().await.unwrap();
@@ -686,7 +684,7 @@ mod tests {
     #[tokio::test]
     async fn server_writer_rejects_write_after_close() {
         let psk = b"test psk";
-        let frame_writer = V4StreamWriter::new(tokio::io::sink(), psk).unwrap();
+        let frame_writer = SnellStreamWriter::new(tokio::io::sink(), psk, VERSION_4).unwrap();
         let mut writer = super::TcpServerWriter::new(frame_writer);
 
         writer.close_write().await.unwrap();
@@ -702,7 +700,7 @@ mod tests {
         let psk = b"test psk";
 
         let read = async {
-            let mut reader = V4StreamReader::new(client_download, psk).unwrap();
+            let mut reader = SnellStreamReader::new(client_download, psk, VERSION_4).unwrap();
             assert!(matches!(
                 reader.read_server_reply().await,
                 Ok(ServerReply::Error {
@@ -713,8 +711,8 @@ mod tests {
         };
 
         let reject = async {
-            let reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
-            let writer = V4StreamWriter::new(server_download, psk).unwrap();
+            let reader = SnellStreamReader::new(tokio::io::empty(), psk, VERSION_4).unwrap();
+            let writer = SnellStreamWriter::new(server_download, psk, VERSION_4).unwrap();
             let stream = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
             stream.reject(9, "blocked").await.unwrap();
         };

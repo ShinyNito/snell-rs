@@ -40,7 +40,14 @@ pub(crate) async fn open_quic_udp(
 ) -> Result<QuicProxyRelay> {
     match options.upstream {
         UpstreamRelay::Direct => {
-            let target = resolve_udp_target(&host, port, options.ipv6, &options.resolver).await?;
+            let target = resolve_udp_target(
+                &host,
+                port,
+                options.ipv6,
+                options.dns_ip_preference,
+                &options.resolver,
+            )
+            .await?;
             let outbound = UdpSocket::bind(SocketAddr::new(relay_bind_ip(target), 0)).await?;
             Ok(QuicProxyRelay {
                 outbound: Arc::new(outbound),
@@ -153,6 +160,7 @@ async fn resolve_udp_target(
     host: &str,
     port: u16,
     ipv6: bool,
+    dns_ip_preference: crate::service::dns::DnsIpPreference,
     resolver: &crate::service::dns::DnsResolver,
 ) -> Result<SocketAddr> {
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -167,8 +175,8 @@ async fn resolve_udp_target(
         resolver.lookup_socket_addrs(host, port),
     )
     .await
-    .map_err(|_| Error::Timeout("udp target resolution"))??;
-    select_udp_target(addrs, ipv6)
+    .map_err(|_| Error::DnsTimeout)??;
+    select_udp_target(addrs, ipv6, dns_ip_preference)
 }
 
 fn relay_bind_ip(relay_addr: SocketAddr) -> IpAddr {
@@ -182,16 +190,18 @@ fn relay_bind_ip(relay_addr: SocketAddr) -> IpAddr {
 fn select_udp_target(
     addrs: impl IntoIterator<Item = SocketAddr>,
     ipv6: bool,
+    dns_ip_preference: crate::service::dns::DnsIpPreference,
 ) -> Result<SocketAddr> {
-    let mut saw_disallowed_ipv6 = false;
-    for addr in addrs {
-        if ipv6 || addr.is_ipv4() {
-            return Ok(addr);
-        }
-        saw_disallowed_ipv6 = true;
+    let addrs = addrs.into_iter().collect::<Vec<_>>();
+    let selected = dns_ip_preference.select_addrs(addrs.iter().copied(), ipv6);
+    if let Some(addr) = selected.into_iter().next() {
+        return Ok(addr);
     }
 
-    if saw_disallowed_ipv6 {
+    if !ipv6
+        && dns_ip_preference != crate::service::dns::DnsIpPreference::Ipv4Only
+        && addrs.iter().any(SocketAddr::is_ipv6)
+    {
         Err(Error::Ipv6Disabled)
     } else {
         Err(Error::InvalidAddressType)

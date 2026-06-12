@@ -4,7 +4,7 @@
 //! no cache) so hot paths like per-datagram UDP target resolution hit the
 //! in-process cache instead of issuing a fresh query for every packet.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
 use hickory_resolver::config::{
@@ -17,6 +17,67 @@ use hickory_resolver::{Resolver, ResolverBuilder, TokioResolver};
 use crate::error::{Error, Result};
 
 const DNS_CACHE_SIZE: u64 = 256;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DnsIpPreference {
+    #[default]
+    Default,
+    PreferIpv4,
+    PreferIpv6,
+    Ipv4Only,
+    Ipv6Only,
+}
+
+impl DnsIpPreference {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "default" => Some(Self::Default),
+            "prefer-ipv4" => Some(Self::PreferIpv4),
+            "prefer-ipv6" => Some(Self::PreferIpv6),
+            "ipv4-only" => Some(Self::Ipv4Only),
+            "ipv6-only" => Some(Self::Ipv6Only),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn select_addrs(
+        self,
+        addrs: impl IntoIterator<Item = SocketAddr>,
+        ipv6_enabled: bool,
+    ) -> Vec<SocketAddr> {
+        let addrs = addrs.into_iter().collect::<Vec<_>>();
+        if self == Self::Default {
+            return addrs
+                .into_iter()
+                .filter(|addr| ipv6_enabled || addr.is_ipv4())
+                .collect();
+        }
+
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for addr in addrs {
+            match addr.ip() {
+                IpAddr::V4(_) => v4.push(addr),
+                IpAddr::V6(_) if ipv6_enabled => v6.push(addr),
+                IpAddr::V6(_) => {}
+            }
+        }
+
+        match self {
+            Self::Default => unreachable!("default returns before sorting"),
+            Self::PreferIpv4 => {
+                v4.extend(v6);
+                v4
+            }
+            Self::PreferIpv6 => {
+                v6.extend(v4);
+                v6
+            }
+            Self::Ipv4Only => v4,
+            Self::Ipv6Only => v6,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct DnsResolver {
@@ -124,7 +185,44 @@ mod tests {
     use tokio::task::JoinHandle;
     use tokio_util::sync::CancellationToken;
 
-    use super::DnsResolver;
+    use super::{DnsIpPreference, DnsResolver};
+
+    #[test]
+    fn dns_ip_preference_selects_and_orders_addresses() {
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        let v4_alt = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 443);
+        let v6 = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 443);
+
+        assert_eq!(
+            DnsIpPreference::Default.select_addrs([v6, v4, v4_alt], true),
+            vec![v6, v4, v4_alt]
+        );
+        assert_eq!(
+            DnsIpPreference::Default.select_addrs([v6, v4], false),
+            vec![v4]
+        );
+        assert_eq!(
+            DnsIpPreference::PreferIpv4.select_addrs([v6, v4, v4_alt], true),
+            vec![v4, v4_alt, v6]
+        );
+        assert_eq!(
+            DnsIpPreference::PreferIpv6.select_addrs([v4, v6, v4_alt], true),
+            vec![v6, v4, v4_alt]
+        );
+        assert_eq!(
+            DnsIpPreference::Ipv4Only.select_addrs([v6, v4], true),
+            vec![v4]
+        );
+        assert_eq!(
+            DnsIpPreference::Ipv6Only.select_addrs([v4, v6], true),
+            vec![v6]
+        );
+        assert!(
+            DnsIpPreference::Ipv6Only
+                .select_addrs([v4, v6], false)
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn configured_resolvers_are_instance_scoped() {

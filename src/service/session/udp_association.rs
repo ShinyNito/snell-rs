@@ -232,6 +232,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::relay_udp_server_stream;
+    use crate::VERSION_4;
     use crate::error::Error;
     use crate::protocol::socks5::{
         SocksReply, SocksRequest, SocksTarget, parse_udp_packet as parse_socks_udp_packet,
@@ -445,7 +446,7 @@ mod tests {
 
         let server = async {
             let (client, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(client, psk, socks5_options(false, socks_addr))
+            serve_server_connection(client, psk, VERSION_4, socks5_options(false, socks_addr))
                 .await
                 .unwrap()
         };
@@ -491,7 +492,7 @@ mod tests {
 
         let server = async {
             let (client, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(client, psk, socks5_options(false, socks_addr)).await
+            serve_server_connection(client, psk, VERSION_4, socks5_options(false, socks_addr)).await
         };
 
         let client = async {
@@ -531,7 +532,7 @@ mod tests {
 
         let server = async {
             let (client, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(client, psk, socks5_options(false, socks_addr))
+            serve_server_connection(client, psk, VERSION_4, socks5_options(false, socks_addr))
                 .await
                 .unwrap()
         };
@@ -691,7 +692,7 @@ mod tests {
 
         let server = async {
             let (client, _) = listener.accept().await.unwrap();
-            serve_server_connection(client, psk, direct_options(false)).await
+            serve_server_connection(client, psk, VERSION_4, direct_options(false)).await
         };
 
         let client = async {

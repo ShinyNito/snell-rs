@@ -5,9 +5,13 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+use crate::VERSION_6;
 use crate::error::Result;
+use crate::protocol::frame_v6::{V6_SALT_REPLAY_CACHE_CAPACITY, V6SaltReplayCache};
 use crate::service::dns::DnsResolver;
-use crate::service::inbound::snell::serve_server_connection;
+use crate::service::inbound::snell::{
+    serve_server_connection, serve_server_connection_with_salt_replay_cache,
+};
 use crate::service::outbound::{RelayOptions, UpstreamRelay};
 use crate::service::runtime::config::{ServerConfig, TcpBrutalConfig};
 use crate::service::runtime::lifecycle::{
@@ -24,39 +28,46 @@ pub async fn bind_configured_tcp_server_with_shutdown(
 ) -> Result<()> {
     let options = RelayOptions {
         ipv6: config.ipv6,
+        dns_ip_preference: config.dns_ip_preference,
         upstream: UpstreamRelay::from(config.upstream_socks5),
         resolver: DnsResolver::from_config(config.dns)?,
     };
-    let listener = bind_tcp_listener(config.listen, config.tcp_fast_open)?;
+    let listeners = config
+        .listen
+        .iter()
+        .copied()
+        .map(|addr| bind_tcp_listener(addr, config.tcp_fast_open))
+        .collect::<std::io::Result<Vec<_>>>()?;
     validate_tcp_brutal_available(config.tcp_brutal).await?;
+    let v6_salt_replay_cache = (config.version == VERSION_6)
+        .then(|| V6SaltReplayCache::new(V6_SALT_REPLAY_CACHE_CAPACITY));
+    let tcp_runtime = TcpServerRuntime {
+        psk: config.psk.to_vec(),
+        version: config.version,
+        options,
+        tcp_brutal: config.tcp_brutal,
+        v6_salt_replay_cache,
+        shutdown: shutdown.clone(),
+        drain_timeout: SHUTDOWN_DRAIN_TIMEOUT,
+    };
     if !config.quic_proxy {
-        return serve_tcp_listener_with_shutdown_and_timeout(
-            listener,
-            config.psk.to_vec(),
-            options,
-            config.tcp_brutal,
-            shutdown,
-            SHUTDOWN_DRAIN_TIMEOUT,
-        )
-        .await;
+        return serve_tcp_listeners_with_shutdown_and_timeout(listeners, tcp_runtime).await;
     }
 
-    let udp_socket = UdpSocket::bind(config.listen).await?;
+    let listen_addr = config.listen[0];
+    let listener = listeners
+        .into_iter()
+        .next()
+        .expect("config validation keeps one listener for quic_proxy");
+    let udp_socket = UdpSocket::bind(listen_addr).await?;
     let udp = serve_quic_proxy_socket(
         udp_socket,
         config.psk.to_vec(),
-        options.clone(),
+        tcp_runtime.options.clone(),
         QUIC_PROXY_SESSION_IDLE_TIMEOUT,
         shutdown.clone(),
     );
-    let tcp = serve_tcp_listener_with_shutdown_and_timeout(
-        listener,
-        config.psk.to_vec(),
-        options,
-        config.tcp_brutal,
-        shutdown.clone(),
-        SHUTDOWN_DRAIN_TIMEOUT,
-    );
+    let tcp = serve_tcp_listener_with_shutdown_and_timeout(listener, tcp_runtime);
     tokio::pin!(udp);
     tokio::pin!(tcp);
     tokio::select! {
@@ -75,14 +86,72 @@ pub async fn bind_configured_tcp_server_with_shutdown(
     }
 }
 
-pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
-    listener: TcpListener,
+#[derive(Clone)]
+pub(crate) struct TcpServerRuntime {
     psk: Vec<u8>,
+    version: u8,
     options: RelayOptions,
     tcp_brutal: Option<TcpBrutalConfig>,
+    v6_salt_replay_cache: Option<V6SaltReplayCache>,
     shutdown: CancellationToken,
     drain_timeout: Duration,
+}
+
+pub(crate) async fn serve_tcp_listeners_with_shutdown_and_timeout(
+    listeners: Vec<TcpListener>,
+    runtime: TcpServerRuntime,
 ) -> Result<()> {
+    if listeners.len() <= 1 {
+        if let Some(listener) = listeners.into_iter().next() {
+            return serve_tcp_listener_with_shutdown_and_timeout(listener, runtime).await;
+        }
+        return Ok(());
+    }
+
+    let mut tasks = JoinSet::new();
+    let shutdown = runtime.shutdown.clone();
+    for listener in listeners {
+        tasks.spawn(serve_tcp_listener_with_shutdown_and_timeout(
+            listener,
+            runtime.clone(),
+        ));
+    }
+
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                shutdown.cancel();
+                first_error.get_or_insert(err);
+            }
+            Err(err) => {
+                shutdown.cancel();
+                first_error.get_or_insert_with(|| err.into());
+            }
+        }
+    }
+
+    if let Some(err) = first_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
+    listener: TcpListener,
+    runtime: TcpServerRuntime,
+) -> Result<()> {
+    let TcpServerRuntime {
+        psk,
+        version,
+        options,
+        tcp_brutal,
+        v6_salt_replay_cache,
+        shutdown,
+        drain_timeout,
+    } = runtime;
     let psk = std::sync::Arc::new(Zeroizing::new(psk));
     let mut tasks = JoinSet::new();
 
@@ -93,12 +162,26 @@ pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
                 let (client, peer_addr) = result?;
                 let psk = psk.clone();
                 let options = options.clone();
+                let v6_salt_replay_cache = v6_salt_replay_cache.clone();
                 tasks.spawn(async move {
                     if let Err(err) = apply_tcp_brutal(&client, tcp_brutal) {
                         tracing::warn!(%err, %peer_addr, "snell tcp_brutal could not be enabled");
                         return;
                     }
-                    if let Err(err) = serve_server_connection(client, &psk, options).await {
+                    let result = match v6_salt_replay_cache {
+                        Some(cache) => {
+                            serve_server_connection_with_salt_replay_cache(
+                                client,
+                                &psk,
+                                version,
+                                options,
+                                Some(cache),
+                            )
+                            .await
+                        }
+                        None => serve_server_connection(client, &psk, version, options).await,
+                    };
+                    if let Err(err) = result {
                         tracing::debug!(%err, %peer_addr, "snell tcp server connection failed");
                     }
                 });
@@ -125,20 +208,26 @@ mod tests {
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
-    use super::serve_tcp_listener_with_shutdown_and_timeout;
-    use crate::VERSION_4;
+    use super::{
+        TcpServerRuntime, serve_tcp_listener_with_shutdown_and_timeout,
+        serve_tcp_listeners_with_shutdown_and_timeout,
+    };
     use crate::error::Error;
+    use crate::protocol::frame_v6::V6SaltReplayCache;
+    use crate::protocol::header::{COMMAND_PING, PROTOCOL_VERSION};
     use crate::protocol::request::ServerReply;
     use crate::protocol::socks5::{SocksReply, SocksRequest, SocksTarget};
     use crate::service::dns::DnsResolver;
     use crate::service::inbound::snell::{
-        serve_server_connection, serve_server_connection_with_target_opener,
+        V6_ERROR_CONNECTION_REFUSED, serve_server_connection,
+        serve_server_connection_with_salt_replay_cache, serve_server_connection_with_target_opener,
     };
     use crate::service::inbound::socks5::{read_client_request, write_reply_with_bind};
     use crate::service::outbound::RelayOptions;
     use crate::service::runtime::lifecycle::bind_tcp_listener;
     use crate::transport::tcp_stream::{TcpClientStream, TcpClientWriter};
-    use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
+    use crate::transport::tokio_io::{SnellStreamReader, SnellStreamWriter};
+    use crate::{VERSION_4, VERSION_6};
 
     fn direct_options(ipv6: bool) -> RelayOptions {
         RelayOptions::direct(ipv6, DnsResolver::system())
@@ -146,6 +235,24 @@ mod tests {
 
     fn socks5_options(ipv6: bool, proxy_addr: std::net::SocketAddr) -> RelayOptions {
         RelayOptions::socks5(ipv6, proxy_addr, DnsResolver::system())
+    }
+
+    fn tcp_server_runtime(
+        psk: &[u8],
+        version: u8,
+        options: RelayOptions,
+        shutdown: CancellationToken,
+        drain_timeout: Duration,
+    ) -> TcpServerRuntime {
+        TcpServerRuntime {
+            psk: psk.to_vec(),
+            version,
+            options,
+            tcp_brutal: None,
+            v6_salt_replay_cache: None,
+            shutdown,
+            drain_timeout,
+        }
     }
 
     async fn write_client_payload<W>(
@@ -184,6 +291,7 @@ mod tests {
             serve_server_connection_with_target_opener(
                 client,
                 psk,
+                VERSION_4,
                 direct_options(true),
                 move |target, _options| async move {
                     assert_eq!(target.host, "example.com");
@@ -217,6 +325,165 @@ mod tests {
         };
 
         let ((), (), ()) = tokio::join!(server, client, echo);
+    }
+
+    #[tokio::test]
+    async fn serve_server_connection_relays_v6_to_connected_target() {
+        let psk = b"test psk";
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let snell_addr = snell_listener.local_addr().unwrap();
+
+        let echo = async {
+            let (mut stream, _) = echo_listener.accept().await.unwrap();
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input).await.unwrap();
+            assert_eq!(input, b"v6 ping");
+            stream.write_all(b"v6 pong").await.unwrap();
+            stream.shutdown().await.unwrap();
+        };
+
+        let server = async {
+            let (client, _) = snell_listener.accept().await.unwrap();
+            serve_server_connection_with_target_opener(
+                client,
+                psk,
+                VERSION_6,
+                direct_options(true),
+                move |target, _options| async move {
+                    assert_eq!(target.host, "v6.example.com");
+                    assert_eq!(target.port, 443);
+                    Ok(TcpStream::connect(echo_addr).await?)
+                },
+            )
+            .await
+            .unwrap()
+        };
+
+        let client = async {
+            let stream = TcpStream::connect(snell_addr).await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let snell = TcpClientStream::open_io(
+                reader,
+                writer,
+                psk,
+                "v6.example.com",
+                443,
+                VERSION_6,
+                false,
+            )
+            .await
+            .unwrap();
+            let (mut snell_reader, mut snell_writer) = snell.into_split();
+
+            write_client_payload(&mut snell_writer, b"v6 ping")
+                .await
+                .unwrap();
+            snell_writer.close_write().await.unwrap();
+
+            let payload = snell_reader.read_payload_chunk().await.unwrap().unwrap();
+            assert_eq!(payload, b"v6 pong");
+            let len = payload.len();
+            snell_reader.consume_payload_chunk(len);
+            assert!(snell_reader.read_payload_chunk().await.unwrap().is_none());
+        };
+
+        let ((), (), ()) = tokio::join!(server, client, echo);
+    }
+
+    #[tokio::test]
+    async fn serve_server_connection_handles_v6_ping() {
+        let psk = b"test psk";
+        let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let snell_addr = snell_listener.local_addr().unwrap();
+
+        let server = async {
+            let (client, _) = snell_listener.accept().await.unwrap();
+            serve_server_connection(client, psk, VERSION_6, direct_options(false))
+                .await
+                .unwrap()
+        };
+
+        let client = async {
+            let stream = TcpStream::connect(snell_addr).await.unwrap();
+            let (snell_reader_io, snell_writer_io) = stream.into_split();
+            let mut snell_writer = SnellStreamWriter::new(snell_writer_io, psk, VERSION_6).unwrap();
+            snell_writer
+                .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
+                .await
+                .unwrap();
+
+            let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, VERSION_6).unwrap();
+            assert_eq!(
+                snell_reader.read_server_reply().await.unwrap(),
+                ServerReply::Pong
+            );
+        };
+
+        let ((), ()) = tokio::join!(server, client);
+    }
+
+    #[tokio::test]
+    async fn serve_server_connection_v6_rejects_replayed_client_salt() {
+        let psk = b"test psk";
+        let salt = [0x44; 16];
+        let cache = V6SaltReplayCache::new(16);
+        let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let snell_addr = snell_listener.local_addr().unwrap();
+
+        let server = async {
+            let (first, _) = snell_listener.accept().await.unwrap();
+            serve_server_connection_with_salt_replay_cache(
+                first,
+                psk,
+                VERSION_6,
+                direct_options(false),
+                Some(cache.clone()),
+            )
+            .await
+            .unwrap();
+
+            let (second, _) = snell_listener.accept().await.unwrap();
+            assert!(matches!(
+                serve_server_connection_with_salt_replay_cache(
+                    second,
+                    psk,
+                    VERSION_6,
+                    direct_options(false),
+                    Some(cache),
+                )
+                .await,
+                Err(Error::SaltReplay)
+            ));
+        };
+
+        let client = async {
+            let stream = TcpStream::connect(snell_addr).await.unwrap();
+            let (snell_reader_io, snell_writer_io) = stream.into_split();
+            let mut writer =
+                SnellStreamWriter::new_with_v6_salt(snell_writer_io, psk, salt).unwrap();
+            writer
+                .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
+                .await
+                .unwrap();
+            let mut reader = SnellStreamReader::new(snell_reader_io, psk, VERSION_6).unwrap();
+            assert_eq!(reader.read_server_reply().await.unwrap(), ServerReply::Pong);
+
+            let stream = TcpStream::connect(snell_addr).await.unwrap();
+            let (snell_reader_io, snell_writer_io) = stream.into_split();
+            let mut writer =
+                SnellStreamWriter::new_with_v6_salt(snell_writer_io, psk, salt).unwrap();
+            writer
+                .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
+                .await
+                .unwrap();
+            let mut reader = SnellStreamReader::new(snell_reader_io, psk, VERSION_6).unwrap();
+            let err = reader.read_server_reply().await.unwrap_err();
+            assert!(err.is_closed_io(), "{err:?}");
+        };
+
+        let ((), ()) = tokio::join!(server, client);
     }
 
     #[tokio::test]
@@ -263,7 +530,7 @@ mod tests {
 
         let server = async {
             let (client, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(client, psk, socks5_options(true, socks_addr))
+            serve_server_connection(client, psk, VERSION_4, socks5_options(true, socks_addr))
                 .await
                 .unwrap()
         };
@@ -315,7 +582,7 @@ mod tests {
 
         let server = async {
             let (client, _) = snell_listener.accept().await.unwrap();
-            serve_server_connection(client, psk, socks5_options(true, socks_addr)).await
+            serve_server_connection(client, psk, VERSION_4, socks5_options(true, socks_addr)).await
         };
 
         let client = async {
@@ -363,6 +630,7 @@ mod tests {
             serve_server_connection_with_target_opener(
                 client,
                 psk,
+                VERSION_4,
                 direct_options(true),
                 move |target, _options| {
                     let connect_rx = connect_rx.take().unwrap();
@@ -381,10 +649,10 @@ mod tests {
         let client = async {
             let stream = TcpStream::connect(snell_addr).await.unwrap();
             let (snell_reader_io, snell_writer_io) = stream.into_split();
-            let mut snell_reader = V4StreamReader::new(snell_reader_io, psk).unwrap();
-            let mut snell_writer = V4StreamWriter::new(snell_writer_io, psk).unwrap();
+            let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, VERSION_4).unwrap();
+            let mut snell_writer = SnellStreamWriter::new(snell_writer_io, psk, VERSION_4).unwrap();
             snell_writer
-                .write_tcp_request("example.com", 443, VERSION_4, false)
+                .write_tcp_request("example.com", 443, false)
                 .await
                 .unwrap();
 
@@ -422,11 +690,13 @@ mod tests {
         let shutdown = CancellationToken::new();
         let server = tokio::spawn(serve_tcp_listener_with_shutdown_and_timeout(
             listener,
-            psk.to_vec(),
-            direct_options(true),
-            None,
-            shutdown.clone(),
-            Duration::from_millis(100),
+            tcp_server_runtime(
+                psk,
+                VERSION_4,
+                direct_options(true),
+                shutdown.clone(),
+                Duration::from_millis(100),
+            ),
         ));
 
         shutdown.cancel();
@@ -437,6 +707,50 @@ mod tests {
             .unwrap();
 
         assert!(TcpStream::connect(addr).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn serve_tcp_listeners_accepts_connections_on_each_listener() {
+        let psk = b"test psk";
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let server = tokio::spawn(serve_tcp_listeners_with_shutdown_and_timeout(
+            vec![first, second],
+            TcpServerRuntime {
+                v6_salt_replay_cache: Some(V6SaltReplayCache::new(16)),
+                ..tcp_server_runtime(
+                    psk,
+                    VERSION_6,
+                    direct_options(false),
+                    shutdown.clone(),
+                    Duration::from_millis(100),
+                )
+            },
+        ));
+
+        async fn ping(addr: std::net::SocketAddr, psk: &[u8]) {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (snell_reader_io, snell_writer_io) = stream.into_split();
+            let mut writer = SnellStreamWriter::new(snell_writer_io, psk, VERSION_6).unwrap();
+            writer
+                .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
+                .await
+                .unwrap();
+            let mut reader = SnellStreamReader::new(snell_reader_io, psk, VERSION_6).unwrap();
+            assert_eq!(reader.read_server_reply().await.unwrap(), ServerReply::Pong);
+        }
+
+        ping(first_addr, psk).await;
+        ping(second_addr, psk).await;
+        shutdown.cancel();
+        timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -451,11 +765,13 @@ mod tests {
         let (echo_continue_tx, echo_continue_rx) = oneshot::channel();
         let server = tokio::spawn(serve_tcp_listener_with_shutdown_and_timeout(
             snell_listener,
-            psk.to_vec(),
-            direct_options(true),
-            None,
-            shutdown.clone(),
-            Duration::from_secs(1),
+            tcp_server_runtime(
+                psk,
+                VERSION_4,
+                direct_options(true),
+                shutdown.clone(),
+                Duration::from_secs(1),
+            ),
         ));
 
         let echo = async {
@@ -537,12 +853,18 @@ mod tests {
     #[tokio::test]
     async fn connect_target_rejects_ipv6_literal_when_disabled() {
         let resolver = crate::service::dns::DnsResolver::system();
-        let result =
-            crate::service::outbound::direct::open_direct_tcp("::1", 443, false, &resolver).await;
+        let result = crate::service::outbound::direct::open_direct_tcp(
+            "::1",
+            443,
+            false,
+            crate::service::dns::DnsIpPreference::Default,
+            &resolver,
+        )
+        .await;
 
         assert!(matches!(
             result,
-            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput
+            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::InvalidInput
         ));
     }
 
@@ -557,6 +879,7 @@ mod tests {
             serve_server_connection_with_target_opener(
                 client,
                 psk,
+                VERSION_4,
                 direct_options(true),
                 |_target, _options| async move {
                     Err(Error::Io(std::io::Error::new(
@@ -571,13 +894,13 @@ mod tests {
         let client = async {
             let stream = TcpStream::connect(snell_addr).await.unwrap();
             let (snell_reader_io, snell_writer_io) = stream.into_split();
-            let mut snell_writer = V4StreamWriter::new(snell_writer_io, psk).unwrap();
+            let mut snell_writer = SnellStreamWriter::new(snell_writer_io, psk, VERSION_4).unwrap();
             snell_writer
-                .write_tcp_request("blocked.example", 443, VERSION_4, false)
+                .write_tcp_request("blocked.example", 443, false)
                 .await
                 .unwrap();
 
-            let mut snell_reader = V4StreamReader::new(snell_reader_io, psk).unwrap();
+            let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, VERSION_4).unwrap();
             assert_eq!(
                 snell_reader.read_server_reply().await.unwrap(),
                 ServerReply::Tunnel {
@@ -587,6 +910,52 @@ mod tests {
             );
             let err = snell_reader.read_frame_payload().await.unwrap_err();
             assert!(err.is_closed_io(), "{err:?}");
+        };
+
+        let (server_result, ()) = tokio::join!(server, client);
+        assert!(matches!(server_result, Err(Error::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn serve_server_connection_v6_returns_error_reply_on_connect_failure() {
+        let psk = b"test psk";
+        let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let snell_addr = snell_listener.local_addr().unwrap();
+
+        let server = async {
+            let (client, _) = snell_listener.accept().await.unwrap();
+            serve_server_connection_with_target_opener(
+                client,
+                psk,
+                VERSION_6,
+                direct_options(true),
+                |_target, _options| async move {
+                    Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "test refusal",
+                    )))
+                },
+            )
+            .await
+        };
+
+        let client = async {
+            let stream = TcpStream::connect(snell_addr).await.unwrap();
+            let (snell_reader_io, snell_writer_io) = stream.into_split();
+            let mut snell_writer = SnellStreamWriter::new(snell_writer_io, psk, VERSION_6).unwrap();
+            snell_writer
+                .write_tcp_request("blocked.example", 443, false)
+                .await
+                .unwrap();
+
+            let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, VERSION_6).unwrap();
+            assert_eq!(
+                snell_reader.read_server_reply().await.unwrap(),
+                ServerReply::Error {
+                    code: V6_ERROR_CONNECTION_REFUSED,
+                    message: "test refusal",
+                }
+            );
         };
 
         let (server_result, ()) = tokio::join!(server, client);

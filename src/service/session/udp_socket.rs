@@ -7,7 +7,7 @@ use tokio::time::timeout;
 
 use crate::error::{Error, Result};
 use crate::protocol::udp::{AddressRef, UdpPacketRef};
-use crate::service::dns::DnsResolver;
+use crate::service::dns::{DnsIpPreference, DnsResolver};
 
 pub(super) const UDP_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -43,6 +43,7 @@ impl UdpSockets {
 pub(super) async fn resolve_udp_target(
     packet: UdpPacketRef<'_>,
     ipv6: bool,
+    dns_ip_preference: DnsIpPreference,
     resolver: &DnsResolver,
 ) -> Result<SocketAddr> {
     match packet.address {
@@ -58,8 +59,8 @@ pub(super) async fn resolve_udp_target(
                 resolver.lookup_socket_addrs(host, packet.port),
             )
             .await
-            .map_err(|_| Error::Timeout("udp target resolution"))??;
-            select_udp_target(addrs, ipv6)
+            .map_err(|_| Error::DnsTimeout)??;
+            select_udp_target(addrs, ipv6, dns_ip_preference)
         }
     }
 }
@@ -75,16 +76,18 @@ pub(super) fn relay_bind_ip(relay_addr: SocketAddr) -> IpAddr {
 pub(super) fn select_udp_target(
     addrs: impl IntoIterator<Item = SocketAddr>,
     ipv6: bool,
+    dns_ip_preference: DnsIpPreference,
 ) -> Result<SocketAddr> {
-    let mut saw_disallowed_ipv6 = false;
-    for addr in addrs {
-        if ipv6 || addr.is_ipv4() {
-            return Ok(addr);
-        }
-        saw_disallowed_ipv6 = true;
+    let addrs = addrs.into_iter().collect::<Vec<_>>();
+    let selected = dns_ip_preference.select_addrs(addrs.iter().copied(), ipv6);
+    if let Some(addr) = selected.into_iter().next() {
+        return Ok(addr);
     }
 
-    if saw_disallowed_ipv6 {
+    if !ipv6
+        && dns_ip_preference != DnsIpPreference::Ipv4Only
+        && addrs.iter().any(SocketAddr::is_ipv6)
+    {
         Err(Error::Ipv6Disabled)
     } else {
         Err(Error::InvalidAddressType)
@@ -101,14 +104,29 @@ mod tests {
 
     use super::select_udp_target;
     use crate::error::Error;
+    use crate::service::dns::DnsIpPreference;
 
     #[test]
     fn domain_target_prefers_ipv4_when_ipv6_is_disabled() {
         let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 53);
         let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53);
 
-        assert_eq!(select_udp_target([v6, v4], false).unwrap(), v4);
-        assert_eq!(select_udp_target([v6, v4], true).unwrap(), v6);
+        assert_eq!(
+            select_udp_target([v6, v4], false, DnsIpPreference::Default).unwrap(),
+            v4
+        );
+        assert_eq!(
+            select_udp_target([v6, v4], true, DnsIpPreference::Default).unwrap(),
+            v6
+        );
+        assert_eq!(
+            select_udp_target([v6, v4], true, DnsIpPreference::PreferIpv4).unwrap(),
+            v4
+        );
+        assert_eq!(
+            select_udp_target([v4, v6], true, DnsIpPreference::PreferIpv6).unwrap(),
+            v6
+        );
     }
 
     #[test]
@@ -116,8 +134,27 @@ mod tests {
         let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 53);
 
         assert!(matches!(
-            select_udp_target([v6], false),
+            select_udp_target([v6], false, DnsIpPreference::Default),
             Err(Error::Ipv6Disabled)
+        ));
+    }
+
+    #[test]
+    fn domain_target_honors_only_preferences() {
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 53);
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53);
+
+        assert_eq!(
+            select_udp_target([v6, v4], true, DnsIpPreference::Ipv4Only).unwrap(),
+            v4
+        );
+        assert_eq!(
+            select_udp_target([v4, v6], true, DnsIpPreference::Ipv6Only).unwrap(),
+            v6
+        );
+        assert!(matches!(
+            select_udp_target([v6], false, DnsIpPreference::Ipv4Only),
+            Err(Error::InvalidAddressType)
         ));
     }
 }

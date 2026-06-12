@@ -10,8 +10,8 @@ use crate::error::{Error, Result};
 use crate::service::runtime::net::connect_tcp;
 use crate::transport::reuse::ReuseClientConn;
 use crate::transport::tcp_stream::TcpClientStream;
-use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
-use crate::{VERSION_4, VERSION_5};
+use crate::transport::tokio_io::{SnellStreamReader, SnellStreamWriter};
+use crate::{VERSION_4, VERSION_5, VERSION_6};
 
 const REUSE_POOL_MAX_SIZE: usize = 10;
 const REUSE_POOL_MAX_IDLE_AGE: Duration = Duration::from_secs(15);
@@ -127,7 +127,7 @@ impl ReusePool {
         max_size: usize,
         max_idle_age: Duration,
     ) -> Result<Self> {
-        if !matches!(version, VERSION_4 | VERSION_5) {
+        if !matches!(version, VERSION_4 | VERSION_5 | VERSION_6) {
             return Err(Error::UnsupportedVersion(version));
         }
         Ok(Self {
@@ -142,7 +142,7 @@ impl ReusePool {
 
     pub(crate) async fn open(&self, host: &str, port: u16) -> Result<ReusedSnellTcp> {
         if let Some(mut conn) = self.take().await {
-            match conn.start_request(host, port, self.version).await {
+            match conn.start_request(host, port).await {
                 Ok(()) => return Ok(conn),
                 Err(err) if err.is_closed_io() => {
                     conn.close_whole_connection().await;
@@ -152,7 +152,7 @@ impl ReusePool {
         }
 
         let mut conn = self.open_fresh().await?;
-        conn.start_request(host, port, self.version).await?;
+        conn.start_request(host, port).await?;
         Ok(conn)
     }
 
@@ -160,8 +160,8 @@ impl ReusePool {
         let stream = connect_tcp(self.server_addr).await?;
         stream.set_nodelay(true)?;
         let (reader_io, writer_io) = stream.into_split();
-        let reader = V4StreamReader::new(reader_io, self.psk.as_slice())?;
-        let writer = V4StreamWriter::new(writer_io, self.psk.as_slice())?;
+        let reader = SnellStreamReader::new(reader_io, self.psk.as_slice(), self.version)?;
+        let writer = SnellStreamWriter::new(writer_io, self.psk.as_slice(), self.version)?;
         Ok(ReuseClientConn::from_parts(reader, writer))
     }
 
@@ -285,7 +285,8 @@ mod tests {
     use super::{ReusePool, ReusedSnellTcp, SharedPsk, SnellClientOutbound};
     use crate::error::Error;
     use crate::protocol::request::ClientRequest;
-    use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
+    use crate::transport::tokio_io::{SnellStreamReader, SnellStreamWriter};
+    use crate::{VERSION_4, VERSION_6};
 
     macro_rules! assert_next_payload {
         ($conn:expr, $expected:expr) => {{
@@ -321,7 +322,7 @@ mod tests {
         let pool = ReusePool::with_limits(
             server_addr,
             shared_psk(psk),
-            crate::VERSION_4,
+            VERSION_4,
             4,
             Duration::from_secs(60),
         )
@@ -330,8 +331,8 @@ mod tests {
         let server = async {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader_io, writer_io) = stream.into_split();
-            let mut reader = V4StreamReader::new(reader_io, psk).unwrap();
-            let mut server_writer = V4StreamWriter::new(writer_io, psk).unwrap();
+            let mut reader = SnellStreamReader::new(reader_io, psk, VERSION_4).unwrap();
+            let mut server_writer = SnellStreamWriter::new(writer_io, psk, VERSION_4).unwrap();
             let request = reader.read_client_request().await.unwrap();
             assert_eq!(
                 request,
@@ -399,8 +400,7 @@ mod tests {
     fn snell_outbound_shares_psk_with_reuse_pool() {
         let server_addr = "127.0.0.1:1".parse().unwrap();
         let outbound =
-            SnellClientOutbound::new(server_addr, b"test psk".to_vec(), true, crate::VERSION_4)
-                .unwrap();
+            SnellClientOutbound::new(server_addr, b"test psk".to_vec(), true, VERSION_4).unwrap();
         let pool = outbound.pool.as_ref().expect("reuse pool");
 
         assert!(Arc::ptr_eq(&outbound.psk, &pool.psk));
@@ -414,7 +414,7 @@ mod tests {
         let pool = ReusePool::with_limits(
             server_addr,
             shared_psk(psk),
-            crate::VERSION_4,
+            VERSION_4,
             2,
             Duration::from_secs(60),
         )
@@ -423,8 +423,89 @@ mod tests {
         let server = async {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader_io, writer_io) = stream.into_split();
-            let mut reader = V4StreamReader::new(reader_io, psk).unwrap();
-            let mut server_writer = V4StreamWriter::new(writer_io, psk).unwrap();
+            let mut reader = SnellStreamReader::new(reader_io, psk, VERSION_4).unwrap();
+            let mut server_writer = SnellStreamWriter::new(writer_io, psk, VERSION_4).unwrap();
+
+            for (host, reply) in [("one.example", b"one" as &[u8]), ("two.example", b"two")] {
+                let request = timeout(Duration::from_secs(1), reader.read_client_request())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    request,
+                    ClientRequest::Connect {
+                        reuse: true,
+                        host,
+                        port: 443,
+                        rest_span: Range { start: 17, end: 17 },
+                        rest: b"",
+                    }
+                );
+                server_writer.write_test_tunnel_reply(reply).await.unwrap();
+                server_writer.write_zero_chunk().await.unwrap();
+
+                std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
+            }
+
+            assert!(
+                timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        };
+
+        let client = async {
+            let mut first = pool.open("one.example", 443).await.unwrap();
+            assert_next_payload!(first, b"one");
+            assert!(
+                first
+                    .reader_mut()
+                    .read_payload_chunk()
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            first.writer_mut().close_write().await.unwrap();
+            pool.put(first).await;
+            assert_eq!(idle_len(&pool), 1);
+
+            let mut second = pool.open("two.example", 443).await.unwrap();
+            assert_next_payload!(second, b"two");
+            assert!(
+                second
+                    .reader_mut()
+                    .read_payload_chunk()
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            second.writer_mut().close_write().await.unwrap();
+            pool.put(second).await;
+            assert_eq!(idle_len(&pool), 1);
+        };
+
+        let ((), ()) = tokio::join!(server, client);
+    }
+
+    #[tokio::test]
+    async fn reuse_pool_reuses_completed_v6_stream() {
+        let psk = b"test psk";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let pool = ReusePool::with_limits(
+            server_addr,
+            shared_psk(psk),
+            VERSION_6,
+            2,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader_io, writer_io) = stream.into_split();
+            let mut reader = SnellStreamReader::new(reader_io, psk, VERSION_6).unwrap();
+            let mut server_writer = SnellStreamWriter::new(writer_io, psk, VERSION_6).unwrap();
 
             for (host, reply) in [("one.example", b"one" as &[u8]), ("two.example", b"two")] {
                 let request = timeout(Duration::from_secs(1), reader.read_client_request())
@@ -495,7 +576,7 @@ mod tests {
         let pool = ReusePool::with_limits(
             server_addr,
             shared_psk(psk),
-            crate::VERSION_4,
+            VERSION_4,
             1,
             Duration::from_secs(60),
         )
@@ -505,8 +586,8 @@ mod tests {
             for host in ["old.example", "new.example"] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (reader_io, writer_io) = stream.into_split();
-                let mut reader = V4StreamReader::new(reader_io, psk).unwrap();
-                let mut server_writer = V4StreamWriter::new(writer_io, psk).unwrap();
+                let mut reader = SnellStreamReader::new(reader_io, psk, VERSION_4).unwrap();
+                let mut server_writer = SnellStreamWriter::new(writer_io, psk, VERSION_4).unwrap();
                 let request = reader.read_client_request().await.unwrap();
                 assert_eq!(
                     request,
@@ -588,7 +669,7 @@ mod tests {
         let pool = ReusePool::with_limits(
             server_addr,
             shared_psk(psk),
-            crate::VERSION_4,
+            VERSION_4,
             1,
             Duration::from_secs(60),
         )
@@ -598,8 +679,8 @@ mod tests {
             for host in ["one.example", "two.example"] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (reader_io, writer_io) = stream.into_split();
-                let mut reader = V4StreamReader::new(reader_io, psk).unwrap();
-                let mut server_writer = V4StreamWriter::new(writer_io, psk).unwrap();
+                let mut reader = SnellStreamReader::new(reader_io, psk, VERSION_4).unwrap();
+                let mut server_writer = SnellStreamWriter::new(writer_io, psk, VERSION_4).unwrap();
                 let request = reader.read_client_request().await.unwrap();
                 assert_eq!(
                     request,

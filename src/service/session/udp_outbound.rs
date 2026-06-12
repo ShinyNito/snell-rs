@@ -12,13 +12,13 @@ use crate::service::session::udp_io::{
     MAX_SOCKS_UDP_HEADER, MAX_VALID_SOCKS_UDP_DATAGRAM, SnellUdpPacketKind, parse_socks_udp_header,
     recv_socks_udp_datagram_into, reframe_socks_udp_packet, send_udp_parts,
 };
-use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
+use crate::transport::tokio_io::{SnellStreamReader, SnellStreamWriter};
 
 use super::udp_association::UdpAssociationState;
 use super::udp_socket::{UdpSockets, resolve_udp_target};
 
 pub(super) async fn relay_snell_to_udp<R>(
-    reader: &mut V4StreamReader<R>,
+    reader: &mut SnellStreamReader<R>,
     sockets: UdpSockets,
     options: RelayOptions,
     state: Arc<UdpAssociationState>,
@@ -28,7 +28,8 @@ where
 {
     let resolver = options.resolver.clone();
     while let Some(packet) = read_udp_request_frame(reader).await? {
-        let target = resolve_udp_target(packet, options.ipv6, &resolver).await?;
+        let target =
+            resolve_udp_target(packet, options.ipv6, options.dns_ip_preference, &resolver).await?;
         let socket = sockets.socket_for(target)?;
         send_udp_payload(&socket, packet.payload, target).await?;
         state.add_sent(packet.payload.len() as u64);
@@ -38,7 +39,7 @@ where
 }
 
 pub(super) async fn relay_snell_to_proxy_udp<R>(
-    reader: &mut V4StreamReader<R>,
+    reader: &mut SnellStreamReader<R>,
     socket: Arc<UdpSocket>,
     relay_addr: std::net::SocketAddr,
     options: RelayOptions,
@@ -70,7 +71,7 @@ where
 }
 
 pub(super) async fn relay_proxy_udp_to_snell<W>(
-    writer: &mut V4StreamWriter<W>,
+    writer: &mut SnellStreamWriter<W>,
     socket: Arc<UdpSocket>,
     relay_addr: std::net::SocketAddr,
     state: Arc<UdpAssociationState>,
@@ -89,7 +90,7 @@ where
 }
 
 pub(super) async fn relay_udp_to_snell<W>(
-    writer: &mut V4StreamWriter<W>,
+    writer: &mut SnellStreamWriter<W>,
     sockets: UdpSockets,
     state: Arc<UdpAssociationState>,
 ) -> Result<()>
@@ -123,7 +124,7 @@ where
     }
 }
 
-pub(super) async fn write_zero_chunk<W>(writer: &mut V4StreamWriter<W>) -> Result<()>
+pub(super) async fn write_zero_chunk<W>(writer: &mut SnellStreamWriter<W>) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -148,7 +149,7 @@ where
 }
 
 async fn read_udp_request_frame<R>(
-    reader: &mut V4StreamReader<R>,
+    reader: &mut SnellStreamReader<R>,
 ) -> Result<Option<UdpPacketRef<'_>>>
 where
     R: AsyncRead + Unpin,
@@ -161,7 +162,7 @@ where
 }
 
 async fn write_ipv4_udp_response<W>(
-    writer: &mut V4StreamWriter<W>,
+    writer: &mut SnellStreamWriter<W>,
     socket: &UdpSocket,
 ) -> Result<WriteBackStatus>
 where
@@ -180,7 +181,7 @@ where
 }
 
 async fn write_ipv6_udp_response<W>(
-    writer: &mut V4StreamWriter<W>,
+    writer: &mut SnellStreamWriter<W>,
     socket: &UdpSocket,
 ) -> Result<WriteBackStatus>
 where
@@ -199,7 +200,7 @@ where
 }
 
 async fn write_proxy_udp_packet_response<W>(
-    writer: &mut V4StreamWriter<W>,
+    writer: &mut SnellStreamWriter<W>,
     socket: &UdpSocket,
     relay_addr: std::net::SocketAddr,
 ) -> Result<WriteBackStatus>
@@ -275,9 +276,10 @@ enum WriteBackStatus {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+    use crate::VERSION_4;
     use crate::error::Error;
     use crate::protocol::udp::{AddressRef, parse_udp_response};
-    use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
+    use crate::transport::tokio_io::{SnellStreamReader, SnellStreamWriter};
 
     const UDP_IPV4_RESPONSE_OVERHEAD: usize = 1 + 4 + 2;
     const UDP_IPV6_RESPONSE_OVERHEAD: usize = 1 + 16 + 2;
@@ -294,8 +296,8 @@ mod tests {
 
         let read_v4 = async {
             let (writer_io, reader_io) = tokio::io::duplex(crate::MAX_PACKET_SIZE + 2048);
-            let mut reader = V4StreamReader::new(reader_io, psk).unwrap();
-            let mut writer = V4StreamWriter::new(writer_io, psk).unwrap();
+            let mut reader = SnellStreamReader::new(reader_io, psk, VERSION_4).unwrap();
+            let mut writer = SnellStreamWriter::new(writer_io, psk, VERSION_4).unwrap();
             let write = writer.write_test_udp_response(
                 AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 53,
@@ -315,8 +317,8 @@ mod tests {
 
         let read_v6 = async {
             let (writer_io, reader_io) = tokio::io::duplex(crate::MAX_PACKET_SIZE + 2048);
-            let mut reader = V4StreamReader::new(reader_io, psk).unwrap();
-            let mut writer = V4StreamWriter::new(writer_io, psk).unwrap();
+            let mut reader = SnellStreamReader::new(reader_io, psk, VERSION_4).unwrap();
+            let mut writer = SnellStreamWriter::new(writer_io, psk, VERSION_4).unwrap();
             let write = writer.write_test_udp_response(
                 AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
                 53,
@@ -342,8 +344,8 @@ mod tests {
         let psk = b"test psk";
         let v4_payload = vec![0x42; UDP_MAX_IPV4_RESPONSE_PAYLOAD + 1];
         let v6_payload = vec![0x43; UDP_MAX_IPV6_RESPONSE_PAYLOAD + 1];
-        let mut v4_writer = V4StreamWriter::new(tokio::io::sink(), psk).unwrap();
-        let mut v6_writer = V4StreamWriter::new(tokio::io::sink(), psk).unwrap();
+        let mut v4_writer = SnellStreamWriter::new(tokio::io::sink(), psk, VERSION_4).unwrap();
+        let mut v6_writer = SnellStreamWriter::new(tokio::io::sink(), psk, VERSION_4).unwrap();
 
         assert!(matches!(
             v4_writer

@@ -6,7 +6,9 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::MAX_PACKET_SIZE;
+use crate::VERSION_6;
 use crate::error::{Error, Result};
+use crate::protocol::frame_v6::V6SaltReplayCache;
 use crate::protocol::request::ClientRequest;
 use crate::relay::tcp::relay_tcp_reader_to_plain_counted;
 use crate::service::outbound::{RelayOptions, RelayStats, open_udp};
@@ -14,26 +16,82 @@ use crate::service::session::udp_association::{
     UDP_ASSOCIATION_IDLE_TIMEOUT, relay_udp_server_stream_prepared,
 };
 use crate::transport::tcp_stream::{TcpReader, TcpServerStream, TcpServerWriter, TcpTarget};
-use crate::transport::tokio_io::{V4StreamReader, V4StreamWriter};
+use crate::transport::tokio_io::{SnellStreamReader, SnellStreamWriter};
 use crate::transport::udp_stream::UdpServerStream;
 
 pub(crate) const CONNECT_FAILED_CODE: u8 = 1;
 pub(crate) const CONNECT_FAILED_MESSAGE: &str = "connect failed";
+pub(crate) const V6_ERROR_ADDRESS_FAMILY_NOT_SUPPORTED: u8 = 0x01;
+pub(crate) const V6_ERROR_NETWORK_DOWN: u8 = 0x02;
+pub(crate) const V6_ERROR_NETWORK_UNREACHABLE: u8 = 0x03;
+pub(crate) const V6_ERROR_CONNECTION_RESET: u8 = 0x04;
+pub(crate) const V6_ERROR_TIMED_OUT: u8 = 0x05;
+pub(crate) const V6_ERROR_CONNECTION_REFUSED: u8 = 0x06;
+pub(crate) const V6_ERROR_HOST_UNREACHABLE: u8 = 0x08;
+pub(crate) const V6_ERROR_DNS_FAILED: u8 = 0x64;
+pub(crate) const V6_ERROR_REMOTE_EOF: u8 = 0x65;
+pub(crate) const V6_ERROR_FALLBACK: u8 = 0xff;
+const V6_ERROR_DNS_FAILED_MESSAGE: &str = "DNS Failed";
+const V6_ERROR_REMOTE_EOF_MESSAGE: &str = "remote eof";
 const SERVER_FAST_OPEN_BUFFER_LIMIT: usize = 64 * 1024;
 
 pub(crate) async fn serve_server_connection(
     client: TcpStream,
     psk: &[u8],
+    version: u8,
     options: RelayOptions,
 ) -> Result<()> {
-    client.set_nodelay(true)?;
-    serve_server_connection_with_target_opener(client, psk, options, open_target_stream).await
+    serve_server_connection_with_salt_replay_cache(client, psk, version, options, None).await
 }
 
+pub(crate) async fn serve_server_connection_with_salt_replay_cache(
+    client: TcpStream,
+    psk: &[u8],
+    version: u8,
+    options: RelayOptions,
+    v6_salt_replay_cache: Option<V6SaltReplayCache>,
+) -> Result<()> {
+    client.set_nodelay(true)?;
+    serve_server_connection_with_target_opener_and_salt_replay_cache(
+        client,
+        psk,
+        version,
+        options,
+        v6_salt_replay_cache,
+        open_target_stream,
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(crate) async fn serve_server_connection_with_target_opener<F, Fut>(
     client: TcpStream,
     psk: &[u8],
+    version: u8,
     options: RelayOptions,
+    open_target: F,
+) -> Result<()>
+where
+    F: FnMut(TcpTarget, RelayOptions) -> Fut,
+    Fut: Future<Output = Result<TcpStream>>,
+{
+    serve_server_connection_with_target_opener_and_salt_replay_cache(
+        client,
+        psk,
+        version,
+        options,
+        None,
+        open_target,
+    )
+    .await
+}
+
+pub(crate) async fn serve_server_connection_with_target_opener_and_salt_replay_cache<F, Fut>(
+    client: TcpStream,
+    psk: &[u8],
+    version: u8,
+    options: RelayOptions,
+    v6_salt_replay_cache: Option<V6SaltReplayCache>,
     mut open_target: F,
 ) -> Result<()>
 where
@@ -41,8 +99,9 @@ where
     Fut: Future<Output = Result<TcpStream>>,
 {
     let (client_reader, client_writer) = client.into_split();
-    let mut frame_reader = V4StreamReader::new(client_reader, psk)?;
-    let mut frame_writer = V4StreamWriter::new(client_writer, psk)?;
+    let mut frame_reader =
+        SnellStreamReader::new_server(client_reader, psk, version, v6_salt_replay_cache)?;
+    let mut frame_writer = SnellStreamWriter::new(client_writer, psk, version)?;
 
     loop {
         let initial = match frame_reader.read_client_request().await {
@@ -84,18 +143,22 @@ where
                 let snell =
                     TcpServerStream::from_parts_with_pending(frame_reader, frame_writer, pending);
                 let connect = open_target(target, options.clone());
-                let (stats, next_reader, next_writer) =
-                    match relay_tcp_server_stream_fast_open(snell, connect, keep_alive).await {
-                        Ok(result) => result,
-                        Err(err) => {
-                            tracing::debug!(
-                                %err,
-                                duration_ms = started.elapsed().as_millis(),
-                                "snell tcp server relay failed"
-                            );
-                            return Err(err);
-                        }
-                    };
+                let result = if version == VERSION_6 {
+                    relay_tcp_server_stream_v6_connect_then_accept(snell, connect, keep_alive).await
+                } else {
+                    relay_tcp_server_stream_fast_open(snell, connect, keep_alive).await
+                };
+                let (stats, next_reader, next_writer) = match result {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tracing::debug!(
+                            %err,
+                            duration_ms = started.elapsed().as_millis(),
+                            "snell tcp server relay failed"
+                        );
+                        return Err(err);
+                    }
+                };
                 tracing::debug!(
                     uploaded = stats.uploaded,
                     downloaded = stats.downloaded,
@@ -180,7 +243,7 @@ async fn relay_tcp_server_stream_fast_open<R, W, Fut>(
     mut snell: TcpServerStream<R, W>,
     connect: Fut,
     keep_alive: bool,
-) -> Result<(RelayStats, V4StreamReader<R>, V4StreamWriter<W>)>
+) -> Result<(RelayStats, SnellStreamReader<R>, SnellStreamWriter<W>)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -193,6 +256,44 @@ where
         buffer_fast_open_payload_until_connected(&mut snell_reader, connect, &mut early_payload)
             .await?;
 
+    relay_tcp_server_split_reusable(
+        snell_reader,
+        snell_writer,
+        upstream,
+        keep_alive,
+        early_payload,
+    )
+    .await
+}
+
+async fn relay_tcp_server_stream_v6_connect_then_accept<R, W, Fut>(
+    snell: TcpServerStream<R, W>,
+    connect: Fut,
+    keep_alive: bool,
+) -> Result<(RelayStats, SnellStreamReader<R>, SnellStreamWriter<W>)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    Fut: Future<Output = Result<TcpStream>>,
+{
+    let (mut snell_reader, mut snell_writer) = snell.into_split();
+    let mut early_payload = BytesMut::new();
+    let upstream = match buffer_fast_open_payload_until_connected(
+        &mut snell_reader,
+        connect,
+        &mut early_payload,
+    )
+    .await
+    {
+        Ok(upstream) => upstream,
+        Err(err) => {
+            let (code, message) = v6_server_error_reply(&err);
+            snell_writer.reject(code, &message).await?;
+            return Err(err);
+        }
+    };
+
+    snell_writer.open_tunnel().await?;
     relay_tcp_server_split_reusable(
         snell_reader,
         snell_writer,
@@ -243,12 +344,49 @@ fn can_buffer_more_fast_open_payload(buffered: usize) -> bool {
     buffered.saturating_add(MAX_PACKET_SIZE) <= SERVER_FAST_OPEN_BUFFER_LIMIT
 }
 
+fn v6_server_error_reply(err: &Error) -> (u8, String) {
+    match err {
+        Error::Dns(_) | Error::DnsUnavailable | Error::DnsTimeout => {
+            (V6_ERROR_DNS_FAILED, V6_ERROR_DNS_FAILED_MESSAGE.to_owned())
+        }
+        Error::Io(io) => v6_io_error_reply(io),
+        _ => (V6_ERROR_FALLBACK, err.to_string()),
+    }
+}
+
+fn v6_io_error_reply(io: &std::io::Error) -> (u8, String) {
+    let message = io.to_string();
+    let code = match io.kind() {
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::AddrNotAvailable => {
+            V6_ERROR_ADDRESS_FAMILY_NOT_SUPPORTED
+        }
+        std::io::ErrorKind::NetworkDown => V6_ERROR_NETWORK_DOWN,
+        std::io::ErrorKind::NetworkUnreachable => V6_ERROR_NETWORK_UNREACHABLE,
+        std::io::ErrorKind::ConnectionReset => V6_ERROR_CONNECTION_RESET,
+        std::io::ErrorKind::TimedOut => V6_ERROR_TIMED_OUT,
+        std::io::ErrorKind::ConnectionRefused => V6_ERROR_CONNECTION_REFUSED,
+        std::io::ErrorKind::HostUnreachable => V6_ERROR_HOST_UNREACHABLE,
+        std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotConnected => V6_ERROR_REMOTE_EOF,
+        _ => V6_ERROR_FALLBACK,
+    };
+
+    let message = if code == V6_ERROR_REMOTE_EOF {
+        V6_ERROR_REMOTE_EOF_MESSAGE.to_owned()
+    } else {
+        message
+    };
+    (code, message)
+}
+
 #[cfg(test)]
 async fn relay_tcp_server_stream_reusable<R, W>(
     snell: TcpServerStream<R, W>,
     upstream: TcpStream,
     keep_alive: bool,
-) -> Result<(RelayStats, V4StreamReader<R>, V4StreamWriter<W>)>
+) -> Result<(RelayStats, SnellStreamReader<R>, SnellStreamWriter<W>)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -270,7 +408,7 @@ async fn relay_tcp_server_split_reusable<R, W>(
     upstream: TcpStream,
     keep_alive: bool,
     early_payload: BytesMut,
-) -> Result<(RelayStats, V4StreamReader<R>, V4StreamWriter<W>)>
+) -> Result<(RelayStats, SnellStreamReader<R>, SnellStreamWriter<W>)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -396,17 +534,38 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::{
-        SERVER_FAST_OPEN_BUFFER_LIMIT, buffer_fast_open_payload_until_connected,
-        relay_tcp_server_stream_reusable,
+        SERVER_FAST_OPEN_BUFFER_LIMIT, V6_ERROR_DNS_FAILED, V6_ERROR_DNS_FAILED_MESSAGE,
+        V6_ERROR_FALLBACK, buffer_fast_open_payload_until_connected,
+        relay_tcp_server_stream_reusable, v6_server_error_reply,
     };
     use crate::error::Error;
     use crate::protocol::request::{ClientRequest, ServerReply};
     use crate::transport::tcp_stream::{TcpPayloadReader, TcpServerStream};
     use crate::transport::tokio_io::{
-        STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY, V4StreamReader,
-        V4StreamWriter,
+        STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY, SnellStreamReader,
+        SnellStreamWriter,
     };
     use crate::{MAX_PACKET_SIZE, VERSION_4};
+
+    #[test]
+    fn v6_server_error_reply_maps_dns_errors_structurally() {
+        let (code, message) = v6_server_error_reply(&Error::DnsUnavailable);
+        assert_eq!(code, V6_ERROR_DNS_FAILED);
+        assert_eq!(message, V6_ERROR_DNS_FAILED_MESSAGE);
+
+        let (code, message) = v6_server_error_reply(&Error::DnsTimeout);
+        assert_eq!(code, V6_ERROR_DNS_FAILED);
+        assert_eq!(message, V6_ERROR_DNS_FAILED_MESSAGE);
+    }
+
+    #[test]
+    fn v6_server_error_reply_does_not_parse_io_error_text() {
+        let (code, message) =
+            v6_server_error_reply(&Error::Io(std::io::Error::other("dns resolution failed")));
+
+        assert_eq!(code, V6_ERROR_FALLBACK);
+        assert_eq!(message, "dns resolution failed");
+    }
 
     #[tokio::test]
     async fn reusable_relay_compacts_stream_buffers_after_request() {
@@ -425,12 +584,13 @@ mod tests {
         let (mut target, _) = upstream_listener.accept().await.unwrap();
 
         let client = async {
-            let mut writer = V4StreamWriter::new(client_upload, psk).unwrap();
+            let mut writer = SnellStreamWriter::new(client_upload, psk, VERSION_4).unwrap();
             writer.write_test_frame(&upload).await.unwrap();
             writer.write_zero_chunk().await.unwrap();
 
-            let mut reader =
-                TcpPayloadReader::client(V4StreamReader::new(client_download, psk).unwrap());
+            let mut reader = TcpPayloadReader::client(
+                SnellStreamReader::new(client_download, psk, VERSION_4).unwrap(),
+            );
             reader.read_tunnel_reply().await.unwrap();
 
             let mut received = Vec::new();
@@ -451,8 +611,8 @@ mod tests {
         };
 
         let server = async {
-            let reader = V4StreamReader::new(server_upload, psk).unwrap();
-            let writer = V4StreamWriter::new(server_download, psk).unwrap();
+            let reader = SnellStreamReader::new(server_upload, psk, VERSION_4).unwrap();
+            let writer = SnellStreamWriter::new(server_download, psk, VERSION_4).unwrap();
             let snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
 
             let (stats, reader, writer) = relay_tcp_server_stream_reusable(snell, upstream, true)
@@ -475,11 +635,11 @@ mod tests {
         let psk = b"test psk";
         let (client_upload, server_upload) = duplex(4096);
 
-        let mut writer = V4StreamWriter::new(client_upload, psk).unwrap();
+        let mut writer = SnellStreamWriter::new(client_upload, psk, VERSION_4).unwrap();
         writer.write_test_frame(b"held").await.unwrap();
 
-        let reader = V4StreamReader::new(server_upload, psk).unwrap();
-        let writer = V4StreamWriter::new(tokio::io::sink(), psk).unwrap();
+        let reader = SnellStreamReader::new(server_upload, psk, VERSION_4).unwrap();
+        let writer = SnellStreamWriter::new(tokio::io::sink(), psk, VERSION_4).unwrap();
         let snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
         let (mut snell_reader, _) = snell.into_split();
         let mut early_payload = BytesMut::new();
@@ -535,8 +695,8 @@ mod tests {
         };
 
         let client = async {
-            let mut reader = V4StreamReader::new(client_download, psk).unwrap();
-            let mut writer = V4StreamWriter::new(client_upload, psk).unwrap();
+            let mut reader = SnellStreamReader::new(client_download, psk, VERSION_4).unwrap();
+            let mut writer = SnellStreamWriter::new(client_upload, psk, VERSION_4).unwrap();
 
             assert!(matches!(
                 reader.read_server_reply().await,
@@ -556,14 +716,14 @@ mod tests {
                 .unwrap();
             writer.write_zero_chunk().await.unwrap();
             writer
-                .write_tcp_request("next.example", 443, VERSION_4, true)
+                .write_tcp_request("next.example", 443, true)
                 .await
                 .unwrap();
         };
 
         let server = async {
-            let reader = V4StreamReader::new(server_upload, psk).unwrap();
-            let writer = V4StreamWriter::new(server_download, psk).unwrap();
+            let reader = SnellStreamReader::new(server_upload, psk, VERSION_4).unwrap();
+            let writer = SnellStreamWriter::new(server_download, psk, VERSION_4).unwrap();
             let snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
 
             let (stats, mut reader, _) = relay_tcp_server_stream_reusable(snell, upstream, true)

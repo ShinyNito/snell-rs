@@ -74,11 +74,12 @@ impl LoopbackHarness {
         let snell_addr = available_loopback_addr()?;
         let snell_shutdown = CancellationToken::new();
         let snell_config = ServerConfig {
-            listen: snell_addr,
+            listen: vec![snell_addr],
             psk: Zeroizing::new(PSK.to_vec()),
             version: snell_rs::VERSION_4,
             ipv6: false,
             dns: None,
+            dns_ip_preference: Default::default(),
             tcp_fast_open: false,
             quic_proxy: false,
             tcp_brutal: None,

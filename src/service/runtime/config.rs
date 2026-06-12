@@ -6,6 +6,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::protocol::header::validate_version;
+use crate::service::dns::DnsIpPreference;
 use crate::{DEFAULT_VERSION, VERSION_5};
 
 const SNELL_SERVER_SECTION: &str = "snell-server";
@@ -15,11 +16,12 @@ const TCP_BRUTAL_SEND_MBIT_TO_BYTES: u64 = 125_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerConfig {
-    pub listen: SocketAddr,
+    pub listen: Vec<SocketAddr>,
     pub psk: Zeroizing<Vec<u8>>,
     pub version: u8,
     pub ipv6: bool,
     pub dns: Option<SocketAddr>,
+    pub dns_ip_preference: DnsIpPreference,
     pub tcp_fast_open: bool,
     pub quic_proxy: bool,
     pub tcp_brutal: Option<TcpBrutalConfig>,
@@ -48,7 +50,8 @@ impl ServerConfig {
             .section(Some(SNELL_SERVER_SECTION))
             .ok_or_else(|| missing_section(SNELL_SERVER_SECTION))?;
 
-        let listen = required(section, SNELL_SERVER_SECTION, "listen").and_then(parse_listen)?;
+        let listen =
+            required(section, SNELL_SERVER_SECTION, "listen").and_then(parse_listen_addrs)?;
         let psk = required(section, SNELL_SERVER_SECTION, "psk")?;
         if psk.is_empty() {
             return Err(Error::Config("snell-server.psk is empty".to_owned()));
@@ -63,6 +66,12 @@ impl ServerConfig {
                 "snell-server.quic_proxy requires version = 5".to_owned(),
             ));
         }
+        if quic_proxy && listen.len() > 1 {
+            return Err(Error::Config(
+                "snell-server.listen multiple addresses are not supported with quic_proxy"
+                    .to_owned(),
+            ));
+        }
 
         Ok(Self {
             listen,
@@ -70,6 +79,12 @@ impl ServerConfig {
             version,
             ipv6: optional_bool(section, SNELL_SERVER_SECTION, "ipv6")?.unwrap_or(false),
             dns: optional_dns_addr(section, SNELL_SERVER_SECTION, "dns")?,
+            dns_ip_preference: optional_dns_ip_preference(
+                section,
+                SNELL_SERVER_SECTION,
+                "dns-ip-preference",
+            )?
+            .unwrap_or_default(),
             tcp_fast_open: optional_bool(section, SNELL_SERVER_SECTION, "tcp_fast_open")?
                 .unwrap_or(false),
             quic_proxy,
@@ -105,7 +120,8 @@ impl ClientConfig {
             .section(Some(SNELL_CLIENT_SECTION))
             .ok_or_else(|| missing_section(SNELL_CLIENT_SECTION))?;
 
-        let listen = required(section, SNELL_CLIENT_SECTION, "listen").and_then(parse_listen)?;
+        let listen =
+            required(section, SNELL_CLIENT_SECTION, "listen").and_then(parse_listen_addr)?;
         let server = required(section, SNELL_CLIENT_SECTION, "server")?
             .parse::<SocketAddr>()
             .map_err(|err| Error::Config(format!("invalid snell-client.server: {err}")))?;
@@ -252,7 +268,35 @@ fn optional_dns_addr(
         .map_err(|err| Error::Config(format!("invalid {section_name}.{key}: {err}")))
 }
 
-fn parse_listen(value: &str) -> Result<SocketAddr> {
+fn optional_dns_ip_preference(
+    section: &ini::Properties,
+    section_name: &str,
+    key: &str,
+) -> Result<Option<DnsIpPreference>> {
+    let Some(value) = section.get(key).map(str::trim) else {
+        return Ok(None);
+    };
+    DnsIpPreference::parse(value)
+        .map(Some)
+        .ok_or_else(|| Error::Config(format!("invalid {section_name}.{key}: {value}")))
+}
+
+fn parse_listen_addrs(value: &str) -> Result<Vec<SocketAddr>> {
+    let mut addrs = Vec::new();
+    for raw in value.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err(Error::Config(format!("invalid listen address: {value}")));
+        }
+        addrs.push(parse_listen_addr(raw)?);
+    }
+    if addrs.is_empty() {
+        return Err(Error::Config("snell-server.listen is empty".to_owned()));
+    }
+    Ok(addrs)
+}
+
+fn parse_listen_addr(value: &str) -> Result<SocketAddr> {
     if let Ok(addr) = value.parse::<SocketAddr>() {
         return Ok(addr);
     }
@@ -273,6 +317,7 @@ mod tests {
 
     use super::{ClientConfig, ServerConfig, TcpBrutalConfig};
     use crate::error::Error;
+    use crate::service::dns::DnsIpPreference;
 
     fn parse_server_config(input: &str) -> crate::error::Result<ServerConfig> {
         let config =
@@ -301,11 +346,12 @@ tcp_fast_open = true
 
         assert_eq!(
             config.listen,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 29246)
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 29246)]
         );
         assert_eq!(&config.psk[..], b"PSKMOCK");
         assert!(config.ipv6);
         assert_eq!(config.dns, None);
+        assert_eq!(config.dns_ip_preference, DnsIpPreference::Default);
         assert!(config.tcp_fast_open);
         assert_eq!(config.version, crate::VERSION_5);
         assert!(config.quic_proxy);
@@ -326,13 +372,51 @@ psk = PSKMOCK
 
         assert_eq!(
             config.listen,
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 11807)
+            vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 11807)]
         );
         assert!(!config.ipv6);
         assert_eq!(config.dns, None);
         assert!(!config.tcp_fast_open);
         assert_eq!(config.tcp_brutal, None);
         assert_eq!(config.upstream_socks5, None);
+    }
+
+    #[test]
+    fn parses_snell_server_multiple_listen_addrs() {
+        let config = parse_server_config(
+            r#"
+[snell-server]
+listen = 0.0.0.0:7177, [::]:7177
+psk = PSKMOCK
+version = 6
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.listen,
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7177),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7177),
+            ]
+        );
+        assert_eq!(config.version, crate::VERSION_6);
+        assert!(!config.quic_proxy);
+    }
+
+    #[test]
+    fn rejects_multiple_listen_addrs_with_quic_proxy() {
+        assert!(matches!(
+            parse_server_config(
+                r#"
+[snell-server]
+listen = 0.0.0.0:7177, [::]:7177
+psk = PSKMOCK
+version = 5
+"#
+            ),
+            Err(Error::Config(message)) if message.contains("multiple addresses")
+        ));
     }
 
     #[test]
@@ -462,6 +546,37 @@ dns = 1.1.1.1:5353
     }
 
     #[test]
+    fn parses_snell_server_dns_ip_preference() {
+        let config = parse_server_config(
+            r#"
+[snell-server]
+listen = 0.0.0.0:29246
+psk = PSKMOCK
+version = 6
+dns-ip-preference = prefer-ipv6
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.dns_ip_preference, DnsIpPreference::PreferIpv6);
+    }
+
+    #[test]
+    fn rejects_invalid_snell_server_dns_ip_preference() {
+        assert!(matches!(
+            parse_server_config(
+                r#"
+[snell-server]
+listen = 0.0.0.0:29246
+psk = PSKMOCK
+dns-ip-preference = prefer-both
+"#
+            ),
+            Err(Error::Config(message)) if message.contains("invalid snell-server.dns-ip-preference")
+        ));
+    }
+
+    #[test]
     fn v5_defaults_quic_proxy_on() {
         let config = parse_server_config(
             r#"
@@ -486,6 +601,38 @@ version = 5
 listen = 0.0.0.0:29246
 psk = PSKMOCK
 version = 4
+quic_proxy = true
+"#
+            ),
+            Err(Error::Config(message)) if message.contains("quic_proxy requires version = 5")
+        ));
+    }
+
+    #[test]
+    fn parses_v6_server_without_quic_proxy() {
+        let config = parse_server_config(
+            r#"
+[snell-server]
+listen = 0.0.0.0:29246
+psk = PSKMOCK
+version = 6
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.version, crate::VERSION_6);
+        assert!(!config.quic_proxy);
+    }
+
+    #[test]
+    fn rejects_v6_server_quic_proxy() {
+        assert!(matches!(
+            parse_server_config(
+                r#"
+[snell-server]
+listen = 0.0.0.0:29246
+psk = PSKMOCK
+version = 6
 quic_proxy = true
 "#
             ),
@@ -558,5 +705,39 @@ version = 5
 
         assert_eq!(config.version, crate::VERSION_5);
         assert!(config.quic_proxy);
+    }
+
+    #[test]
+    fn parses_v6_client_without_quic_proxy() {
+        let config = parse_client_config(
+            r#"
+[snell-client]
+listen = 127.0.0.1:1080
+server = 127.0.0.1:29246
+psk = PSKMOCK
+version = 6
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.version, crate::VERSION_6);
+        assert!(!config.quic_proxy);
+    }
+
+    #[test]
+    fn rejects_v6_client_quic_proxy() {
+        assert!(matches!(
+            parse_client_config(
+                r#"
+[snell-client]
+listen = 127.0.0.1:1080
+server = 127.0.0.1:29246
+psk = PSKMOCK
+version = 6
+quic_proxy = true
+"#
+            ),
+            Err(Error::Config(message)) if message.contains("quic_proxy requires version = 5")
+        ));
     }
 }
