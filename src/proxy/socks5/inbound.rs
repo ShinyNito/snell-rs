@@ -44,13 +44,13 @@ pub(crate) async fn relay_socks5_connection(
             relay_tcp_connect(local, connect).await
         }
         SocksRequest::UdpAssociate(_) => {
-            relay_socks5_udp_association(
+            Box::pin(relay_socks5_udp_association(
                 local,
                 outbound.server_addr(),
                 outbound.psk(),
                 outbound.version(),
                 quic_proxy,
-            )
+            ))
             .await
         }
     }

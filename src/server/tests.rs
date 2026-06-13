@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +29,7 @@ use crate::proxy::snell::server::{
 use crate::proxy::socks5::inbound::{read_client_request, write_reply_with_bind};
 use crate::server::shutdown::bind_tcp_listener;
 use crate::session::tcp::{TcpClientStream, TcpClientWriter};
+use crate::test_support::{TEST_PSK, test_tcp_listener};
 
 fn direct_options(ipv6: bool) -> RelayOptions {
     RelayOptions::direct(ipv6, DnsResolver::system())
@@ -63,7 +64,7 @@ where
 {
     let mut plain = payload;
     Ok(writer
-        .write_payload_from_reader(&mut plain)
+        .write_next_payload_record_from_reader(&mut plain)
         .await?
         .unwrap_or(0))
 }
@@ -100,10 +101,10 @@ async fn assert_snell_ping(addr: std::net::SocketAddr, psk: &[u8], version: Prot
 
 #[tokio::test]
 async fn serve_server_connection_relays_to_connected_target() {
-    let psk = b"test psk";
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let echo_listener = test_tcp_listener().await;
     let echo_addr = echo_listener.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let echo = async {
@@ -152,11 +153,9 @@ async fn serve_server_connection_relays_to_connected_target() {
             .unwrap();
         snell_writer.close_write().await.unwrap();
 
-        let payload = snell_reader.read_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(payload, b"pong");
-        let len = payload.len();
-        snell_reader.consume_payload_chunk(len);
-        assert!(snell_reader.read_payload_chunk().await.unwrap().is_none());
+        let payload = snell_reader.take_payload_chunk().await.unwrap().unwrap();
+        assert_eq!(&payload[..], b"pong");
+        assert!(snell_reader.take_payload_chunk().await.unwrap().is_none());
     };
 
     let ((), (), ()) = tokio::join!(server, client, echo);
@@ -164,10 +163,10 @@ async fn serve_server_connection_relays_to_connected_target() {
 
 #[tokio::test]
 async fn serve_server_connection_relays_v5_family_to_connected_target() {
-    let psk = b"test psk";
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let echo_listener = test_tcp_listener().await;
     let echo_addr = echo_listener.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let echo = async {
@@ -216,11 +215,9 @@ async fn serve_server_connection_relays_v5_family_to_connected_target() {
             .unwrap();
         snell_writer.close_write().await.unwrap();
 
-        let payload = snell_reader.read_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(payload, b"v5 pong");
-        let len = payload.len();
-        snell_reader.consume_payload_chunk(len);
-        assert!(snell_reader.read_payload_chunk().await.unwrap().is_none());
+        let payload = snell_reader.take_payload_chunk().await.unwrap().unwrap();
+        assert_eq!(&payload[..], b"v5 pong");
+        assert!(snell_reader.take_payload_chunk().await.unwrap().is_none());
     };
 
     let ((), (), ()) = tokio::join!(server, client, echo);
@@ -228,10 +225,10 @@ async fn serve_server_connection_relays_v5_family_to_connected_target() {
 
 #[tokio::test]
 async fn serve_server_connection_relays_v6_to_connected_target() {
-    let psk = b"test psk";
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let echo_listener = test_tcp_listener().await;
     let echo_addr = echo_listener.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let echo = async {
@@ -280,11 +277,9 @@ async fn serve_server_connection_relays_v6_to_connected_target() {
             .unwrap();
         snell_writer.close_write().await.unwrap();
 
-        let payload = snell_reader.read_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(payload, b"v6 pong");
-        let len = payload.len();
-        snell_reader.consume_payload_chunk(len);
-        assert!(snell_reader.read_payload_chunk().await.unwrap().is_none());
+        let payload = snell_reader.take_payload_chunk().await.unwrap().unwrap();
+        assert_eq!(&payload[..], b"v6 pong");
+        assert!(snell_reader.take_payload_chunk().await.unwrap().is_none());
     };
 
     let ((), (), ()) = tokio::join!(server, client, echo);
@@ -292,10 +287,10 @@ async fn serve_server_connection_relays_v6_to_connected_target() {
 
 #[tokio::test]
 async fn v4_family_detection_does_not_pollute_v6_replay_cache() {
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let salt = [0x44; 16];
     let cache = V6SaltReplayCache::new(16);
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let server = async {
@@ -345,8 +340,8 @@ async fn v4_family_detection_does_not_pollute_v6_replay_cache() {
 
 #[tokio::test]
 async fn serve_server_connection_handles_v6_ping() {
-    let psk = b"test psk";
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let server = async {
@@ -379,10 +374,10 @@ async fn serve_server_connection_handles_v6_ping() {
 
 #[tokio::test]
 async fn serve_server_connection_v6_rejects_replayed_client_salt() {
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let salt = [0x44; 16];
     let cache = V6SaltReplayCache::new(16);
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let server = async {
@@ -437,12 +432,12 @@ async fn serve_server_connection_v6_rejects_replayed_client_salt() {
 
 #[tokio::test]
 async fn serve_server_connection_relays_via_upstream_socks5() {
-    let psk = b"test psk";
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let echo_listener = test_tcp_listener().await;
     let echo_addr = echo_listener.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let echo = async {
@@ -505,11 +500,9 @@ async fn serve_server_connection_relays_via_upstream_socks5() {
             .unwrap();
         snell_writer.close_write().await.unwrap();
 
-        let payload = snell_reader.read_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(payload, b"pong");
-        let len = payload.len();
-        snell_reader.consume_payload_chunk(len);
-        assert!(snell_reader.read_payload_chunk().await.unwrap().is_none());
+        let payload = snell_reader.take_payload_chunk().await.unwrap().unwrap();
+        assert_eq!(&payload[..], b"pong");
+        assert!(snell_reader.take_payload_chunk().await.unwrap().is_none());
     };
 
     let ((), (), (), ()) = tokio::join!(echo, socks, server, client);
@@ -517,10 +510,10 @@ async fn serve_server_connection_relays_via_upstream_socks5() {
 
 #[tokio::test]
 async fn serve_server_connection_closes_when_upstream_socks5_rejects_after_fast_open() {
-    let psk = b"test psk";
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let socks = async {
@@ -557,7 +550,7 @@ async fn serve_server_connection_closes_when_upstream_socks5_rejects_after_fast_
         .unwrap();
         let (mut snell_reader, _) = snell.into_split();
         assert!(
-            timeout(Duration::from_secs(1), snell_reader.read_payload_chunk())
+            timeout(Duration::from_secs(1), snell_reader.take_payload_chunk())
                 .await
                 .unwrap()
                 .unwrap()
@@ -571,10 +564,10 @@ async fn serve_server_connection_closes_when_upstream_socks5_rejects_after_fast_
 
 #[tokio::test]
 async fn serve_server_connection_fast_open_accepts_before_target_connects() {
-    let psk = b"test psk";
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let echo_listener = test_tcp_listener().await;
     let echo_addr = echo_listener.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
     let (connect_tx, connect_rx) = oneshot::channel();
 
@@ -648,8 +641,8 @@ async fn serve_server_connection_fast_open_accepts_before_target_connects() {
 
 #[tokio::test]
 async fn serve_tcp_listener_with_shutdown_stops_accepting_connections() {
-    let psk = b"test psk";
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let listener = test_tcp_listener().await;
     let addr = listener.local_addr().unwrap();
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve_tcp_listener_with_shutdown_and_timeout(
@@ -674,10 +667,10 @@ async fn serve_tcp_listener_with_shutdown_stops_accepting_connections() {
 
 #[tokio::test]
 async fn serve_tcp_listeners_accepts_connections_on_each_listener() {
-    let psk = b"test psk";
-    let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let first = test_tcp_listener().await;
     let first_addr = first.local_addr().unwrap();
-    let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second = test_tcp_listener().await;
     let second_addr = second.local_addr().unwrap();
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve_tcp_listeners_with_shutdown_and_timeout(
@@ -705,8 +698,8 @@ async fn serve_tcp_listeners_accepts_connections_on_each_listener() {
 
 #[tokio::test]
 async fn serve_tcp_listener_auto_detects_v5_family_and_v6_on_same_listener() {
-    let psk = b"test psk";
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let listener = test_tcp_listener().await;
     let addr = listener.local_addr().unwrap();
     let shutdown = CancellationToken::new();
     let server = tokio::spawn(serve_tcp_listener_with_shutdown_and_timeout(
@@ -731,10 +724,10 @@ async fn serve_tcp_listener_auto_detects_v5_family_and_v6_on_same_listener() {
 
 #[tokio::test]
 async fn serve_tcp_listener_with_shutdown_drains_active_connection() {
-    let psk = b"test psk";
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let echo_listener = test_tcp_listener().await;
     let echo_addr = echo_listener.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
     let shutdown = CancellationToken::new();
     let (echo_ready_tx, echo_ready_rx) = oneshot::channel();
@@ -785,11 +778,9 @@ async fn serve_tcp_listener_with_shutdown_drains_active_connection() {
         shutdown.cancel();
         echo_continue_tx.send(()).unwrap();
 
-        let payload = snell_reader.read_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(payload, b"pong");
-        let len = payload.len();
-        snell_reader.consume_payload_chunk(len);
-        assert!(snell_reader.read_payload_chunk().await.unwrap().is_none());
+        let payload = snell_reader.take_payload_chunk().await.unwrap().unwrap();
+        assert_eq!(&payload[..], b"pong");
+        assert!(snell_reader.take_payload_chunk().await.unwrap().is_none());
     };
 
     let ((), ()) = tokio::join!(client, echo);
@@ -845,8 +836,8 @@ async fn connect_target_rejects_ipv6_literal_when_disabled() {
 
 #[tokio::test]
 async fn serve_server_connection_closes_after_fast_open_connect_failure() {
-    let psk = b"test psk";
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let server = async {
@@ -894,8 +885,8 @@ async fn serve_server_connection_closes_after_fast_open_connect_failure() {
 
 #[tokio::test]
 async fn serve_server_connection_v6_returns_error_reply_on_connect_failure() {
-    let psk = b"test psk";
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let server = async {

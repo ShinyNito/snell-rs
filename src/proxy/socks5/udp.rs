@@ -20,7 +20,7 @@ use crate::proxy::outbound::RelayStats;
 use crate::proxy::socks5::inbound::{write_reply_and_shutdown, write_reply_with_bind};
 use crate::session::udp::io::{
     MAX_SOCKS_UDP_HEADER, SnellUdpPacketKind, max_socks_udp_datagram_len, parse_socks_udp_header,
-    recv_socks_udp_datagram_into, reframe_socks_udp_packet, send_udp_parts,
+    recv_socks_udp_datagram_into, recv_udp_datagram_into, reframe_socks_udp_packet, send_udp_parts,
 };
 use crate::session::udp::outbound::write_zero_chunk;
 use crate::session::udp::stream::UdpClientStream;
@@ -38,7 +38,12 @@ pub(crate) async fn relay_socks5_udp_association(
     quic_proxy: bool,
 ) -> Result<RelayStats> {
     if quic_proxy && version == ProtocolVersion::V5 {
-        return relay_socks5_udp_association_lazy_quic(control, server_addr, psk).await;
+        return Box::pin(relay_socks5_udp_association_lazy_quic(
+            control,
+            server_addr,
+            psk,
+        ))
+        .await;
     }
 
     let control_peer_ip = control.peer_addr()?.ip();
@@ -166,8 +171,15 @@ async fn relay_socks5_udp_association_lazy_quic(
                 result?;
                 return Ok(RelayStats::default());
             }
-            recv_result = udp_socket.recv_buf_from(&mut first_socks_in) => {
-                let (n, peer) = recv_result?;
+            recv_result = recv_udp_datagram_into(&udp_socket, &mut first_socks_in, SOCKS5_UDP_BUFFER_SIZE) => {
+                let (n, peer) = match recv_result {
+                    Ok(result) => result,
+                    Err(Error::PayloadTooLarge) => {
+                        tracing::debug!("ignored oversized socks5 udp datagram");
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 if !is_allowed_socks_udp_peer(control_peer_ip, peer) {
                     tracing::debug!(%peer, %control_peer_ip, "ignored socks5 udp datagram from unexpected source ip");
                     first_socks_in.clear();
@@ -201,7 +213,7 @@ async fn relay_socks5_udp_association_lazy_quic(
     let (first_peer, mut target, first_payload_start, first_payload_len, mut first_datagram) =
         first;
     let mut client_addr = Some(first_peer);
-    let mut socks_in = [0; SOCKS5_UDP_BUFFER_SIZE];
+    let mut socks_in = BytesMut::with_capacity(SOCKS5_UDP_BUFFER_SIZE);
 
     if !first_datagram[first_payload_start..first_payload_start + first_payload_len]
         .first()
@@ -310,7 +322,7 @@ async fn relay_socks5_udp_association_lazy_quic(
     let quic_socket = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?;
     let mut uploaded = first_payload.len() as u64;
     let mut downloaded = 0;
-    let mut quic_in = [0; MAX_PACKET_SIZE + 512];
+    let mut quic_in = BytesMut::with_capacity(MAX_PACKET_SIZE + 512);
     let mut socks_header = BytesMut::with_capacity(MAX_SOCKS_UDP_HEADER);
     let mut socks_packet = BytesMut::new();
     let mut plaintext = BytesMut::with_capacity(MAX_PACKET_SIZE);
@@ -337,8 +349,15 @@ async fn relay_socks5_udp_association_lazy_quic(
                 result?;
                 break;
             }
-            recv_result = udp_socket.recv_from(&mut socks_in) => {
-                let (n, peer) = recv_result?;
+            recv_result = recv_udp_datagram_into(&udp_socket, &mut socks_in, SOCKS5_UDP_BUFFER_SIZE) => {
+                let (n, peer) = match recv_result {
+                    Ok(result) => result,
+                    Err(Error::PayloadTooLarge) => {
+                        tracing::debug!("ignored oversized socks5 udp datagram");
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 if !is_allowed_socks_udp_peer(control_peer_ip, peer) {
                     tracing::debug!(%peer, %control_peer_ip, "ignored socks5 udp datagram from unexpected source ip");
                     continue;
@@ -381,8 +400,15 @@ async fn relay_socks5_udp_association_lazy_quic(
                 uploaded += packet.payload.len() as u64;
                 idle.as_mut().reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
             }
-            recv_result = quic_socket.recv_from(&mut quic_in) => {
-                let (n, peer) = recv_result?;
+            recv_result = recv_udp_datagram_into(&quic_socket, &mut quic_in, MAX_PACKET_SIZE + 512) => {
+                let (n, peer) = match recv_result {
+                    Ok(result) => result,
+                    Err(Error::PayloadTooLarge) => {
+                        tracing::debug!("ignored oversized quic proxy response");
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 if peer != server_addr {
                     tracing::debug!(%peer, server = %server_addr, "ignored quic proxy response from unexpected peer");
                     continue;

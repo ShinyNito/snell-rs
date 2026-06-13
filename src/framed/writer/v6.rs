@@ -79,7 +79,10 @@ where
         Ok(wire_len)
     }
 
-    pub async fn write_payload_from_reader<R>(&mut self, plain: &mut R) -> Result<Option<usize>>
+    pub async fn write_next_payload_record_from_reader<R>(
+        &mut self,
+        plain: &mut R,
+    ) -> Result<Option<usize>>
     where
         R: AsyncRead + Unpin,
     {
@@ -97,16 +100,11 @@ where
         Ok(Some(frame.read_len))
     }
 
-    pub async fn write_tunnel_reply_from_reader<R>(
+    pub async fn write_payload_from_buffer(
         &mut self,
-        plain: &mut R,
-    ) -> Result<Option<usize>>
-    where
-        R: AsyncRead + Unpin,
-    {
-        let prefix = [COMMAND_TUNNEL];
-
-        let Some(frame) = self.read_payload_frame_from_reader(plain, &prefix).await? else {
+        plain: &mut BytesMut,
+    ) -> Result<Option<usize>> {
+        let Some(frame) = self.read_payload_frame_from_buffer(plain, &[])? else {
             return Ok(None);
         };
 
@@ -115,7 +113,27 @@ where
         tracing::trace!(
             payload_len = frame.read_len,
             wire_len,
-            "wrote snell v6 tunnel payload frame"
+            "wrote snell v6 buffered payload frame"
+        );
+        Ok(Some(frame.read_len))
+    }
+
+    pub async fn write_tunnel_reply_from_buffer(
+        &mut self,
+        plain: &mut BytesMut,
+    ) -> Result<Option<usize>> {
+        let prefix = [COMMAND_TUNNEL];
+
+        let Some(frame) = self.read_payload_frame_from_buffer(plain, &prefix)? else {
+            return Ok(None);
+        };
+
+        let wire_len = self.write_payload_buffer(frame.payload_len, false).await?;
+        self.chunk_sizer.commit_record(Instant::now());
+        tracing::trace!(
+            payload_len = frame.read_len,
+            wire_len,
+            "wrote snell v6 buffered tunnel payload frame"
         );
         Ok(Some(frame.read_len))
     }
@@ -131,42 +149,19 @@ where
         poll_fn(|cx| {
             let now = Instant::now();
             let limit = self.chunk_sizer.peek_limit(self.encoder.seq(), now);
-            let prefix_len = prefix.len();
-            let Some(read_limit) = limit.checked_sub(prefix_len).filter(|limit| *limit != 0) else {
-                self.payload.clear();
-                return Poll::Ready(Err(crate::error::Error::PayloadTooLarge));
-            };
-
-            self.payload.clear();
-            self.payload
-                .reserve(limit + crate::protocol::crypto::AEAD_TAG_SIZE);
-            if !prefix.is_empty() {
-                self.payload.extend_from_slice(prefix);
-            }
-
-            match poll_read_into_spare(plain, cx, &mut self.payload, read_limit) {
-                Poll::Pending => {
-                    self.payload.clear();
-                    Poll::Pending
-                }
-                Poll::Ready(Ok(read_len)) => {
-                    if read_len == 0 {
-                        self.payload.clear();
-                        return Poll::Ready(Ok(None));
-                    }
-                    Poll::Ready(Ok(Some(ReaderPayloadFrame {
-                        payload_len: prefix_len + read_len,
-                        read_len,
-                        limit,
-                    })))
-                }
-                Poll::Ready(Err(err)) => {
-                    self.payload.clear();
-                    Poll::Ready(Err(err))
-                }
-            }
+            poll_read_payload_frame_from_reader(plain, cx, &mut self.payload, prefix, limit)
         })
         .await
+    }
+
+    fn read_payload_frame_from_buffer(
+        &mut self,
+        plain: &mut BytesMut,
+        prefix: &[u8],
+    ) -> Result<Option<ReaderPayloadFrame>> {
+        let now = Instant::now();
+        let limit = self.chunk_sizer.peek_limit(self.encoder.seq(), now);
+        prepare_payload_frame_from_buffer(plain, &mut self.payload, prefix, limit)
     }
 
     pub async fn write_tcp_request(&mut self, host: &str, port: u16, reuse: bool) -> Result<()> {

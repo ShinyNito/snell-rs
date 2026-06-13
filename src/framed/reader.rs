@@ -1,4 +1,5 @@
 use std::future::poll_fn;
+use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -136,11 +137,13 @@ where
         })
     }
 
-    pub async fn read_frame_payload(&mut self) -> Result<&[u8]> {
+    // Cancel-safe frame read: a decoded header is cached until the full body is
+    // buffered, so a later poll does not consume the frame nonce twice.
+    fn poll_read_frame_payload_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.discard_consumed();
         if self.decoder.is_none() {
             let salt_block_len = self.profile.salt_block_len();
-            self.fill_to(salt_block_len).await?;
+            ready!(self.poll_fill_to(cx, salt_block_len))?;
             let salt = self.profile.extract_salt(&self.body[..salt_block_len])?;
             if let Some(cache) = &self.salt_replay_cache {
                 cache.remember(salt)?;
@@ -158,7 +161,7 @@ where
         let header = match self.pending_header {
             Some(header) => header,
             None => {
-                self.fill_to(prefix_len + V6_HEADER_CIPHER_SIZE).await?;
+                ready!(self.poll_fill_to(cx, prefix_len + V6_HEADER_CIPHER_SIZE))?;
                 let prefix = &self.body[..prefix_len];
                 let mut header_bytes = [0; V6_HEADER_CIPHER_SIZE];
                 header_bytes
@@ -172,7 +175,7 @@ where
                     Ok(header) => header,
                     Err(err) => {
                         log_frame_decode_error(&err, "v6", "header", None, None);
-                        return Err(err);
+                        return Poll::Ready(Err(err));
                     }
                 };
                 self.pending_header = Some(header);
@@ -183,7 +186,7 @@ where
         let body_start = prefix_len + V6_HEADER_CIPHER_SIZE;
         let body_len = header.body_len()?;
         let frame_len = body_start + body_len;
-        self.fill_to(frame_len).await?;
+        ready!(self.poll_fill_to(cx, frame_len))?;
         self.pending_header = None;
         self.consumed = frame_len;
 
@@ -202,7 +205,7 @@ where
             .decode_payload_in_place(header, &mut self.body[body_start..frame_len])
         {
             log_frame_decode_error(&err, "v6", "payload", Some(payload_len), Some(body_len));
-            return Err(err);
+            return Poll::Ready(Err(err));
         }
         self.last_chunk_limit = Some(chunk_limit);
         if payload_len != 0 {
@@ -211,17 +214,17 @@ where
         self.payload_start = body_start + header.padding_len;
         self.payload_end = self.payload_start + payload_len;
         tracing::trace!(payload_len, body_len, "read snell v6 frame");
+        Poll::Ready(Ok(()))
+    }
+
+    pub async fn read_frame_payload(&mut self) -> Result<&[u8]> {
+        poll_fn(|cx| self.poll_read_frame_payload_inner(cx)).await?;
         Ok(&self.body[self.payload_start..self.payload_end])
     }
 
-    pub async fn read_client_request(&mut self) -> Result<ClientRequest<'_>> {
-        let payload = self.read_frame_payload().await?;
-        parse_client_request(payload)
-    }
-
-    pub async fn read_server_reply(&mut self) -> Result<ServerReply<'_>> {
-        let payload = self.read_frame_payload().await?;
-        parse_server_reply(payload)
+    pub(crate) fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+        ready!(self.poll_read_frame_payload_inner(cx))?;
+        Poll::Ready(Ok(&self.body[self.payload_start..self.payload_end]))
     }
 
     pub(crate) fn take_payload_from(&mut self, offset: usize) -> Bytes {
@@ -287,22 +290,24 @@ where
         self.payload_end = 0;
     }
 
-    async fn fill_to(&mut self, needed: usize) -> Result<()> {
+    fn poll_fill_to(&mut self, cx: &mut Context<'_>, needed: usize) -> Poll<Result<()>> {
         while self.body.len() < needed {
             let min_spare = needed - self.body.len();
-            let n = poll_fn(|cx| {
-                poll_read_ahead_into_spare(&mut self.inner, cx, &mut self.body, min_spare)
-            })
-            .await?;
+            let n = ready!(poll_read_ahead_into_spare(
+                &mut self.inner,
+                cx,
+                &mut self.body,
+                min_spare
+            ))?;
             if n == 0 {
-                return Err(std::io::Error::new(
+                return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "early eof reading snell v6 frame",
                 )
-                .into());
+                .into()));
             }
         }
-        Ok(())
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -366,10 +371,18 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn read_frame_payload(&mut self) -> Result<&[u8]> {
         match self {
             Self::V4(reader) => reader.read_frame_payload().await,
             Self::V6(reader) => reader.read_frame_payload().await,
+        }
+    }
+
+    pub(crate) fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+        match self {
+            Self::V4(reader) => reader.poll_read_frame_payload(cx),
+            Self::V6(reader) => reader.poll_read_frame_payload(cx),
         }
     }
 
@@ -406,16 +419,36 @@ where
 
     pub(crate) async fn read_client_request(&mut self) -> Result<ClientRequest<'_>> {
         match self {
-            Self::V4(reader) => reader.read_client_request().await,
-            Self::V6(reader) => reader.read_client_request().await,
+            Self::V4(reader) => {
+                let payload = reader.read_frame_payload().await?;
+                parse_client_request(payload)
+            }
+            Self::V6(reader) => {
+                let payload = reader.read_frame_payload().await?;
+                parse_client_request(payload)
+            }
         }
     }
 
     pub(crate) async fn read_server_reply(&mut self) -> Result<ServerReply<'_>> {
         match self {
-            Self::V4(reader) => reader.read_server_reply().await,
-            Self::V6(reader) => reader.read_server_reply().await,
+            Self::V4(reader) => {
+                let payload = reader.read_frame_payload().await?;
+                parse_server_reply(payload)
+            }
+            Self::V6(reader) => {
+                let payload = reader.read_frame_payload().await?;
+                parse_server_reply(payload)
+            }
         }
+    }
+
+    pub(crate) fn poll_read_server_reply(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ServerReply<'_>>> {
+        let payload = ready!(self.poll_read_frame_payload(cx))?;
+        Poll::Ready(parse_server_reply(payload))
     }
 
     pub(crate) fn take_payload_from(&mut self, offset: usize) -> Bytes {
@@ -683,15 +716,12 @@ where
         })
     }
 
-    /// Reads one Snell frame and returns a payload slice borrowed from this reader.
-    ///
-    /// The returned slice is valid until the next frame read or
-    /// `take_payload_from` call on the same reader. A zero chunk is returned as
-    /// `Error::ZeroChunk`.
-    pub async fn read_frame_payload(&mut self) -> Result<&[u8]> {
+    // Cancel-safe frame read: a decoded header is cached until the full body is
+    // buffered, so a later poll does not consume the frame nonce twice.
+    fn poll_read_frame_payload_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.discard_consumed();
         if self.decoder.is_none() {
-            self.fill_to(SALT_SIZE).await?;
+            ready!(self.poll_fill_to(cx, SALT_SIZE))?;
             let mut salt = [0; SALT_SIZE];
             salt.copy_from_slice(&self.body[..SALT_SIZE]);
             self.body.advance(SALT_SIZE);
@@ -702,7 +732,7 @@ where
         let header = match self.pending_header {
             Some(header) => header,
             None => {
-                self.fill_to(V4_HEADER_CIPHER_SIZE).await?;
+                ready!(self.poll_fill_to(cx, V4_HEADER_CIPHER_SIZE))?;
                 let header_bytes: &mut [u8; V4_HEADER_CIPHER_SIZE] = (&mut self.body
                     [..V4_HEADER_CIPHER_SIZE])
                     .try_into()
@@ -716,7 +746,7 @@ where
                     Ok(header) => header,
                     Err(err) => {
                         log_frame_decode_error(&err, "v4", "header", None, None);
-                        return Err(err);
+                        return Poll::Ready(Err(err));
                     }
                 };
                 self.pending_header = Some(header);
@@ -726,7 +756,7 @@ where
 
         let body_len = header.body_len()?;
         let frame_len = V4_HEADER_CIPHER_SIZE + body_len;
-        self.fill_to(frame_len).await?;
+        ready!(self.poll_fill_to(cx, frame_len))?;
         self.pending_header = None;
         self.consumed = frame_len;
 
@@ -738,24 +768,27 @@ where
             .decode_payload_in_place(header, &mut self.body[V4_HEADER_CIPHER_SIZE..frame_len])
         {
             log_frame_decode_error(&err, "v4", "payload", Some(payload_len), Some(body_len));
-            return Err(err);
+            return Poll::Ready(Err(err));
         }
         self.payload_start = V4_HEADER_CIPHER_SIZE;
         self.payload_end = V4_HEADER_CIPHER_SIZE + payload_len;
         tracing::trace!(payload_len, body_len, "read snell v4 frame");
+        Poll::Ready(Ok(()))
+    }
+
+    /// Reads one Snell frame and returns a payload slice borrowed from this reader.
+    ///
+    /// The returned slice is valid until the next frame read or
+    /// `take_payload_from` call on the same reader. A zero chunk is returned as
+    /// `Error::ZeroChunk`.
+    pub async fn read_frame_payload(&mut self) -> Result<&[u8]> {
+        poll_fn(|cx| self.poll_read_frame_payload_inner(cx)).await?;
         Ok(&self.body[self.payload_start..self.payload_end])
     }
 
-    /// Reads and parses one client request as a borrowed view into the frame payload.
-    pub async fn read_client_request(&mut self) -> Result<ClientRequest<'_>> {
-        let payload = self.read_frame_payload().await?;
-        parse_client_request(payload)
-    }
-
-    /// Reads and parses one server reply as a borrowed view into the frame payload.
-    pub async fn read_server_reply(&mut self) -> Result<ServerReply<'_>> {
-        let payload = self.read_frame_payload().await?;
-        parse_server_reply(payload)
+    pub(crate) fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+        ready!(self.poll_read_frame_payload_inner(cx))?;
+        Poll::Ready(Ok(&self.body[self.payload_start..self.payload_end]))
     }
 
     pub(crate) fn take_payload_from(&mut self, offset: usize) -> Bytes {
@@ -799,21 +832,23 @@ where
         self.payload_end = 0;
     }
 
-    async fn fill_to(&mut self, needed: usize) -> Result<()> {
+    fn poll_fill_to(&mut self, cx: &mut Context<'_>, needed: usize) -> Poll<Result<()>> {
         while self.body.len() < needed {
             let min_spare = needed - self.body.len();
-            let n = poll_fn(|cx| {
-                poll_read_ahead_into_spare(&mut self.inner, cx, &mut self.body, min_spare)
-            })
-            .await?;
+            let n = ready!(poll_read_ahead_into_spare(
+                &mut self.inner,
+                cx,
+                &mut self.body,
+                min_spare
+            ))?;
             if n == 0 {
-                return Err(std::io::Error::new(
+                return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "early eof reading snell frame",
                 )
-                .into());
+                .into()));
             }
         }
-        Ok(())
+        Poll::Ready(Ok(()))
     }
 }

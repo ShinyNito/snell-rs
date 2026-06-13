@@ -82,29 +82,33 @@ where
 mod tests {
     use core::range::Range;
 
-    use tokio::io::duplex;
-
     use super::{UdpClientStream, UdpServerStream};
     use crate::ProtocolVersion;
     use crate::error::Error;
-    use crate::framed::{SnellStreamReader, SnellStreamWriter};
     use crate::protocol::request::{ClientRequest, ServerReply};
+    use crate::test_support::{
+        TEST_PSK, test_duplex_pair, test_snell_reader, test_snell_reader_with_version,
+        test_snell_writer, test_snell_writer_with_version,
+    };
 
     #[tokio::test]
     async fn udp_client_open_writes_udp_request_and_accepts_empty_tunnel() {
-        let (client_upload, server_upload) = duplex(4096);
-        let (server_download, client_download) = duplex(4096);
-        let psk = b"test psk";
+        let (client_upload, server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let client = async {
-            UdpClientStream::open_io(client_download, client_upload, psk, ProtocolVersion::V4)
-                .await
-                .unwrap()
+            UdpClientStream::open_io(
+                client_download,
+                client_upload,
+                TEST_PSK,
+                ProtocolVersion::V4,
+            )
+            .await
+            .unwrap()
         };
 
         let server = async {
-            let mut reader =
-                SnellStreamReader::new(server_upload, psk, ProtocolVersion::V4).unwrap();
+            let mut reader = test_snell_reader(server_upload);
             let request = reader.read_client_request().await.unwrap();
             assert_eq!(
                 request,
@@ -114,7 +118,7 @@ mod tests {
                 }
             );
 
-            let writer = SnellStreamWriter::new(server_download, psk, ProtocolVersion::V4).unwrap();
+            let writer = test_snell_writer(server_download);
             UdpServerStream::accept(reader, writer).await.unwrap()
         };
 
@@ -125,19 +129,22 @@ mod tests {
 
     #[tokio::test]
     async fn udp_client_open_supports_v6_stream() {
-        let (client_upload, server_upload) = duplex(4096);
-        let (server_download, client_download) = duplex(4096);
-        let psk = b"test psk";
+        let (client_upload, server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let client = async {
-            UdpClientStream::open_io(client_download, client_upload, psk, ProtocolVersion::V6)
-                .await
-                .unwrap()
+            UdpClientStream::open_io(
+                client_download,
+                client_upload,
+                TEST_PSK,
+                ProtocolVersion::V6,
+            )
+            .await
+            .unwrap()
         };
 
         let server = async {
-            let mut reader =
-                SnellStreamReader::new(server_upload, psk, ProtocolVersion::V6).unwrap();
+            let mut reader = test_snell_reader_with_version(server_upload, ProtocolVersion::V6);
             let request = reader.read_client_request().await.unwrap();
             assert_eq!(
                 request,
@@ -147,7 +154,7 @@ mod tests {
                 }
             );
 
-            let writer = SnellStreamWriter::new(server_download, psk, ProtocolVersion::V6).unwrap();
+            let writer = test_snell_writer_with_version(server_download, ProtocolVersion::V6);
             UdpServerStream::accept(reader, writer).await.unwrap()
         };
 
@@ -158,24 +165,27 @@ mod tests {
 
     #[tokio::test]
     async fn udp_client_open_rejects_non_empty_tunnel_reply() {
-        let (client_upload, server_upload) = duplex(4096);
-        let (server_download, client_download) = duplex(4096);
-        let psk = b"test psk";
+        let (client_upload, server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let client = async {
-            UdpClientStream::open_io(client_download, client_upload, psk, ProtocolVersion::V4).await
+            UdpClientStream::open_io(
+                client_download,
+                client_upload,
+                TEST_PSK,
+                ProtocolVersion::V4,
+            )
+            .await
         };
 
         let server = async {
-            let mut reader =
-                SnellStreamReader::new(server_upload, psk, ProtocolVersion::V4).unwrap();
+            let mut reader = test_snell_reader(server_upload);
             assert!(matches!(
                 reader.read_client_request().await.unwrap(),
                 ClientRequest::Udp { .. }
             ));
 
-            let mut server_writer =
-                SnellStreamWriter::new(server_download, psk, ProtocolVersion::V4).unwrap();
+            let mut server_writer = test_snell_writer(server_download);
             server_writer
                 .write_test_tunnel_reply(b"unexpected")
                 .await
@@ -188,19 +198,16 @@ mod tests {
 
     #[tokio::test]
     async fn udp_server_accept_sends_empty_tunnel_reply() {
-        let (server_download, client_download) = duplex(4096);
-        let psk = b"test psk";
+        let (server_download, client_download) = test_duplex_pair();
 
         let server = async {
-            let reader =
-                SnellStreamReader::new(tokio::io::empty(), psk, ProtocolVersion::V4).unwrap();
-            let writer = SnellStreamWriter::new(server_download, psk, ProtocolVersion::V4).unwrap();
+            let reader = test_snell_reader(tokio::io::empty());
+            let writer = test_snell_writer(server_download);
             UdpServerStream::accept(reader, writer).await.unwrap()
         };
 
         let client = async {
-            let mut reader =
-                SnellStreamReader::new(client_download, psk, ProtocolVersion::V4).unwrap();
+            let mut reader = test_snell_reader(client_download);
             assert_eq!(
                 reader.read_server_reply().await.unwrap(),
                 ServerReply::Tunnel {

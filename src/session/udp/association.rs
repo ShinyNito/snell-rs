@@ -228,7 +228,7 @@ mod tests {
     use std::time::Duration;
 
     use tokio::io::AsyncReadExt;
-    use tokio::net::{TcpListener, TcpStream, UdpSocket};
+    use tokio::net::TcpStream;
     use tokio::time::timeout;
 
     use super::relay_udp_server_stream;
@@ -245,7 +245,10 @@ mod tests {
         read_client_request as read_socks_client_request, write_reply_with_bind,
     };
     use crate::session::udp::stream::UdpClientStream;
-    use crate::test_support::{accept_udp_server_stream, read_udp_response_frame};
+    use crate::test_support::{
+        TEST_PSK, accept_udp_server_stream, read_udp_response_frame, test_duplex_pair,
+        test_tcp_listener, test_udp_socket,
+    };
 
     fn direct_options(ipv6: bool) -> RelayOptions {
         RelayOptions::direct(ipv6, DnsResolver::system())
@@ -257,11 +260,11 @@ mod tests {
 
     #[tokio::test]
     async fn udp_server_stream_relays_one_datagram_response() {
-        let psk = b"test psk";
-        let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let udp_target = test_udp_socket().await;
         let target_addr = udp_target.local_addr().unwrap();
-        let (client_upload, server_upload) = tokio::io::duplex(4096);
-        let (server_download, client_download) = tokio::io::duplex(4096);
+        let (client_upload, server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let target = async {
             let mut input = [0u8; 64];
@@ -318,13 +321,13 @@ mod tests {
 
     #[tokio::test]
     async fn udp_stream_does_not_head_of_line_block_on_missing_response() {
-        let psk = b"test psk";
-        let no_reply_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let no_reply_target = test_udp_socket().await;
         let no_reply_addr = no_reply_target.local_addr().unwrap();
-        let reply_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reply_target = test_udp_socket().await;
         let reply_addr = reply_target.local_addr().unwrap();
-        let (client_upload, server_upload) = tokio::io::duplex(4096);
-        let (server_download, client_download) = tokio::io::duplex(4096);
+        let (client_upload, server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let no_reply = async {
             let mut input = [0u8; 64];
@@ -402,12 +405,12 @@ mod tests {
 
     #[tokio::test]
     async fn udp_server_relays_datagram_via_upstream_socks5() {
-        let psk = b"test psk";
-        let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let udp_target = test_udp_socket().await;
         let target_addr = udp_target.local_addr().unwrap();
-        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_listener = test_tcp_listener().await;
         let socks_addr = socks_listener.local_addr().unwrap();
-        let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let snell_listener = test_tcp_listener().await;
         let snell_addr = snell_listener.local_addr().unwrap();
 
         let target = async {
@@ -427,14 +430,14 @@ mod tests {
                     port: 0,
                 })
             );
-            let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let relay = test_udp_socket().await;
             let relay_addr = relay.local_addr().unwrap();
             write_reply_with_bind(&mut control, SocksReply::Succeeded, relay_addr)
                 .await
                 .unwrap();
 
-            let mut request = [0u8; crate::MAX_PACKET_SIZE + 512];
-            let (n, snell_peer) = relay.recv_from(&mut request).await.unwrap();
+            let mut request = bytes::BytesMut::with_capacity(crate::MAX_PACKET_SIZE + 512);
+            let (n, snell_peer) = relay.recv_buf_from(&mut request).await.unwrap();
             let packet = parse_socks_udp_packet(&request[..n]).unwrap();
             assert_eq!(
                 packet.address,
@@ -496,10 +499,10 @@ mod tests {
 
     #[tokio::test]
     async fn udp_upstream_socks5_failure_returns_server_error_before_tunnel_success() {
-        let psk = b"test psk";
-        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let socks_listener = test_tcp_listener().await;
         let socks_addr = socks_listener.local_addr().unwrap();
-        let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let snell_listener = test_tcp_listener().await;
         let snell_addr = snell_listener.local_addr().unwrap();
 
         let socks = async {
@@ -527,17 +530,17 @@ mod tests {
 
     #[tokio::test]
     async fn udp_upstream_socks5_control_close_ends_association() {
-        let psk = b"test psk";
-        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let socks_listener = test_tcp_listener().await;
         let socks_addr = socks_listener.local_addr().unwrap();
-        let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let snell_listener = test_tcp_listener().await;
         let snell_addr = snell_listener.local_addr().unwrap();
 
         let socks = async {
             let (mut control, _) = socks_listener.accept().await.unwrap();
             let request = read_socks_client_request(&mut control).await.unwrap();
             assert!(matches!(request, SocksRequest::UdpAssociate(_)));
-            let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let relay = test_udp_socket().await;
             write_reply_with_bind(
                 &mut control,
                 SocksReply::Succeeded,
@@ -579,9 +582,9 @@ mod tests {
 
     #[tokio::test]
     async fn udp_association_idle_timeout_sends_zero_chunk_to_client() {
-        let psk = b"test psk";
-        let (client_upload, server_upload) = tokio::io::duplex(4096);
-        let (server_download, client_download) = tokio::io::duplex(4096);
+        let psk = TEST_PSK;
+        let (client_upload, server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let server = async {
             let stream = accept_udp_server_stream(
@@ -626,9 +629,9 @@ mod tests {
 
     #[tokio::test]
     async fn client_zero_chunk_ends_udp_association_without_waiting_for_idle() {
-        let psk = b"test psk";
-        let (client_upload, server_upload) = tokio::io::duplex(4096);
-        let (server_download, client_download) = tokio::io::duplex(4096);
+        let psk = TEST_PSK;
+        let (client_upload, server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let server = async {
             let stream = accept_udp_server_stream(
@@ -668,11 +671,11 @@ mod tests {
 
     #[tokio::test]
     async fn udp_to_snell_stops_when_snell_writer_is_closed() {
-        let psk = b"test psk";
-        let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let udp_target = test_udp_socket().await;
         let target_addr = udp_target.local_addr().unwrap();
-        let (client_upload, server_upload) = tokio::io::duplex(4096);
-        let (server_download, client_download) = tokio::io::duplex(4096);
+        let (client_upload, server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let target = async {
             let mut input = [0u8; 64];
@@ -731,8 +734,8 @@ mod tests {
 
     #[tokio::test]
     async fn udp_tcp_connection_rejects_ipv6_when_disabled() {
-        let psk = b"test psk";
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let listener = test_tcp_listener().await;
         let server_addr = listener.local_addr().unwrap();
 
         let server = async {

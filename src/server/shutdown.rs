@@ -45,6 +45,8 @@ fn try_set_tcp_fast_open(socket: &TcpSocket, enabled: bool) {
     use std::os::fd::AsRawFd;
 
     let value: libc::c_int = SERVER_LISTEN_BACKLOG as libc::c_int;
+    // SAFETY: `value` is a live c_int for the duration of the setsockopt call,
+    // and the socket raw fd comes from Tokio's TcpSocket.
     let result = unsafe {
         libc::setsockopt(
             socket.as_raw_fd(),

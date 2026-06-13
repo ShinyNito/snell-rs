@@ -4,6 +4,7 @@ mod reader;
 mod tests;
 mod writer;
 
+pub(crate) use buffer::poll_read_ahead_into_spare_with_capacity;
 pub(crate) use reader::SnellStreamReader;
 pub(crate) use writer::SnellStreamWriter;
 
@@ -14,5 +15,6 @@ pub const TCP_FIRST_RECORD_OVERHEAD: usize = 55;
 pub const TCP_STEADY_RECORD_OVERHEAD: usize = 39;
 pub const TCP_RECORD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const STREAM_BUFFER_INITIAL_CAPACITY: usize = 2048;
+pub(crate) const STREAM_READ_AHEAD_CAPACITY: usize = 64 * 1024;
 pub(crate) const STREAM_BUFFER_RETAIN_CAPACITY: usize = MAX_PACKET_SIZE + 1024;
 pub(super) const FRAME_HEAD_INITIAL_CAPACITY: usize = 512;

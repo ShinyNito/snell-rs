@@ -2,27 +2,27 @@ use core::range::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::TcpListener;
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
 use super::{ReusePool, ReusedSnellTcp, SharedPsk, SnellClientOutbound};
 use crate::ProtocolVersion;
 use crate::error::Error;
-use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::protocol::request::ClientRequest;
+use crate::test_support::{
+    TEST_PSK, test_snell_reader, test_snell_reader_with_version, test_snell_writer,
+    test_snell_writer_with_version, test_tcp_listener,
+};
 
 macro_rules! assert_next_payload {
     ($conn:expr, $expected:expr) => {{
         let payload = $conn
             .reader_mut()
-            .read_payload_chunk()
+            .take_payload_chunk()
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(payload, $expected);
-        let len = payload.len();
-        $conn.reader_mut().consume_payload_chunk(len);
+        assert_eq!(&payload[..], $expected);
     }};
 }
 
@@ -35,17 +35,15 @@ fn shared_psk(psk: &[u8]) -> SharedPsk {
 }
 
 async fn pool_conn_after_reply(
-    psk: &[u8],
     reply: &'static [u8],
     send_server_zero: bool,
-    consume_len: usize,
     read_until_done: bool,
 ) -> (ReusePool, ReusedSnellTcp) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_tcp_listener().await;
     let server_addr = listener.local_addr().unwrap();
     let pool = ReusePool::with_limits(
         server_addr,
-        shared_psk(psk),
+        shared_psk(TEST_PSK),
         ProtocolVersion::V4,
         4,
         Duration::from_secs(60),
@@ -55,9 +53,8 @@ async fn pool_conn_after_reply(
     let server = async {
         let (stream, _) = listener.accept().await.unwrap();
         let (reader_io, writer_io) = stream.into_split();
-        let mut reader = SnellStreamReader::new(reader_io, psk, ProtocolVersion::V4).unwrap();
-        let mut server_writer =
-            SnellStreamWriter::new(writer_io, psk, ProtocolVersion::V4).unwrap();
+        let mut reader = test_snell_reader(reader_io);
+        let mut server_writer = test_snell_writer(writer_io);
         let request = reader.read_client_request().await.unwrap();
         assert_eq!(
             request,
@@ -82,16 +79,15 @@ async fn pool_conn_after_reply(
         let mut conn = pool.open("example.com", 443).await.unwrap();
         let payload = conn
             .reader_mut()
-            .read_payload_chunk()
+            .take_payload_chunk()
             .await
             .unwrap()
             .unwrap();
-        let len = consume_len.min(payload.len());
-        conn.reader_mut().consume_payload_chunk(len);
+        assert_eq!(payload, reply);
         if read_until_done {
             assert!(
                 conn.reader_mut()
-                    .read_payload_chunk()
+                    .take_payload_chunk()
                     .await
                     .unwrap()
                     .is_none()
@@ -105,15 +101,15 @@ async fn pool_conn_after_reply(
     (pool, conn)
 }
 
-async fn completed_pool_conn(psk: &[u8]) -> (ReusePool, ReusedSnellTcp) {
-    pool_conn_after_reply(psk, b"ok", true, usize::MAX, true).await
+async fn completed_pool_conn() -> (ReusePool, ReusedSnellTcp) {
+    pool_conn_after_reply(b"ok", true, true).await
 }
 
 async fn read_ok_and_close(conn: &mut ReusedSnellTcp) {
     assert_next_payload!(conn, b"ok");
     assert!(
         conn.reader_mut()
-            .read_payload_chunk()
+            .take_payload_chunk()
             .await
             .unwrap()
             .is_none()
@@ -125,7 +121,7 @@ async fn read_ok_and_close(conn: &mut ReusedSnellTcp) {
 fn snell_outbound_shares_psk_with_reuse_pool() {
     let server_addr = "127.0.0.1:1".parse().unwrap();
     let outbound =
-        SnellClientOutbound::new(server_addr, b"test psk".to_vec(), true, ProtocolVersion::V4)
+        SnellClientOutbound::new(server_addr, TEST_PSK.to_vec(), true, ProtocolVersion::V4)
             .unwrap();
     let pool = outbound.pool.as_ref().expect("reuse pool");
 
@@ -134,12 +130,11 @@ fn snell_outbound_shares_psk_with_reuse_pool() {
 
 #[tokio::test]
 async fn reuse_pool_reuses_completed_stream() {
-    let psk = b"test psk";
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_tcp_listener().await;
     let server_addr = listener.local_addr().unwrap();
     let pool = ReusePool::with_limits(
         server_addr,
-        shared_psk(psk),
+        shared_psk(TEST_PSK),
         ProtocolVersion::V4,
         2,
         Duration::from_secs(60),
@@ -149,9 +144,8 @@ async fn reuse_pool_reuses_completed_stream() {
     let server = async {
         let (stream, _) = listener.accept().await.unwrap();
         let (reader_io, writer_io) = stream.into_split();
-        let mut reader = SnellStreamReader::new(reader_io, psk, ProtocolVersion::V4).unwrap();
-        let mut server_writer =
-            SnellStreamWriter::new(writer_io, psk, ProtocolVersion::V4).unwrap();
+        let mut reader = test_snell_reader(reader_io);
+        let mut server_writer = test_snell_writer(writer_io);
 
         for (host, reply) in [("one.example", b"one" as &[u8]), ("two.example", b"two")] {
             let request = timeout(Duration::from_secs(1), reader.read_client_request())
@@ -187,7 +181,7 @@ async fn reuse_pool_reuses_completed_stream() {
         assert!(
             first
                 .reader_mut()
-                .read_payload_chunk()
+                .take_payload_chunk()
                 .await
                 .unwrap()
                 .is_none()
@@ -201,7 +195,7 @@ async fn reuse_pool_reuses_completed_stream() {
         assert!(
             second
                 .reader_mut()
-                .read_payload_chunk()
+                .take_payload_chunk()
                 .await
                 .unwrap()
                 .is_none()
@@ -216,12 +210,11 @@ async fn reuse_pool_reuses_completed_stream() {
 
 #[tokio::test]
 async fn reuse_pool_reuses_completed_v6_stream() {
-    let psk = b"test psk";
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_tcp_listener().await;
     let server_addr = listener.local_addr().unwrap();
     let pool = ReusePool::with_limits(
         server_addr,
-        shared_psk(psk),
+        shared_psk(TEST_PSK),
         ProtocolVersion::V6,
         2,
         Duration::from_secs(60),
@@ -231,9 +224,8 @@ async fn reuse_pool_reuses_completed_v6_stream() {
     let server = async {
         let (stream, _) = listener.accept().await.unwrap();
         let (reader_io, writer_io) = stream.into_split();
-        let mut reader = SnellStreamReader::new(reader_io, psk, ProtocolVersion::V6).unwrap();
-        let mut server_writer =
-            SnellStreamWriter::new(writer_io, psk, ProtocolVersion::V6).unwrap();
+        let mut reader = test_snell_reader_with_version(reader_io, ProtocolVersion::V6);
+        let mut server_writer = test_snell_writer_with_version(writer_io, ProtocolVersion::V6);
 
         for (host, reply) in [("one.example", b"one" as &[u8]), ("two.example", b"two")] {
             let request = timeout(Duration::from_secs(1), reader.read_client_request())
@@ -269,7 +261,7 @@ async fn reuse_pool_reuses_completed_v6_stream() {
         assert!(
             first
                 .reader_mut()
-                .read_payload_chunk()
+                .take_payload_chunk()
                 .await
                 .unwrap()
                 .is_none()
@@ -283,7 +275,7 @@ async fn reuse_pool_reuses_completed_v6_stream() {
         assert!(
             second
                 .reader_mut()
-                .read_payload_chunk()
+                .take_payload_chunk()
                 .await
                 .unwrap()
                 .is_none()
@@ -298,12 +290,11 @@ async fn reuse_pool_reuses_completed_v6_stream() {
 
 #[tokio::test]
 async fn reuse_pool_prunes_expired_connections_before_put() {
-    let psk = b"test psk";
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_tcp_listener().await;
     let server_addr = listener.local_addr().unwrap();
     let pool = ReusePool::with_limits(
         server_addr,
-        shared_psk(psk),
+        shared_psk(TEST_PSK),
         ProtocolVersion::V4,
         1,
         Duration::from_secs(60),
@@ -314,9 +305,8 @@ async fn reuse_pool_prunes_expired_connections_before_put() {
         for host in ["old.example", "new.example"] {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader_io, writer_io) = stream.into_split();
-            let mut reader = SnellStreamReader::new(reader_io, psk, ProtocolVersion::V4).unwrap();
-            let mut server_writer =
-                SnellStreamWriter::new(writer_io, psk, ProtocolVersion::V4).unwrap();
+            let mut reader = test_snell_reader(reader_io);
+            let mut server_writer = test_snell_writer(writer_io);
             let request = reader.read_client_request().await.unwrap();
             assert_eq!(
                 request,
@@ -358,8 +348,7 @@ async fn reuse_pool_prunes_expired_connections_before_put() {
 
 #[tokio::test]
 async fn reuse_pool_drops_idle_expired_connection() {
-    let psk = b"test psk";
-    let (pool, conn) = completed_pool_conn(psk).await;
+    let (pool, conn) = completed_pool_conn().await;
     pool.put(conn).await;
     {
         let mut idle = pool.idle.lock().expect("reuse pool mutex poisoned");
@@ -372,8 +361,7 @@ async fn reuse_pool_drops_idle_expired_connection() {
 
 #[tokio::test]
 async fn reuse_pool_close_idle_drains_idle_connections() {
-    let psk = b"test psk";
-    let (pool, conn) = completed_pool_conn(psk).await;
+    let (pool, conn) = completed_pool_conn().await;
     pool.put(conn).await;
     assert_eq!(idle_len(&pool), 1);
 
@@ -384,20 +372,18 @@ async fn reuse_pool_close_idle_drains_idle_connections() {
 
 #[tokio::test]
 async fn reuse_conn_total_age_does_not_block_reuse() {
-    let psk = b"test psk";
-    let (_pool, conn) = completed_pool_conn(psk).await;
+    let (_pool, conn) = completed_pool_conn().await;
 
     assert!(conn.can_reuse());
 }
 
 #[tokio::test]
 async fn reuse_pool_keeps_only_max_size_connections() {
-    let psk = b"test psk";
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_tcp_listener().await;
     let server_addr = listener.local_addr().unwrap();
     let pool = ReusePool::with_limits(
         server_addr,
-        shared_psk(psk),
+        shared_psk(TEST_PSK),
         ProtocolVersion::V4,
         1,
         Duration::from_secs(60),
@@ -408,9 +394,8 @@ async fn reuse_pool_keeps_only_max_size_connections() {
         for host in ["one.example", "two.example"] {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader_io, writer_io) = stream.into_split();
-            let mut reader = SnellStreamReader::new(reader_io, psk, ProtocolVersion::V4).unwrap();
-            let mut server_writer =
-                SnellStreamWriter::new(writer_io, psk, ProtocolVersion::V4).unwrap();
+            let mut reader = test_snell_reader(reader_io);
+            let mut server_writer = test_snell_writer(writer_io);
             let request = reader.read_client_request().await.unwrap();
             assert_eq!(
                 request,
@@ -452,14 +437,11 @@ async fn reuse_pool_only_recycles_complete_successful_streams() {
         ServerStillOpen,
     }
 
-    let psk = b"test psk";
     for case in [Case::Complete, Case::PendingPayload, Case::ServerStillOpen] {
         let (pool, conn) = match case {
-            Case::PendingPayload => pool_conn_after_reply(psk, b"pending", true, 2, false).await,
-            Case::ServerStillOpen => {
-                pool_conn_after_reply(psk, b"ok", false, usize::MAX, false).await
-            }
-            Case::Complete => completed_pool_conn(psk).await,
+            Case::PendingPayload => pool_conn_after_reply(b"pending", true, false).await,
+            Case::ServerStillOpen => pool_conn_after_reply(b"ok", false, false).await,
+            Case::Complete => completed_pool_conn().await,
         };
 
         let expected_idle = match case {

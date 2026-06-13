@@ -8,7 +8,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::{Error, Result};
 
-use super::{STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY};
+use super::{
+    STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY, STREAM_READ_AHEAD_CAPACITY,
+};
 
 pub(super) async fn write_all_vectored<W>(
     writer: &mut W,
@@ -62,7 +64,7 @@ where
     .await
 }
 
-pub(super) fn poll_read_into_spare<R>(
+pub(super) fn poll_read_into_prepared_spare<R>(
     reader: &mut R,
     cx: &mut Context<'_>,
     buffer: &mut BytesMut,
@@ -71,39 +73,17 @@ pub(super) fn poll_read_into_spare<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let spare_len = buffer.chunk_mut().len();
-    if spare_len < read_limit {
-        buffer.reserve(read_limit);
-    }
-
     let spare = buffer.chunk_mut();
     if spare.len() < read_limit {
         return Poll::Ready(Err(Error::PayloadTooLarge));
     }
 
-    // Same boundary Tokio's read_buf uses: poll_read may initialize only the
-    // unfilled tail we hand to ReadBuf.
-    let spare = unsafe { spare.as_uninit_slice_mut() };
-    let mut read_buf = ReadBuf::uninit(&mut spare[..read_limit]);
-
-    match Pin::new(reader).poll_read(cx, &mut read_buf) {
-        Poll::Pending => Poll::Pending,
-        Poll::Ready(Ok(())) => {
-            let read_len = read_buf.filled().len();
-            // ReadBuf reports exactly how many bytes poll_read initialized in
-            // BytesMut's spare capacity.
-            unsafe {
-                buffer.advance_mut(read_len);
-            }
-            Poll::Ready(Ok(read_len))
-        }
-        Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
-    }
+    poll_read_into_spare(reader, cx, buffer, read_limit)
 }
 
 /// Like `poll_read_into_spare`, but offers the reader the whole spare capacity
-/// (at least `min_spare`) instead of an exact byte count, so one syscall can
-/// pull in bytes of several frames.
+/// up to the stream read-ahead budget instead of an exact byte count, so one
+/// syscall can pull in bytes of several frames.
 pub(super) fn poll_read_ahead_into_spare<R>(
     reader: &mut R,
     cx: &mut Context<'_>,
@@ -113,22 +93,59 @@ pub(super) fn poll_read_ahead_into_spare<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let spare_len = buffer.chunk_mut().len();
-    if spare_len < min_spare {
-        buffer.reserve(min_spare);
+    poll_read_ahead_into_spare_with_capacity(
+        reader,
+        cx,
+        buffer,
+        min_spare,
+        STREAM_READ_AHEAD_CAPACITY,
+    )
+}
+
+pub(crate) fn poll_read_ahead_into_spare_with_capacity<R>(
+    reader: &mut R,
+    cx: &mut Context<'_>,
+    buffer: &mut BytesMut,
+    min_spare: usize,
+    read_ahead_capacity: usize,
+) -> Poll<Result<usize>>
+where
+    R: AsyncRead + Unpin,
+{
+    let desired_spare = min_spare.max(read_ahead_capacity.saturating_sub(buffer.len()));
+    if desired_spare == 0 {
+        return Poll::Ready(Ok(0));
+    }
+    if buffer.chunk_mut().len() < desired_spare {
+        buffer.reserve(desired_spare);
     }
 
-    // Same boundary Tokio's read_buf uses: poll_read may initialize only the
-    // unfilled tail we hand to ReadBuf.
+    let read_len = buffer.chunk_mut().len().min(desired_spare);
+    poll_read_into_spare(reader, cx, buffer, read_len)
+}
+
+fn poll_read_into_spare<R>(
+    reader: &mut R,
+    cx: &mut Context<'_>,
+    buffer: &mut BytesMut,
+    read_len: usize,
+) -> Poll<Result<usize>>
+where
+    R: AsyncRead + Unpin,
+{
+    debug_assert!(buffer.chunk_mut().len() >= read_len);
+
+    // SAFETY: `chunk_mut` exposes only BytesMut's spare capacity. `ReadBuf`
+    // tracks exactly which bytes the AsyncRead implementation initializes.
     let spare = unsafe { buffer.chunk_mut().as_uninit_slice_mut() };
-    let mut read_buf = ReadBuf::uninit(spare);
+    let mut read_buf = ReadBuf::uninit(&mut spare[..read_len]);
 
     match Pin::new(reader).poll_read(cx, &mut read_buf) {
         Poll::Pending => Poll::Pending,
         Poll::Ready(Ok(())) => {
             let read_len = read_buf.filled().len();
-            // ReadBuf reports exactly how many bytes poll_read initialized in
-            // BytesMut's spare capacity.
+            // SAFETY: `read_len` comes from `ReadBuf::filled`, so these bytes
+            // are initialized and lie within the spare slice handed to poll_read.
             unsafe {
                 buffer.advance_mut(read_len);
             }

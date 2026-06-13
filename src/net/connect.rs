@@ -66,18 +66,17 @@ pub(crate) async fn connect_tcp_any(addrs: Vec<SocketAddr>) -> std::io::Result<T
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
     use super::connect_tcp_any;
+    use crate::test_support::test_tcp_listener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn connect_tcp_any_returns_first_successful_connection() {
-        let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused = test_tcp_listener().await;
         let unused_addr = unused.local_addr().unwrap();
         drop(unused);
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = test_tcp_listener().await;
         let addr = listener.local_addr().unwrap();
 
         let server = async {
@@ -103,7 +102,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_tcp_any_returns_connect_error_when_all_candidates_fail() {
-        let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused = test_tcp_listener().await;
         let unused_addr = unused.local_addr().unwrap();
         drop(unused);
 

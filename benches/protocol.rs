@@ -8,6 +8,9 @@ use snell_rs::protocol::crypto::{AES_128_KEY_SIZE, Aes128GcmCrypto, SALT_SIZE, d
 use snell_rs::protocol::v4::frame::{
     V4_HEADER_CIPHER_SIZE, V4FrameDecoder, V4FrameEncoder, split_salt,
 };
+use snell_rs::protocol::v6::{
+    V6_HEADER_CIPHER_SIZE, V6FrameDecoder, V6FrameEncoder, V6Profile, split_salt_block,
+};
 
 const PSK: &[u8] = b"benchmark psk";
 const SALT: [u8; SALT_SIZE] = [7; SALT_SIZE];
@@ -187,6 +190,118 @@ fn benchmark_v4_frame_decode(c: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_v6_frame_encode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("protocol/v6_frame_encode");
+
+    for size in PAYLOAD_SIZES {
+        let payload = vec![0x42; size];
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("first_frame", size), &size, |b, _| {
+            b.iter_batched(
+                || {
+                    (
+                        V6FrameEncoder::with_salt(PSK, SALT).unwrap(),
+                        BytesMut::with_capacity(2048),
+                        BytesMut::from(payload.as_slice()),
+                    )
+                },
+                |(mut encoder, mut head, mut body)| {
+                    let payload_len = body.len();
+                    let written = encoder
+                        .encode_payload_in_place(black_box(&mut body), payload_len, &mut head)
+                        .unwrap();
+                    black_box(written);
+                    black_box(head);
+                    black_box(body);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.bench_with_input(BenchmarkId::new("steady_frame", size), &size, |b, _| {
+            let mut encoder = V6FrameEncoder::with_salt(PSK, SALT).unwrap();
+            let mut head = BytesMut::with_capacity(2048);
+            let mut body = BytesMut::from(payload.as_slice());
+            encoder
+                .encode_payload_in_place(&mut body, payload.len(), &mut head)
+                .unwrap();
+
+            b.iter_batched(
+                || BytesMut::from(payload.as_slice()),
+                |mut body| {
+                    head.clear();
+                    let payload_len = body.len();
+                    let written = encoder
+                        .encode_payload_in_place(black_box(&mut body), payload_len, &mut head)
+                        .unwrap();
+                    black_box(written);
+                    black_box(head.len() + body.len());
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+fn benchmark_v6_frame_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("protocol/v6_frame_decode");
+
+    for size in PAYLOAD_SIZES {
+        let payload = vec![0x42; size];
+        let first = v6_first_frame(&payload);
+        let steady = v6_steady_frame(&payload);
+
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("first_frame", size), &size, |b, _| {
+            b.iter_batched(
+                || {
+                    let decoder = V6FrameDecoder::new(PSK, first.salt).unwrap();
+                    let prefix = first.prefix.clone();
+                    let header = first.header;
+                    let body = first.body.clone();
+                    (decoder, prefix, header, body)
+                },
+                |(mut decoder, prefix, mut header, mut body)| {
+                    let decoded = decoder.decode_header(&prefix, &mut header).unwrap();
+                    let payload = decoder.decode_payload_in_place(decoded, &mut body).unwrap();
+                    black_box(payload.len());
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.bench_with_input(BenchmarkId::new("steady_frame", size), &size, |b, _| {
+            b.iter_batched(
+                || {
+                    let mut decoder = V6FrameDecoder::new(PSK, steady.salt).unwrap();
+                    let mut warm_header = steady.warmup.header;
+                    let mut warm_body = steady.warmup.body.clone();
+                    let warm_decoded = decoder
+                        .decode_header(&steady.warmup.prefix, &mut warm_header)
+                        .unwrap();
+                    decoder
+                        .decode_payload_in_place(warm_decoded, &mut warm_body)
+                        .unwrap();
+
+                    let prefix = steady.measured.prefix.clone();
+                    let header = steady.measured.header;
+                    let body = steady.measured.body.clone();
+                    (decoder, prefix, header, body)
+                },
+                |(mut decoder, prefix, mut header, mut body)| {
+                    let decoded = decoder.decode_header(&prefix, &mut header).unwrap();
+                    let payload = decoder.decode_payload_in_place(decoded, &mut body).unwrap();
+                    black_box(payload.len());
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 #[derive(Clone)]
 struct FrameParts {
     salt: [u8; SALT_SIZE],
@@ -198,6 +313,20 @@ struct SteadyFrame {
     salt: [u8; SALT_SIZE],
     warmup: FrameParts,
     measured: FrameParts,
+}
+
+#[derive(Clone)]
+struct V6FrameParts {
+    salt: [u8; SALT_SIZE],
+    prefix: Vec<u8>,
+    header: [u8; V6_HEADER_CIPHER_SIZE],
+    body: Vec<u8>,
+}
+
+struct V6SteadyFrame {
+    salt: [u8; SALT_SIZE],
+    warmup: V6FrameParts,
+    measured: V6FrameParts,
 }
 
 fn first_frame(payload: &[u8]) -> FrameParts {
@@ -238,11 +367,86 @@ fn steady_frame(payload: &[u8]) -> SteadyFrame {
     }
 }
 
+fn encode_v6_frame_in_place(
+    encoder: &mut V6FrameEncoder,
+    payload: &[u8],
+    out: &mut BytesMut,
+) -> usize {
+    let start_len = out.len();
+    let mut head = BytesMut::new();
+    let mut body = BytesMut::from(payload);
+    encoder
+        .encode_payload_in_place(&mut body, payload.len(), &mut head)
+        .unwrap();
+    out.extend_from_slice(&head);
+    out.extend_from_slice(&body);
+    out.len() - start_len
+}
+
+fn v6_first_frame(payload: &[u8]) -> V6FrameParts {
+    let mut encoder = V6FrameEncoder::with_salt(PSK, SALT).unwrap();
+    let mut wire = BytesMut::new();
+    encode_v6_frame_in_place(&mut encoder, payload, &mut wire);
+
+    let profile = V6Profile::derive(PSK);
+    let (salt, frame) = split_salt_block(&profile, &wire).unwrap();
+    let (prefix, header, body) = split_v6_frame(frame, profile.record_prefix_len(0));
+    V6FrameParts {
+        salt,
+        prefix,
+        header,
+        body,
+    }
+}
+
+fn v6_steady_frame(payload: &[u8]) -> V6SteadyFrame {
+    let mut encoder = V6FrameEncoder::with_salt(PSK, SALT).unwrap();
+    let profile = V6Profile::derive(PSK);
+
+    let mut warmup_wire = BytesMut::new();
+    encode_v6_frame_in_place(&mut encoder, payload, &mut warmup_wire);
+    let (salt, warmup_frame) = split_salt_block(&profile, &warmup_wire).unwrap();
+    let (warmup_prefix, warmup_header, warmup_body) =
+        split_v6_frame(warmup_frame, profile.record_prefix_len(0));
+
+    let mut measured_wire = BytesMut::new();
+    encode_v6_frame_in_place(&mut encoder, payload, &mut measured_wire);
+    let (measured_prefix, measured_header, measured_body) =
+        split_v6_frame(&measured_wire, profile.record_prefix_len(1));
+
+    V6SteadyFrame {
+        salt,
+        warmup: V6FrameParts {
+            salt,
+            prefix: warmup_prefix,
+            header: warmup_header,
+            body: warmup_body,
+        },
+        measured: V6FrameParts {
+            salt,
+            prefix: measured_prefix,
+            header: measured_header,
+            body: measured_body,
+        },
+    }
+}
+
 fn split_frame(frame: &[u8]) -> ([u8; V4_HEADER_CIPHER_SIZE], Vec<u8>) {
     let mut header = [0; V4_HEADER_CIPHER_SIZE];
     header.copy_from_slice(&frame[..V4_HEADER_CIPHER_SIZE]);
     let body = frame[V4_HEADER_CIPHER_SIZE..].to_vec();
     (header, body)
+}
+
+fn split_v6_frame(
+    frame: &[u8],
+    prefix_len: usize,
+) -> (Vec<u8>, [u8; V6_HEADER_CIPHER_SIZE], Vec<u8>) {
+    let prefix = frame[..prefix_len].to_vec();
+    let mut header = [0; V6_HEADER_CIPHER_SIZE];
+    header.copy_from_slice(&frame[prefix_len..prefix_len + V6_HEADER_CIPHER_SIZE]);
+    let body = frame[prefix_len + V6_HEADER_CIPHER_SIZE..].to_vec();
+    (prefix, header, body)
 }
 
 fn criterion_config() -> Criterion {
@@ -254,6 +458,6 @@ fn criterion_config() -> Criterion {
 criterion_group! {
     name = benches;
     config = criterion_config();
-    targets = benchmark_crypto, benchmark_v4_frame_encode, benchmark_v4_frame_decode
+    targets = benchmark_crypto, benchmark_v4_frame_encode, benchmark_v4_frame_decode, benchmark_v6_frame_encode, benchmark_v6_frame_decode
 }
 criterion_main!(benches);

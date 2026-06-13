@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{Error, Result};
@@ -102,7 +103,7 @@ where
         Ok(())
     }
 
-    pub(crate) async fn read_payload_chunk(&mut self) -> Result<Option<&[u8]>> {
+    pub(crate) async fn take_payload_chunk(&mut self) -> Result<Option<Bytes>> {
         if self.payload.is_done() {
             return Ok(None);
         }
@@ -110,17 +111,13 @@ where
             self.read_tunnel_reply().await?;
         }
 
-        match self.payload.read_payload_chunk_strict().await {
+        match self.payload.take_payload_chunk_strict().await {
             Ok(payload) => Ok(payload),
             Err(err) => {
                 self.broken = true;
                 Err(err)
             }
         }
-    }
-
-    pub(crate) fn consume_payload_chunk(&mut self, len: usize) {
-        self.payload.consume_payload_chunk(len);
     }
 
     fn compact_buffers_for_reuse(&mut self) {
@@ -156,7 +153,7 @@ where
         }
     }
 
-    pub(crate) async fn write_payload_from_reader<P>(
+    pub(crate) async fn write_next_payload_record_from_reader<P>(
         &mut self,
         plain: &mut P,
     ) -> Result<Option<usize>>
@@ -166,7 +163,11 @@ where
         if self.write_closed {
             return Err(Error::WriteClosed);
         }
-        match self.frame_writer.write_payload_from_reader(plain).await {
+        match self
+            .frame_writer
+            .write_next_payload_record_from_reader(plain)
+            .await
+        {
             Ok(n) => Ok(n),
             Err(err) => {
                 self.broken = true;
@@ -201,25 +202,22 @@ where
 mod tests {
     use core::range::Range;
 
-    use tokio::io::{AsyncReadExt, AsyncWrite, duplex};
+    use tokio::io::{AsyncReadExt, AsyncWrite};
 
     use super::{ReuseClientConn, ReuseClientWriter};
-    use crate::ProtocolVersion;
     use crate::error::Error;
-    use crate::framed::{SnellStreamReader, SnellStreamWriter};
     use crate::protocol::request::ClientRequest;
+    use crate::test_support::{test_duplex_pair, test_snell_reader, test_snell_writer};
 
     macro_rules! assert_next_payload {
         ($conn:expr, $expected:expr) => {{
             let payload = $conn
                 .reader_mut()
-                .read_payload_chunk()
+                .take_payload_chunk()
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(payload, $expected);
-            let len = payload.len();
-            $conn.reader_mut().consume_payload_chunk(len);
+            assert_eq!(&payload[..], $expected);
         }};
     }
 
@@ -232,26 +230,24 @@ mod tests {
     {
         let mut plain = payload;
         Ok(writer
-            .write_payload_from_reader(&mut plain)
+            .write_next_payload_record_from_reader(&mut plain)
             .await?
             .unwrap_or(0))
     }
 
     #[tokio::test]
     async fn reuse_conn_requires_both_sides_done_before_reuse() {
-        let (client_upload, server_upload) = duplex(4096);
-        let (server_download, client_download) = duplex(4096);
-        let psk = b"test psk";
+        let (client_upload, server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let client = async {
-            let mut writer =
-                SnellStreamWriter::new(client_upload, psk, ProtocolVersion::V4).unwrap();
+            let mut writer = test_snell_writer(client_upload);
             writer
                 .write_tcp_request("example.com", 443, true)
                 .await
                 .unwrap();
 
-            let reader = SnellStreamReader::new(client_download, psk, ProtocolVersion::V4).unwrap();
+            let reader = test_snell_reader(client_download);
             let mut conn = ReuseClientConn::from_parts(reader, writer);
 
             assert_next_payload!(conn, b"pong");
@@ -259,7 +255,7 @@ mod tests {
 
             assert!(
                 conn.reader_mut()
-                    .read_payload_chunk()
+                    .take_payload_chunk()
                     .await
                     .unwrap()
                     .is_none()
@@ -271,8 +267,7 @@ mod tests {
         };
 
         let server = async {
-            let mut reader =
-                SnellStreamReader::new(server_upload, psk, ProtocolVersion::V4).unwrap();
+            let mut reader = test_snell_reader(server_upload);
             let request = reader.read_client_request().await.unwrap();
             assert_eq!(
                 request,
@@ -285,8 +280,7 @@ mod tests {
                 }
             );
 
-            let mut server_writer =
-                SnellStreamWriter::new(server_download, psk, ProtocolVersion::V4).unwrap();
+            let mut server_writer = test_snell_writer(server_download);
             server_writer
                 .write_test_tunnel_reply(b"pong")
                 .await
@@ -304,29 +298,26 @@ mod tests {
 
     #[tokio::test]
     async fn reuse_conn_with_pending_payload_is_not_reusable() {
-        let (client_upload, _server_upload) = duplex(4096);
-        let (server_download, client_download) = duplex(4096);
-        let psk = b"test psk";
+        let (client_upload, _server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let client = async {
-            let writer = SnellStreamWriter::new(client_upload, psk, ProtocolVersion::V4).unwrap();
-            let reader = SnellStreamReader::new(client_download, psk, ProtocolVersion::V4).unwrap();
+            let writer = test_snell_writer(client_upload);
+            let reader = test_snell_reader(client_download);
             let mut conn = ReuseClientConn::from_parts(reader, writer);
             let payload = conn
                 .reader_mut()
-                .read_payload_chunk()
+                .take_payload_chunk()
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(&payload[..2], b"po");
-            conn.reader_mut().consume_payload_chunk(2);
             conn.writer_mut().close_write().await.unwrap();
             assert!(!conn.can_reuse());
         };
 
         let server = async {
-            let mut server_writer =
-                SnellStreamWriter::new(server_download, psk, ProtocolVersion::V4).unwrap();
+            let mut server_writer = test_snell_writer(server_download);
             server_writer
                 .write_test_tunnel_reply(b"pong")
                 .await
@@ -339,23 +330,21 @@ mod tests {
 
     #[tokio::test]
     async fn reuse_conn_surfaces_server_error_reply() {
-        let (client_upload, _server_upload) = duplex(4096);
-        let (server_download, client_download) = duplex(4096);
-        let psk = b"test psk";
+        let (client_upload, _server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let client = async {
-            let writer = SnellStreamWriter::new(client_upload, psk, ProtocolVersion::V4).unwrap();
-            let reader = SnellStreamReader::new(client_download, psk, ProtocolVersion::V4).unwrap();
+            let writer = test_snell_writer(client_upload);
+            let reader = test_snell_reader(client_download);
             let mut conn = ReuseClientConn::from_parts(reader, writer);
             assert!(matches!(
-                conn.reader_mut().read_payload_chunk().await,
+                conn.reader_mut().take_payload_chunk().await,
                 Err(Error::Server { code: 9, message }) if message == "denied"
             ));
         };
 
         let server = async {
-            let mut server_writer =
-                SnellStreamWriter::new(server_download, psk, ProtocolVersion::V4).unwrap();
+            let mut server_writer = test_snell_writer(server_download);
             server_writer.write_error_reply(9, "denied").await.unwrap();
         };
 
@@ -364,21 +353,19 @@ mod tests {
 
     #[tokio::test]
     async fn reuse_conn_error_is_not_reusable() {
-        let (client_upload, _server_upload) = duplex(4096);
-        let (server_download, client_download) = duplex(4096);
-        let psk = b"test psk";
+        let (client_upload, _server_upload) = test_duplex_pair();
+        let (server_download, client_download) = test_duplex_pair();
 
         let client = async {
-            let writer = SnellStreamWriter::new(client_upload, psk, ProtocolVersion::V4).unwrap();
-            let reader = SnellStreamReader::new(client_download, psk, ProtocolVersion::V4).unwrap();
+            let writer = test_snell_writer(client_upload);
+            let reader = test_snell_reader(client_download);
             let mut conn = ReuseClientConn::from_parts(reader, writer);
-            assert!(conn.reader_mut().read_payload_chunk().await.is_err());
+            assert!(conn.reader_mut().take_payload_chunk().await.is_err());
             assert!(!conn.can_reuse());
         };
 
         let server = async {
-            let mut server_writer =
-                SnellStreamWriter::new(server_download, psk, ProtocolVersion::V4).unwrap();
+            let mut server_writer = test_snell_writer(server_download);
             server_writer.write_error_reply(9, "denied").await.unwrap();
         };
 
@@ -387,12 +374,11 @@ mod tests {
 
     #[tokio::test]
     async fn reuse_conn_rejects_write_after_close() {
-        let (client_upload, _server_upload) = duplex(4096);
-        let (_server_download, client_download) = duplex(4096);
-        let psk = b"test psk";
+        let (client_upload, _server_upload) = test_duplex_pair();
+        let (_server_download, client_download) = test_duplex_pair();
 
-        let writer = SnellStreamWriter::new(client_upload, psk, ProtocolVersion::V4).unwrap();
-        let reader = SnellStreamReader::new(client_download, psk, ProtocolVersion::V4).unwrap();
+        let writer = test_snell_writer(client_upload);
+        let reader = test_snell_reader(client_download);
         let mut conn = ReuseClientConn::from_parts(reader, writer);
 
         conn.writer_mut().close_write().await.unwrap();
@@ -404,12 +390,11 @@ mod tests {
 
     #[tokio::test]
     async fn close_whole_connection_drops_reader_and_writer_halves() {
-        let (client_upload, mut server_upload) = duplex(4096);
-        let (_server_download, client_download) = duplex(4096);
-        let psk = b"test psk";
+        let (client_upload, mut server_upload) = test_duplex_pair();
+        let (_server_download, client_download) = test_duplex_pair();
 
-        let writer = SnellStreamWriter::new(client_upload, psk, ProtocolVersion::V4).unwrap();
-        let reader = SnellStreamReader::new(client_download, psk, ProtocolVersion::V4).unwrap();
+        let writer = test_snell_writer(client_upload);
+        let reader = test_snell_reader(client_download);
         let conn = ReuseClientConn::from_parts(reader, writer);
 
         conn.close_whole_connection().await;

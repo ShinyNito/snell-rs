@@ -1,7 +1,8 @@
 use std::net::IpAddr;
 
 use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, duplex};
+use tokio::net::{TcpListener, UdpSocket};
 
 use crate::ProtocolVersion;
 use crate::error::{Error, Result};
@@ -9,6 +10,60 @@ use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::protocol::request::ClientRequest;
 use crate::protocol::udp::{AddressRef, UdpPacketRef, parse_udp_request, parse_udp_response};
 use crate::session::udp::stream::UdpServerStream;
+
+pub(crate) const TEST_PSK: &[u8] = b"test psk";
+pub(crate) const TEST_VERSION: ProtocolVersion = ProtocolVersion::V4;
+pub(crate) const TEST_DUPLEX_CAPACITY: usize = 4096;
+
+pub(crate) fn test_duplex_pair() -> (DuplexStream, DuplexStream) {
+    duplex(TEST_DUPLEX_CAPACITY)
+}
+
+pub(crate) async fn test_tcp_listener() -> TcpListener {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test_tcp_listener should bind an ephemeral localhost TCP port")
+}
+
+pub(crate) async fn test_udp_socket() -> UdpSocket {
+    UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("test_udp_socket should bind an ephemeral localhost UDP port")
+}
+
+pub(crate) fn test_snell_reader<R>(io: R) -> SnellStreamReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    test_snell_reader_with_version(io, TEST_VERSION)
+}
+
+pub(crate) fn test_snell_reader_with_version<R>(
+    io: R,
+    version: ProtocolVersion,
+) -> SnellStreamReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    SnellStreamReader::new(io, TEST_PSK, version).unwrap()
+}
+
+pub(crate) fn test_snell_writer<W>(io: W) -> SnellStreamWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    test_snell_writer_with_version(io, TEST_VERSION)
+}
+
+pub(crate) fn test_snell_writer_with_version<W>(
+    io: W,
+    version: ProtocolVersion,
+) -> SnellStreamWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    SnellStreamWriter::new(io, TEST_PSK, version).unwrap()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TestUdpPacket {

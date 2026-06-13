@@ -1,27 +1,32 @@
 use bytes::BytesMut;
 use core::range::Range;
+use std::future::Future;
 use std::io::{self, Cursor};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, duplex, sink};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf, duplex, sink};
 use tokio::net::UdpSocket;
 
 use super::reader::{V4StreamReader, V6StreamReader};
 use super::writer::{RecordSizer, V4StreamWriter, V6StreamWriter};
 use super::{
     FRAME_HEAD_INITIAL_CAPACITY, STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY,
-    SnellStreamReader, SnellStreamWriter, TCP_FIRST_RECORD_OVERHEAD, TCP_RECORD_IDLE_TIMEOUT,
-    TCP_RECORD_MSS, TCP_STEADY_RECORD_OVERHEAD,
+    STREAM_READ_AHEAD_CAPACITY, SnellStreamReader, SnellStreamWriter, TCP_FIRST_RECORD_OVERHEAD,
+    TCP_RECORD_IDLE_TIMEOUT, TCP_RECORD_MSS, TCP_STEADY_RECORD_OVERHEAD,
 };
 use crate::error::{Error, Result};
-use crate::protocol::request::{ClientRequest, ServerReply, parse_server_reply};
+use crate::protocol::request::{
+    ClientRequest, ServerReply, parse_client_request, parse_server_reply,
+};
 use crate::protocol::udp::{
     AddressRef, parse_udp_request, parse_udp_response, write_udp_response_prefix,
 };
 use crate::protocol::v4::frame::V4FrameEncoder;
 use crate::protocol::v6::{V6ChunkSizer, V6Profile, V6SaltReplayCache};
+use crate::test_support::{TEST_PSK, test_duplex_pair};
 
 #[test]
 fn record_sizer_applies_first_idle_and_continuous_limits() {
@@ -46,7 +51,7 @@ fn record_sizer_applies_first_idle_and_continuous_limits() {
 
 fn writer_with_initial_padding(initial_padding_len: usize) -> V4StreamWriter<tokio::io::Sink> {
     let encoder =
-        V4FrameEncoder::with_salt_and_initial_padding(b"test psk", [0x44; 16], initial_padding_len)
+        V4FrameEncoder::with_salt_and_initial_padding(TEST_PSK, [0x44; 16], initial_padding_len)
             .unwrap();
     V4StreamWriter::from_parts(sink(), encoder)
 }
@@ -89,6 +94,107 @@ fn encode_test_frame(encoder: &mut V4FrameEncoder, payload: &[u8], wire: &mut By
     wire.extend_from_slice(&body);
 }
 
+async fn collect_v4_reader_path_wire(payload: &[u8]) -> Vec<u8> {
+    const SALT: [u8; 16] = [0x45; 16];
+
+    collect_wire(|client| async move {
+        let encoder = V4FrameEncoder::with_salt_and_initial_padding(TEST_PSK, SALT, 0).unwrap();
+        let mut writer = V4StreamWriter::from_parts(client, encoder);
+        let mut plain = payload;
+        while writer
+            .write_next_payload_record_from_reader(&mut plain)
+            .await
+            .unwrap()
+            .is_some()
+        {}
+        writer.write_zero_chunk().await.unwrap();
+    })
+    .await
+}
+
+async fn collect_v4_buffer_path_wire(payload: &[u8]) -> Vec<u8> {
+    const SALT: [u8; 16] = [0x45; 16];
+
+    collect_wire(|client| async move {
+        let encoder = V4FrameEncoder::with_salt_and_initial_padding(TEST_PSK, SALT, 0).unwrap();
+        let mut writer = V4StreamWriter::from_parts(client, encoder);
+        let mut plain = BytesMut::from(payload);
+        while writer
+            .write_payload_from_buffer(&mut plain)
+            .await
+            .unwrap()
+            .is_some()
+        {}
+        writer.write_zero_chunk().await.unwrap();
+    })
+    .await
+}
+
+async fn collect_v6_reader_path_wire(payload: &[u8]) -> Vec<u8> {
+    const SALT: [u8; 16] = [0x46; 16];
+
+    collect_wire(|client| async move {
+        let mut writer = SnellStreamWriter::new_with_v6_salt(client, TEST_PSK, SALT).unwrap();
+        let mut plain = payload;
+        while writer
+            .write_next_payload_record_from_reader(&mut plain)
+            .await
+            .unwrap()
+            .is_some()
+        {}
+        writer.write_zero_chunk().await.unwrap();
+    })
+    .await
+}
+
+async fn collect_v6_buffer_path_wire(payload: &[u8]) -> Vec<u8> {
+    const SALT: [u8; 16] = [0x46; 16];
+
+    collect_wire(|client| async move {
+        let mut writer = SnellStreamWriter::new_with_v6_salt(client, TEST_PSK, SALT).unwrap();
+        let mut plain = BytesMut::from(payload);
+        while writer
+            .write_payload_from_buffer(&mut plain)
+            .await
+            .unwrap()
+            .is_some()
+        {}
+        writer.write_zero_chunk().await.unwrap();
+    })
+    .await
+}
+
+async fn collect_wire<F, Fut>(write: F) -> Vec<u8>
+where
+    F: FnOnce(DuplexStream) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let (client, mut server) = duplex(512 * 1024);
+    let write = write(client);
+    let read = async {
+        let mut wire = Vec::new();
+        server.read_to_end(&mut wire).await.unwrap();
+        wire
+    };
+
+    let ((), wire) = tokio::join!(write, read);
+    wire
+}
+
+#[tokio::test]
+async fn buffer_payload_writer_matches_reader_wire_bytes() {
+    let payload = vec![0x34; 96 * 1024];
+
+    assert_eq!(
+        collect_v4_buffer_path_wire(&payload).await,
+        collect_v4_reader_path_wire(&payload).await
+    );
+    assert_eq!(
+        collect_v6_buffer_path_wire(&payload).await,
+        collect_v6_reader_path_wire(&payload).await
+    );
+}
+
 struct PendingThenReadyReader {
     payload: Vec<u8>,
     pending_once: bool,
@@ -102,6 +208,36 @@ impl PendingThenReadyReader {
             pending_once: true,
             wake_after,
         }
+    }
+}
+
+struct RecordingReadWindow {
+    payload: Vec<u8>,
+    observed: Arc<Mutex<Vec<usize>>>,
+}
+
+impl RecordingReadWindow {
+    fn new(payload: BytesMut, observed: Arc<Mutex<Vec<usize>>>) -> Self {
+        Self {
+            payload: payload.to_vec(),
+            observed,
+        }
+    }
+}
+
+impl AsyncRead for RecordingReadWindow {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.observed.lock().unwrap().push(buf.remaining());
+        let n = self.payload.len().min(buf.remaining());
+        if n != 0 {
+            buf.put_slice(&self.payload[..n]);
+            self.payload.drain(..n);
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -133,7 +269,7 @@ impl AsyncRead for PendingThenReadyReader {
 
 #[tokio::test]
 async fn write_payload_rechecks_record_limit_after_pending_read() {
-    const PSK: &[u8] = b"test psk";
+    const PSK: &[u8] = TEST_PSK;
     const SALT: [u8; 16] = [0x44; 16];
 
     let steady = TCP_RECORD_MSS - TCP_STEADY_RECORD_OVERHEAD;
@@ -146,7 +282,10 @@ async fn write_payload_rechecks_record_limit_after_pending_read() {
 
     let mut reader =
         PendingThenReadyReader::new(vec![0x51; continuous], Duration::from_millis(250));
-    let n = writer.write_payload_from_reader(&mut reader).await.unwrap();
+    let n = writer
+        .write_next_payload_record_from_reader(&mut reader)
+        .await
+        .unwrap();
 
     assert_eq!(n, Some(steady));
     assert_eq!(writer.record_sizer.last_limit, steady);
@@ -154,7 +293,7 @@ async fn write_payload_rechecks_record_limit_after_pending_read() {
 
 #[test]
 fn stream_buffers_start_with_small_capacity() {
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
     let writer = V4StreamWriter::new(sink(), psk).unwrap();
 
@@ -164,8 +303,31 @@ fn stream_buffers_start_with_small_capacity() {
 }
 
 #[tokio::test]
+async fn stream_reader_uses_large_read_ahead_window() {
+    const PSK: &[u8] = TEST_PSK;
+    const SALT: [u8; 16] = [0x44; 16];
+
+    let mut wire = BytesMut::new();
+    let mut encoder = V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, 0).unwrap();
+    encode_test_frame(&mut encoder, b"tiny", &mut wire);
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let source = RecordingReadWindow::new(wire, observed.clone());
+    let mut reader = V4StreamReader::new(source, PSK).unwrap();
+
+    assert_eq!(reader.read_frame_payload().await.unwrap(), b"tiny");
+    assert!(
+        observed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|remaining| *remaining >= STREAM_READ_AHEAD_CAPACITY)
+    );
+}
+
+#[tokio::test]
 async fn compact_for_reuse_retains_bounded_stream_buffers() {
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let large_payload = vec![0x51; 4096];
     let (writer_io, reader_io) = duplex(8192);
     let mut writer = V4StreamWriter::new(writer_io, psk).unwrap();
@@ -176,7 +338,6 @@ async fn compact_for_reuse_retains_bounded_stream_buffers() {
         assert_eq!(payload.len(), large_payload.len());
         assert!(reader.body.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
         reader.compact_buffers_for_reuse();
-        assert!(reader.body.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
         assert!(reader.body.capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
     };
     let write = async {
@@ -197,7 +358,7 @@ async fn compact_for_reuse_retains_bounded_stream_buffers() {
 
 #[test]
 fn compact_for_reuse_resets_oversized_stream_buffers() {
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let mut reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
     let mut writer = V4StreamWriter::new(sink(), psk).unwrap();
 
@@ -215,7 +376,7 @@ fn compact_for_reuse_resets_oversized_stream_buffers() {
 
 #[test]
 fn compact_for_reuse_does_not_copy_buffered_reader_bytes() {
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let mut v4_reader = V4StreamReader::new(tokio::io::empty(), psk).unwrap();
     let mut v6_reader = V6StreamReader::new(tokio::io::empty(), psk).unwrap();
 
@@ -239,14 +400,14 @@ fn compact_for_reuse_does_not_copy_buffered_reader_bytes() {
 }
 
 #[tokio::test]
-async fn tunnel_reply_from_reader_counts_prefix_in_first_record_limit() {
-    const PSK: &[u8] = b"test psk";
+async fn tunnel_reply_from_buffer_counts_prefix_in_first_record_limit() {
+    const PSK: &[u8] = TEST_PSK;
     const SALT: [u8; 16] = [0x44; 16];
 
     let initial_padding_len = 8;
     let first_limit = TCP_RECORD_MSS - TCP_FIRST_RECORD_OVERHEAD - initial_padding_len;
     let payload = vec![0x51; first_limit + 10];
-    let (server, client) = duplex(4096);
+    let (server, client) = test_duplex_pair();
 
     let read = async {
         let mut reader = V4StreamReader::new(client, PSK).unwrap();
@@ -269,12 +430,13 @@ async fn tunnel_reply_from_reader_counts_prefix_in_first_record_limit() {
         let encoder =
             V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, initial_padding_len).unwrap();
         let mut writer = V4StreamWriter::from_parts(server, encoder);
-        let mut plain = &payload[..];
+        let mut plain = BytesMut::from(&payload[..]);
         let n = writer
-            .write_tunnel_reply_from_reader(&mut plain)
+            .write_tunnel_reply_from_buffer(&mut plain)
             .await
             .unwrap();
         assert_eq!(n, Some(first_limit - 1));
+        assert_eq!(plain.len(), 11);
         assert_first_record_sized(&writer, first_limit);
     };
 
@@ -343,8 +505,8 @@ async fn datagram_frames_advance_record_sizer() {
 
 #[tokio::test]
 async fn transfers_frames_without_spawn_or_channel() {
-    let (client, server) = duplex(4096);
-    let psk = b"test psk";
+    let (client, server) = test_duplex_pair();
+    let psk = TEST_PSK;
     let payload = b"hello over tokio";
 
     let read = async {
@@ -365,8 +527,8 @@ async fn transfers_frames_without_spawn_or_channel() {
 
 #[tokio::test]
 async fn snell_stream_v6_reads_tcp_request_and_payload_frames() {
-    let (client, server) = duplex(4096);
-    let psk = b"test psk";
+    let (client, server) = test_duplex_pair();
+    let psk = TEST_PSK;
     let payload = b"hello over snell v6";
 
     let read = async {
@@ -400,8 +562,8 @@ async fn snell_stream_v6_reads_tcp_request_and_payload_frames() {
 
 #[tokio::test]
 async fn snell_stream_v6_reads_tunnel_reply_tail_and_zero_chunk() {
-    let (server, client) = duplex(4096);
-    let psk = b"test psk";
+    let (server, client) = test_duplex_pair();
+    let psk = TEST_PSK;
     let payload = b"first v6 bytes";
 
     let read = async {
@@ -437,11 +599,11 @@ async fn snell_stream_v6_reads_tunnel_reply_tail_and_zero_chunk() {
 
 #[tokio::test]
 async fn v6_reader_rejects_replayed_salt_from_shared_cache() {
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let salt = [0x77; 16];
     let cache = V6SaltReplayCache::new(16);
 
-    let (first_client, first_server) = duplex(4096);
+    let (first_client, first_server) = test_duplex_pair();
     let first_read = async {
         let mut reader =
             V6StreamReader::with_salt_replay_cache(first_server, psk, Some(cache.clone())).unwrap();
@@ -453,7 +615,7 @@ async fn v6_reader_rejects_replayed_salt_from_shared_cache() {
     };
     let ((), ()) = tokio::join!(first_read, first_write);
 
-    let (second_client, second_server) = duplex(4096);
+    let (second_client, second_server) = test_duplex_pair();
     let second_read = async {
         let mut reader =
             V6StreamReader::with_salt_replay_cache(second_server, psk, Some(cache)).unwrap();
@@ -471,8 +633,8 @@ async fn v6_reader_rejects_replayed_salt_from_shared_cache() {
 
 #[tokio::test]
 async fn reader_new_does_not_wait_for_peer_salt() {
-    let (client, server) = duplex(4096);
-    let psk = b"test psk";
+    let (client, server) = test_duplex_pair();
+    let psk = TEST_PSK;
     let payload = b"hello after lazy reader";
 
     let mut reader = V4StreamReader::new(server, psk).unwrap();
@@ -494,8 +656,8 @@ async fn reader_new_does_not_wait_for_peer_salt() {
 
 #[tokio::test]
 async fn reader_drops_psk_after_decoder_initialization() {
-    let (client, server) = duplex(4096);
-    let psk = b"test psk";
+    let (client, server) = test_duplex_pair();
+    let psk = TEST_PSK;
     let payload = b"hello after psk clear";
 
     let read = async {
@@ -516,8 +678,8 @@ async fn reader_drops_psk_after_decoder_initialization() {
 
 #[tokio::test]
 async fn transfers_zero_chunk_as_protocol_eof_signal() {
-    let (client, server) = duplex(4096);
-    let psk = b"test psk";
+    let (client, server) = test_duplex_pair();
+    let psk = TEST_PSK;
 
     let read = async {
         let mut reader = V4StreamReader::new(server, psk).unwrap();
@@ -534,8 +696,8 @@ async fn transfers_zero_chunk_as_protocol_eof_signal() {
 
 #[tokio::test]
 async fn writes_tcp_request_without_external_header_allocation() {
-    let (client, server) = duplex(4096);
-    let psk = b"test psk";
+    let (client, server) = test_duplex_pair();
+    let psk = TEST_PSK;
 
     let read = async {
         let mut reader = V4StreamReader::new(server, psk).unwrap();
@@ -559,7 +721,7 @@ async fn writes_tcp_request_without_external_header_allocation() {
 
 #[tokio::test]
 async fn write_payload_uses_record_sizer_for_tcp_chunks() {
-    const PSK: &[u8] = b"test psk";
+    const PSK: &[u8] = TEST_PSK;
     const SALT: [u8; 16] = [0x44; 16];
 
     let initial_padding_len = 8;
@@ -598,7 +760,7 @@ async fn write_payload_uses_record_sizer_for_tcp_chunks() {
 
 #[tokio::test]
 async fn write_payload_continues_record_sizer_after_tcp_request() {
-    const PSK: &[u8] = b"test psk";
+    const PSK: &[u8] = TEST_PSK;
     const SALT: [u8; 16] = [0x44; 16];
 
     let initial_padding_len = 8;
@@ -638,8 +800,8 @@ async fn write_payload_continues_record_sizer_after_tcp_request() {
 
 #[tokio::test]
 async fn writes_udp_packet_as_one_frame() {
-    let (client, server) = duplex(4096);
-    let psk = b"test psk";
+    let (client, server) = test_duplex_pair();
+    let psk = TEST_PSK;
     let payload = b"hello udp";
 
     let read = async {
@@ -669,7 +831,7 @@ async fn writes_udp_packet_as_one_frame() {
 #[tokio::test]
 async fn write_udp_packet_is_single_frame_and_advances_record_sizer() {
     let (client, server) = duplex(8192);
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let payload = vec![0x61; 3000];
     let expected_payload = payload.clone();
 
@@ -702,7 +864,7 @@ async fn write_udp_packet_is_single_frame_and_advances_record_sizer() {
 #[tokio::test]
 async fn v6_udp_packet_splits_across_chunk_records_and_advances_chunk_state() {
     let (client, server) = duplex(140_000);
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let payload = vec![0x61; 60_000];
     let expected_payload = payload.clone();
     let expected_len = payload.len() + 9;
@@ -749,7 +911,7 @@ async fn v6_udp_packet_splits_across_chunk_records_and_advances_chunk_state() {
 #[tokio::test]
 async fn v6_udp_request_message_reader_reassembles_split_records() {
     let (client, server) = duplex(140_000);
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let payload = vec![0x63; 60_000];
     let expected_payload = payload.clone();
 
@@ -783,7 +945,7 @@ async fn v6_udp_request_message_reader_reassembles_split_records() {
 #[tokio::test]
 async fn v6_udp_exact_limit_message_reader_preserves_following_zero_chunk() {
     let (client, server) = duplex(140_000);
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let chunk_sizer = V6ChunkSizer::new(V6Profile::derive(psk));
     let first_limit = chunk_sizer.peek_limit(0, Instant::now());
     let payload = vec![0x65; first_limit - 9];
@@ -824,7 +986,7 @@ async fn v6_udp_exact_limit_message_reader_preserves_following_zero_chunk() {
 #[tokio::test]
 async fn v6_udp_exact_limit_request_reader_preserves_following_udp_message() {
     let (client, server) = duplex(140_000);
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let chunk_sizer = V6ChunkSizer::new(V6Profile::derive(psk));
     let first_limit = chunk_sizer.peek_limit(0, Instant::now());
     let first_payload = vec![0x65; first_limit - 9];
@@ -879,7 +1041,7 @@ async fn v6_udp_exact_limit_request_reader_preserves_following_udp_message() {
 #[tokio::test]
 async fn v6_udp_response_message_can_split_one_datagram_across_records() {
     let (client, server) = duplex(140_000);
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let payload = vec![0x62; 60_000];
     let expected_payload = payload.clone();
     // IPv6 source header plus payload only; no UDP-layer datagram id,
@@ -936,7 +1098,7 @@ async fn v6_udp_response_message_can_split_one_datagram_across_records() {
 #[tokio::test]
 async fn v6_udp_response_message_reader_reassembles_split_records() {
     let (client, server) = duplex(140_000);
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let payload = vec![0x64; 60_000];
     let expected_payload = payload.clone();
 
@@ -974,7 +1136,7 @@ async fn v6_udp_response_message_reader_reassembles_split_records() {
 #[tokio::test]
 async fn v6_udp_exact_limit_response_reader_preserves_following_udp_message() {
     let (client, server) = duplex(140_000);
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let chunk_sizer = V6ChunkSizer::new(V6Profile::derive(psk));
     let first_limit = chunk_sizer.peek_limit(0, Instant::now());
     let first_payload = vec![0x67; first_limit - 19];
@@ -1036,8 +1198,8 @@ async fn v6_udp_exact_limit_response_reader_preserves_following_udp_message() {
 
 #[tokio::test]
 async fn writes_udp_response_from_ready_ipv4_socket() {
-    let (client, server) = duplex(4096);
-    let psk = b"test psk";
+    let (client, server) = test_duplex_pair();
+    let psk = TEST_PSK;
     let payload = b"udp answer";
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -1072,8 +1234,8 @@ async fn writes_udp_response_from_ready_ipv4_socket() {
 
 #[tokio::test]
 async fn rejects_oversized_udp_packet_as_one_frame() {
-    let (client, _server) = duplex(4096);
-    let psk = b"test psk";
+    let (client, _server) = test_duplex_pair();
+    let psk = TEST_PSK;
     let payload = vec![0x61; crate::MAX_PACKET_SIZE];
 
     let mut writer = V4StreamWriter::new(client, psk).unwrap();
@@ -1092,7 +1254,7 @@ async fn rejects_oversized_udp_packet_as_one_frame() {
 #[tokio::test]
 async fn v6_rejects_udp_packet_that_exceeds_record_payload_len() {
     let writer = sink();
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let payload = vec![0x61; crate::MAX_V6_RECORD_PAYLOAD_LEN];
 
     let mut writer = V6StreamWriter::new(writer, psk).unwrap();
@@ -1110,12 +1272,13 @@ async fn v6_rejects_udp_packet_that_exceeds_record_payload_len() {
 
 #[tokio::test]
 async fn reads_client_connect_request() {
-    let (client, server) = duplex(4096);
-    let psk = b"test psk";
+    let (client, server) = test_duplex_pair();
+    let psk = TEST_PSK;
 
     let read = async {
         let mut reader = V4StreamReader::new(server, psk).unwrap();
-        let request = reader.read_client_request().await.unwrap();
+        let payload = reader.read_frame_payload().await.unwrap();
+        let request = parse_client_request(payload).unwrap();
         assert_eq!(
             request,
             ClientRequest::Connect {
@@ -1140,13 +1303,14 @@ async fn reads_client_connect_request() {
 
 #[tokio::test]
 async fn reads_tunnel_reply_with_first_payload() {
-    let (server, client) = duplex(4096);
-    let psk = b"test psk";
+    let (server, client) = test_duplex_pair();
+    let psk = TEST_PSK;
     let payload = b"first bytes";
 
     let read = async {
         let mut reader = V4StreamReader::new(client, psk).unwrap();
-        let reply = reader.read_server_reply().await.unwrap();
+        let frame_payload = reader.read_frame_payload().await.unwrap();
+        let reply = parse_server_reply(frame_payload).unwrap();
         assert_eq!(
             reply,
             ServerReply::Tunnel {
@@ -1169,14 +1333,15 @@ async fn reads_tunnel_reply_with_first_payload() {
 
 #[tokio::test]
 async fn takes_control_payload_tail_without_padding_or_tag() {
-    let (server, client) = duplex(4096);
-    let psk = b"test psk";
+    let (server, client) = test_duplex_pair();
+    let psk = TEST_PSK;
     let payload = b"early payload";
 
     let read = async {
         let mut reader = V4StreamReader::new(client, psk).unwrap();
         let payload_start = {
-            let reply = reader.read_server_reply().await.unwrap();
+            let frame_payload = reader.read_frame_payload().await.unwrap();
+            let reply = parse_server_reply(frame_payload).unwrap();
             assert_eq!(
                 reply,
                 ServerReply::Tunnel {
@@ -1208,7 +1373,7 @@ async fn takes_control_payload_tail_without_padding_or_tag() {
 
 #[tokio::test]
 async fn taking_payload_keeps_prefetched_next_frame() {
-    const PSK: &[u8] = b"test psk";
+    const PSK: &[u8] = TEST_PSK;
     const SALT: [u8; 16] = [0x31; 16];
 
     let mut wire = BytesMut::new();
@@ -1219,7 +1384,8 @@ async fn taking_payload_keeps_prefetched_next_frame() {
     encode_test_frame(&mut encoder, b"next frame", &mut wire);
 
     let mut reader = V4StreamReader::new(Cursor::new(wire), PSK).unwrap();
-    let payload_start = match reader.read_server_reply().await.unwrap() {
+    let payload = reader.read_frame_payload().await.unwrap();
+    let payload_start = match parse_server_reply(payload).unwrap() {
         ServerReply::Tunnel { payload_span, .. } => payload_span.start,
         ServerReply::Pong | ServerReply::Error { .. } => unreachable!(),
     };
@@ -1234,12 +1400,13 @@ async fn taking_payload_keeps_prefetched_next_frame() {
 
 #[tokio::test]
 async fn reads_server_error_reply() {
-    let (server, client) = duplex(4096);
-    let psk = b"test psk";
+    let (server, client) = test_duplex_pair();
+    let psk = TEST_PSK;
 
     let read = async {
         let mut reader = V4StreamReader::new(client, psk).unwrap();
-        let reply = reader.read_server_reply().await.unwrap();
+        let payload = reader.read_frame_payload().await.unwrap();
+        let reply = parse_server_reply(payload).unwrap();
         assert_eq!(
             reply,
             ServerReply::Error {

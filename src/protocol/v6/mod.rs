@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 
 use crate::MAX_V6_RECORD_PAYLOAD_LEN;
 use crate::error::{Error, Result};
@@ -116,6 +116,7 @@ pub use replay::V6SaltReplayCache;
 pub(in crate::protocol::v6) use salt::salt_positions;
 pub use salt::split_salt_block;
 
+#[inline]
 fn mix_padding_payload(
     profile: &V6Profile,
     seq: u32,
@@ -151,6 +152,11 @@ fn mix_fixed_stride(
 ) {
     let rr = mix_round_delta(round);
     let stride = (profile.mix_stride + rr as usize).max(1);
+    if stride == 1 {
+        padding[..n].swap_with_slice(&mut payload_cipher[..n]);
+        return;
+    }
+
     let mut off = profile.mix_offset_base % stride;
     while off < n {
         std::mem::swap(&mut padding[off], &mut payload_cipher[off]);
@@ -168,10 +174,9 @@ fn mix_alternating_block(
     let block = profile.mix_block;
     let mut off = (round as usize & 1) * block;
     while off + block <= n {
-        for index in off..off + block {
-            std::mem::swap(&mut padding[index], &mut payload_cipher[index]);
-        }
-        off += 2 * block;
+        let end = off + block;
+        padding[off..end].swap_with_slice(&mut payload_cipher[off..end]);
+        off += block * 2;
     }
 }
 
@@ -187,15 +192,22 @@ fn mix_prf_stride(
     let stride = (profile.mix_stride + rr as usize).max(1);
     let mut off =
         (profile.prf32(LABEL_MIX_OFFSET, seq, round) as usize + profile.mix_offset_base) % stride;
+    if stride == 1 {
+        padding[..n].swap_with_slice(&mut payload_cipher[..n]);
+        return;
+    }
+
     while off < n {
         std::mem::swap(&mut padding[off], &mut payload_cipher[off]);
         off += stride;
     }
 }
 
-fn blake2b_256(input: &[u8]) -> [u8; 32] {
+fn blake2b_256_from_slices(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Blake2b256::new();
-    Digest::update(&mut hasher, input);
+    for part in parts {
+        Digest::update(&mut hasher, *part);
+    }
     let digest = hasher.finalize();
     let mut out = [0; 32];
     out.copy_from_slice(&digest);
@@ -243,21 +255,63 @@ fn prf32_mix(namespace: u64, label: u32, a: u32, b: u32) -> u32 {
 }
 
 fn expand_stream(namespace: u64, label: u32, seq: u32, len: usize, out: &mut BytesMut) {
+    if len == 0 {
+        return;
+    }
+
     out.reserve(len);
-    let target_len = out.len() + len;
-    let mut state = STREAM_INITIAL_STATE.wrapping_add((seq as u64).wrapping_mul(DOMAIN_MUL))
+    let mut state = stream_initial_state(namespace, label, seq, len);
+    let mut written = 0;
+
+    {
+        let spare = out.chunk_mut();
+        debug_assert!(spare.len() >= len);
+        let spare = &mut spare[..len];
+
+        while written + 8 <= len {
+            state = state.wrapping_add(GOLDEN_RATIO_64);
+            spare[written..written + 8].copy_from_slice(&splitmix64(state).to_le_bytes());
+            written += 8;
+        }
+
+        if written < len {
+            state = state.wrapping_add(GOLDEN_RATIO_64);
+            spare[written..len].copy_from_slice(&splitmix64(state).to_le_bytes()[..len - written]);
+        }
+    }
+
+    // SAFETY: every byte in the spare region is initialized by copy_from_slice
+    // before the initialized length is advanced.
+    unsafe {
+        out.advance_mut(len);
+    }
+}
+
+fn expand_stream_array<const N: usize>(namespace: u64, label: u32, seq: u32) -> [u8; N] {
+    let mut out = [0; N];
+    let mut state = stream_initial_state(namespace, label, seq, N);
+    let mut chunks = out.chunks_exact_mut(8);
+    for chunk in &mut chunks {
+        state = state.wrapping_add(GOLDEN_RATIO_64);
+        chunk.copy_from_slice(&splitmix64(state).to_le_bytes());
+    }
+
+    let tail = chunks.into_remainder();
+    if !tail.is_empty() {
+        state = state.wrapping_add(GOLDEN_RATIO_64);
+        tail.copy_from_slice(&splitmix64(state).to_le_bytes()[..tail.len()]);
+    }
+    out
+}
+
+#[inline]
+fn stream_initial_state(namespace: u64, label: u32, seq: u32, len: usize) -> u64 {
+    STREAM_INITIAL_STATE.wrapping_add((seq as u64).wrapping_mul(DOMAIN_MUL))
         ^ (label as u64).wrapping_mul(STREAM_LABEL_MUL)
         ^ (len as u64)
             .wrapping_mul(STREAM_LEN_MUL)
             .wrapping_add(STREAM_LEN_ADD)
-        ^ namespace;
-
-    while out.len() < target_len {
-        state = state.wrapping_add(GOLDEN_RATIO_64);
-        let word = splitmix64(state).to_le_bytes();
-        let remaining = target_len - out.len();
-        out.extend_from_slice(&word[..remaining.min(word.len())]);
-    }
+        ^ namespace
 }
 
 fn salt_shuffle_prf(ns_salt: u64, domain_round: u32, index: u32) -> u32 {

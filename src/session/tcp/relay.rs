@@ -26,19 +26,17 @@ macro_rules! define_snell_reader_to_plain_relay {
             W: AsyncWrite + Unpin,
         {
             loop {
-                let n = match snell.read_payload_chunk().await? {
+                match snell.take_payload_chunk().await? {
                     Some(payload) => {
                         let n = payload.len();
-                        plain.write_all(payload).await?;
-                        n
+                        plain.write_all(&payload).await?;
+                        *total += n as u64;
                     }
                     None => {
                         plain.shutdown().await?;
                         return Ok(());
                     }
                 };
-                snell.consume_payload_chunk(n);
-                *total += n as u64;
             }
         }
     };
@@ -54,7 +52,7 @@ macro_rules! define_plain_to_snell_writer_relay {
             let mut total = 0;
 
             loop {
-                match snell.write_payload_from_reader(plain).await? {
+                match snell.write_next_payload_record_from_reader(plain).await? {
                     Some(n) => total += n as u64,
                     None => {
                         snell.close_write().await?;

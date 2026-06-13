@@ -52,14 +52,17 @@ impl V6FrameEncoder {
         })
     }
 
+    #[must_use]
     pub const fn salt(&self) -> &[u8; SALT_SIZE] {
         &self.salt
     }
 
+    #[must_use]
     pub const fn profile(&self) -> &V6Profile {
         &self.profile
     }
 
+    #[must_use]
     pub const fn seq(&self) -> u32 {
         self.seq
     }
@@ -158,14 +161,17 @@ impl V6FrameDecoder {
         })
     }
 
+    #[must_use]
     pub const fn profile(&self) -> &V6Profile {
         &self.profile
     }
 
+    #[must_use]
     pub const fn seq(&self) -> u32 {
         self.seq
     }
 
+    #[must_use]
     pub fn next_prefix_len(&self) -> usize {
         self.profile.record_prefix_len(self.seq)
     }

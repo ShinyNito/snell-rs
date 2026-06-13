@@ -69,10 +69,12 @@ impl V4FrameEncoder {
         })
     }
 
+    #[must_use]
     pub const fn salt(&self) -> &[u8; SALT_SIZE] {
         &self.salt
     }
 
+    #[must_use]
     pub const fn initial_padding_len(&self) -> usize {
         self.initial_padding_len
     }
@@ -401,6 +403,7 @@ mod tests {
         swap_padding, v4_padding_target_ones_for_ratio,
     };
     use crate::error::Error;
+    use crate::test_support::TEST_PSK;
 
     fn encode_test_frame(
         encoder: &mut V4FrameEncoder,
@@ -500,7 +503,7 @@ mod tests {
 
     #[test]
     fn encodes_and_decodes_payload_frame() {
-        let psk = b"test psk";
+        let psk = TEST_PSK;
         let salt = [3u8; 16];
         let payload = b"GET / HTTP/1.1\r\n\r\n";
         let mut encoder = V4FrameEncoder::with_salt_and_initial_padding(psk, salt, 8).unwrap();
@@ -526,7 +529,7 @@ mod tests {
 
     #[test]
     fn encoded_padding_biases_unmixed_body_bit_ratio() {
-        let psk = b"test psk";
+        let psk = TEST_PSK;
         let salt = [7u8; 16];
         let payload = [0x51; 128];
         let initial_padding_len = 256;
@@ -568,7 +571,7 @@ mod tests {
 
     #[test]
     fn payload_in_place_path_appends_to_non_empty_output() {
-        let psk = b"test psk";
+        let psk = TEST_PSK;
         let salt = [9u8; 16];
         let payload = b"streamed payload";
         let mut encoder = V4FrameEncoder::with_salt_and_initial_padding(psk, salt, 8).unwrap();
@@ -601,7 +604,7 @@ mod tests {
 
     #[test]
     fn encodes_zero_chunk() {
-        let psk = b"test psk";
+        let psk = TEST_PSK;
         let salt = [4u8; 16];
         let mut encoder = V4FrameEncoder::with_salt_and_initial_padding(psk, salt, 8).unwrap();
         let mut wire = BytesMut::new();

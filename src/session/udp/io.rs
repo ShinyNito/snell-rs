@@ -63,7 +63,7 @@ impl SocksUdpHeader {
     }
 }
 
-pub(crate) async fn recv_socks_udp_datagram_into(
+pub(crate) async fn recv_udp_datagram_into(
     socket: &UdpSocket,
     datagram: &mut BytesMut,
     max_datagram_len: usize,
@@ -78,7 +78,7 @@ pub(crate) async fn recv_socks_udp_datagram_into(
     datagram.reserve(recv_buffer_len);
 
     let (n, peer) = socket.recv_buf_from(datagram).await?;
-    if socks_udp_datagram_too_large(n, max_datagram_len) {
+    if udp_datagram_too_large(n, max_datagram_len) {
         datagram.clear();
         return Err(Error::PayloadTooLarge);
     }
@@ -86,11 +86,19 @@ pub(crate) async fn recv_socks_udp_datagram_into(
     Ok((n, peer))
 }
 
+pub(crate) async fn recv_socks_udp_datagram_into(
+    socket: &UdpSocket,
+    datagram: &mut BytesMut,
+    max_datagram_len: usize,
+) -> Result<(usize, SocketAddr)> {
+    recv_udp_datagram_into(socket, datagram, max_datagram_len).await
+}
+
 pub(crate) const fn max_socks_udp_datagram_len(max_snell_udp_payload_len: usize) -> usize {
     max_snell_udp_payload_len + SOCKS_UDP_RSV_FRAG_LEN
 }
 
-fn socks_udp_datagram_too_large(n: usize, max_datagram_len: usize) -> bool {
+fn udp_datagram_too_large(n: usize, max_datagram_len: usize) -> bool {
     n > max_datagram_len
 }
 
@@ -281,6 +289,8 @@ fn try_send_udp_parts(
         },
     ];
 
+    // SAFETY: zero is a valid baseline for msghdr; the fields used by sendmsg
+    // are filled immediately below before the value is passed to libc.
     let mut msg: libc::msghdr = unsafe { zeroed() };
     msg.msg_name = (&mut storage as *mut libc::sockaddr_storage).cast();
     msg.msg_namelen = storage_len;
@@ -288,6 +298,8 @@ fn try_send_udp_parts(
     msg.msg_iovlen = iov.len() as _;
 
     loop {
+        // SAFETY: msg points to stack-owned sockaddr/iovec values that live for
+        // this call, and the iovec buffers are valid immutable byte slices.
         let n = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, libc::MSG_DONTWAIT) };
         if n >= 0 {
             return Ok(n as usize);
@@ -304,10 +316,14 @@ fn try_send_udp_parts(
 
 #[cfg(unix)]
 fn socket_addr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: zeroed sockaddr_storage is valid storage; each match arm writes a
+    // concrete sockaddr value before the storage is read by sendmsg.
     let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
     let storage_len = match addr {
         SocketAddr::V4(addr) => {
             let raw = sockaddr_in(addr);
+            // SAFETY: sockaddr_storage is large and aligned enough for
+            // sockaddr_in by the platform ABI.
             unsafe {
                 (&mut storage as *mut libc::sockaddr_storage)
                     .cast::<libc::sockaddr_in>()
@@ -317,6 +333,8 @@ fn socket_addr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::sockl
         }
         SocketAddr::V6(addr) => {
             let raw = sockaddr_in6(addr);
+            // SAFETY: sockaddr_storage is large and aligned enough for
+            // sockaddr_in6 by the platform ABI.
             unsafe {
                 (&mut storage as *mut libc::sockaddr_storage)
                     .cast::<libc::sockaddr_in6>()
@@ -331,6 +349,8 @@ fn socket_addr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::sockl
 
 #[cfg(unix)]
 fn sockaddr_in(addr: SocketAddrV4) -> libc::sockaddr_in {
+    // SAFETY: zeroed sockaddr_in is a valid baseline; all required fields are
+    // assigned before the value is passed to libc.
     let mut raw: libc::sockaddr_in = unsafe { zeroed() };
     #[cfg(any(
         target_os = "dragonfly",
@@ -355,6 +375,8 @@ fn sockaddr_in(addr: SocketAddrV4) -> libc::sockaddr_in {
 
 #[cfg(unix)]
 fn sockaddr_in6(addr: SocketAddrV6) -> libc::sockaddr_in6 {
+    // SAFETY: zeroed sockaddr_in6 is a valid baseline; all required fields are
+    // assigned before the value is passed to libc.
     let mut raw: libc::sockaddr_in6 = unsafe { zeroed() };
     #[cfg(any(
         target_os = "dragonfly",
@@ -390,7 +412,6 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use bytes::{Buf, BytesMut};
-    use tokio::net::UdpSocket;
 
     use super as udp_io;
     use super::{
@@ -403,6 +424,7 @@ mod tests {
         AddressRef, parse_udp_request, parse_udp_response, write_udp_request_prefix,
         write_udp_response_prefix,
     };
+    use crate::test_support::test_udp_socket;
 
     fn v4_socks_udp_datagram_limit() -> usize {
         udp_io::max_socks_udp_datagram_len(crate::MAX_PACKET_SIZE)
@@ -411,6 +433,7 @@ mod tests {
     fn reframe(mut datagram: BytesMut, kind: SnellUdpPacketKind) -> (BytesMut, usize) {
         let header = parse_socks_udp_header(&datagram).unwrap();
         let payload_len = header.payload_len();
+        // SAFETY: `payload_start` was parsed from this datagram and is in-bounds.
         let payload_ptr = unsafe { datagram.as_ptr().add(header.payload_start) };
 
         let prefix_start =
@@ -418,6 +441,8 @@ mod tests {
         datagram.advance(prefix_start);
 
         let new_payload_start = datagram.len() - payload_len;
+        // SAFETY: `new_payload_start` is derived from the current datagram
+        // length and the preserved payload length, so it is in-bounds.
         let new_payload_ptr = unsafe { datagram.as_ptr().add(new_payload_start) };
         assert_eq!(new_payload_ptr, payload_ptr);
 
@@ -553,8 +578,8 @@ mod tests {
 
     #[tokio::test]
     async fn recv_socks_udp_datagram_reports_peer_and_preserves_bytes() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = test_udp_socket().await;
+        let sender = test_udp_socket().await;
         let sender_addr = sender.local_addr().unwrap();
         let mut sent = BytesMut::new();
         write_socks_udp_packet(
@@ -584,8 +609,8 @@ mod tests {
     #[test]
     fn recv_oversized_sentinel_marks_datagram_too_large() {
         let v4_limit = v4_socks_udp_datagram_limit();
-        assert!(!udp_io::socks_udp_datagram_too_large(v4_limit, v4_limit,));
-        assert!(udp_io::socks_udp_datagram_too_large(v4_limit + 1, v4_limit,));
+        assert!(!udp_io::udp_datagram_too_large(v4_limit, v4_limit,));
+        assert!(udp_io::udp_datagram_too_large(v4_limit + 1, v4_limit,));
     }
 
     #[test]
@@ -598,8 +623,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_udp_parts_combines_prefix_and_payload() {
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = test_udp_socket().await;
+        let receiver = test_udp_socket().await;
         let mut scratch = BytesMut::new();
 
         udp_io::send_udp_parts(
@@ -628,8 +653,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_udp_parts_rejects_packets_above_call_site_limit() {
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = test_udp_socket().await;
+        let receiver = test_udp_socket().await;
         let mut scratch = BytesMut::with_capacity(8);
         scratch.extend_from_slice(b"stale");
 

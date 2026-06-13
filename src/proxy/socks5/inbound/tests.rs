@@ -5,13 +5,12 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::ProtocolVersion;
 use crate::error::{Error, Result};
-use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::net::dns::DnsResolver;
 use crate::protocol::quic_proxy::decode_init_datagram;
 use crate::protocol::request::ClientRequest;
@@ -22,7 +21,10 @@ use crate::proxy::outbound::RelayOptions;
 use crate::proxy::outbound::snell::SnellClientOutbound;
 use crate::proxy::snell::server::serve_server_connection;
 use crate::proxy::socks5::udp::is_allowed_socks_udp_peer;
-use crate::test_support::{accept_udp_server_stream, read_udp_request_frame};
+use crate::test_support::{
+    TEST_PSK, accept_udp_server_stream, read_udp_request_frame, test_snell_reader,
+    test_snell_writer, test_tcp_listener, test_udp_socket,
+};
 
 fn direct_options(ipv6: bool) -> RelayOptions {
     RelayOptions::direct(ipv6, DnsResolver::system())
@@ -64,12 +66,12 @@ async fn relay_socks5_connection_with_options(
 
 #[tokio::test]
 async fn socks5_connection_relays_tcp_over_snell() {
-    let psk = b"test psk";
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let echo_listener = test_tcp_listener().await;
     let echo_addr = echo_listener.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
 
     let echo = async {
@@ -124,10 +126,10 @@ async fn socks5_connection_relays_tcp_over_snell() {
 
 #[tokio::test]
 async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
-    let psk = b"test psk";
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
     let request_payload = b"GET / HTTP/1.1\r\n\r\n";
     let response_payload = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -135,7 +137,7 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
     let snell_server = async {
         let (stream, _) = snell_listener.accept().await.unwrap();
         let (server_read, server_write) = stream.into_split();
-        let mut reader = SnellStreamReader::new(server_read, psk, ProtocolVersion::V4).unwrap();
+        let mut reader = test_snell_reader(server_read);
         let request = reader.read_client_request().await.unwrap();
         assert_eq!(
             request,
@@ -151,8 +153,7 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
         let payload = reader.read_frame_payload().await.unwrap();
         assert_eq!(payload, request_payload);
 
-        let mut server_writer =
-            SnellStreamWriter::new(server_write, psk, ProtocolVersion::V4).unwrap();
+        let mut server_writer = test_snell_writer(server_write);
         server_writer
             .write_test_tunnel_reply(response_payload)
             .await
@@ -200,11 +201,11 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
 
 #[tokio::test]
 async fn socks5_failure_reply_closes_tcp_connection() {
-    let psk = b"test psk";
-    let dead_snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let dead_snell_listener = test_tcp_listener().await;
     let dead_snell_addr = dead_snell_listener.local_addr().unwrap();
     drop(dead_snell_listener);
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
 
     let socks_server = async {
@@ -247,12 +248,12 @@ async fn socks5_failure_reply_closes_tcp_connection() {
 
 #[tokio::test]
 async fn socks5_udp_associate_relays_datagram_over_snell() {
-    let psk = b"test psk";
-    let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let udp_target = test_udp_socket().await;
     let target_addr = udp_target.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
 
     let target = async {
@@ -295,7 +296,7 @@ async fn socks5_udp_associate_relays_datagram_over_snell() {
             u16::from_be_bytes([reply[8], reply[9]]),
         );
 
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp = test_udp_socket().await;
         let mut request = BytesMut::new();
         write_udp_packet(
             &mut request,
@@ -325,10 +326,10 @@ async fn socks5_udp_associate_relays_datagram_over_snell() {
 
 #[tokio::test]
 async fn socks5_v5_quic_first_packet_uses_quic_proxy_udp() {
-    let psk = b"test psk";
-    let snell_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let snell_udp = test_udp_socket().await;
     let snell_addr = snell_udp.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
 
     let snell_server = async {
@@ -374,7 +375,7 @@ async fn socks5_v5_quic_first_packet_uses_quic_proxy_udp() {
             u16::from_be_bytes([reply[8], reply[9]]),
         );
 
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp = test_udp_socket().await;
         let mut request = BytesMut::new();
         write_udp_packet(
             &mut request,
@@ -402,10 +403,10 @@ async fn socks5_v5_quic_first_packet_uses_quic_proxy_udp() {
 
 #[tokio::test]
 async fn socks5_v5_quic_initial_after_short_header_is_rewrapped() {
-    let psk = b"test psk";
-    let snell_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let snell_udp = test_udp_socket().await;
     let snell_addr = snell_udp.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
     let (done_tx, done_rx) = oneshot::channel();
 
@@ -460,7 +461,7 @@ async fn socks5_v5_quic_initial_after_short_header_is_rewrapped() {
             u16::from_be_bytes([reply[8], reply[9]]),
         );
 
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp = test_udp_socket().await;
         for payload in [b"\xc0first".as_slice(), b"\x40one-rtt", b"\xc0new"] {
             let mut request = BytesMut::new();
             write_udp_packet(
@@ -485,10 +486,10 @@ async fn socks5_v5_quic_initial_after_short_header_is_rewrapped() {
 
 #[tokio::test]
 async fn socks5_v5_non_quic_udp_falls_back_to_udp_over_tcp() {
-    let psk = b"test psk";
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
 
     let snell_server = async {
@@ -542,7 +543,7 @@ async fn socks5_v5_non_quic_udp_falls_back_to_udp_over_tcp() {
             u16::from_be_bytes([reply[8], reply[9]]),
         );
 
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp = test_udp_socket().await;
         let mut request = BytesMut::new();
         write_udp_packet(
             &mut request,
@@ -570,10 +571,10 @@ async fn socks5_v5_non_quic_udp_falls_back_to_udp_over_tcp() {
 
 #[tokio::test]
 async fn socks5_v4_udp_ignores_quic_proxy_flag() {
-    let psk = b"test psk";
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
 
     let snell_server = async {
@@ -623,7 +624,7 @@ async fn socks5_v4_udp_ignores_quic_proxy_flag() {
             u16::from_be_bytes([reply[8], reply[9]]),
         );
 
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp = test_udp_socket().await;
         let mut request = BytesMut::new();
         write_udp_packet(
             &mut request,
@@ -650,12 +651,12 @@ async fn socks5_v4_udp_ignores_quic_proxy_flag() {
 
 #[tokio::test]
 async fn socks5_udp_associate_allows_same_ip_different_udp_port() {
-    let psk = b"test psk";
-    let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let udp_target = test_udp_socket().await;
     let target_addr = udp_target.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
 
     let target = async {
@@ -701,8 +702,8 @@ async fn socks5_udp_associate_allows_same_ip_different_udp_port() {
             u16::from_be_bytes([reply[8], reply[9]]),
         );
 
-        let first_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let second_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_peer = test_udp_socket().await;
+        let second_peer = test_udp_socket().await;
 
         let mut first = BytesMut::new();
         write_udp_packet(
@@ -767,12 +768,12 @@ fn socks5_udp_peer_filter_uses_source_ip_not_port() {
 
 #[tokio::test]
 async fn socks5_udp_associate_drops_invalid_datagrams_without_closing() {
-    let psk = b"test psk";
-    let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let udp_target = test_udp_socket().await;
     let target_addr = udp_target.local_addr().unwrap();
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
 
     let target = async {
@@ -814,7 +815,7 @@ async fn socks5_udp_associate_drops_invalid_datagrams_without_closing() {
             u16::from_be_bytes([reply[8], reply[9]]),
         );
 
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp = test_udp_socket().await;
         udp.send_to(&[0, 0, 1, 1, 127, 0, 0, 1, 0, 53, b'x'], relay_addr)
             .await
             .unwrap();
@@ -847,10 +848,10 @@ async fn socks5_udp_associate_drops_invalid_datagrams_without_closing() {
 
 #[tokio::test]
 async fn socks5_udp_associate_drops_invalid_snell_responses_without_closing() {
-    let psk = b"test psk";
-    let snell_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let psk = TEST_PSK;
+    let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
 
     let snell_server = async {
@@ -903,7 +904,7 @@ async fn socks5_udp_associate_drops_invalid_snell_responses_without_closing() {
             u16::from_be_bytes([reply[8], reply[9]]),
         );
 
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp = test_udp_socket().await;
         let mut request = BytesMut::new();
         write_udp_packet(
             &mut request,

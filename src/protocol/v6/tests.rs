@@ -6,6 +6,7 @@ use super::{
     mix_padding_payload, split_salt_block,
 };
 use crate::error::Error;
+use crate::test_support::TEST_PSK;
 
 fn encode_test_frame(encoder: &mut V6FrameEncoder, payload: &[u8], wire: &mut BytesMut) -> usize {
     let start_len = wire.len();
@@ -21,8 +22,8 @@ fn encode_test_frame(encoder: &mut V6FrameEncoder, payload: &[u8], wire: &mut By
 
 #[test]
 fn derives_stable_profile_from_psk() {
-    let first = V6Profile::derive(b"test psk");
-    let second = V6Profile::derive(b"test psk");
+    let first = V6Profile::derive(TEST_PSK);
+    let second = V6Profile::derive(TEST_PSK);
     let other = V6Profile::derive(b"other psk");
 
     assert_eq!(first.profile_id, second.profile_id);
@@ -33,7 +34,7 @@ fn derives_stable_profile_from_psk() {
 
 #[test]
 fn salt_block_round_trips_salt() {
-    let profile = V6Profile::derive(b"test psk");
+    let profile = V6Profile::derive(TEST_PSK);
     let salt = [0x5a; 16];
     let mut block = BytesMut::new();
 
@@ -46,8 +47,8 @@ fn salt_block_round_trips_salt() {
 
 #[test]
 fn official_fill_is_stable_and_profile_specific() {
-    let first_profile = V6Profile::derive(b"test psk");
-    let second_profile = V6Profile::derive(b"test psk");
+    let first_profile = V6Profile::derive(TEST_PSK);
+    let second_profile = V6Profile::derive(TEST_PSK);
     let other_profile = V6Profile::derive(b"other psk");
     let mut first = BytesMut::new();
     let mut second = BytesMut::new();
@@ -84,8 +85,134 @@ fn mixing_is_self_inverse() {
 }
 
 #[test]
+fn optimized_mixing_matches_reference() {
+    let mut profiles = Vec::new();
+    let mut seen = [false; 3];
+
+    for index in 0..512 {
+        let psk = format!("mix-profile-{index}");
+        let profile = V6Profile::derive(psk.as_bytes());
+        let mode = profile.mix_mode as usize;
+        if !seen[mode] {
+            seen[mode] = true;
+            profiles.push(profile);
+        }
+        if seen.iter().all(|seen| *seen) {
+            break;
+        }
+    }
+    assert!(seen.iter().all(|seen| *seen));
+
+    for profile in profiles {
+        for seq in [0, 1, 3, 17, 255] {
+            for len in [0, 1, 7, 8, 31, 64, 127, 512, 1500] {
+                let mut actual_padding = patterned_bytes(len, 0x31);
+                let mut actual_payload = patterned_bytes(len + 17, 0xa7);
+                let mut expected_padding = actual_padding.clone();
+                let mut expected_payload = actual_payload.clone();
+
+                mix_padding_payload(&profile, seq, &mut actual_padding, &mut actual_payload);
+                reference_mix_padding_payload(
+                    &profile,
+                    seq,
+                    &mut expected_padding,
+                    &mut expected_payload,
+                );
+
+                assert_eq!(actual_padding, expected_padding);
+                assert_eq!(actual_payload, expected_payload);
+            }
+        }
+    }
+}
+
+fn patterned_bytes(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| seed.wrapping_add((i as u8).wrapping_mul(37)) ^ ((i >> 3) as u8))
+        .collect()
+}
+
+fn reference_mix_padding_payload(
+    profile: &V6Profile,
+    seq: u32,
+    padding: &mut [u8],
+    payload_cipher: &mut [u8],
+) {
+    let n = padding.len().min(payload_cipher.len());
+    if n == 0 {
+        return;
+    }
+
+    for round in 0..profile.mix_rounds {
+        match profile.mix_mode {
+            0 => reference_mix_fixed_stride(profile, round, padding, payload_cipher, n),
+            1 => reference_mix_alternating_block(profile, round, padding, payload_cipher, n),
+            2 => reference_mix_prf_stride(profile, seq, round, padding, payload_cipher, n),
+            _ => unreachable!("mix mode is derived modulo 3"),
+        }
+    }
+}
+
+fn reference_mix_fixed_stride(
+    profile: &V6Profile,
+    round: u32,
+    padding: &mut [u8],
+    payload_cipher: &mut [u8],
+    n: usize,
+) {
+    let rr = reference_mix_round_delta(round);
+    let stride = (profile.mix_stride + rr as usize).max(1);
+    let mut off = profile.mix_offset_base % stride;
+    while off < n {
+        std::mem::swap(&mut padding[off], &mut payload_cipher[off]);
+        off += stride;
+    }
+}
+
+fn reference_mix_alternating_block(
+    profile: &V6Profile,
+    round: u32,
+    padding: &mut [u8],
+    payload_cipher: &mut [u8],
+    n: usize,
+) {
+    let block = profile.mix_block;
+    let mut off = (round as usize & 1) * block;
+    while off + block <= n {
+        for index in off..off + block {
+            std::mem::swap(&mut padding[index], &mut payload_cipher[index]);
+        }
+        off += 2 * block;
+    }
+}
+
+fn reference_mix_prf_stride(
+    profile: &V6Profile,
+    seq: u32,
+    round: u32,
+    padding: &mut [u8],
+    payload_cipher: &mut [u8],
+    n: usize,
+) {
+    let rr = reference_mix_round_delta(round);
+    let stride = (profile.mix_stride + rr as usize).max(1);
+    let mut off = (profile.prf32(super::LABEL_MIX_OFFSET, seq, round) as usize
+        + profile.mix_offset_base)
+        % stride;
+    while off < n {
+        std::mem::swap(&mut padding[off], &mut payload_cipher[off]);
+        off += stride;
+    }
+}
+
+fn reference_mix_round_delta(round: u32) -> u32 {
+    let quotient = (super::MIX_ROUND_MOD3_RECIPROCAL * round) >> super::MIX_ROUND_MOD3_SHIFT;
+    (round - 3 * quotient) & super::MIX_ROUND_BYTE_MASK
+}
+
+#[test]
 fn encodes_and_decodes_payload_frame() {
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let salt = [3u8; 16];
     let payload = b"GET / HTTP/1.1\r\n\r\n";
     let mut encoder = V6FrameEncoder::with_salt(psk, salt).unwrap();
@@ -115,7 +242,7 @@ fn encodes_and_decodes_payload_frame() {
 
 #[test]
 fn rejects_header_when_prefix_aad_changes() {
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let salt = [9u8; 16];
     let mut encoder = V6FrameEncoder::with_salt(psk, salt).unwrap();
     let mut wire = BytesMut::new();
@@ -139,7 +266,7 @@ fn rejects_header_when_prefix_aad_changes() {
 
 #[test]
 fn decodes_zero_payload_as_zero_chunk_even_with_padding() {
-    let psk = b"test psk";
+    let psk = TEST_PSK;
     let salt = [2u8; 16];
     let mut encoder = V6FrameEncoder::with_salt(psk, salt).unwrap();
     let mut wire = BytesMut::new();

@@ -182,6 +182,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{DnsIpPreference, DnsResolver};
+    use crate::test_support::test_udp_socket;
 
     #[test]
     fn dns_ip_preference_selects_and_orders_addresses() {
@@ -249,7 +250,7 @@ mod tests {
 
     impl DnsFixture {
         async fn start(answer: Ipv4Addr) -> Self {
-            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let socket = test_udp_socket().await;
             let addr = socket.local_addr().unwrap();
             let shutdown = CancellationToken::new();
             let task = tokio::spawn(run_dns_fixture(socket, answer, shutdown.clone()));

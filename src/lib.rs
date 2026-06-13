@@ -1,5 +1,7 @@
 //! Snell proxy implementation.
 
+#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
+
 pub mod error;
 pub(crate) mod parse;
 

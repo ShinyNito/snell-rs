@@ -252,7 +252,6 @@ mod tests {
 
     use bytes::{Bytes, BytesMut};
     use tokio::io::AsyncReadExt;
-    use tokio::net::{TcpListener, UdpSocket};
     use tokio::sync::mpsc;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
@@ -269,6 +268,7 @@ mod tests {
     use crate::proxy::socks5::inbound::{
         read_client_request as read_socks_client_request, write_reply_with_bind,
     };
+    use crate::test_support::{TEST_PSK, test_tcp_listener, test_udp_socket};
 
     fn direct_options(ipv6: bool) -> RelayOptions {
         RelayOptions::direct(ipv6, DnsResolver::system())
@@ -280,12 +280,12 @@ mod tests {
 
     #[tokio::test]
     async fn quic_proxy_init_session_forwards_raw_and_response() {
-        let psk = b"test psk";
-        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let target = test_udp_socket().await;
         let target_addr = target.local_addr().unwrap();
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_udp_socket().await;
         let server_addr = server.local_addr().unwrap();
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_udp_socket().await;
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,
@@ -338,13 +338,13 @@ mod tests {
 
     #[tokio::test]
     async fn quic_proxy_drops_raw_packet_without_session() {
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_udp_socket().await;
         let server_addr = server.local_addr().unwrap();
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_udp_socket().await;
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,
-            b"test psk".to_vec(),
+            TEST_PSK.to_vec(),
             direct_options(true),
             Duration::from_secs(1),
             shutdown.clone(),
@@ -367,12 +367,12 @@ mod tests {
 
     #[tokio::test]
     async fn quic_proxy_rejects_bad_psk_init() {
-        let psk = b"test psk";
-        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let target = test_udp_socket().await;
         let target_addr = target.local_addr().unwrap();
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_udp_socket().await;
         let server_addr = server.local_addr().unwrap();
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_udp_socket().await;
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,
@@ -411,13 +411,13 @@ mod tests {
 
     #[tokio::test]
     async fn quic_proxy_open_failure_keeps_socket_loop_alive() {
-        let psk = b"test psk";
-        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let target = test_udp_socket().await;
         let target_addr = target.local_addr().unwrap();
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_udp_socket().await;
         let server_addr = server.local_addr().unwrap();
-        let bad_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let good_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bad_client = test_udp_socket().await;
+        let good_client = test_udp_socket().await;
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,
@@ -462,9 +462,9 @@ mod tests {
 
     #[tokio::test]
     async fn quic_proxy_response_failure_closes_session_task() {
-        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = test_udp_socket().await;
         let target_addr = target.local_addr().unwrap();
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_udp_socket().await;
         let client_addr = "[::1]:12345".parse().unwrap();
         let (queue, payloads) = mpsc::channel(1);
         let task = tokio::spawn(run_quic_proxy_session(
@@ -494,12 +494,12 @@ mod tests {
 
     #[tokio::test]
     async fn quic_proxy_session_idle_timeout_drops_session() {
-        let psk = b"test psk";
-        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let target = test_udp_socket().await;
         let target_addr = target.local_addr().unwrap();
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_udp_socket().await;
         let server_addr = server.local_addr().unwrap();
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_udp_socket().await;
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,
@@ -549,14 +549,14 @@ mod tests {
 
     #[tokio::test]
     async fn quic_proxy_uses_upstream_socks5_udp_associate() {
-        let psk = b"test psk";
-        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let psk = TEST_PSK;
+        let socks_listener = test_tcp_listener().await;
         let socks_addr = socks_listener.local_addr().unwrap();
-        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = test_udp_socket().await;
         let relay_addr = relay.local_addr().unwrap();
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_udp_socket().await;
         let server_addr = server.local_addr().unwrap();
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_udp_socket().await;
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(serve_quic_proxy_socket(
             server,

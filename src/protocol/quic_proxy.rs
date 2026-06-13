@@ -20,18 +20,22 @@ pub struct QuicProxyInitRef<'a> {
     pub payload: &'a [u8],
 }
 
+#[must_use]
 pub fn is_quic_looking(first_byte: u8) -> bool {
     (0x40..=0x7f).contains(&first_byte) || first_byte >= 0xc0
 }
 
+#[must_use]
 pub fn is_quic_initial(first_byte: u8) -> bool {
     first_byte & 0x80 != 0 && first_byte & 0x40 != 0
 }
 
+#[must_use]
 pub fn is_quic_short_header(first_byte: u8) -> bool {
     first_byte & 0xc0 == 0x40
 }
 
+#[must_use]
 pub fn is_quic_initial_packet(first_byte: u8) -> bool {
     first_byte & 0xf0 == 0xc0
 }
@@ -277,6 +281,7 @@ mod tests {
     use crate::error::Error;
     use crate::protocol::header::PROTOCOL_VERSION;
     use crate::protocol::v4::frame::{V4FrameEncoder, split_salt};
+    use crate::test_support::TEST_PSK;
 
     #[test]
     fn classifies_quic_looking_packets() {
@@ -344,7 +349,7 @@ mod tests {
 
     #[test]
     fn encodes_and_decodes_init_datagram() {
-        let psk = b"test psk";
+        let psk = TEST_PSK;
         let mut plaintext = BytesMut::new();
         let mut wire = BytesMut::new();
 
@@ -369,14 +374,14 @@ mod tests {
     fn encoder_rejects_quic_looking_salt() {
         let salt = [0xc0; 16];
         assert!(matches!(
-            QuicProxyEncoder::with_salt(b"test psk", salt),
+            QuicProxyEncoder::with_salt(TEST_PSK, salt),
             Err(Error::InvalidUdpPacket)
         ));
     }
 
     #[test]
     fn decoder_rejects_padding() {
-        let psk = b"test psk";
+        let psk = TEST_PSK;
         let salt = [0x22; 16];
         let mut payload = BytesMut::new();
         write_init_prefix(&mut payload, "example.com", 443).unwrap();

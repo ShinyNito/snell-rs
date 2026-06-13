@@ -1,4 +1,9 @@
+use std::sync::LazyLock;
+
 use super::*;
+
+static GENERATOR0_BYTE_TABLE: LazyLock<[[[u8; 256]; 8]; 8]> =
+    LazyLock::new(build_generator0_byte_table);
 
 #[derive(Clone, Copy, Debug)]
 struct V6Namespaces {
@@ -49,11 +54,7 @@ impl V6Namespaces {
     }
 
     fn expand_array<const N: usize>(self, label: u32, seq: u32) -> [u8; N] {
-        let mut out = BytesMut::with_capacity(N);
-        self.expand_into(label, seq, N, &mut out);
-        let mut array = [0; N];
-        array.copy_from_slice(&out);
-        array
+        expand_stream_array(self.for_label(label), label, seq)
     }
 }
 
@@ -102,10 +103,7 @@ pub struct V6Profile {
 
 impl V6Profile {
     pub fn derive(psk: &[u8]) -> Self {
-        let mut input = Vec::with_capacity(PROFILE_SEED.len() + psk.len());
-        input.extend_from_slice(PROFILE_SEED);
-        input.extend_from_slice(psk);
-        let profile_secret = blake2b_256(&input);
+        let profile_secret = blake2b_256_from_slices(&[PROFILE_SEED, psk]);
         let namespaces = V6Namespaces::derive(&profile_secret);
 
         let profile_id = namespaces.prf_static(LABEL_PROFILE_ID, 0);
@@ -479,21 +477,9 @@ impl V6Profile {
             (scaled + 50) / 100
         } as u32;
 
+        let table = &GENERATOR0_BYTE_TABLE[target_bits as usize];
         for (i, byte) in out.iter_mut().enumerate() {
-            let orig = *byte;
-            let mut b = *byte;
-            for k in 0..8 {
-                if b.count_ones() == target_bits {
-                    break;
-                }
-                let bit = (usize::from(orig) + i + 3 * k) & 7;
-                if b.count_ones() < target_bits {
-                    b |= 1 << bit;
-                } else {
-                    b &= !(1 << bit);
-                }
-            }
-            *byte = b;
+            *byte = table[i & 7][usize::from(*byte)];
         }
     }
 
@@ -549,13 +535,48 @@ impl V6Profile {
     }
 }
 
+fn build_generator0_byte_table() -> [[[u8; 256]; 8]; 8] {
+    let mut table = [[[0; 256]; 8]; 8];
+    for (target_bits, target_table) in table.iter_mut().enumerate() {
+        for (index_mod, index_table) in target_table.iter_mut().enumerate() {
+            for (byte, slot) in index_table.iter_mut().enumerate() {
+                *slot = generator0_byte(byte as u8, index_mod, target_bits as u32);
+            }
+        }
+    }
+    table
+}
+
+fn generator0_byte(orig: u8, index_mod: usize, target_bits: u32) -> u8 {
+    let mut b = orig;
+    let mut ones = b.count_ones();
+    for k in 0..8 {
+        if ones == target_bits {
+            break;
+        }
+        let bit = (usize::from(orig) + index_mod + 3 * k) & 7;
+        let mask = 1 << bit;
+        if ones < target_bits {
+            if b & mask == 0 {
+                b |= mask;
+                ones += 1;
+            }
+        } else if b & mask != 0 {
+            b &= !mask;
+            ones -= 1;
+        }
+    }
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TEST_PSK;
 
     #[test]
     fn profile_derivation_matches_reversed_constants() {
-        let profile = V6Profile::derive(b"test psk");
+        let profile = V6Profile::derive(TEST_PSK);
 
         assert_eq!(profile.namespaces.profile, 0x0f8a_72f8_718e_3d8b);
         assert_eq!(profile.namespaces.prefix, 0xff24_1509_13b4_c0fe);
@@ -629,7 +650,7 @@ mod tests {
 
     #[test]
     fn runtime_prf_and_fill_match_reversed_constants() {
-        let profile = V6Profile::derive(b"test psk");
+        let profile = V6Profile::derive(TEST_PSK);
         let mut fill = BytesMut::new();
         let mut salt_fill = BytesMut::new();
 
@@ -695,5 +716,173 @@ mod tests {
             ],
             [12267, 7434, 4943]
         );
+    }
+
+    #[test]
+    fn optimized_official_fill_matches_reference() {
+        for psk in [
+            TEST_PSK,
+            b"mix-mode-a",
+            b"mix-mode-b",
+            b"mix-mode-c",
+            b"other psk",
+        ] {
+            let profile = V6Profile::derive(psk);
+            for seq in [0, 1, 2, 7, 31, u32::MAX] {
+                for len in [0, 1, 7, 8, 31, 32, 96, 127, 512, 1500] {
+                    let mut actual = BytesMut::new();
+                    let mut expected = BytesMut::new();
+
+                    let actual_range = profile.append_official_fill(seq, len, &mut actual);
+                    let expected_range = append_reference_fill(&profile, seq, len, &mut expected);
+
+                    assert_eq!(actual_range, expected_range);
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "psk={:?} seq={seq} len={len}",
+                        std::str::from_utf8(psk).unwrap_or("<non-utf8>")
+                    );
+                }
+            }
+        }
+    }
+
+    fn append_reference_fill(
+        profile: &V6Profile,
+        seq: u32,
+        len: usize,
+        out: &mut BytesMut,
+    ) -> Range<usize> {
+        let start = out.len();
+        reference_expand_stream(
+            profile.namespaces.for_label(LABEL_PADDING),
+            LABEL_PADDING,
+            seq,
+            len,
+            out,
+        );
+        let end = out.len();
+        let fill = &mut out[start..end];
+        match profile.generator {
+            0 => reference_generator_0(profile, seq, fill),
+            1 => reference_generator_1(profile, fill),
+            2 => reference_generator_2(profile, fill),
+            3 => reference_generator_3(profile, seq, fill),
+            _ => unreachable!("generator is masked to 0..=3"),
+        }
+        start..end
+    }
+
+    fn reference_expand_stream(
+        namespace: u64,
+        label: u32,
+        seq: u32,
+        len: usize,
+        out: &mut BytesMut,
+    ) {
+        out.reserve(len);
+        let target_len = out.len() + len;
+        let mut state = STREAM_INITIAL_STATE.wrapping_add((seq as u64).wrapping_mul(DOMAIN_MUL))
+            ^ (label as u64).wrapping_mul(STREAM_LABEL_MUL)
+            ^ (len as u64)
+                .wrapping_mul(STREAM_LEN_MUL)
+                .wrapping_add(STREAM_LEN_ADD)
+            ^ namespace;
+
+        while out.len() < target_len {
+            state = state.wrapping_add(GOLDEN_RATIO_64);
+            let word = splitmix64(state).to_le_bytes();
+            let remaining = target_len - out.len();
+            out.extend_from_slice(&word[..remaining.min(word.len())]);
+        }
+    }
+
+    fn reference_expand_array<const N: usize>(namespace: u64, label: u32, seq: u32) -> [u8; N] {
+        let mut out = BytesMut::with_capacity(N);
+        reference_expand_stream(namespace, label, seq, N, &mut out);
+        let mut array = [0; N];
+        array.copy_from_slice(&out);
+        array
+    }
+
+    fn reference_generator_0(profile: &V6Profile, seq: u32, out: &mut [u8]) {
+        let percent = profile.pick(
+            LABEL_BIT_PERCENT,
+            seq,
+            0,
+            profile.bit_min as usize,
+            profile.bit_max as usize,
+        );
+        let scaled = percent * 8;
+        let target_bits = if scaled <= 49 {
+            1
+        } else if scaled > 749 {
+            7
+        } else {
+            (scaled + 50) / 100
+        } as u32;
+
+        for (i, byte) in out.iter_mut().enumerate() {
+            let orig = *byte;
+            let mut b = *byte;
+            for k in 0..8 {
+                if b.count_ones() == target_bits {
+                    break;
+                }
+                let bit = (usize::from(orig) + i + 3 * k) & 7;
+                if b.count_ones() < target_bits {
+                    b |= 1 << bit;
+                } else {
+                    b &= !(1 << bit);
+                }
+            }
+            *byte = b;
+        }
+    }
+
+    fn reference_generator_1(profile: &V6Profile, out: &mut [u8]) {
+        let total = profile.g1 + profile.g2 + profile.g3;
+        for (i, byte) in out.iter_mut().enumerate() {
+            let b = *byte;
+            let r = usize::from(b) % total;
+            *byte = if r < profile.g1 {
+                0x20 + b.wrapping_add(i as u8) % 0x5f
+            } else if r < profile.g1 + profile.g2 {
+                0x80 + ((b ^ i as u8) % 0x40)
+            } else {
+                0xc0 + b.wrapping_add((7 * i) as u8) % 0x40
+            };
+        }
+    }
+
+    fn reference_generator_2(profile: &V6Profile, out: &mut [u8]) {
+        for (i, byte) in out.iter_mut().enumerate() {
+            let b = *byte;
+            let hi = (((b >> 4).wrapping_add((i & 3) as u8).wrapping_add(3)) << 4) & 0xf0;
+            let lo = ((b & 0x0f) as usize + profile.g4 + (i & 1)) % 10;
+            *byte = hi | lo as u8;
+        }
+    }
+
+    fn reference_generator_3(profile: &V6Profile, seq: u32, out: &mut [u8]) {
+        let motif = reference_expand_array::<32>(
+            profile.namespaces.for_label(LABEL_MOTIF),
+            LABEL_MOTIF,
+            seq,
+        );
+        let motif_len = (profile.g5 * 4).min(motif.len());
+        let interval = profile.g6;
+        for (i, byte) in out.iter_mut().enumerate() {
+            let b = *byte;
+            let r = i % interval;
+            *byte = if r < interval - 3 {
+                ((profile.g5 + 3) * i) as u8 ^ motif[i % motif_len]
+            } else if r < interval - 1 {
+                0x30 + b % 10
+            } else {
+                b
+            };
+        }
     }
 }

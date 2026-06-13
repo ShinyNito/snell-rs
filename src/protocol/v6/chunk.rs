@@ -8,6 +8,7 @@ pub struct V6ChunkSizer {
 }
 
 impl V6ChunkSizer {
+    #[must_use]
     pub fn new(profile: V6Profile) -> Self {
         Self {
             profile,
@@ -16,6 +17,7 @@ impl V6ChunkSizer {
         }
     }
 
+    #[must_use]
     pub fn peek_limit(&self, seq: u32, now: Instant) -> usize {
         let current = if self
             .last_record_at

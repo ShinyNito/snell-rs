@@ -3,11 +3,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::task::Poll;
 use std::time::Instant;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
+use crate::protocol::crypto::AEAD_TAG_SIZE;
 #[cfg(test)]
 use crate::protocol::crypto::SALT_SIZE;
 use crate::protocol::header::{COMMAND_TUNNEL, write_tcp_request_header, write_udp_request_header};
@@ -19,7 +20,9 @@ use crate::protocol::v4::frame::V4FrameEncoder;
 use crate::protocol::v6::{V6ChunkSizer, V6FrameEncoder};
 use crate::{MAX_PACKET_SIZE, MAX_V6_RECORD_PAYLOAD_LEN, ProtocolVersion};
 
-use super::buffer::{compact_stream_buffer_for_reuse, poll_read_into_spare, write_all_vectored};
+use super::buffer::{
+    compact_stream_buffer_for_reuse, poll_read_into_prepared_spare, write_all_vectored,
+};
 use super::{
     FRAME_HEAD_INITIAL_CAPACITY, STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY,
     TCP_FIRST_RECORD_OVERHEAD, TCP_RECORD_IDLE_TIMEOUT, TCP_RECORD_MSS, TCP_STEADY_RECORD_OVERHEAD,
@@ -84,6 +87,96 @@ struct ReaderPayloadFrame {
     limit: usize,
 }
 
+#[inline]
+fn prepare_payload_frame_from_buffer(
+    source: &mut BytesMut,
+    payload: &mut BytesMut,
+    prefix: &[u8],
+    limit: usize,
+) -> Result<Option<ReaderPayloadFrame>> {
+    let prefix_len = prefix.len();
+    let Some(read_limit) = limit.checked_sub(prefix_len).filter(|limit| *limit != 0) else {
+        payload.clear();
+        return Err(Error::PayloadTooLarge);
+    };
+
+    if source.is_empty() {
+        payload.clear();
+        return Ok(None);
+    }
+
+    let read_len = source.len().min(read_limit);
+    let payload_len = prefix_len + read_len;
+
+    payload.clear();
+    let required_capacity = payload_len + AEAD_TAG_SIZE;
+    if payload.capacity() < required_capacity {
+        payload.reserve(required_capacity);
+    }
+    if !prefix.is_empty() {
+        payload.extend_from_slice(prefix);
+    }
+    payload.extend_from_slice(&source[..read_len]);
+    source.advance(read_len);
+
+    Ok(Some(ReaderPayloadFrame {
+        payload_len,
+        read_len,
+        limit,
+    }))
+}
+
+#[inline]
+fn poll_read_payload_frame_from_reader<R>(
+    plain: &mut R,
+    cx: &mut std::task::Context<'_>,
+    payload: &mut BytesMut,
+    prefix: &[u8],
+    limit: usize,
+) -> Poll<Result<Option<ReaderPayloadFrame>>>
+where
+    R: AsyncRead + Unpin,
+{
+    let prefix_len = prefix.len();
+    let Some(read_limit) = limit.checked_sub(prefix_len).filter(|limit| *limit != 0) else {
+        payload.clear();
+        return Poll::Ready(Err(Error::PayloadTooLarge));
+    };
+
+    payload.clear();
+
+    let required_capacity = prefix_len + read_limit + AEAD_TAG_SIZE;
+    if payload.capacity() < required_capacity {
+        payload.reserve(required_capacity);
+    }
+
+    if !prefix.is_empty() {
+        payload.extend_from_slice(prefix);
+    }
+
+    match poll_read_into_prepared_spare(plain, cx, payload, read_limit) {
+        Poll::Pending => {
+            payload.clear();
+            Poll::Pending
+        }
+        Poll::Ready(Ok(read_len)) => {
+            if read_len == 0 {
+                payload.clear();
+                return Poll::Ready(Ok(None));
+            }
+            Poll::Ready(Ok(Some(ReaderPayloadFrame {
+                payload_len: prefix_len + read_len,
+                read_len,
+                limit,
+            })))
+        }
+        Poll::Ready(Err(err)) => {
+            payload.clear();
+            Poll::Ready(Err(err))
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum UdpResponseIpVersion {
     V4,
@@ -136,7 +229,7 @@ where
         )?)))
     }
 
-    pub(crate) async fn write_payload_from_reader<R>(
+    pub(crate) async fn write_next_payload_record_from_reader<R>(
         &mut self,
         plain: &mut R,
     ) -> Result<Option<usize>>
@@ -144,21 +237,28 @@ where
         R: AsyncRead + Unpin,
     {
         match self {
-            Self::V4 { writer, .. } => writer.write_payload_from_reader(plain).await,
-            Self::V6(writer) => writer.write_payload_from_reader(plain).await,
+            Self::V4 { writer, .. } => writer.write_next_payload_record_from_reader(plain).await,
+            Self::V6(writer) => writer.write_next_payload_record_from_reader(plain).await,
         }
     }
 
-    pub(crate) async fn write_tunnel_reply_from_reader<R>(
+    pub(crate) async fn write_payload_from_buffer(
         &mut self,
-        plain: &mut R,
-    ) -> Result<Option<usize>>
-    where
-        R: AsyncRead + Unpin,
-    {
+        plain: &mut BytesMut,
+    ) -> Result<Option<usize>> {
         match self {
-            Self::V4 { writer, .. } => writer.write_tunnel_reply_from_reader(plain).await,
-            Self::V6(writer) => writer.write_tunnel_reply_from_reader(plain).await,
+            Self::V4 { writer, .. } => writer.write_payload_from_buffer(plain).await,
+            Self::V6(writer) => writer.write_payload_from_buffer(plain).await,
+        }
+    }
+
+    pub(crate) async fn write_tunnel_reply_from_buffer(
+        &mut self,
+        plain: &mut BytesMut,
+    ) -> Result<Option<usize>> {
+        match self {
+            Self::V4 { writer, .. } => writer.write_tunnel_reply_from_buffer(plain).await,
+            Self::V6(writer) => writer.write_tunnel_reply_from_buffer(plain).await,
         }
     }
 

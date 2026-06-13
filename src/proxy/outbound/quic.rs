@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::protocol::socks5::{
     parse_udp_packet as parse_socks_udp_packet, write_udp_packet as write_socks_udp_packet,
 };
+use crate::session::udp::io::recv_udp_datagram_into;
 
 use super::socks5::open_udp_associate_via_socks5;
 use super::udp::{resolve_socks5_udp_relay_addr, send_udp_payload};
@@ -126,10 +127,20 @@ pub(crate) async fn run_quic_proxy_response_session(
     client_addr: SocketAddr,
     relay: QuicProxyResponseRelay,
 ) -> Result<()> {
-    let mut response = [0; MAX_PACKET_SIZE + 512];
+    let mut response = BytesMut::with_capacity(MAX_PACKET_SIZE + 512);
 
     loop {
-        let (n, peer) = relay.outbound.recv_from(&mut response).await?;
+        let (n, peer) =
+            match recv_udp_datagram_into(&relay.outbound, &mut response, MAX_PACKET_SIZE + 512)
+                .await
+            {
+                Ok(result) => result,
+                Err(Error::PayloadTooLarge) => {
+                    tracing::debug!("ignored oversized quic proxy response");
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
         match &relay.target {
             QuicProxyRelayTarget::Direct(target) => {
                 if peer != *target {

@@ -90,6 +90,7 @@ pub enum Error {
 }
 
 impl Error {
+    #[must_use]
     pub fn is_closed_io(&self) -> bool {
         matches!(
             self,
@@ -97,6 +98,7 @@ impl Error {
         )
     }
 
+    #[must_use]
     pub fn is_invalid_udp_packet(&self) -> bool {
         matches!(
             self,
@@ -107,6 +109,7 @@ impl Error {
         )
     }
 
+    #[must_use]
     pub fn is_closed_io_kind(kind: std::io::ErrorKind) -> bool {
         matches!(
             kind,

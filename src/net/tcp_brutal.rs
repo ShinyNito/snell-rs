@@ -66,6 +66,8 @@ fn set_tcp_sockopt(
     value: *const libc::c_void,
     len: usize,
 ) -> io::Result<()> {
+    // SAFETY: `value` points to a live socket option buffer for the duration of
+    // the call, and `len` is converted to the platform socklen_t.
     let rc = unsafe {
         libc::setsockopt(
             fd,
