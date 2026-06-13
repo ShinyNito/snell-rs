@@ -1,6 +1,14 @@
 # Changelog
 
-All notable changes to this project are generated from Conventional Commits.
+All notable changes to this project are maintained manually.
+
+## [0.4.2] - 2026-06-14
+
+## Release Notes
+
+  * 改用 poll 读取接口并引入预读/缓冲复用，降低协议帧读写热路径开销
+  * 收紧 crate 公共 API 表面，并将大模块测试拆分到就近的 `tests.rs`
+  * 补充 v4/v6 帧读写、复用连接、TCP/UDP 会话和 QUIC proxy 回归测试
 
 ## [0.4.1] - 2026-06-13
 
