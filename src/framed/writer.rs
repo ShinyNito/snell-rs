@@ -71,6 +71,56 @@ const fn steady_record_limit() -> usize {
     TCP_RECORD_MSS - TCP_STEADY_RECORD_OVERHEAD
 }
 
+pub(super) trait MessageRecordEncoder {
+    fn clear_wire(&mut self);
+
+    fn peek_record_limit(&mut self, now: Instant) -> usize;
+
+    fn commit_record_limit(&mut self, now: Instant, limit: usize);
+
+    fn encode_record_into(&mut self, prefix: &[u8], payload: &[u8]) -> Result<usize>;
+}
+
+pub(super) fn encode_payload_message_from_buffer<E>(
+    encoder: &mut E,
+    plain: &mut BytesMut,
+    first_record_prefix: &[u8],
+) -> Result<Option<usize>>
+where
+    E: MessageRecordEncoder,
+{
+    if plain.is_empty() {
+        return Ok(None);
+    }
+
+    encoder.clear_wire();
+    let mut written = 0;
+    let mut first_record = true;
+    while !plain.is_empty() {
+        let now = Instant::now();
+        let prefix = if first_record {
+            first_record_prefix
+        } else {
+            &[]
+        };
+        let limit = encoder.peek_record_limit(now);
+        let Some(read_limit) = limit.checked_sub(prefix.len()).filter(|limit| *limit != 0) else {
+            encoder.clear_wire();
+            return Err(Error::PayloadTooLarge);
+        };
+
+        let read_len = plain.len().min(read_limit);
+        let chunk = &plain[..read_len];
+        encoder.encode_record_into(prefix, chunk)?;
+        plain.advance(read_len);
+        encoder.commit_record_limit(now, limit);
+        written += read_len;
+        first_record = false;
+    }
+
+    Ok(Some(written))
+}
+
 pub(crate) enum SnellStreamWriter<W> {
     V4 {
         writer: Box<V4StreamWriter<W>>,

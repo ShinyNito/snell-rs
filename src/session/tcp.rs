@@ -245,19 +245,9 @@ where
             return Err(Error::WriteClosed);
         }
 
-        poll_fn(|cx| self.plain_batch.poll_fill_from(plain, cx)).await?;
-        match self
-            .frame_writer
-            .write_payload_message_from_buffer(&mut self.plain_batch.buffer)
-            .await?
-        {
-            Some(n) => Ok(Some(n)),
-            None if self.plain_batch.is_done() => Ok(None),
-            None => {
-                debug_assert!(false, "plain batch should contain data or be done");
-                Ok(None)
-            }
-        }
+        self.plain_batch
+            .write_payload_message_from_reader(&mut self.frame_writer, plain)
+            .await
     }
 
     pub(crate) async fn close_write(&mut self) -> Result<()> {
@@ -351,34 +341,21 @@ where
             return Err(Error::WriteClosed);
         }
 
-        poll_fn(|cx| self.plain_batch.poll_fill_from(plain, cx)).await?;
+        self.plain_batch.fill_from_reader(plain).await?;
 
-        let written = if !self.tunnel_open {
-            match self
+        if !self.tunnel_open {
+            let written = self
                 .frame_writer
                 .write_tunnel_reply_message_from_buffer(&mut self.plain_batch.buffer)
-                .await?
-            {
-                Some(n) => {
-                    self.tunnel_open = true;
-                    n
-                }
-                None => 0,
+                .await?;
+            if written.is_some() {
+                self.tunnel_open = true;
             }
+            self.plain_batch.finish_write_result(written)
         } else {
-            self.frame_writer
-                .write_payload_message_from_buffer(&mut self.plain_batch.buffer)
-                .await?
-                .unwrap_or(0)
-        };
-
-        if written != 0 {
-            Ok(Some(written))
-        } else if self.plain_batch.is_done() {
-            Ok(None)
-        } else {
-            debug_assert!(false, "plain batch should contain data or be done");
-            Ok(None)
+            self.plain_batch
+                .write_payload_message(&mut self.frame_writer)
+                .await
         }
     }
 
@@ -419,6 +396,51 @@ impl PlainReadBatch {
             self.buffer = BytesMut::with_capacity(SERVER_PLAIN_BATCH_INITIAL_CAPACITY);
         }
         self.eof = false;
+    }
+
+    pub(crate) async fn write_payload_message_from_reader<P, W>(
+        &mut self,
+        frame_writer: &mut SnellStreamWriter<W>,
+        plain: &mut P,
+    ) -> Result<Option<usize>>
+    where
+        P: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        self.fill_from_reader(plain).await?;
+        self.write_payload_message(frame_writer).await
+    }
+
+    async fn fill_from_reader<P>(&mut self, plain: &mut P) -> Result<()>
+    where
+        P: AsyncRead + Unpin,
+    {
+        poll_fn(|cx| self.poll_fill_from(plain, cx)).await?;
+        Ok(())
+    }
+
+    async fn write_payload_message<W>(
+        &mut self,
+        frame_writer: &mut SnellStreamWriter<W>,
+    ) -> Result<Option<usize>>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let written = frame_writer
+            .write_payload_message_from_buffer(&mut self.buffer)
+            .await?;
+        self.finish_write_result(written)
+    }
+
+    fn finish_write_result(&self, written: Option<usize>) -> Result<Option<usize>> {
+        match written {
+            Some(n) => Ok(Some(n)),
+            None if self.is_done() => Ok(None),
+            None => {
+                debug_assert!(false, "plain batch should contain data or be done");
+                Ok(None)
+            }
+        }
     }
 
     pub(crate) fn poll_fill_from<P>(

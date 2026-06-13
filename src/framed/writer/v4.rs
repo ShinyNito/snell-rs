@@ -39,11 +39,7 @@ where
         Ok(())
     }
 
-    async fn write_payload_buffer(
-        &mut self,
-        payload_len: usize,
-        advance_record_sizer: bool,
-    ) -> Result<usize> {
+    async fn write_payload_buffer(&mut self, payload_len: usize) -> Result<usize> {
         self.head.clear();
         let wire_len =
             self.encoder
@@ -55,7 +51,7 @@ where
             ..
         } = self;
         write_all_vectored(inner, head, payload).await?;
-        if advance_record_sizer && payload_len != 0 {
+        if payload_len != 0 {
             self.record_sizer.next_limit(Instant::now());
         }
         Ok(wire_len)
@@ -81,40 +77,13 @@ where
         plain: &mut BytesMut,
         first_record_prefix: &[u8],
     ) -> Result<Option<usize>> {
-        if plain.is_empty() {
+        let written = encode_payload_message_from_buffer(self, plain, first_record_prefix)?;
+        if written.is_none() {
             return Ok(None);
         }
-
-        self.wire.clear();
-        let mut written = 0;
-        let mut first_record = true;
-        while !plain.is_empty() {
-            let now = Instant::now();
-            let prefix = if first_record {
-                first_record_prefix
-            } else {
-                &[]
-            };
-            let limit = self.record_sizer.peek_limit(now);
-            let Some(read_limit) = limit.checked_sub(prefix.len()).filter(|limit| *limit != 0)
-            else {
-                self.wire.clear();
-                return Err(Error::PayloadTooLarge);
-            };
-
-            let read_len = plain.len().min(read_limit);
-            let chunk = &plain[..read_len];
-            self.encoder
-                .encode_payload_parts_into(prefix, chunk, &mut self.wire)?;
-            plain.advance(read_len);
-            self.record_sizer.commit_limit(now, limit);
-            written += read_len;
-            first_record = false;
-        }
-
         let Self { inner, wire, .. } = self;
         write_all_contiguous(inner, wire).await?;
-        Ok(Some(written))
+        Ok(written)
     }
 
     pub async fn write_tcp_request(
@@ -126,32 +95,32 @@ where
     ) -> Result<()> {
         self.payload.clear();
         write_tcp_request_header(&mut self.payload, host, port, snell_version, reuse)?;
-        self.write_control_scratch().await
+        self.write_control_payload().await
     }
 
     pub async fn write_udp_request(&mut self, snell_version: ProtocolVersion) -> Result<()> {
         self.payload.clear();
         write_udp_request_header(&mut self.payload, snell_version)?;
-        self.write_control_scratch().await
+        self.write_control_payload().await
     }
 
     pub async fn write_empty_tunnel_reply(&mut self) -> Result<()> {
         self.payload.clear();
         write_tunnel_reply(&mut self.payload, &[]);
-        self.write_payload_buffer(self.payload.len(), true).await?;
+        self.write_payload_buffer(self.payload.len()).await?;
         Ok(())
     }
 
     pub async fn write_pong_reply(&mut self) -> Result<()> {
         self.payload.clear();
         write_pong_reply(&mut self.payload);
-        self.write_control_scratch().await
+        self.write_control_payload().await
     }
 
     pub async fn write_error_reply(&mut self, code: u8, message: &str) -> Result<()> {
         self.payload.clear();
         write_error_reply(&mut self.payload, code, message);
-        self.write_control_scratch().await
+        self.write_control_payload().await
     }
 
     pub async fn write_zero_chunk(&mut self) -> Result<()> {
@@ -173,16 +142,29 @@ where
         }
     }
 
-    async fn write_control_scratch(&mut self) -> Result<()> {
-        self.write_plain_scratch(true).await
-    }
-
-    async fn write_plain_scratch(&mut self, advance_record_sizer: bool) -> Result<()> {
+    async fn write_control_payload(&mut self) -> Result<()> {
         let payload_len = self.payload.len();
-        let wire_len = self
-            .write_payload_buffer(payload_len, advance_record_sizer)
-            .await?;
+        let wire_len = self.write_payload_buffer(payload_len).await?;
         tracing::trace!(payload_len, wire_len, "wrote snell v4 request frame");
         Ok(())
+    }
+}
+
+impl<W> MessageRecordEncoder for V4StreamWriter<W> {
+    fn clear_wire(&mut self) {
+        self.wire.clear();
+    }
+
+    fn peek_record_limit(&mut self, now: Instant) -> usize {
+        self.record_sizer.peek_limit(now)
+    }
+
+    fn commit_record_limit(&mut self, now: Instant, limit: usize) {
+        self.record_sizer.commit_limit(now, limit);
+    }
+
+    fn encode_record_into(&mut self, prefix: &[u8], payload: &[u8]) -> Result<usize> {
+        self.encoder
+            .encode_payload_parts_into(prefix, payload, &mut self.wire)
     }
 }

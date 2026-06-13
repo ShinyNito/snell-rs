@@ -1,7 +1,10 @@
 use core::range::Range;
 use std::future::poll_fn;
+use std::io::{self, ErrorKind};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 use super::{ReuseClientConn, ReuseClientReader, ReuseClientWriter};
 use crate::error::Error;
@@ -202,4 +205,37 @@ async fn close_whole_connection_drops_reader_and_writer_halves() {
 
     let mut buf = [0; 1];
     assert_eq!(server_upload.read(&mut buf).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn reuse_conn_writer_filling_from_failed_plain_reader_marks_broken() {
+    let (client_upload, _server_upload) = test_duplex_pair();
+    let (_server_download, client_download) = test_duplex_pair();
+
+    let writer = test_snell_writer(client_upload);
+    let reader = test_snell_reader(client_download);
+    let mut conn = ReuseClientConn::from_parts(reader, writer);
+
+    let mut plain = FailingPlainReader;
+    assert!(matches!(
+        conn.writer
+            .write_payload_message_from_reader(&mut plain)
+            .await,
+        Err(Error::Io(err)) if err.kind() == ErrorKind::UnexpectedEof
+    ));
+    assert!(conn.writer.broken);
+}
+
+// A plain reader whose reads always fail, simulating a broken upstream so the
+// fill stage of `write_payload_message_from_reader` surfaces an error.
+struct FailingPlainReader;
+
+impl AsyncRead for FailingPlainReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::from(ErrorKind::UnexpectedEof)))
+    }
 }

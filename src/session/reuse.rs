@@ -162,10 +162,9 @@ where
         if self.write_closed {
             return Err(Error::WriteClosed);
         }
-        std::future::poll_fn(|cx| self.plain_batch.poll_fill_from(plain, cx)).await?;
         match self
-            .frame_writer
-            .write_payload_message_from_buffer(&mut self.plain_batch.buffer)
+            .plain_batch
+            .write_payload_message_from_reader(&mut self.frame_writer, plain)
             .await
         {
             Ok(n) => Ok(n),
