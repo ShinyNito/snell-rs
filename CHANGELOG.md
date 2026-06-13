@@ -2,6 +2,13 @@
 
 All notable changes to this project are maintained manually.
 
+## [0.4.3] - 2026-06-14
+
+## Release Notes
+
+  * framed writer 改为批量预读后合并帧写入，将多条 record 的密文累积到单次 write，降低写热路径 syscall 开销
+  * v4/v6 帧编码新增 `encode_payload_parts_into`，并补充 reference/message 双路径逐字节等价回归测试，清理被取代的 `write_test_*` 测试桩
+
 ## [0.4.2] - 2026-06-14
 
 ## Release Notes
