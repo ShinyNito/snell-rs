@@ -13,7 +13,10 @@ use crate::protocol::header::write_tcp_request_header;
 use crate::protocol::request::{
     ClientRequest, ServerReply, parse_client_request, parse_server_reply,
 };
-use crate::test_support::{TEST_PSK, test_duplex_pair, test_snell_reader, test_snell_writer};
+use crate::test_support::{
+    TEST_PSK, test_duplex_pair, test_snell_reader, test_snell_writer, write_snell_payload_message,
+    write_snell_tunnel_reply_message,
+};
 
 struct RecordingPlainReadWindow {
     payload: Vec<u8>,
@@ -54,7 +57,7 @@ where
 {
     let mut plain = payload;
     Ok(writer
-        .write_next_payload_record_from_reader(&mut plain)
+        .write_payload_message_from_reader(&mut plain)
         .await?
         .unwrap_or(0))
 }
@@ -68,7 +71,7 @@ where
 {
     let mut plain = payload;
     Ok(writer
-        .write_payload_batch_from_reader(&mut plain)
+        .write_payload_message_from_reader(&mut plain)
         .await?
         .unwrap_or(0))
 }
@@ -184,8 +187,7 @@ async fn client_reader_maps_transport_eof_after_tunnel_to_eof() {
 
     let server = async {
         let mut server_writer = test_snell_writer(server_download);
-        server_writer
-            .write_test_tunnel_reply(b"accepted")
+        write_snell_tunnel_reply_message(&mut server_writer, b"accepted")
             .await
             .unwrap();
         server_writer.shutdown().await.unwrap();
@@ -216,7 +218,9 @@ async fn server_stream_preserves_early_data_and_coalesces_first_reply() {
         plain.extend_from_slice(b"early");
 
         let mut writer = test_snell_writer(client_upload);
-        writer.write_test_frame(&plain).await.unwrap();
+        write_snell_payload_message(&mut writer, &plain)
+            .await
+            .unwrap();
 
         let mut reader = test_snell_reader(client_download);
         let payload = reader.read_frame_payload().await.unwrap();
@@ -298,7 +302,7 @@ async fn server_writer_batch_drains_plain_buffer_across_records() {
 
         assert_eq!(
             writer
-                .write_payload_batch_from_reader(&mut plain)
+                .write_payload_message_from_reader(&mut plain)
                 .await
                 .unwrap(),
             Some(payload.len())
@@ -333,7 +337,7 @@ async fn server_writer_plain_batch_uses_large_read_ahead_window() {
 
     assert_eq!(
         writer
-            .write_payload_batch_from_reader(&mut plain)
+            .write_payload_message_from_reader(&mut plain)
             .await
             .unwrap(),
         Some(4)

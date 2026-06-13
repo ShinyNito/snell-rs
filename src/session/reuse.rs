@@ -3,7 +3,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
-use crate::session::tcp::TcpPayloadReader;
+use crate::session::tcp::{PlainReadBatch, TcpPayloadReader};
 
 pub(crate) struct ReuseClientConn<R, W> {
     reader: ReuseClientReader<R>,
@@ -127,6 +127,7 @@ where
 
 pub(crate) struct ReuseClientWriter<W> {
     frame_writer: SnellStreamWriter<W>,
+    plain_batch: PlainReadBatch,
     write_closed: bool,
     broken: bool,
 }
@@ -138,6 +139,7 @@ where
     fn new(writer: SnellStreamWriter<W>) -> Self {
         Self {
             frame_writer: writer,
+            plain_batch: PlainReadBatch::new(),
             write_closed: false,
             broken: false,
         }
@@ -153,7 +155,7 @@ where
         }
     }
 
-    pub(crate) async fn write_next_payload_record_from_reader<P>(
+    pub(crate) async fn write_payload_message_from_reader<P>(
         &mut self,
         plain: &mut P,
     ) -> Result<Option<usize>>
@@ -163,9 +165,10 @@ where
         if self.write_closed {
             return Err(Error::WriteClosed);
         }
+        std::future::poll_fn(|cx| self.plain_batch.poll_fill_from(plain, cx)).await?;
         match self
             .frame_writer
-            .write_next_payload_record_from_reader(plain)
+            .write_payload_message_from_buffer(&mut self.plain_batch.buffer)
             .await
         {
             Ok(n) => Ok(n),
@@ -195,6 +198,7 @@ where
 
     fn compact_buffers_for_reuse(&mut self) {
         self.frame_writer.compact_buffers_for_reuse();
+        self.plain_batch.compact_for_reuse();
     }
 }
 

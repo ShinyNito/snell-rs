@@ -11,7 +11,7 @@ use crate::error::Error;
 use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::test_support::{
     TEST_PSK, test_snell_reader, test_snell_reader_with_version, test_snell_writer,
-    test_snell_writer_with_version, test_tcp_listener,
+    test_snell_writer_with_version, test_tcp_listener, write_snell_tunnel_reply_message,
 };
 
 macro_rules! assert_next_payload {
@@ -68,7 +68,9 @@ async fn pool_conn_after_reply(
             }
         );
 
-        server_writer.write_test_tunnel_reply(reply).await.unwrap();
+        write_snell_tunnel_reply_message(&mut server_writer, reply)
+            .await
+            .unwrap();
         if send_server_zero {
             server_writer.write_zero_chunk().await.unwrap();
         }
@@ -164,7 +166,9 @@ async fn reuse_pool_reuses_completed_stream() {
                     rest: b"",
                 }
             );
-            server_writer.write_test_tunnel_reply(reply).await.unwrap();
+            write_snell_tunnel_reply_message(&mut server_writer, reply)
+                .await
+                .unwrap();
             server_writer.write_zero_chunk().await.unwrap();
 
             std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
@@ -245,7 +249,9 @@ async fn reuse_pool_reuses_completed_v6_stream() {
                     rest: b"",
                 }
             );
-            server_writer.write_test_tunnel_reply(reply).await.unwrap();
+            write_snell_tunnel_reply_message(&mut server_writer, reply)
+                .await
+                .unwrap();
             server_writer.write_zero_chunk().await.unwrap();
 
             std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
@@ -322,7 +328,9 @@ async fn reuse_pool_prunes_expired_connections_before_put() {
                     rest: b"",
                 }
             );
-            server_writer.write_test_tunnel_reply(b"ok").await.unwrap();
+            write_snell_tunnel_reply_message(&mut server_writer, b"ok")
+                .await
+                .unwrap();
             server_writer.write_zero_chunk().await.unwrap();
             std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
         }
@@ -412,7 +420,9 @@ async fn reuse_pool_keeps_only_max_size_connections() {
                     rest: b"",
                 }
             );
-            server_writer.write_test_tunnel_reply(b"ok").await.unwrap();
+            write_snell_tunnel_reply_message(&mut server_writer, b"ok")
+                .await
+                .unwrap();
             server_writer.write_zero_chunk().await.unwrap();
             std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
         }

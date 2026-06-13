@@ -23,7 +23,8 @@ use crate::proxy::snell::server::serve_server_connection;
 use crate::proxy::socks5::udp::is_allowed_socks_udp_peer;
 use crate::test_support::{
     TEST_PSK, accept_udp_server_stream, read_udp_request_frame, test_snell_reader,
-    test_snell_writer, test_tcp_listener, test_udp_socket,
+    test_snell_writer, test_tcp_listener, test_udp_socket, write_snell_payload_message,
+    write_snell_tunnel_reply_message, write_snell_udp_response,
 };
 
 fn direct_options(ipv6: bool) -> RelayOptions {
@@ -155,8 +156,7 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
         assert_eq!(payload, request_payload);
 
         let mut server_writer = test_snell_writer(server_write);
-        server_writer
-            .write_test_tunnel_reply(response_payload)
+        write_snell_tunnel_reply_message(&mut server_writer, response_payload)
             .await
             .unwrap();
         server_writer.write_zero_chunk().await.unwrap();
@@ -504,14 +504,14 @@ async fn socks5_v5_non_quic_udp_falls_back_to_udp_over_tcp() {
         let request = read_udp_request_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(request.payload, b"query");
         assert_eq!(request.port, 53);
-        writer
-            .write_test_udp_response(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                53,
-                b"answer",
-            )
-            .await
-            .unwrap();
+        write_snell_udp_response(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            53,
+            b"answer",
+        )
+        .await
+        .unwrap();
         std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
     };
 
@@ -589,10 +589,14 @@ async fn socks5_v4_udp_ignores_quic_proxy_flag() {
         let request = read_udp_request_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(request.payload, b"\xc0still-over-tcp");
         assert_eq!(request.port, 443);
-        writer
-            .write_test_udp_response(AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)), 443, b"ok")
-            .await
-            .unwrap();
+        write_snell_udp_response(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            443,
+            b"ok",
+        )
+        .await
+        .unwrap();
         std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
     };
 
@@ -867,15 +871,17 @@ async fn socks5_udp_associate_drops_invalid_snell_responses_without_closing() {
         assert_eq!(request.payload, b"query");
         assert_eq!(request.port, 53);
 
-        writer.write_test_frame(&[0xff]).await.unwrap();
-        writer
-            .write_test_udp_response(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                53,
-                b"answer",
-            )
+        write_snell_payload_message(&mut writer, &[0xff])
             .await
             .unwrap();
+        write_snell_udp_response(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            53,
+            b"answer",
+        )
+        .await
+        .unwrap();
 
         std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
     };

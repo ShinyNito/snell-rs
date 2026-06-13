@@ -8,7 +8,10 @@ use crate::ProtocolVersion;
 use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::protocol::request::{ClientRequest, parse_client_request};
-use crate::protocol::udp::{AddressRef, UdpPacketRef, parse_udp_request, parse_udp_response};
+use crate::protocol::udp::{
+    AddressRef, UdpPacketRef, parse_udp_request, parse_udp_response, write_udp_request_prefix,
+    write_udp_response_prefix,
+};
 use crate::session::udp::stream::UdpServerStream;
 
 pub(crate) const TEST_PSK: &[u8] = b"test psk";
@@ -63,6 +66,77 @@ where
     W: AsyncWrite + Unpin,
 {
     SnellStreamWriter::new(io, TEST_PSK, version).unwrap()
+}
+
+pub(crate) async fn write_snell_payload_message<W>(
+    writer: &mut SnellStreamWriter<W>,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut plain = BytesMut::from(payload);
+    Ok(writer
+        .write_payload_message_from_buffer(&mut plain)
+        .await?
+        .unwrap_or(0))
+}
+
+pub(crate) async fn write_snell_tunnel_reply_message<W>(
+    writer: &mut SnellStreamWriter<W>,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    if payload.is_empty() {
+        writer.write_empty_tunnel_reply().await?;
+        return Ok(0);
+    }
+
+    let mut plain = BytesMut::from(payload);
+    Ok(writer
+        .write_tunnel_reply_message_from_buffer(&mut plain)
+        .await?
+        .unwrap_or(0))
+}
+
+pub(crate) async fn write_snell_udp_packet<W>(
+    writer: &mut SnellStreamWriter<W>,
+    address: AddressRef<'_>,
+    port: u16,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame_len = {
+        let frame = writer.start_payload_frame();
+        write_udp_request_prefix(frame, address, port)?;
+        frame.extend_from_slice(payload);
+        frame.len()
+    };
+    writer.finish_udp_payload_message(frame_len).await?;
+    Ok(payload.len())
+}
+
+pub(crate) async fn write_snell_udp_response<W>(
+    writer: &mut SnellStreamWriter<W>,
+    address: AddressRef<'_>,
+    port: u16,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame_len = {
+        let frame = writer.start_payload_frame();
+        write_udp_response_prefix(frame, address, port)?;
+        frame.extend_from_slice(payload);
+        frame.len()
+    };
+    writer.finish_udp_payload_message(frame_len).await?;
+    Ok(payload.len())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

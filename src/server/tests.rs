@@ -29,7 +29,7 @@ use crate::proxy::snell::server::{
 use crate::proxy::socks5::inbound::{read_client_request, write_reply_with_bind};
 use crate::server::shutdown::bind_tcp_listener;
 use crate::session::tcp::{TcpClientStream, TcpClientWriter};
-use crate::test_support::{TEST_PSK, test_tcp_listener};
+use crate::test_support::{TEST_PSK, test_tcp_listener, write_snell_payload_message};
 
 fn direct_options(ipv6: bool) -> RelayOptions {
     RelayOptions::direct(ipv6, DnsResolver::system())
@@ -64,7 +64,7 @@ where
 {
     let mut plain = payload;
     Ok(writer
-        .write_next_payload_record_from_reader(&mut plain)
+        .write_payload_message_from_reader(&mut plain)
         .await?
         .unwrap_or(0))
 }
@@ -91,8 +91,7 @@ async fn assert_snell_ping(addr: std::net::SocketAddr, psk: &[u8], version: Prot
     let stream = TcpStream::connect(addr).await.unwrap();
     let (snell_reader_io, snell_writer_io) = stream.into_split();
     let mut writer = SnellStreamWriter::new(snell_writer_io, psk, version).unwrap();
-    writer
-        .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
+    write_snell_payload_message(&mut writer, &[PROTOCOL_VERSION, COMMAND_PING])
         .await
         .unwrap();
     let mut reader = SnellStreamReader::new(snell_reader_io, psk, version);
@@ -329,8 +328,7 @@ async fn v4_family_detection_does_not_pollute_v6_replay_cache() {
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
         let mut writer = SnellStreamWriter::new_with_v6_salt(snell_writer_io, psk, salt).unwrap();
-        writer
-            .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
+        write_snell_payload_message(&mut writer, &[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
         let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
@@ -359,8 +357,7 @@ async fn serve_server_connection_handles_v6_ping() {
         let (snell_reader_io, snell_writer_io) = stream.into_split();
         let mut snell_writer =
             SnellStreamWriter::new(snell_writer_io, psk, ProtocolVersion::V6).unwrap();
-        snell_writer
-            .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
+        write_snell_payload_message(&mut snell_writer, &[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
 
@@ -408,8 +405,7 @@ async fn serve_server_connection_v6_rejects_replayed_client_salt() {
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
         let mut writer = SnellStreamWriter::new_with_v6_salt(snell_writer_io, psk, salt).unwrap();
-        writer
-            .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
+        write_snell_payload_message(&mut writer, &[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
         let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
@@ -419,8 +415,7 @@ async fn serve_server_connection_v6_rejects_replayed_client_salt() {
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
         let mut writer = SnellStreamWriter::new_with_v6_salt(snell_writer_io, psk, salt).unwrap();
-        writer
-            .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
+        write_snell_payload_message(&mut writer, &[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
         let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
@@ -628,7 +623,9 @@ async fn serve_server_connection_fast_open_accepts_before_target_connects() {
             }
         );
 
-        snell_writer.write_test_frame(b"early").await.unwrap();
+        write_snell_payload_message(&mut snell_writer, b"early")
+            .await
+            .unwrap();
         snell_writer.write_zero_chunk().await.unwrap();
         connect_tx.send(()).unwrap();
 

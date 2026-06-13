@@ -8,7 +8,7 @@ use crate::protocol::request::{
 };
 use crate::test_support::{
     TEST_PSK, test_duplex_pair, test_snell_reader, test_snell_reader_with_version,
-    test_snell_writer, test_snell_writer_with_version,
+    test_snell_writer, test_snell_writer_with_version, write_snell_tunnel_reply_message,
 };
 
 #[tokio::test]
@@ -109,8 +109,7 @@ async fn udp_client_open_rejects_non_empty_tunnel_reply() {
         ));
 
         let mut server_writer = test_snell_writer(server_download);
-        server_writer
-            .write_test_tunnel_reply(b"unexpected")
+        write_snell_tunnel_reply_message(&mut server_writer, b"unexpected")
             .await
             .unwrap();
     };

@@ -52,7 +52,7 @@ macro_rules! define_plain_to_snell_writer_relay {
             let mut total = 0;
 
             loop {
-                match snell.write_next_payload_record_from_reader(plain).await? {
+                match snell.write_payload_message_from_reader(plain).await? {
                     Some(n) => total += n as u64,
                     None => {
                         snell.close_write().await?;

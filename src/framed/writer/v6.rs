@@ -6,6 +6,7 @@ pub struct V6StreamWriter<W> {
     chunk_sizer: V6ChunkSizer,
     head: BytesMut,
     payload: BytesMut,
+    wire: BytesMut,
 }
 
 impl<W> V6StreamWriter<W>
@@ -31,20 +32,8 @@ where
             chunk_sizer,
             head: BytesMut::with_capacity(FRAME_HEAD_INITIAL_CAPACITY),
             payload: BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY),
+            wire: BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn write_test_frame(&mut self, payload: &[u8]) -> Result<usize> {
-        if payload.is_empty() {
-            self.write_empty_frame().await?;
-            return Ok(0);
-        }
-
-        self.payload.clear();
-        self.payload.extend_from_slice(payload);
-        self.write_payload_buffer(payload.len(), false).await?;
-        Ok(payload.len())
     }
 
     async fn write_empty_frame(&mut self) -> Result<()> {
@@ -79,89 +68,60 @@ where
         Ok(wire_len)
     }
 
-    pub async fn write_next_payload_record_from_reader<R>(
-        &mut self,
-        plain: &mut R,
-    ) -> Result<Option<usize>>
-    where
-        R: AsyncRead + Unpin,
-    {
-        let Some(frame) = self.read_payload_frame_from_reader(plain, &[]).await? else {
-            return Ok(None);
-        };
-
-        let wire_len = self.write_payload_buffer(frame.payload_len, false).await?;
-        self.chunk_sizer.commit_record(Instant::now());
-        tracing::trace!(
-            payload_len = frame.read_len,
-            wire_len,
-            "wrote snell v6 payload frame"
-        );
-        Ok(Some(frame.read_len))
-    }
-
-    pub async fn write_payload_from_buffer(
+    pub async fn write_payload_message_from_buffer(
         &mut self,
         plain: &mut BytesMut,
     ) -> Result<Option<usize>> {
-        let Some(frame) = self.read_payload_frame_from_buffer(plain, &[])? else {
-            return Ok(None);
-        };
-
-        let wire_len = self.write_payload_buffer(frame.payload_len, false).await?;
-        self.chunk_sizer.commit_record(Instant::now());
-        tracing::trace!(
-            payload_len = frame.read_len,
-            wire_len,
-            "wrote snell v6 buffered payload frame"
-        );
-        Ok(Some(frame.read_len))
+        self.write_message_from_buffer(plain, &[]).await
     }
 
-    pub async fn write_tunnel_reply_from_buffer(
+    pub async fn write_tunnel_reply_message_from_buffer(
         &mut self,
         plain: &mut BytesMut,
     ) -> Result<Option<usize>> {
-        let prefix = [COMMAND_TUNNEL];
-
-        let Some(frame) = self.read_payload_frame_from_buffer(plain, &prefix)? else {
-            return Ok(None);
-        };
-
-        let wire_len = self.write_payload_buffer(frame.payload_len, false).await?;
-        self.chunk_sizer.commit_record(Instant::now());
-        tracing::trace!(
-            payload_len = frame.read_len,
-            wire_len,
-            "wrote snell v6 buffered tunnel payload frame"
-        );
-        Ok(Some(frame.read_len))
+        self.write_message_from_buffer(plain, &[COMMAND_TUNNEL])
+            .await
     }
 
-    async fn read_payload_frame_from_reader<R>(
+    async fn write_message_from_buffer(
         &mut self,
-        plain: &mut R,
-        prefix: &[u8],
-    ) -> Result<Option<ReaderPayloadFrame>>
-    where
-        R: AsyncRead + Unpin,
-    {
-        poll_fn(|cx| {
+        plain: &mut BytesMut,
+        first_record_prefix: &[u8],
+    ) -> Result<Option<usize>> {
+        if plain.is_empty() {
+            return Ok(None);
+        }
+
+        self.wire.clear();
+        let mut written = 0;
+        let mut first_record = true;
+        while !plain.is_empty() {
             let now = Instant::now();
+            let prefix = if first_record {
+                first_record_prefix
+            } else {
+                &[]
+            };
             let limit = self.chunk_sizer.peek_limit(self.encoder.seq(), now);
-            poll_read_payload_frame_from_reader(plain, cx, &mut self.payload, prefix, limit)
-        })
-        .await
-    }
+            let Some(read_limit) = limit.checked_sub(prefix.len()).filter(|limit| *limit != 0)
+            else {
+                self.wire.clear();
+                return Err(Error::PayloadTooLarge);
+            };
 
-    fn read_payload_frame_from_buffer(
-        &mut self,
-        plain: &mut BytesMut,
-        prefix: &[u8],
-    ) -> Result<Option<ReaderPayloadFrame>> {
-        let now = Instant::now();
-        let limit = self.chunk_sizer.peek_limit(self.encoder.seq(), now);
-        prepare_payload_frame_from_buffer(plain, &mut self.payload, prefix, limit)
+            let read_len = plain.len().min(read_limit);
+            let chunk = &plain[..read_len];
+            self.encoder
+                .encode_payload_parts_into(prefix, chunk, &mut self.wire)?;
+            plain.advance(read_len);
+            self.chunk_sizer.commit_record(now);
+            written += read_len;
+            first_record = false;
+        }
+
+        let Self { inner, wire, .. } = self;
+        write_all_contiguous(inner, wire).await?;
+        Ok(Some(written))
     }
 
     pub async fn write_tcp_request(&mut self, host: &str, port: u16, reuse: bool) -> Result<()> {
@@ -180,34 +140,6 @@ where
         self.payload.clear();
         write_udp_request_header(&mut self.payload, crate::ProtocolVersion::V6)?;
         self.write_control_scratch().await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn write_test_udp_packet(
-        &mut self,
-        address: AddressRef<'_>,
-        port: u16,
-        payload: &[u8],
-    ) -> Result<usize> {
-        self.payload.clear();
-        write_udp_request_prefix(&mut self.payload, address, port)?;
-        self.payload.extend_from_slice(payload);
-        self.finish_udp_payload_message(self.payload.len()).await?;
-        Ok(payload.len())
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn write_test_udp_response(
-        &mut self,
-        address: AddressRef<'_>,
-        port: u16,
-        payload: &[u8],
-    ) -> Result<usize> {
-        self.payload.clear();
-        write_udp_response_prefix(&mut self.payload, address, port)?;
-        self.payload.extend_from_slice(payload);
-        self.finish_udp_payload_message(self.payload.len()).await?;
-        Ok(payload.len())
     }
 
     pub(crate) async fn try_write_ipv4_udp_response_from_socket(
@@ -281,15 +213,6 @@ where
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) async fn write_test_tunnel_reply(&mut self, payload: &[u8]) -> Result<usize> {
-        self.payload.clear();
-        write_tunnel_reply(&mut self.payload, &[]);
-        self.payload.extend_from_slice(payload);
-        self.write_payload_buffer(self.payload.len(), true).await?;
-        Ok(payload.len())
-    }
-
     pub async fn write_pong_reply(&mut self) -> Result<()> {
         self.payload.clear();
         write_pong_reply(&mut self.payload);
@@ -314,6 +237,7 @@ where
 
     pub(crate) fn compact_buffers_for_reuse(&mut self) {
         compact_stream_buffer_for_reuse(&mut self.payload);
+        compact_stream_buffer_for_reuse(&mut self.wire);
         self.head.clear();
         if self.head.capacity() > STREAM_BUFFER_RETAIN_CAPACITY {
             self.head = BytesMut::with_capacity(FRAME_HEAD_INITIAL_CAPACITY);

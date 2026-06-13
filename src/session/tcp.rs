@@ -219,6 +219,7 @@ where
 
 pub(crate) struct TcpClientWriter<W> {
     frame_writer: SnellStreamWriter<W>,
+    plain_batch: PlainReadBatch,
     write_closed: bool,
 }
 
@@ -229,11 +230,12 @@ where
     fn new(writer: SnellStreamWriter<W>) -> Self {
         Self {
             frame_writer: writer,
+            plain_batch: PlainReadBatch::new(),
             write_closed: false,
         }
     }
 
-    pub(crate) async fn write_next_payload_record_from_reader<P>(
+    pub(crate) async fn write_payload_message_from_reader<P>(
         &mut self,
         plain: &mut P,
     ) -> Result<Option<usize>>
@@ -243,9 +245,20 @@ where
         if self.write_closed {
             return Err(Error::WriteClosed);
         }
-        self.frame_writer
-            .write_next_payload_record_from_reader(plain)
-            .await
+
+        poll_fn(|cx| self.plain_batch.poll_fill_from(plain, cx)).await?;
+        match self
+            .frame_writer
+            .write_payload_message_from_buffer(&mut self.plain_batch.buffer)
+            .await?
+        {
+            Some(n) => Ok(Some(n)),
+            None if self.plain_batch.is_done() => Ok(None),
+            None => {
+                debug_assert!(false, "plain batch should contain data or be done");
+                Ok(None)
+            }
+        }
     }
 
     pub(crate) async fn close_write(&mut self) -> Result<()> {
@@ -328,7 +341,7 @@ where
         Ok(())
     }
 
-    pub(crate) async fn write_payload_batch_from_reader<P>(
+    pub(crate) async fn write_payload_message_from_reader<P>(
         &mut self,
         plain: &mut P,
     ) -> Result<Option<usize>>
@@ -341,30 +354,24 @@ where
 
         poll_fn(|cx| self.plain_batch.poll_fill_from(plain, cx)).await?;
 
-        let mut written = 0;
-        while !self.plain_batch.buffer.is_empty() {
-            let n = if !self.tunnel_open {
-                let Some(n) = self
-                    .frame_writer
-                    .write_tunnel_reply_from_buffer(&mut self.plain_batch.buffer)
-                    .await?
-                else {
-                    break;
-                };
-                self.tunnel_open = true;
-                n
-            } else {
-                let Some(n) = self
-                    .frame_writer
-                    .write_payload_from_buffer(&mut self.plain_batch.buffer)
-                    .await?
-                else {
-                    break;
-                };
-                n
-            };
-            written += n;
-        }
+        let written = if !self.tunnel_open {
+            match self
+                .frame_writer
+                .write_tunnel_reply_message_from_buffer(&mut self.plain_batch.buffer)
+                .await?
+            {
+                Some(n) => {
+                    self.tunnel_open = true;
+                    n
+                }
+                None => 0,
+            }
+        } else {
+            self.frame_writer
+                .write_payload_message_from_buffer(&mut self.plain_batch.buffer)
+                .await?
+                .unwrap_or(0)
+        };
 
         if written != 0 {
             Ok(Some(written))
@@ -390,24 +397,36 @@ where
     }
 }
 
-struct PlainReadBatch {
-    buffer: BytesMut,
+pub(crate) struct PlainReadBatch {
+    pub(crate) buffer: BytesMut,
     eof: bool,
 }
 
 impl PlainReadBatch {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buffer: BytesMut::with_capacity(SERVER_PLAIN_BATCH_INITIAL_CAPACITY),
             eof: false,
         }
     }
 
-    fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         self.eof && self.buffer.is_empty()
     }
 
-    fn poll_fill_from<P>(&mut self, plain: &mut P, cx: &mut Context<'_>) -> Poll<Result<()>>
+    pub(crate) fn compact_for_reuse(&mut self) {
+        self.buffer.clear();
+        if self.buffer.capacity() > SERVER_PLAIN_READ_AHEAD_CAPACITY {
+            self.buffer = BytesMut::with_capacity(SERVER_PLAIN_BATCH_INITIAL_CAPACITY);
+        }
+        self.eof = false;
+    }
+
+    pub(crate) fn poll_fill_from<P>(
+        &mut self,
+        plain: &mut P,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>>
     where
         P: AsyncRead + Unpin,
     {

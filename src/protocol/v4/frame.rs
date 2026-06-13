@@ -141,6 +141,51 @@ impl V4FrameEncoder {
         Ok(head.len() - start_len + payload.len())
     }
 
+    pub fn encode_payload_parts_into(
+        &mut self,
+        prefix: &[u8],
+        payload: &[u8],
+        out: &mut BytesMut,
+    ) -> Result<usize> {
+        let payload_len = prefix.len() + payload.len();
+        let padding_len = self.next_padding_len(payload_len);
+        if payload_len == 0 || payload_len > MAX_PACKET_SIZE || padding_len > MAX_PACKET_SIZE {
+            return Err(Error::PayloadTooLarge);
+        }
+
+        let start_len = out.len();
+        let salt_len = if self.salt_sent { 0 } else { SALT_SIZE };
+        out.reserve(salt_len + V4_HEADER_CIPHER_SIZE + padding_len + payload_len + AEAD_TAG_SIZE);
+
+        if !self.salt_sent {
+            out.extend_from_slice(&self.salt);
+            self.salt_sent = true;
+        }
+
+        self.write_encrypted_header(padding_len, payload_len, out)?;
+        let padding_start = out.len();
+        out.resize(padding_start + padding_len, 0);
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(payload);
+
+        let payload_start = padding_start + padding_len;
+        let payload_end = payload_start + payload_len;
+        let tag = self
+            .crypto
+            .encrypt_detached(self.nonce.as_bytes(), &mut out[payload_start..payload_end])?;
+        self.nonce.increment();
+        out.extend_from_slice(&tag);
+
+        if padding_len > 0 {
+            let body = &mut out[padding_start..payload_end + AEAD_TAG_SIZE];
+            let (padding, payload_cipher) = body.split_at_mut(padding_len);
+            make_v4_padding(padding, payload_cipher)?;
+            swap_padding(padding, payload_cipher);
+        }
+
+        Ok(out.len() - start_len)
+    }
+
     fn next_padding_len(&self, payload_len: usize) -> usize {
         if self.salt_sent || payload_len == 0 {
             0

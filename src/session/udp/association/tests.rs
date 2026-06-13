@@ -21,7 +21,7 @@ use crate::proxy::socks5::inbound::{
 use crate::session::udp::stream::UdpClientStream;
 use crate::test_support::{
     TEST_PSK, accept_udp_server_stream, read_udp_response_frame, test_duplex_pair,
-    test_tcp_listener, test_udp_socket,
+    test_tcp_listener, test_udp_socket, write_snell_udp_packet,
 };
 
 fn direct_options(ipv6: bool) -> RelayOptions {
@@ -71,14 +71,14 @@ async fn udp_server_stream_relays_one_datagram_response() {
         .await
         .unwrap()
         .into_parts();
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                target_addr.port(),
-                b"query",
-            )
-            .await
-            .unwrap();
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            target_addr.port(),
+            b"query",
+        )
+        .await
+        .unwrap();
 
         let response = read_udp_response_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(response.payload, b"answer");
@@ -140,22 +140,22 @@ async fn udp_stream_does_not_head_of_line_block_on_missing_response() {
         .await
         .unwrap()
         .into_parts();
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                no_reply_addr.port(),
-                b"lost",
-            )
-            .await
-            .unwrap();
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                reply_addr.port(),
-                b"query",
-            )
-            .await
-            .unwrap();
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            no_reply_addr.port(),
+            b"lost",
+        )
+        .await
+        .unwrap();
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            reply_addr.port(),
+            b"query",
+        )
+        .await
+        .unwrap();
 
         let response = tokio::time::timeout(
             Duration::from_millis(500),
@@ -253,14 +253,14 @@ async fn udp_server_relays_datagram_via_upstream_socks5() {
                 .await
                 .unwrap()
                 .into_parts();
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                target_addr.port(),
-                b"query",
-            )
-            .await
-            .unwrap();
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            target_addr.port(),
+            b"query",
+        )
+        .await
+        .unwrap();
 
         let response = read_udp_response_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(response.payload, b"answer");
@@ -486,14 +486,14 @@ async fn udp_to_snell_stops_when_snell_writer_is_closed() {
         .await
         .unwrap()
         .into_parts();
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                target_addr.port(),
-                b"query",
-            )
-            .await
-            .unwrap();
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            target_addr.port(),
+            b"query",
+        )
+        .await
+        .unwrap();
         drop(reader);
         writer
     };
@@ -525,14 +525,14 @@ async fn udp_tcp_connection_rejects_ipv6_when_disabled() {
                 .await
                 .unwrap()
                 .into_parts();
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
-                53,
-                b"query",
-            )
-            .await
-            .unwrap();
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            53,
+            b"query",
+        )
+        .await
+        .unwrap();
     };
 
     let (server_result, ()) = tokio::join!(server, client);

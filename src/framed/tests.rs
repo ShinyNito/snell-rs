@@ -22,7 +22,8 @@ use crate::protocol::request::{
     ClientRequest, ServerReply, parse_client_request, parse_server_reply,
 };
 use crate::protocol::udp::{
-    AddressRef, parse_udp_request, parse_udp_response, write_udp_response_prefix,
+    AddressRef, parse_udp_request, parse_udp_response, write_udp_request_prefix,
+    write_udp_response_prefix,
 };
 use crate::protocol::v4::frame::V4FrameEncoder;
 use crate::protocol::v6::{V6ChunkSizer, V6Profile, V6SaltReplayCache};
@@ -61,21 +62,143 @@ fn assert_first_record_sized<W>(writer: &V4StreamWriter<W>, expected_limit: usiz
     assert!(writer.record_sizer.last_record_at.is_some());
 }
 
-async fn write_payload<W>(writer: &mut V4StreamWriter<W>, mut payload: &[u8]) -> Result<usize>
+async fn write_payload<W>(writer: &mut V4StreamWriter<W>, payload: &[u8]) -> Result<usize>
 where
     W: AsyncWrite + Unpin,
 {
-    let total = payload.len();
-    while !payload.is_empty() {
-        let chunk_len = payload
-            .len()
-            .min(writer.record_sizer.next_limit(Instant::now()));
-        let slot = writer.start_payload_frame();
-        slot.extend_from_slice(&payload[..chunk_len]);
-        writer.finish_payload_frame(chunk_len).await?;
-        payload = &payload[chunk_len..];
+    let mut plain = BytesMut::from(payload);
+    Ok(writer
+        .write_payload_message_from_buffer(&mut plain)
+        .await?
+        .unwrap_or(0))
+}
+
+async fn write_v4_tunnel_reply_message<W>(
+    writer: &mut V4StreamWriter<W>,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    if payload.is_empty() {
+        writer.write_empty_tunnel_reply().await?;
+        return Ok(0);
     }
-    Ok(total)
+
+    let mut plain = BytesMut::from(payload);
+    Ok(writer
+        .write_tunnel_reply_message_from_buffer(&mut plain)
+        .await?
+        .unwrap_or(0))
+}
+
+async fn write_snell_payload_message<W>(
+    writer: &mut SnellStreamWriter<W>,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut plain = BytesMut::from(payload);
+    Ok(writer
+        .write_payload_message_from_buffer(&mut plain)
+        .await?
+        .unwrap_or(0))
+}
+
+async fn write_snell_tunnel_reply_message<W>(
+    writer: &mut SnellStreamWriter<W>,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    if payload.is_empty() {
+        writer.write_empty_tunnel_reply().await?;
+        return Ok(0);
+    }
+
+    let mut plain = BytesMut::from(payload);
+    Ok(writer
+        .write_tunnel_reply_message_from_buffer(&mut plain)
+        .await?
+        .unwrap_or(0))
+}
+
+async fn write_v4_udp_packet<W>(
+    writer: &mut V4StreamWriter<W>,
+    address: AddressRef<'_>,
+    port: u16,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame_len = {
+        let frame = writer.start_payload_frame();
+        write_udp_request_prefix(frame, address, port)?;
+        frame.extend_from_slice(payload);
+        frame.len()
+    };
+    writer.finish_udp_payload_message(frame_len).await?;
+    Ok(payload.len())
+}
+
+async fn write_v4_udp_response<W>(
+    writer: &mut V4StreamWriter<W>,
+    address: AddressRef<'_>,
+    port: u16,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame_len = {
+        let frame = writer.start_payload_frame();
+        write_udp_response_prefix(frame, address, port)?;
+        frame.extend_from_slice(payload);
+        frame.len()
+    };
+    writer.finish_udp_payload_message(frame_len).await?;
+    Ok(payload.len())
+}
+
+async fn write_v6_udp_packet<W>(
+    writer: &mut V6StreamWriter<W>,
+    address: AddressRef<'_>,
+    port: u16,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame_len = {
+        let frame = writer.start_payload_frame();
+        write_udp_request_prefix(frame, address, port)?;
+        frame.extend_from_slice(payload);
+        frame.len()
+    };
+    writer.finish_udp_payload_message(frame_len).await?;
+    Ok(payload.len())
+}
+
+async fn write_v6_udp_response<W>(
+    writer: &mut V6StreamWriter<W>,
+    address: AddressRef<'_>,
+    port: u16,
+    payload: &[u8],
+) -> Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame_len = {
+        let frame = writer.start_payload_frame();
+        write_udp_response_prefix(frame, address, port)?;
+        frame.extend_from_slice(payload);
+        frame.len()
+    };
+    writer.finish_udp_payload_message(frame_len).await?;
+    Ok(payload.len())
 }
 
 fn encode_test_frame(encoder: &mut V4FrameEncoder, payload: &[u8], wire: &mut BytesMut) {
@@ -94,71 +217,76 @@ fn encode_test_frame(encoder: &mut V4FrameEncoder, payload: &[u8], wire: &mut By
     wire.extend_from_slice(&body);
 }
 
-async fn collect_v4_reader_path_wire(payload: &[u8]) -> Vec<u8> {
+fn collect_v4_reference_wire(payload: &[u8]) -> Vec<u8> {
     const SALT: [u8; 16] = [0x45; 16];
 
-    collect_wire(|client| async move {
-        let encoder = V4FrameEncoder::with_salt_and_initial_padding(TEST_PSK, SALT, 0).unwrap();
-        let mut writer = V4StreamWriter::from_parts(client, encoder);
-        let mut plain = payload;
-        while writer
-            .write_next_payload_record_from_reader(&mut plain)
-            .await
-            .unwrap()
-            .is_some()
-        {}
-        writer.write_zero_chunk().await.unwrap();
-    })
-    .await
+    let mut encoder = V4FrameEncoder::with_salt_and_initial_padding(TEST_PSK, SALT, 0).unwrap();
+    let mut sizer = RecordSizer::new(0);
+    let mut plain = payload;
+    let mut wire = BytesMut::new();
+    while !plain.is_empty() {
+        let limit = sizer.next_limit(Instant::now());
+        let chunk_len = plain.len().min(limit);
+        encode_test_frame(&mut encoder, &plain[..chunk_len], &mut wire);
+        plain = &plain[chunk_len..];
+    }
+    encode_test_frame(&mut encoder, &[], &mut wire);
+    wire.to_vec()
 }
 
-async fn collect_v4_buffer_path_wire(payload: &[u8]) -> Vec<u8> {
+async fn collect_v4_message_path_wire(payload: &[u8]) -> Vec<u8> {
     const SALT: [u8; 16] = [0x45; 16];
 
     collect_wire(|client| async move {
         let encoder = V4FrameEncoder::with_salt_and_initial_padding(TEST_PSK, SALT, 0).unwrap();
         let mut writer = V4StreamWriter::from_parts(client, encoder);
         let mut plain = BytesMut::from(payload);
-        while writer
-            .write_payload_from_buffer(&mut plain)
+        writer
+            .write_payload_message_from_buffer(&mut plain)
             .await
-            .unwrap()
-            .is_some()
-        {}
+            .unwrap();
         writer.write_zero_chunk().await.unwrap();
     })
     .await
 }
 
-async fn collect_v6_reader_path_wire(payload: &[u8]) -> Vec<u8> {
+fn collect_v6_reference_wire(payload: &[u8]) -> Vec<u8> {
     const SALT: [u8; 16] = [0x46; 16];
 
-    collect_wire(|client| async move {
-        let mut writer = SnellStreamWriter::new_with_v6_salt(client, TEST_PSK, SALT).unwrap();
-        let mut plain = payload;
-        while writer
-            .write_next_payload_record_from_reader(&mut plain)
-            .await
-            .unwrap()
-            .is_some()
-        {}
-        writer.write_zero_chunk().await.unwrap();
-    })
-    .await
+    let mut encoder = crate::protocol::v6::V6FrameEncoder::with_salt(TEST_PSK, SALT).unwrap();
+    let mut chunk_sizer = V6ChunkSizer::new(encoder.profile().clone());
+    let mut plain = payload;
+    let mut wire = BytesMut::new();
+    while !plain.is_empty() {
+        let now = Instant::now();
+        let limit = chunk_sizer.peek_limit(encoder.seq(), now);
+        let chunk_len = plain.len().min(limit);
+        let mut head = BytesMut::new();
+        let mut body = BytesMut::from(&plain[..chunk_len]);
+        encoder
+            .encode_payload_in_place(&mut body, chunk_len, &mut head)
+            .unwrap();
+        wire.extend_from_slice(&head);
+        wire.extend_from_slice(&body);
+        chunk_sizer.commit_record(now);
+        plain = &plain[chunk_len..];
+    }
+    let mut head = BytesMut::new();
+    encoder.encode_empty_frame(&mut head).unwrap();
+    wire.extend_from_slice(&head);
+    wire.to_vec()
 }
 
-async fn collect_v6_buffer_path_wire(payload: &[u8]) -> Vec<u8> {
+async fn collect_v6_message_path_wire(payload: &[u8]) -> Vec<u8> {
     const SALT: [u8; 16] = [0x46; 16];
 
     collect_wire(|client| async move {
         let mut writer = SnellStreamWriter::new_with_v6_salt(client, TEST_PSK, SALT).unwrap();
         let mut plain = BytesMut::from(payload);
-        while writer
-            .write_payload_from_buffer(&mut plain)
+        writer
+            .write_payload_message_from_buffer(&mut plain)
             .await
-            .unwrap()
-            .is_some()
-        {}
+            .unwrap();
         writer.write_zero_chunk().await.unwrap();
     })
     .await
@@ -186,34 +314,28 @@ async fn buffer_payload_writer_matches_reader_wire_bytes() {
     let payload = vec![0x34; 96 * 1024];
 
     assert_eq!(
-        collect_v4_buffer_path_wire(&payload).await,
-        collect_v4_reader_path_wire(&payload).await
+        collect_v4_message_path_wire(&payload).await,
+        collect_v4_reference_wire(&payload)
     );
     assert_eq!(
-        collect_v6_buffer_path_wire(&payload).await,
-        collect_v6_reader_path_wire(&payload).await
+        collect_v6_message_path_wire(&payload).await,
+        collect_v6_reference_wire(&payload)
     );
-}
-
-struct PendingThenReadyReader {
-    payload: Vec<u8>,
-    pending_once: bool,
-    wake_after: Duration,
-}
-
-impl PendingThenReadyReader {
-    fn new(payload: Vec<u8>, wake_after: Duration) -> Self {
-        Self {
-            payload,
-            pending_once: true,
-            wake_after,
-        }
-    }
 }
 
 struct RecordingReadWindow {
     payload: BytesMut,
     observed: Arc<Mutex<Vec<usize>>>,
+}
+
+struct RecordingWriteSink {
+    writes: Arc<Mutex<Vec<usize>>>,
+}
+
+impl RecordingWriteSink {
+    fn new(writes: Arc<Mutex<Vec<usize>>>) -> Self {
+        Self { writes }
+    }
 }
 
 impl RecordingReadWindow {
@@ -238,54 +360,93 @@ impl AsyncRead for RecordingReadWindow {
     }
 }
 
-impl AsyncRead for PendingThenReadyReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if self.pending_once {
-            self.pending_once = false;
-            let waker = cx.waker().clone();
-            let wake_after = self.wake_after;
-            std::thread::spawn(move || {
-                std::thread::sleep(wake_after);
-                waker.wake();
-            });
-            return Poll::Pending;
-        }
+impl AsyncWrite for RecordingWriteSink {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.writes.lock().unwrap().push(buf.len());
+        Poll::Ready(Ok(buf.len()))
+    }
 
-        let n = self.payload.len().min(buf.remaining());
-        if n != 0 {
-            buf.put_slice(&self.payload[..n]);
-            self.payload.drain(..n);
-        }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
 
 #[tokio::test]
-async fn write_payload_rechecks_record_limit_after_pending_read() {
+async fn message_writer_uses_current_record_limit() {
     const PSK: &[u8] = TEST_PSK;
     const SALT: [u8; 16] = [0x44; 16];
 
     let steady = TCP_RECORD_MSS - TCP_STEADY_RECORD_OVERHEAD;
     let continuous = steady + steady;
     let encoder = V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, 0).unwrap();
-    let mut writer = V4StreamWriter::from_parts(sink(), encoder);
+    let (client, server) = duplex(16 * 1024);
+    let mut writer = V4StreamWriter::from_parts(client, encoder);
     writer.record_sizer.last_limit = steady;
     writer.record_sizer.last_record_at =
-        Some(Instant::now() - TCP_RECORD_IDLE_TIMEOUT + Duration::from_millis(200));
+        Some(Instant::now() - TCP_RECORD_IDLE_TIMEOUT - Duration::from_millis(1));
+    let mut plain = BytesMut::from(vec![0x51; continuous].as_slice());
 
-    let mut reader =
-        PendingThenReadyReader::new(vec![0x51; continuous], Duration::from_millis(250));
-    let n = writer
-        .write_next_payload_record_from_reader(&mut reader)
-        .await
-        .unwrap();
+    let write = async {
+        let n = writer
+            .write_payload_message_from_buffer(&mut plain)
+            .await
+            .unwrap();
 
-    assert_eq!(n, Some(steady));
-    assert_eq!(writer.record_sizer.last_limit, steady);
+        assert_eq!(n, Some(continuous));
+        assert!(plain.is_empty());
+    };
+    let read = async {
+        let mut reader = V4StreamReader::new(server, PSK);
+        assert_eq!(reader.read_frame_payload().await.unwrap().len(), steady);
+    };
+
+    let ((), ()) = tokio::join!(write, read);
+}
+
+#[tokio::test]
+async fn message_writer_uses_one_write_for_multiple_records() {
+    let payload = vec![0x62; 96 * 1024];
+
+    let v4_writes = Arc::new(Mutex::new(Vec::new()));
+    let encoder = V4FrameEncoder::with_salt_and_initial_padding(TEST_PSK, [0x44; 16], 0).unwrap();
+    let mut v4_writer =
+        V4StreamWriter::from_parts(RecordingWriteSink::new(v4_writes.clone()), encoder);
+    let mut v4_plain = BytesMut::from(payload.as_slice());
+    assert_eq!(
+        v4_writer
+            .write_payload_message_from_buffer(&mut v4_plain)
+            .await
+            .unwrap(),
+        Some(payload.len())
+    );
+    assert!(v4_plain.is_empty());
+    assert_eq!(v4_writes.lock().unwrap().len(), 1);
+
+    let v6_writes = Arc::new(Mutex::new(Vec::new()));
+    let mut v6_writer = V6StreamWriter::new_with_salt(
+        RecordingWriteSink::new(v6_writes.clone()),
+        TEST_PSK,
+        [0x46; 16],
+    )
+    .unwrap();
+    let mut v6_plain = BytesMut::from(payload.as_slice());
+    assert_eq!(
+        v6_writer
+            .write_payload_message_from_buffer(&mut v6_plain)
+            .await
+            .unwrap(),
+        Some(payload.len())
+    );
+    assert!(v6_plain.is_empty());
+    assert_eq!(v6_writes.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -341,7 +502,7 @@ async fn compact_for_reuse_retains_bounded_stream_buffers() {
         let slot = writer.start_payload_frame();
         slot.extend_from_slice(&large_payload);
         writer
-            .finish_payload_frame(large_payload.len())
+            .finish_udp_payload_message(large_payload.len())
             .await
             .unwrap();
         assert!(writer.payload.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
@@ -429,12 +590,11 @@ async fn tunnel_reply_from_buffer_counts_prefix_in_first_record_limit() {
         let mut writer = V4StreamWriter::from_parts(server, encoder);
         let mut plain = BytesMut::from(&payload[..]);
         let n = writer
-            .write_tunnel_reply_from_buffer(&mut plain)
+            .write_tunnel_reply_message_from_buffer(&mut plain)
             .await
             .unwrap();
-        assert_eq!(n, Some(first_limit - 1));
-        assert_eq!(plain.len(), 11);
-        assert_first_record_sized(&writer, first_limit);
+        assert_eq!(n, Some(payload.len()));
+        assert!(plain.is_empty());
     };
 
     let ((), ()) = tokio::join!(read, write);
@@ -460,7 +620,7 @@ async fn control_frames_advance_record_sizer() {
     assert_first_record_sized(&writer, first_limit);
 
     let mut writer = writer_with_initial_padding(initial_padding_len);
-    writer.write_test_tunnel_reply(&[]).await.unwrap();
+    writer.write_empty_tunnel_reply().await.unwrap();
     assert_first_record_sized(&writer, first_limit);
 
     let mut writer = writer_with_initial_padding(initial_padding_len);
@@ -478,25 +638,25 @@ async fn datagram_frames_advance_record_sizer() {
     let first_limit = TCP_RECORD_MSS - TCP_FIRST_RECORD_OVERHEAD - initial_padding_len;
 
     let mut writer = writer_with_initial_padding(initial_padding_len);
-    writer
-        .write_test_udp_packet(
-            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-            53,
-            b"query",
-        )
-        .await
-        .unwrap();
+    write_v4_udp_packet(
+        &mut writer,
+        AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        53,
+        b"query",
+    )
+    .await
+    .unwrap();
     assert_first_record_sized(&writer, first_limit);
 
     let mut writer = writer_with_initial_padding(initial_padding_len);
-    writer
-        .write_test_udp_response(
-            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
-            53,
-            b"answer",
-        )
-        .await
-        .unwrap();
+    write_v4_udp_response(
+        &mut writer,
+        AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+        53,
+        b"answer",
+    )
+    .await
+    .unwrap();
     assert_first_record_sized(&writer, first_limit);
 }
 
@@ -514,7 +674,7 @@ async fn transfers_frames_without_spawn_or_channel() {
     };
     let write = async {
         let mut writer = V4StreamWriter::new(client, psk).unwrap();
-        writer.write_test_frame(payload).await
+        write_payload(&mut writer, payload).await
     };
 
     let (read_result, write_result) = tokio::join!(read, write);
@@ -552,7 +712,9 @@ async fn snell_stream_v6_reads_tcp_request_and_payload_frames() {
             .write_tcp_request("example.com", 443, false)
             .await
             .unwrap();
-        writer.write_test_frame(payload).await.unwrap();
+        write_snell_payload_message(&mut writer, payload)
+            .await
+            .unwrap();
     };
 
     let ((), ()) = tokio::join!(read, write);
@@ -589,7 +751,9 @@ async fn snell_stream_v6_reads_tunnel_reply_tail_and_zero_chunk() {
     };
     let write = async {
         let mut writer = SnellStreamWriter::new(server, psk, crate::ProtocolVersion::V6).unwrap();
-        writer.write_test_tunnel_reply(payload).await.unwrap();
+        write_snell_tunnel_reply_message(&mut writer, payload)
+            .await
+            .unwrap();
         writer.write_zero_chunk().await.unwrap();
     };
 
@@ -610,7 +774,9 @@ async fn v6_reader_rejects_replayed_salt_from_shared_cache() {
     };
     let first_write = async {
         let mut writer = SnellStreamWriter::new_with_v6_salt(first_client, psk, salt).unwrap();
-        writer.write_test_frame(b"first").await.unwrap();
+        write_snell_payload_message(&mut writer, b"first")
+            .await
+            .unwrap();
     };
     let ((), ()) = tokio::join!(first_read, first_write);
 
@@ -624,7 +790,9 @@ async fn v6_reader_rejects_replayed_salt_from_shared_cache() {
     };
     let second_write = async {
         let mut writer = SnellStreamWriter::new_with_v6_salt(second_client, psk, salt).unwrap();
-        writer.write_test_frame(b"second").await.unwrap();
+        write_snell_payload_message(&mut writer, b"second")
+            .await
+            .unwrap();
     };
     let ((), ()) = tokio::join!(second_read, second_write);
 }
@@ -644,7 +812,7 @@ async fn reader_new_does_not_wait_for_peer_salt() {
     };
     let write = async {
         let mut writer = V4StreamWriter::new(client, psk).unwrap();
-        writer.write_test_frame(payload).await
+        write_payload(&mut writer, payload).await
     };
 
     let (read_result, write_result) = tokio::join!(read, write);
@@ -667,7 +835,7 @@ async fn reader_drops_psk_after_decoder_initialization() {
     };
     let write = async {
         let mut writer = V4StreamWriter::new(client, psk).unwrap();
-        writer.write_test_frame(payload).await
+        write_payload(&mut writer, payload).await
     };
 
     let ((), write_result) = tokio::join!(read, write);
@@ -812,13 +980,13 @@ async fn writes_udp_packet_as_one_frame() {
     };
     let write = async {
         let mut writer = V4StreamWriter::new(client, psk).unwrap();
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-                53,
-                payload,
-            )
-            .await
+        write_v4_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            53,
+            payload,
+        )
+        .await
     };
 
     let (read_result, write_result) = tokio::join!(read, write);
@@ -843,13 +1011,13 @@ async fn write_udp_packet_is_single_frame_and_advances_record_sizer() {
     };
     let write = async {
         let mut writer = V4StreamWriter::new(client, psk).unwrap();
-        let written = writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
-                53,
-                &payload,
-            )
-            .await?;
+        let written = write_v4_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            53,
+            &payload,
+        )
+        .await?;
         assert!(writer.record_sizer.last_record_at.is_some());
         Ok::<usize, Error>(written)
     };
@@ -890,13 +1058,13 @@ async fn v6_udp_packet_splits_across_chunk_records_and_advances_chunk_state() {
     };
     let write = async {
         let mut writer = V6StreamWriter::new(client, psk).unwrap();
-        let written = writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
-                53,
-                &payload,
-            )
-            .await?;
+        let written = write_v6_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            53,
+            &payload,
+        )
+        .await?;
         assert!(writer.has_committed_chunk_record());
         Ok::<usize, Error>(written)
     };
@@ -927,13 +1095,13 @@ async fn v6_udp_request_message_reader_reassembles_split_records() {
     };
     let write = async {
         let mut writer = V6StreamWriter::new(client, psk).unwrap();
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
-                53,
-                &payload,
-            )
-            .await
+        write_v6_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            53,
+            &payload,
+        )
+        .await
     };
 
     let ((), write_result) = tokio::join!(read, write);
@@ -966,13 +1134,13 @@ async fn v6_udp_exact_limit_message_reader_preserves_following_zero_chunk() {
     };
     let write = async {
         let mut writer = V6StreamWriter::new(client, psk).unwrap();
-        let written = writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
-                53,
-                &payload,
-            )
-            .await?;
+        let written = write_v6_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            53,
+            &payload,
+        )
+        .await?;
         writer.write_zero_chunk().await?;
         Ok::<usize, Error>(written)
     };
@@ -1016,20 +1184,20 @@ async fn v6_udp_exact_limit_request_reader_preserves_following_udp_message() {
     };
     let write = async {
         let mut writer = V6StreamWriter::new(client, psk).unwrap();
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
-                53,
-                &first_payload,
-            )
-            .await?;
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
-                54,
-                &second_payload,
-            )
-            .await
+        write_v6_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            53,
+            &first_payload,
+        )
+        .await?;
+        write_v6_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            54,
+            &second_payload,
+        )
+        .await
     };
 
     let ((), write_result) = tokio::join!(read, write);
@@ -1118,13 +1286,13 @@ async fn v6_udp_response_message_reader_reassembles_split_records() {
     };
     let write = async {
         let mut writer = V6StreamWriter::new(client, psk).unwrap();
-        writer
-            .write_test_udp_response(
-                AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-                53,
-                &payload,
-            )
-            .await
+        write_v6_udp_response(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            53,
+            &payload,
+        )
+        .await
     };
 
     let ((), write_result) = tokio::join!(read, write);
@@ -1174,20 +1342,20 @@ async fn v6_udp_exact_limit_response_reader_preserves_following_udp_message() {
     };
     let write = async {
         let mut writer = V6StreamWriter::new(client, psk).unwrap();
-        writer
-            .write_test_udp_response(
-                AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-                53,
-                &first_payload,
-            )
-            .await?;
-        writer
-            .write_test_udp_response(
-                AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-                54,
-                &second_payload,
-            )
-            .await
+        write_v6_udp_response(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            53,
+            &first_payload,
+        )
+        .await?;
+        write_v6_udp_response(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            54,
+            &second_payload,
+        )
+        .await
     };
 
     let ((), write_result) = tokio::join!(read, write);
@@ -1238,13 +1406,13 @@ async fn rejects_oversized_udp_packet_as_one_frame() {
 
     let mut writer = V4StreamWriter::new(client, psk).unwrap();
     assert!(matches!(
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
-                53,
-                &payload,
-            )
-            .await,
+        write_v4_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            53,
+            &payload,
+        )
+        .await,
         Err(Error::PayloadTooLarge)
     ));
 }
@@ -1257,13 +1425,13 @@ async fn v6_rejects_udp_packet_that_exceeds_record_payload_len() {
 
     let mut writer = V6StreamWriter::new(writer, psk).unwrap();
     assert!(matches!(
-        writer
-            .write_test_udp_packet(
-                AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
-                53,
-                &payload,
-            )
-            .await,
+        write_v6_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+            53,
+            &payload,
+        )
+        .await,
         Err(Error::PayloadTooLarge)
     ));
 }
@@ -1322,7 +1490,7 @@ async fn reads_tunnel_reply_with_first_payload() {
     };
     let write = async {
         let mut writer = V4StreamWriter::new(server, psk).unwrap();
-        writer.write_test_tunnel_reply(payload).await
+        write_v4_tunnel_reply_message(&mut writer, payload).await
     };
 
     let ((), write_result) = tokio::join!(read, write);
@@ -1362,7 +1530,7 @@ async fn takes_control_payload_tail_without_padding_or_tag() {
     let write = async {
         let encoder = V4FrameEncoder::with_salt_and_initial_padding(psk, [0x31; 16], 128).unwrap();
         let mut writer = V4StreamWriter::from_parts(server, encoder);
-        writer.write_test_tunnel_reply(payload).await
+        write_v4_tunnel_reply_message(&mut writer, payload).await
     };
 
     let ((), write_result) = tokio::join!(read, write);

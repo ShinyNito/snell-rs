@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 use super::{
     STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY, STREAM_READ_AHEAD_CAPACITY,
@@ -64,21 +64,31 @@ where
     .await
 }
 
-pub(super) fn poll_read_into_prepared_spare<R>(
-    reader: &mut R,
-    cx: &mut Context<'_>,
-    buffer: &mut BytesMut,
-    read_limit: usize,
-) -> Poll<Result<usize>>
+pub(super) async fn write_all_contiguous<W>(writer: &mut W, mut buffer: &[u8]) -> Result<()>
 where
-    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
-    let spare = buffer.chunk_mut();
-    if spare.len() < read_limit {
-        return Poll::Ready(Err(Error::PayloadTooLarge));
-    }
+    poll_fn(|cx| {
+        while !buffer.is_empty() {
+            let n = match Pin::new(&mut *writer).poll_write(cx, buffer) {
+                Poll::Ready(result) => result?,
+                Poll::Pending => return Poll::Pending,
+            };
 
-    poll_read_into_spare(reader, cx, buffer, read_limit)
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write snell frame batch",
+                )
+                .into()));
+            }
+
+            buffer = &buffer[n..];
+        }
+
+        Poll::Ready(Ok(()))
+    })
+    .await
 }
 
 /// Like `poll_read_into_spare`, but offers the reader the whole spare capacity

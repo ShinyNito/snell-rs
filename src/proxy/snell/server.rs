@@ -675,7 +675,7 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
-        match snell.write_payload_batch_from_reader(plain).await? {
+        match snell.write_payload_message_from_reader(plain).await? {
             Some(n) => *total += n as u64,
             None => {
                 snell.close_write().await?;

@@ -24,6 +24,7 @@ use crate::protocol::request::{
 use crate::session::tcp::TcpServerStream;
 use crate::test_support::{
     test_duplex_pair, test_snell_reader, test_snell_writer, test_tcp_listener,
+    write_snell_payload_message,
 };
 
 #[test]
@@ -51,7 +52,9 @@ async fn fast_open_buffer_stops_before_next_frame_could_exceed_limit() {
     let (client_upload, server_upload) = test_duplex_pair();
 
     let mut writer = test_snell_writer(client_upload);
-    writer.write_test_frame(b"held").await.unwrap();
+    write_snell_payload_message(&mut writer, b"held")
+        .await
+        .unwrap();
 
     let reader = test_snell_reader(server_upload);
     let writer = test_snell_writer(tokio::io::sink());
@@ -192,7 +195,9 @@ async fn tcp_reader_with_payloads(
     let (client_upload, server_upload) = test_duplex_pair();
     let mut client_writer = test_snell_writer(client_upload);
     for payload in payloads {
-        client_writer.write_test_frame(payload).await.unwrap();
+        write_snell_payload_message(&mut client_writer, payload)
+            .await
+            .unwrap();
     }
     client_writer.write_zero_chunk().await.unwrap();
     drop(client_writer);

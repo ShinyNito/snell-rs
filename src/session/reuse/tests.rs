@@ -5,7 +5,9 @@ use tokio::io::{AsyncReadExt, AsyncWrite};
 use super::{ReuseClientConn, ReuseClientWriter};
 use crate::error::Error;
 use crate::protocol::request::{ClientRequest, parse_client_request};
-use crate::test_support::{test_duplex_pair, test_snell_reader, test_snell_writer};
+use crate::test_support::{
+    test_duplex_pair, test_snell_reader, test_snell_writer, write_snell_tunnel_reply_message,
+};
 
 macro_rules! assert_next_payload {
     ($conn:expr, $expected:expr) => {{
@@ -23,7 +25,7 @@ where
 {
     let mut plain = payload;
     Ok(writer
-        .write_next_payload_record_from_reader(&mut plain)
+        .write_payload_message_from_reader(&mut plain)
         .await?
         .unwrap_or(0))
 }
@@ -69,8 +71,7 @@ async fn reuse_conn_requires_both_sides_done_before_reuse() {
         );
 
         let mut server_writer = test_snell_writer(server_download);
-        server_writer
-            .write_test_tunnel_reply(b"pong")
+        write_snell_tunnel_reply_message(&mut server_writer, b"pong")
             .await
             .unwrap();
         server_writer.write_zero_chunk().await.unwrap();
@@ -101,8 +102,7 @@ async fn reuse_conn_with_pending_payload_is_not_reusable() {
 
     let server = async {
         let mut server_writer = test_snell_writer(server_download);
-        server_writer
-            .write_test_tunnel_reply(b"pong")
+        write_snell_tunnel_reply_message(&mut server_writer, b"pong")
             .await
             .unwrap();
         server_writer.write_zero_chunk().await.unwrap();
