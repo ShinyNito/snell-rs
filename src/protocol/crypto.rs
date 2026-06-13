@@ -19,7 +19,6 @@ pub struct Aes128GcmCrypto {
 }
 
 impl Aes128GcmCrypto {
-    #[must_use]
     pub fn new(key: [u8; AES_128_KEY_SIZE]) -> Self {
         let key = UnboundKey::new(&AES_128_GCM, &key)
             .expect("Aes128GcmCrypto::new received a fixed-size AES-128 key");

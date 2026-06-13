@@ -163,7 +163,7 @@ impl ReusePool {
         let stream = connect_tcp(self.server_addr).await?;
         stream.set_nodelay(true)?;
         let (reader_io, writer_io) = stream.into_split();
-        let reader = SnellStreamReader::new(reader_io, self.psk.as_slice(), self.version)?;
+        let reader = SnellStreamReader::new(reader_io, self.psk.as_slice(), self.version);
         let writer = SnellStreamWriter::new(writer_io, self.psk.as_slice(), self.version)?;
         Ok(ReuseClientConn::from_parts(reader, writer))
     }

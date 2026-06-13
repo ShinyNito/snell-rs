@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 use super::{ReusePool, ReusedSnellTcp, SharedPsk, SnellClientOutbound};
 use crate::ProtocolVersion;
 use crate::error::Error;
-use crate::protocol::request::ClientRequest;
+use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::test_support::{
     TEST_PSK, test_snell_reader, test_snell_reader_with_version, test_snell_writer,
     test_snell_writer_with_version, test_tcp_listener,
@@ -55,7 +55,8 @@ async fn pool_conn_after_reply(
         let (reader_io, writer_io) = stream.into_split();
         let mut reader = test_snell_reader(reader_io);
         let mut server_writer = test_snell_writer(writer_io);
-        let request = reader.read_client_request().await.unwrap();
+        let payload = reader.read_frame_payload().await.unwrap();
+        let request = parse_client_request(payload).unwrap();
         assert_eq!(
             request,
             ClientRequest::Connect {
@@ -148,10 +149,11 @@ async fn reuse_pool_reuses_completed_stream() {
         let mut server_writer = test_snell_writer(writer_io);
 
         for (host, reply) in [("one.example", b"one" as &[u8]), ("two.example", b"two")] {
-            let request = timeout(Duration::from_secs(1), reader.read_client_request())
+            let payload = timeout(Duration::from_secs(1), reader.read_frame_payload())
                 .await
                 .unwrap()
                 .unwrap();
+            let request = parse_client_request(payload).unwrap();
             assert_eq!(
                 request,
                 ClientRequest::Connect {
@@ -228,10 +230,11 @@ async fn reuse_pool_reuses_completed_v6_stream() {
         let mut server_writer = test_snell_writer_with_version(writer_io, ProtocolVersion::V6);
 
         for (host, reply) in [("one.example", b"one" as &[u8]), ("two.example", b"two")] {
-            let request = timeout(Duration::from_secs(1), reader.read_client_request())
+            let payload = timeout(Duration::from_secs(1), reader.read_frame_payload())
                 .await
                 .unwrap()
                 .unwrap();
+            let request = parse_client_request(payload).unwrap();
             assert_eq!(
                 request,
                 ClientRequest::Connect {
@@ -307,7 +310,8 @@ async fn reuse_pool_prunes_expired_connections_before_put() {
             let (reader_io, writer_io) = stream.into_split();
             let mut reader = test_snell_reader(reader_io);
             let mut server_writer = test_snell_writer(writer_io);
-            let request = reader.read_client_request().await.unwrap();
+            let payload = reader.read_frame_payload().await.unwrap();
+            let request = parse_client_request(payload).unwrap();
             assert_eq!(
                 request,
                 ClientRequest::Connect {
@@ -396,7 +400,8 @@ async fn reuse_pool_keeps_only_max_size_connections() {
             let (reader_io, writer_io) = stream.into_split();
             let mut reader = test_snell_reader(reader_io);
             let mut server_writer = test_snell_writer(writer_io);
-            let request = reader.read_client_request().await.unwrap();
+            let payload = reader.read_frame_payload().await.unwrap();
+            let request = parse_client_request(payload).unwrap();
             assert_eq!(
                 request,
                 ClientRequest::Connect {

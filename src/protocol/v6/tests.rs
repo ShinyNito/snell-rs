@@ -226,7 +226,7 @@ fn encodes_and_decodes_payload_frame() {
     assert_eq!(decoded_salt, salt);
 
     let mut frame = BytesMut::from(frame);
-    let mut decoder = V6FrameDecoder::new(psk, decoded_salt).unwrap();
+    let mut decoder = V6FrameDecoder::new(psk, decoded_salt, profile).unwrap();
     let prefix_len = decoder.next_prefix_len();
     let prefix = frame.split_to(prefix_len);
     let mut header_cipher = [0; V6_HEADER_CIPHER_SIZE];
@@ -251,7 +251,7 @@ fn rejects_header_when_prefix_aad_changes() {
     let profile = V6Profile::derive(psk);
     let (decoded_salt, frame) = split_salt_block(&profile, &wire).unwrap();
     let mut frame = BytesMut::from(frame);
-    let mut decoder = V6FrameDecoder::new(psk, decoded_salt).unwrap();
+    let mut decoder = V6FrameDecoder::new(psk, decoded_salt, profile).unwrap();
     let prefix_len = decoder.next_prefix_len();
     let mut prefix = frame.split_to(prefix_len);
     prefix[0] ^= 0xff;
@@ -275,7 +275,7 @@ fn decodes_zero_payload_as_zero_chunk_even_with_padding() {
     let profile = V6Profile::derive(psk);
     let (decoded_salt, frame) = split_salt_block(&profile, &wire).unwrap();
     let mut frame = BytesMut::from(frame);
-    let mut decoder = V6FrameDecoder::new(psk, decoded_salt).unwrap();
+    let mut decoder = V6FrameDecoder::new(psk, decoded_salt, profile).unwrap();
     let prefix_len = decoder.next_prefix_len();
     let prefix = frame.split_to(prefix_len);
     let mut header_cipher = [0; V6_HEADER_CIPHER_SIZE];

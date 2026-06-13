@@ -5,16 +5,11 @@ use bytes::BytesMut;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use snell_rs::MAX_PACKET_SIZE;
 use snell_rs::protocol::crypto::{AES_128_KEY_SIZE, Aes128GcmCrypto, SALT_SIZE, derive_aes128_key};
-use snell_rs::protocol::v4::frame::{
-    V4_HEADER_CIPHER_SIZE, V4FrameDecoder, V4FrameEncoder, split_salt,
-};
-use snell_rs::protocol::v6::{
-    V6_HEADER_CIPHER_SIZE, V6FrameDecoder, V6FrameEncoder, V6Profile, split_salt_block,
-};
+use snell_rs::protocol::v4::frame::{V4_HEADER_CIPHER_SIZE, V4FrameDecoder, V4FrameEncoder};
+use snell_rs::protocol::v6::{V6_HEADER_CIPHER_SIZE, V6FrameDecoder, V6FrameEncoder, V6Profile};
 
 const PSK: &[u8] = b"benchmark psk";
 const SALT: [u8; SALT_SIZE] = [7; SALT_SIZE];
-const INITIAL_PADDING_LEN: usize = 0x100;
 const PAYLOAD_SIZES: [usize; 4] = [64, 1024, 8192, MAX_PACKET_SIZE];
 
 fn encode_frame_in_place(
@@ -90,12 +85,7 @@ fn benchmark_v4_frame_encode(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     (
-                        V4FrameEncoder::with_salt_and_initial_padding(
-                            PSK,
-                            SALT,
-                            INITIAL_PADDING_LEN,
-                        )
-                        .unwrap(),
+                        V4FrameEncoder::new(PSK).unwrap(),
                         BytesMut::with_capacity(512),
                         BytesMut::from(payload.as_slice()),
                     )
@@ -114,9 +104,7 @@ fn benchmark_v4_frame_encode(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("steady_frame", size), &size, |b, _| {
-            let mut encoder =
-                V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, INITIAL_PADDING_LEN)
-                    .unwrap();
+            let mut encoder = V4FrameEncoder::new(PSK).unwrap();
             let mut head = BytesMut::with_capacity(512);
             encoder.encode_empty_frame(&mut head).unwrap();
             b.iter_batched(
@@ -201,7 +189,7 @@ fn benchmark_v6_frame_encode(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     (
-                        V6FrameEncoder::with_salt(PSK, SALT).unwrap(),
+                        V6FrameEncoder::new(PSK).unwrap(),
                         BytesMut::with_capacity(2048),
                         BytesMut::from(payload.as_slice()),
                     )
@@ -220,7 +208,7 @@ fn benchmark_v6_frame_encode(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("steady_frame", size), &size, |b, _| {
-            let mut encoder = V6FrameEncoder::with_salt(PSK, SALT).unwrap();
+            let mut encoder = V6FrameEncoder::new(PSK).unwrap();
             let mut head = BytesMut::with_capacity(2048);
             let mut body = BytesMut::from(payload.as_slice());
             encoder
@@ -257,7 +245,8 @@ fn benchmark_v6_frame_decode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("first_frame", size), &size, |b, _| {
             b.iter_batched(
                 || {
-                    let decoder = V6FrameDecoder::new(PSK, first.salt).unwrap();
+                    let decoder =
+                        V6FrameDecoder::new(PSK, first.salt, first.profile.clone()).unwrap();
                     let prefix = first.prefix.clone();
                     let header = first.header;
                     let body = first.body.clone();
@@ -275,7 +264,8 @@ fn benchmark_v6_frame_decode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("steady_frame", size), &size, |b, _| {
             b.iter_batched(
                 || {
-                    let mut decoder = V6FrameDecoder::new(PSK, steady.salt).unwrap();
+                    let mut decoder =
+                        V6FrameDecoder::new(PSK, steady.salt, steady.profile.clone()).unwrap();
                     let mut warm_header = steady.warmup.header;
                     let mut warm_body = steady.warmup.body.clone();
                     let warm_decoded = decoder
@@ -318,6 +308,7 @@ struct SteadyFrame {
 #[derive(Clone)]
 struct V6FrameParts {
     salt: [u8; SALT_SIZE],
+    profile: V6Profile,
     prefix: Vec<u8>,
     header: [u8; V6_HEADER_CIPHER_SIZE],
     body: Vec<u8>,
@@ -325,27 +316,26 @@ struct V6FrameParts {
 
 struct V6SteadyFrame {
     salt: [u8; SALT_SIZE],
+    profile: V6Profile,
     warmup: V6FrameParts,
     measured: V6FrameParts,
 }
 
 fn first_frame(payload: &[u8]) -> FrameParts {
-    let mut encoder =
-        V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, INITIAL_PADDING_LEN).unwrap();
+    let mut encoder = V4FrameEncoder::new(PSK).unwrap();
     let mut wire = BytesMut::new();
     encode_frame_in_place(&mut encoder, payload, &mut wire);
 
-    let (salt, frame) = split_salt(&wire).unwrap();
+    let (salt, frame) = split_v4_salt(&wire);
     let (header, body) = split_frame(frame);
     FrameParts { salt, header, body }
 }
 
 fn steady_frame(payload: &[u8]) -> SteadyFrame {
-    let mut encoder =
-        V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, INITIAL_PADDING_LEN).unwrap();
+    let mut encoder = V4FrameEncoder::new(PSK).unwrap();
     let mut warmup_wire = BytesMut::new();
     encode_frame_in_place(&mut encoder, payload, &mut warmup_wire);
-    let (salt, warmup_frame) = split_salt(&warmup_wire).unwrap();
+    let (salt, warmup_frame) = split_v4_salt(&warmup_wire);
     let (warmup_header, warmup_body) = split_frame(warmup_frame);
 
     let mut measured_wire = BytesMut::new();
@@ -384,15 +374,16 @@ fn encode_v6_frame_in_place(
 }
 
 fn v6_first_frame(payload: &[u8]) -> V6FrameParts {
-    let mut encoder = V6FrameEncoder::with_salt(PSK, SALT).unwrap();
+    let mut encoder = V6FrameEncoder::new(PSK).unwrap();
     let mut wire = BytesMut::new();
     encode_v6_frame_in_place(&mut encoder, payload, &mut wire);
 
     let profile = V6Profile::derive(PSK);
-    let (salt, frame) = split_salt_block(&profile, &wire).unwrap();
+    let (salt, frame) = split_v6_salt_block(&profile, &wire);
     let (prefix, header, body) = split_v6_frame(frame, profile.record_prefix_len(0));
     V6FrameParts {
         salt,
+        profile,
         prefix,
         header,
         body,
@@ -400,12 +391,12 @@ fn v6_first_frame(payload: &[u8]) -> V6FrameParts {
 }
 
 fn v6_steady_frame(payload: &[u8]) -> V6SteadyFrame {
-    let mut encoder = V6FrameEncoder::with_salt(PSK, SALT).unwrap();
+    let mut encoder = V6FrameEncoder::new(PSK).unwrap();
     let profile = V6Profile::derive(PSK);
 
     let mut warmup_wire = BytesMut::new();
     encode_v6_frame_in_place(&mut encoder, payload, &mut warmup_wire);
-    let (salt, warmup_frame) = split_salt_block(&profile, &warmup_wire).unwrap();
+    let (salt, warmup_frame) = split_v6_salt_block(&profile, &warmup_wire);
     let (warmup_prefix, warmup_header, warmup_body) =
         split_v6_frame(warmup_frame, profile.record_prefix_len(0));
 
@@ -416,14 +407,17 @@ fn v6_steady_frame(payload: &[u8]) -> V6SteadyFrame {
 
     V6SteadyFrame {
         salt,
+        profile: profile.clone(),
         warmup: V6FrameParts {
             salt,
+            profile: profile.clone(),
             prefix: warmup_prefix,
             header: warmup_header,
             body: warmup_body,
         },
         measured: V6FrameParts {
             salt,
+            profile,
             prefix: measured_prefix,
             header: measured_header,
             body: measured_body,
@@ -438,6 +432,12 @@ fn split_frame(frame: &[u8]) -> ([u8; V4_HEADER_CIPHER_SIZE], Vec<u8>) {
     (header, body)
 }
 
+fn split_v4_salt(frame: &[u8]) -> ([u8; SALT_SIZE], &[u8]) {
+    let mut salt = [0; SALT_SIZE];
+    salt.copy_from_slice(&frame[..SALT_SIZE]);
+    (salt, &frame[SALT_SIZE..])
+}
+
 fn split_v6_frame(
     frame: &[u8],
     prefix_len: usize,
@@ -447,6 +447,12 @@ fn split_v6_frame(
     header.copy_from_slice(&frame[prefix_len..prefix_len + V6_HEADER_CIPHER_SIZE]);
     let body = frame[prefix_len + V6_HEADER_CIPHER_SIZE..].to_vec();
     (prefix, header, body)
+}
+
+fn split_v6_salt_block<'a>(profile: &V6Profile, frame: &'a [u8]) -> ([u8; SALT_SIZE], &'a [u8]) {
+    let salt_block_len = profile.salt_block_len();
+    let salt = profile.extract_salt(&frame[..salt_block_len]).unwrap();
+    (salt, &frame[salt_block_len..])
 }
 
 fn criterion_config() -> Criterion {

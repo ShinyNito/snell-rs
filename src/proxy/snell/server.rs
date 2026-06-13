@@ -5,14 +5,14 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::MAX_PACKET_SIZE;
 use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
-use crate::protocol::request::ClientRequest;
+use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::protocol::v6::V6SaltReplayCache;
 use crate::proxy::outbound::{RelayOptions, RelayStats, open_udp};
 use crate::session::tcp::{TcpReader, TcpServerStream, TcpServerWriter, TcpTarget};
@@ -111,25 +111,8 @@ where
         SnellStreamWriter::new(client_writer, psk, frame_family.writer_version())?;
 
     loop {
-        let initial = match frame_reader.read_client_request().await {
-            Ok(ClientRequest::Connect {
-                reuse,
-                host,
-                port,
-                rest_span,
-                ..
-            }) => {
-                let target = TcpTarget {
-                    host: host.to_owned(),
-                    port,
-                    reuse,
-                };
-                let pending = frame_reader.take_payload_from(rest_span.start);
-                InitialRequest::Tcp(target, pending)
-            }
-            Ok(ClientRequest::Udp { rest: [], .. }) => InitialRequest::Udp,
-            Ok(ClientRequest::Ping) => InitialRequest::Ping,
-            Ok(ClientRequest::Udp { .. }) => return Err(Error::InvalidClientRequest),
+        let initial = match poll_fn(|cx| poll_read_initial_request(&mut frame_reader, cx)).await {
+            Ok(initial) => initial,
             Err(Error::Io(err))
                 if matches!(
                     err.kind(),
@@ -249,6 +232,52 @@ enum InitialRequest {
     Ping,
 }
 
+enum ParsedInitialRequest {
+    Tcp(TcpTarget, usize),
+    Udp,
+    Ping,
+}
+
+fn poll_read_initial_request<R>(
+    frame_reader: &mut SnellStreamReader<R>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<InitialRequest>>
+where
+    R: AsyncRead + Unpin,
+{
+    let parsed = {
+        let payload = ready!(frame_reader.poll_read_frame_payload(cx))?;
+        match parse_client_request(payload)? {
+            ClientRequest::Connect {
+                reuse,
+                host,
+                port,
+                rest_span,
+                ..
+            } => ParsedInitialRequest::Tcp(
+                TcpTarget {
+                    host: host.to_owned(),
+                    port,
+                    reuse,
+                },
+                rest_span.start,
+            ),
+            ClientRequest::Udp { rest: [], .. } => ParsedInitialRequest::Udp,
+            ClientRequest::Ping => ParsedInitialRequest::Ping,
+            ClientRequest::Udp { .. } => return Poll::Ready(Err(Error::InvalidClientRequest)),
+        }
+    };
+
+    let initial = match parsed {
+        ParsedInitialRequest::Tcp(target, rest_start) => {
+            InitialRequest::Tcp(target, frame_reader.take_payload_from(rest_start))
+        }
+        ParsedInitialRequest::Udp => InitialRequest::Udp,
+        ParsedInitialRequest::Ping => InitialRequest::Ping,
+    };
+    Poll::Ready(Ok(initial))
+}
+
 async fn open_target_stream(target: TcpTarget, options: RelayOptions) -> Result<TcpStream> {
     crate::proxy::outbound::open_tcp(&target.host, target.port, options).await
 }
@@ -265,7 +294,7 @@ where
 {
     snell.accept().await?;
     let (mut snell_reader, snell_writer) = snell.into_split();
-    let mut early_payload = BytesMut::new();
+    let mut early_payload = PlainUploadBatch::new();
     let upstream =
         buffer_fast_open_payload_until_connected(&mut snell_reader, connect, &mut early_payload)
             .await?;
@@ -291,7 +320,7 @@ where
     Fut: Future<Output = Result<TcpStream>>,
 {
     let (mut snell_reader, mut snell_writer) = snell.into_split();
-    let mut early_payload = BytesMut::new();
+    let mut early_payload = PlainUploadBatch::new();
     let upstream = match buffer_fast_open_payload_until_connected(
         &mut snell_reader,
         connect,
@@ -321,7 +350,7 @@ where
 async fn buffer_fast_open_payload_until_connected<R, Fut, T>(
     snell: &mut TcpReader<R>,
     connect: Fut,
-    early_payload: &mut BytesMut,
+    early_payload: &mut PlainUploadBatch,
 ) -> Result<T>
 where
     R: AsyncRead + Unpin,
@@ -346,7 +375,7 @@ where
                 if early_payload.len().saturating_add(payload.len()) > SERVER_FAST_OPEN_BUFFER_LIMIT {
                     return Err(Error::PayloadTooLarge);
                 }
-                early_payload.extend_from_slice(&payload);
+                early_payload.push(payload);
             }
         }
     }
@@ -409,7 +438,7 @@ where
         snell_writer,
         upstream,
         keep_alive,
-        BytesMut::new(),
+        PlainUploadBatch::new(),
     )
     .await
 }
@@ -419,7 +448,7 @@ async fn relay_tcp_server_split_reusable<R, W>(
     mut snell_writer: TcpServerWriter<W>,
     upstream: TcpStream,
     keep_alive: bool,
-    early_payload: BytesMut,
+    early_payload: PlainUploadBatch,
 ) -> Result<(RelayStats, SnellStreamReader<R>, SnellStreamWriter<W>)>
 where
     R: AsyncRead + Unpin,
@@ -483,16 +512,13 @@ async fn relay_tcp_reader_to_plain_vectored_counted_with_initial<R, W>(
     snell: &mut TcpReader<R>,
     plain: &mut W,
     total: &mut u64,
-    early_payload: BytesMut,
+    early_payload: PlainUploadBatch,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buffered = PlainUploadBatch::new();
-    if !early_payload.is_empty() {
-        buffered.push(early_payload.freeze());
-    }
+    let mut buffered = early_payload;
 
     loop {
         match poll_fn(|cx| poll_coalesce_plain_upload(snell, &mut buffered, cx)).await? {

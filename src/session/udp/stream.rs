@@ -1,9 +1,12 @@
+use std::future::poll_fn;
+use std::task::{Context, Poll, ready};
+
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::ProtocolVersion;
 use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
-use crate::protocol::request::ServerReply;
+use crate::protocol::request::{ServerReply, parse_server_reply};
 
 pub(crate) struct UdpClientStream<R, W> {
     reader: SnellStreamReader<R>,
@@ -23,7 +26,7 @@ where
     ) -> Result<Self> {
         let mut writer = SnellStreamWriter::new(writer_io, psk, snell_version)?;
         writer.write_udp_request().await?;
-        let reader = SnellStreamReader::new(reader_io, psk, snell_version)?;
+        let reader = SnellStreamReader::new(reader_io, psk, snell_version);
         Self::finish_open(reader, writer).await
     }
 
@@ -31,15 +34,8 @@ where
         mut reader: SnellStreamReader<R>,
         writer: SnellStreamWriter<W>,
     ) -> Result<Self> {
-        match reader.read_server_reply().await? {
-            ServerReply::Tunnel { payload: [], .. } => Ok(Self::from_parts(reader, writer)),
-            ServerReply::Tunnel { .. } => Err(Error::InvalidServerReply),
-            ServerReply::Pong => Err(Error::InvalidServerReply),
-            ServerReply::Error { code, message } => Err(Error::Server {
-                code,
-                message: message.to_owned(),
-            }),
-        }
+        poll_fn(|cx| poll_read_empty_tunnel_reply(&mut reader, cx)).await?;
+        Ok(Self::from_parts(reader, writer))
     }
 
     fn from_parts(reader: SnellStreamReader<R>, writer: SnellStreamWriter<W>) -> Self {
@@ -48,6 +44,26 @@ where
 
     pub(crate) fn into_parts(self) -> (SnellStreamReader<R>, SnellStreamWriter<W>) {
         (self.reader, self.writer)
+    }
+}
+
+fn poll_read_empty_tunnel_reply<R>(
+    reader: &mut SnellStreamReader<R>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<()>>
+where
+    R: AsyncRead + Unpin,
+{
+    let payload = ready!(reader.poll_read_frame_payload(cx))?;
+    match parse_server_reply(payload)? {
+        ServerReply::Tunnel { payload: [], .. } => Poll::Ready(Ok(())),
+        ServerReply::Tunnel { .. } | ServerReply::Pong => {
+            Poll::Ready(Err(Error::InvalidServerReply))
+        }
+        ServerReply::Error { code, message } => Poll::Ready(Err(Error::Server {
+            code,
+            message: message.to_owned(),
+        })),
     }
 }
 
@@ -79,145 +95,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use core::range::Range;
-
-    use super::{UdpClientStream, UdpServerStream};
-    use crate::ProtocolVersion;
-    use crate::error::Error;
-    use crate::protocol::request::{ClientRequest, ServerReply};
-    use crate::test_support::{
-        TEST_PSK, test_duplex_pair, test_snell_reader, test_snell_reader_with_version,
-        test_snell_writer, test_snell_writer_with_version,
-    };
-
-    #[tokio::test]
-    async fn udp_client_open_writes_udp_request_and_accepts_empty_tunnel() {
-        let (client_upload, server_upload) = test_duplex_pair();
-        let (server_download, client_download) = test_duplex_pair();
-
-        let client = async {
-            UdpClientStream::open_io(
-                client_download,
-                client_upload,
-                TEST_PSK,
-                ProtocolVersion::V4,
-            )
-            .await
-            .unwrap()
-        };
-
-        let server = async {
-            let mut reader = test_snell_reader(server_upload);
-            let request = reader.read_client_request().await.unwrap();
-            assert_eq!(
-                request,
-                ClientRequest::Udp {
-                    rest_span: Range { start: 3, end: 3 },
-                    rest: b"",
-                }
-            );
-
-            let writer = test_snell_writer(server_download);
-            UdpServerStream::accept(reader, writer).await.unwrap()
-        };
-
-        let (client, server) = tokio::join!(client, server);
-        let _ = client.into_parts();
-        let _ = server.into_parts();
-    }
-
-    #[tokio::test]
-    async fn udp_client_open_supports_v6_stream() {
-        let (client_upload, server_upload) = test_duplex_pair();
-        let (server_download, client_download) = test_duplex_pair();
-
-        let client = async {
-            UdpClientStream::open_io(
-                client_download,
-                client_upload,
-                TEST_PSK,
-                ProtocolVersion::V6,
-            )
-            .await
-            .unwrap()
-        };
-
-        let server = async {
-            let mut reader = test_snell_reader_with_version(server_upload, ProtocolVersion::V6);
-            let request = reader.read_client_request().await.unwrap();
-            assert_eq!(
-                request,
-                ClientRequest::Udp {
-                    rest_span: Range { start: 3, end: 3 },
-                    rest: b"",
-                }
-            );
-
-            let writer = test_snell_writer_with_version(server_download, ProtocolVersion::V6);
-            UdpServerStream::accept(reader, writer).await.unwrap()
-        };
-
-        let (client, server) = tokio::join!(client, server);
-        let _ = client.into_parts();
-        let _ = server.into_parts();
-    }
-
-    #[tokio::test]
-    async fn udp_client_open_rejects_non_empty_tunnel_reply() {
-        let (client_upload, server_upload) = test_duplex_pair();
-        let (server_download, client_download) = test_duplex_pair();
-
-        let client = async {
-            UdpClientStream::open_io(
-                client_download,
-                client_upload,
-                TEST_PSK,
-                ProtocolVersion::V4,
-            )
-            .await
-        };
-
-        let server = async {
-            let mut reader = test_snell_reader(server_upload);
-            assert!(matches!(
-                reader.read_client_request().await.unwrap(),
-                ClientRequest::Udp { .. }
-            ));
-
-            let mut server_writer = test_snell_writer(server_download);
-            server_writer
-                .write_test_tunnel_reply(b"unexpected")
-                .await
-                .unwrap();
-        };
-
-        let (result, ()) = tokio::join!(client, server);
-        assert!(matches!(result, Err(Error::InvalidServerReply)));
-    }
-
-    #[tokio::test]
-    async fn udp_server_accept_sends_empty_tunnel_reply() {
-        let (server_download, client_download) = test_duplex_pair();
-
-        let server = async {
-            let reader = test_snell_reader(tokio::io::empty());
-            let writer = test_snell_writer(server_download);
-            UdpServerStream::accept(reader, writer).await.unwrap()
-        };
-
-        let client = async {
-            let mut reader = test_snell_reader(client_download);
-            assert_eq!(
-                reader.read_server_reply().await.unwrap(),
-                ServerReply::Tunnel {
-                    payload_span: Range { start: 1, end: 1 },
-                    payload: b"",
-                }
-            );
-        };
-
-        let (server, ()) = tokio::join!(server, client);
-        let _ = server.into_parts();
-    }
-}
+mod tests;

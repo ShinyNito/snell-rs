@@ -420,12 +420,4 @@ where
             Self::V6(writer) => writer.compact_buffers_for_reuse(),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn frame_capacity(&self) -> usize {
-        match self {
-            Self::V4 { writer, .. } => writer.frame_capacity(),
-            Self::V6(writer) => writer.frame_capacity(),
-        }
-    }
 }

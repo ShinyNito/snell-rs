@@ -1,7 +1,7 @@
 use super::*;
 
-#[doc(hidden)]
-pub fn split_salt_block<'a>(
+#[cfg(test)]
+pub(crate) fn split_salt_block<'a>(
     profile: &V6Profile,
     frame: &'a [u8],
 ) -> Result<([u8; SALT_SIZE], &'a [u8])> {

@@ -17,7 +17,7 @@ use crate::error::Error;
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::net::dns::DnsResolver;
 use crate::protocol::header::{COMMAND_PING, PROTOCOL_VERSION};
-use crate::protocol::request::ServerReply;
+use crate::protocol::request::{ServerReply, parse_server_reply};
 use crate::protocol::socks5::{SocksReply, SocksRequest, SocksTarget};
 use crate::protocol::v4::frame::V4FrameEncoder;
 use crate::protocol::v6::V6SaltReplayCache;
@@ -95,8 +95,9 @@ async fn assert_snell_ping(addr: std::net::SocketAddr, psk: &[u8], version: Prot
         .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
         .await
         .unwrap();
-    let mut reader = SnellStreamReader::new(snell_reader_io, psk, version).unwrap();
-    assert_eq!(reader.read_server_reply().await.unwrap(), ServerReply::Pong);
+    let mut reader = SnellStreamReader::new(snell_reader_io, psk, version);
+    let payload = reader.read_frame_payload().await.unwrap();
+    assert_eq!(parse_server_reply(payload).unwrap(), ServerReply::Pong);
 }
 
 #[tokio::test]
@@ -321,8 +322,9 @@ async fn v4_family_detection_does_not_pollute_v6_replay_cache() {
         )
         .await
         .unwrap();
-        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V4).unwrap();
-        assert_eq!(reader.read_server_reply().await.unwrap(), ServerReply::Pong);
+        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V4);
+        let payload = reader.read_frame_payload().await.unwrap();
+        assert_eq!(parse_server_reply(payload).unwrap(), ServerReply::Pong);
 
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
@@ -331,8 +333,9 @@ async fn v4_family_detection_does_not_pollute_v6_replay_cache() {
             .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
-        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6).unwrap();
-        assert_eq!(reader.read_server_reply().await.unwrap(), ServerReply::Pong);
+        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
+        let payload = reader.read_frame_payload().await.unwrap();
+        assert_eq!(parse_server_reply(payload).unwrap(), ServerReply::Pong);
     };
 
     let ((), ()) = tokio::join!(server, client);
@@ -361,12 +364,9 @@ async fn serve_server_connection_handles_v6_ping() {
             .await
             .unwrap();
 
-        let mut snell_reader =
-            SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6).unwrap();
-        assert_eq!(
-            snell_reader.read_server_reply().await.unwrap(),
-            ServerReply::Pong
-        );
+        let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
+        let payload = snell_reader.read_frame_payload().await.unwrap();
+        assert_eq!(parse_server_reply(payload).unwrap(), ServerReply::Pong);
     };
 
     let ((), ()) = tokio::join!(server, client);
@@ -412,8 +412,9 @@ async fn serve_server_connection_v6_rejects_replayed_client_salt() {
             .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
-        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6).unwrap();
-        assert_eq!(reader.read_server_reply().await.unwrap(), ServerReply::Pong);
+        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
+        let payload = reader.read_frame_payload().await.unwrap();
+        assert_eq!(parse_server_reply(payload).unwrap(), ServerReply::Pong);
 
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
@@ -422,8 +423,8 @@ async fn serve_server_connection_v6_rejects_replayed_client_salt() {
             .write_test_frame(&[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
-        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6).unwrap();
-        let err = reader.read_server_reply().await.unwrap_err();
+        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
+        let err = reader.read_frame_payload().await.unwrap_err();
         assert!(err.is_closed_io(), "{err:?}");
     };
 
@@ -604,8 +605,7 @@ async fn serve_server_connection_fast_open_accepts_before_target_connects() {
     let client = async {
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
-        let mut snell_reader =
-            SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V4).unwrap();
+        let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V4);
         let mut snell_writer =
             SnellStreamWriter::new(snell_writer_io, psk, ProtocolVersion::V4).unwrap();
         snell_writer
@@ -613,11 +613,15 @@ async fn serve_server_connection_fast_open_accepts_before_target_connects() {
             .await
             .unwrap();
 
+        let payload = timeout(
+            Duration::from_millis(200),
+            snell_reader.read_frame_payload(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
-            timeout(Duration::from_millis(200), snell_reader.read_server_reply())
-                .await
-                .unwrap()
-                .unwrap(),
+            parse_server_reply(payload).unwrap(),
             ServerReply::Tunnel {
                 payload_span: Range { start: 1, end: 1 },
                 payload: b"",
@@ -866,10 +870,10 @@ async fn serve_server_connection_closes_after_fast_open_connect_failure() {
             .await
             .unwrap();
 
-        let mut snell_reader =
-            SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V4).unwrap();
+        let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V4);
+        let payload = snell_reader.read_frame_payload().await.unwrap();
         assert_eq!(
-            snell_reader.read_server_reply().await.unwrap(),
+            parse_server_reply(payload).unwrap(),
             ServerReply::Tunnel {
                 payload_span: Range { start: 1, end: 1 },
                 payload: b"",
@@ -915,10 +919,10 @@ async fn serve_server_connection_v6_returns_error_reply_on_connect_failure() {
             .await
             .unwrap();
 
-        let mut snell_reader =
-            SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6).unwrap();
+        let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
+        let payload = snell_reader.read_frame_payload().await.unwrap();
         assert_eq!(
-            snell_reader.read_server_reply().await.unwrap(),
+            parse_server_reply(payload).unwrap(),
             ServerReply::Error {
                 code: V6_ERROR_CONNECTION_REFUSED,
                 message: "test refusal",

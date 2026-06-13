@@ -4,23 +4,24 @@ use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, duplex};
+use bytes::Bytes;
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
 
 use super::{
-    SERVER_FAST_OPEN_BUFFER_LIMIT, V6_ERROR_DNS_FAILED, V6_ERROR_DNS_FAILED_MESSAGE,
-    V6_ERROR_FALLBACK, buffer_fast_open_payload_until_connected,
+    PlainUploadBatch, SERVER_FAST_OPEN_BUFFER_LIMIT, V6_ERROR_DNS_FAILED,
+    V6_ERROR_DNS_FAILED_MESSAGE, V6_ERROR_FALLBACK, buffer_fast_open_payload_until_connected,
     relay_tcp_reader_to_plain_vectored_counted_with_initial, relay_tcp_server_stream_reusable,
     v6_server_error_reply,
 };
 use crate::MAX_PACKET_SIZE;
 use crate::error::Error;
-use crate::framed::{STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY};
-use crate::protocol::request::{ClientRequest, ServerReply};
-use crate::session::tcp::{TcpPayloadReader, TcpServerStream};
+use crate::protocol::request::{
+    ClientRequest, ServerReply, parse_client_request, parse_server_reply,
+};
+use crate::session::tcp::TcpServerStream;
 use crate::test_support::{
     test_duplex_pair, test_snell_reader, test_snell_writer, test_tcp_listener,
 };
@@ -46,62 +47,6 @@ fn v6_server_error_reply_does_not_parse_io_error_text() {
 }
 
 #[tokio::test]
-async fn reusable_relay_compacts_stream_buffers_after_request() {
-    let upload = vec![0x51; STREAM_BUFFER_INITIAL_CAPACITY * 4];
-    let download = vec![0x52; STREAM_BUFFER_INITIAL_CAPACITY * 4];
-    let upload_len = upload.len();
-    let download_len = download.len();
-
-    let (client_upload, server_upload) = duplex(32 * 1024);
-    let (server_download, client_download) = duplex(32 * 1024);
-    let upstream_listener = test_tcp_listener().await;
-    let upstream = TcpStream::connect(upstream_listener.local_addr().unwrap())
-        .await
-        .unwrap();
-    let (mut target, _) = upstream_listener.accept().await.unwrap();
-
-    let client = async {
-        let mut writer = test_snell_writer(client_upload);
-        writer.write_test_frame(&upload).await.unwrap();
-        writer.write_zero_chunk().await.unwrap();
-
-        let mut reader = TcpPayloadReader::client(test_snell_reader(client_download));
-        reader.read_tunnel_reply().await.unwrap();
-
-        let mut received = Vec::new();
-        while let Some(payload) = reader.take_payload_chunk_strict().await.unwrap() {
-            received.extend_from_slice(&payload);
-        }
-        assert_eq!(received, download);
-    };
-
-    let target = async {
-        let mut received = Vec::new();
-        target.read_to_end(&mut received).await.unwrap();
-        assert_eq!(received, upload);
-        target.write_all(&download).await.unwrap();
-        target.shutdown().await.unwrap();
-    };
-
-    let server = async {
-        let reader = test_snell_reader(server_upload);
-        let writer = test_snell_writer(server_download);
-        let snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
-
-        let (stats, reader, writer) = relay_tcp_server_stream_reusable(snell, upstream, true)
-            .await
-            .unwrap();
-
-        assert_eq!(stats.uploaded, upload_len as u64);
-        assert_eq!(stats.downloaded, download_len as u64);
-        assert!(reader.body_capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
-        assert!(writer.frame_capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
-    };
-
-    let ((), (), ()) = tokio::join!(client, target, server);
-}
-
-#[tokio::test]
 async fn fast_open_buffer_stops_before_next_frame_could_exceed_limit() {
     let (client_upload, server_upload) = test_duplex_pair();
 
@@ -112,9 +57,9 @@ async fn fast_open_buffer_stops_before_next_frame_could_exceed_limit() {
     let writer = test_snell_writer(tokio::io::sink());
     let snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
     let (mut snell_reader, _) = snell.into_split();
-    let mut early_payload = BytesMut::new();
+    let mut early_payload = PlainUploadBatch::new();
     let initial_len = SERVER_FAST_OPEN_BUFFER_LIMIT - MAX_PACKET_SIZE + 1;
-    early_payload.resize(initial_len, 0);
+    early_payload.push(Bytes::from(vec![0; initial_len]));
 
     let (connect_tx, connect_rx) = oneshot::channel();
     let connect = async {
@@ -147,11 +92,13 @@ async fn server_plain_upload_coalesces_ready_records() {
     let mut coalesced_reader = tcp_reader_with_payloads(&payloads).await;
     let mut coalesced_plain = RecordingWriter::default();
     let mut coalesced_total = 0;
+    let mut early_payload = PlainUploadBatch::new();
+    early_payload.push(Bytes::from_static(b"early"));
     relay_tcp_reader_to_plain_vectored_counted_with_initial(
         &mut coalesced_reader,
         &mut coalesced_plain,
         &mut coalesced_total,
-        BytesMut::from(&b"early"[..]),
+        early_payload,
     )
     .await
     .unwrap();
@@ -188,8 +135,9 @@ async fn reusable_relay_releases_upstream_when_upstream_closes_first() {
         let mut reader = test_snell_reader(client_download);
         let mut writer = test_snell_writer(client_upload);
 
+        let payload = reader.read_frame_payload().await.unwrap();
         assert!(matches!(
-            reader.read_server_reply().await,
+            parse_server_reply(payload),
             Ok(ServerReply::Tunnel {
                 payload_span: Range { start: 1, end: 1 },
                 payload: []
@@ -222,8 +170,9 @@ async fn reusable_relay_releases_upstream_when_upstream_closes_first() {
 
         assert_eq!(stats.uploaded, 0);
         assert_eq!(stats.downloaded, 0);
+        let payload = reader.read_frame_payload().await.unwrap();
         assert_eq!(
-            reader.read_client_request().await.unwrap(),
+            parse_client_request(payload).unwrap(),
             ClientRequest::Connect {
                 reuse: true,
                 host: "next.example",

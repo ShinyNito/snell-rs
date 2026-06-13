@@ -294,11 +294,6 @@ where
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn frame_capacity(&self) -> usize {
-        self.payload.capacity()
-    }
-
     async fn try_write_udp_response_from_socket(
         &mut self,
         socket: &UdpSocket,

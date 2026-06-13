@@ -240,6 +240,7 @@ async fn relay_socks5_udp_association_lazy_quic(
             first_payload_len,
             target.address_ref(),
             target.port,
+            &mut socks_header,
         )?;
         snell_writer
             .write_owned_udp_payload_message(first_datagram)
@@ -588,14 +589,15 @@ fn rewrite_socks_datagram_as_snell_request(
     payload_len: usize,
     address: AddressRef<'_>,
     port: u16,
+    prefix: &mut BytesMut,
 ) -> Result<()> {
-    let mut prefix = BytesMut::with_capacity(MAX_SOCKS_UDP_HEADER);
-    write_udp_request_prefix(&mut prefix, address, port)?;
+    prefix.clear();
+    write_udp_request_prefix(prefix, address, port)?;
     let Some(prefix_start) = payload_start.checked_sub(prefix.len()) else {
         return Err(Error::InvalidSocksRequest);
     };
 
-    datagram[prefix_start..payload_start].copy_from_slice(&prefix);
+    datagram[prefix_start..payload_start].copy_from_slice(prefix);
     datagram.advance(prefix_start);
     datagram.truncate(prefix.len() + payload_len);
     Ok(())

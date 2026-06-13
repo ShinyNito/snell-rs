@@ -84,7 +84,7 @@ impl LoopbackHarness {
             tcp_brutal: None,
             upstream_socks5: None,
         };
-        let snell_task = spawn_snell_server(snell_config, snell_shutdown.clone());
+        let snell_task = spawn_snell_server(snell_config, &snell_shutdown);
         wait_for_tcp(snell_addr).await?;
 
         let socks_addr = available_loopback_addr()?;
@@ -97,7 +97,7 @@ impl LoopbackHarness {
             reuse,
             quic_proxy: false,
         };
-        let socks_task = spawn_socks5_client(client_config, socks_shutdown.clone());
+        let socks_task = spawn_socks5_client(client_config, &socks_shutdown);
         wait_for_tcp(socks_addr).await?;
 
         Ok(Self {
@@ -160,7 +160,7 @@ async fn echo_connection(mut stream: TcpStream) -> io::Result<()> {
     stream.shutdown().await
 }
 
-fn spawn_snell_server(config: ServerConfig, shutdown: CancellationToken) -> JoinHandle<()> {
+fn spawn_snell_server(config: ServerConfig, shutdown: &CancellationToken) -> JoinHandle<()> {
     let task_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let result = bind_configured_tcp_server_with_shutdown(config, task_shutdown.clone()).await;
@@ -172,7 +172,7 @@ fn spawn_snell_server(config: ServerConfig, shutdown: CancellationToken) -> Join
     })
 }
 
-fn spawn_socks5_client(config: ClientConfig, shutdown: CancellationToken) -> JoinHandle<()> {
+fn spawn_socks5_client(config: ClientConfig, shutdown: &CancellationToken) -> JoinHandle<()> {
     let task_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let result =

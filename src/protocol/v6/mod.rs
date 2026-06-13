@@ -114,7 +114,8 @@ pub use frame::{V6DecodedHeader, V6FrameDecoder, V6FrameEncoder};
 pub use profile::V6Profile;
 pub use replay::V6SaltReplayCache;
 pub(in crate::protocol::v6) use salt::salt_positions;
-pub use salt::split_salt_block;
+#[cfg(test)]
+pub(crate) use salt::split_salt_block;
 
 #[inline]
 fn mix_padding_payload(

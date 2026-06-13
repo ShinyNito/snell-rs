@@ -35,11 +35,15 @@ impl V6FrameEncoder {
     pub fn new(psk: &[u8]) -> Result<Self> {
         let mut salt = [0; SALT_SIZE];
         fill_random(&mut salt)?;
-        Self::with_salt(psk, salt)
+        Self::from_salt(psk, salt)
     }
 
-    #[doc(hidden)]
-    pub fn with_salt(psk: &[u8], salt: [u8; SALT_SIZE]) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn with_salt(psk: &[u8], salt: [u8; SALT_SIZE]) -> Result<Self> {
+        Self::from_salt(psk, salt)
+    }
+
+    fn from_salt(psk: &[u8], salt: [u8; SALT_SIZE]) -> Result<Self> {
         let profile = V6Profile::derive(psk);
         let crypto = Aes128GcmCrypto::from_psk_and_salt(psk, &salt)?;
         Ok(Self {
@@ -52,17 +56,14 @@ impl V6FrameEncoder {
         })
     }
 
-    #[must_use]
     pub const fn salt(&self) -> &[u8; SALT_SIZE] {
         &self.salt
     }
 
-    #[must_use]
     pub const fn profile(&self) -> &V6Profile {
         &self.profile
     }
 
-    #[must_use]
     pub const fn seq(&self) -> u32 {
         self.seq
     }
@@ -151,8 +152,7 @@ pub struct V6FrameDecoder {
 }
 
 impl V6FrameDecoder {
-    pub fn new(psk: &[u8], salt: [u8; SALT_SIZE]) -> Result<Self> {
-        let profile = V6Profile::derive(psk);
+    pub fn new(psk: &[u8], salt: [u8; SALT_SIZE], profile: V6Profile) -> Result<Self> {
         Ok(Self {
             profile,
             crypto: Aes128GcmCrypto::from_psk_and_salt(psk, &salt)?,
@@ -161,17 +161,14 @@ impl V6FrameDecoder {
         })
     }
 
-    #[must_use]
     pub const fn profile(&self) -> &V6Profile {
         &self.profile
     }
 
-    #[must_use]
     pub const fn seq(&self) -> u32 {
         self.seq
     }
 
-    #[must_use]
     pub fn next_prefix_len(&self) -> usize {
         self.profile.record_prefix_len(self.seq)
     }

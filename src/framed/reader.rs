@@ -9,9 +9,6 @@ use zeroize::Zeroizing;
 use crate::ProtocolVersion;
 use crate::error::{Error, Result};
 use crate::protocol::crypto::SALT_SIZE;
-use crate::protocol::request::{
-    ClientRequest, ServerReply, parse_client_request, parse_server_reply,
-};
 use crate::protocol::udp::{parse_udp_request, parse_udp_response};
 use crate::protocol::v4::frame::{DecodedHeader, V4_HEADER_CIPHER_SIZE, V4FrameDecoder};
 use crate::protocol::v6::{
@@ -61,7 +58,7 @@ pub struct V4StreamReader<R> {
 pub struct V6StreamReader<R> {
     inner: R,
     pub(super) psk: Zeroizing<Vec<u8>>,
-    profile: V6Profile,
+    profile: Option<V6Profile>,
     chunk_sizer: V6ChunkSizer,
     salt_replay_cache: Option<V6SaltReplayCache>,
     decoder: Option<V6FrameDecoder>,
@@ -90,7 +87,7 @@ impl<R> V6StreamReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    pub fn new(inner: R, psk: &[u8]) -> Result<Self> {
+    pub fn new(inner: R, psk: &[u8]) -> Self {
         Self::with_salt_replay_cache(inner, psk, None)
     }
 
@@ -98,7 +95,7 @@ where
         inner: R,
         psk: &[u8],
         salt_replay_cache: Option<V6SaltReplayCache>,
-    ) -> Result<Self> {
+    ) -> Self {
         Self::with_body_and_salt_replay_cache(
             inner,
             psk,
@@ -107,8 +104,13 @@ where
         )
     }
 
-    fn with_prefilled_body(inner: R, psk: &[u8], body: BytesMut) -> Result<Self> {
-        Self::with_body_and_salt_replay_cache(inner, psk, body, None)
+    fn with_prefilled_body_and_profile(
+        inner: R,
+        psk: &[u8],
+        body: BytesMut,
+        profile: V6Profile,
+    ) -> Self {
+        Self::with_body_salt_replay_cache_and_profile(inner, psk, body, None, profile)
     }
 
     fn with_body_and_salt_replay_cache(
@@ -116,13 +118,23 @@ where
         psk: &[u8],
         body: BytesMut,
         salt_replay_cache: Option<V6SaltReplayCache>,
-    ) -> Result<Self> {
+    ) -> Self {
         let profile = V6Profile::derive(psk);
+        Self::with_body_salt_replay_cache_and_profile(inner, psk, body, salt_replay_cache, profile)
+    }
+
+    fn with_body_salt_replay_cache_and_profile(
+        inner: R,
+        psk: &[u8],
+        body: BytesMut,
+        salt_replay_cache: Option<V6SaltReplayCache>,
+        profile: V6Profile,
+    ) -> Self {
         let chunk_sizer = V6ChunkSizer::new(profile.clone());
-        Ok(Self {
+        Self {
             inner,
             psk: Zeroizing::new(psk.to_vec()),
-            profile,
+            profile: Some(profile),
             chunk_sizer,
             salt_replay_cache,
             decoder: None,
@@ -134,7 +146,7 @@ where
             last_chunk_limit: None,
             pending_udp_eof: false,
             pending_udp_record: None,
-        })
+        }
     }
 
     // Cancel-safe frame read: a decoded header is cached until the full body is
@@ -142,14 +154,26 @@ where
     fn poll_read_frame_payload_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.discard_consumed();
         if self.decoder.is_none() {
-            let salt_block_len = self.profile.salt_block_len();
+            let salt_block_len = self
+                .profile
+                .as_ref()
+                .expect("v6 profile is present before decoder initialization")
+                .salt_block_len();
             ready!(self.poll_fill_to(cx, salt_block_len))?;
-            let salt = self.profile.extract_salt(&self.body[..salt_block_len])?;
+            let salt = self
+                .profile
+                .as_ref()
+                .expect("v6 profile is present before decoder initialization")
+                .extract_salt(&self.body[..salt_block_len])?;
             if let Some(cache) = &self.salt_replay_cache {
                 cache.remember(salt)?;
             }
             self.body.advance(salt_block_len);
-            self.decoder = Some(V6FrameDecoder::new(&self.psk, salt)?);
+            let profile = self
+                .profile
+                .take()
+                .expect("v6 profile is present before decoder initialization");
+            self.decoder = Some(V6FrameDecoder::new(&self.psk, salt, profile)?);
             self.psk.clear();
         }
 
@@ -222,7 +246,7 @@ where
         Ok(&self.body[self.payload_start..self.payload_end])
     }
 
-    pub(crate) fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+    fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
         ready!(self.poll_read_frame_payload_inner(cx))?;
         Poll::Ready(Ok(&self.body[self.payload_start..self.payload_end]))
     }
@@ -276,11 +300,6 @@ where
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn body_capacity(&self) -> usize {
-        self.body.capacity()
-    }
-
     fn discard_consumed(&mut self) {
         if self.consumed != 0 {
             self.body.advance(self.consumed);
@@ -320,11 +339,11 @@ impl<R> SnellStreamReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    pub(crate) fn new(inner: R, psk: &[u8], version: ProtocolVersion) -> Result<Self> {
+    pub(crate) fn new(inner: R, psk: &[u8], version: ProtocolVersion) -> Self {
         if version.uses_v6_frames() {
-            Ok(Self::V6(Box::new(V6StreamReader::new(inner, psk)?)))
+            Self::V6(Box::new(V6StreamReader::new(inner, psk)))
         } else {
-            Ok(Self::V4(Box::new(V4StreamReader::new(inner, psk)?)))
+            Self::V4(Box::new(V4StreamReader::new(inner, psk)))
         }
     }
 
@@ -340,13 +359,17 @@ where
             match (v6_attempt, v4_attempt) {
                 (DetectionAttempt::Authenticated(salt), _) => {
                     v6_salt_replay_cache.remember(salt)?;
-                    let reader =
-                        V6StreamReader::with_prefilled_body(detector.inner, psk, detector.body)?;
+                    let reader = V6StreamReader::with_prefilled_body_and_profile(
+                        detector.inner,
+                        psk,
+                        detector.body,
+                        detector.profile,
+                    );
                     return Ok((Self::V6(Box::new(reader)), SnellFrameFamily::V6));
                 }
                 (_, DetectionAttempt::Authenticated(())) => {
                     let reader =
-                        V4StreamReader::with_prefilled_body(detector.inner, psk, detector.body)?;
+                        V4StreamReader::with_prefilled_body(detector.inner, psk, detector.body);
                     return Ok((Self::V4(Box::new(reader)), SnellFrameFamily::V4));
                 }
                 (DetectionAttempt::Failed(v6_error), DetectionAttempt::Failed(v4_error)) => {
@@ -417,40 +440,6 @@ where
         }
     }
 
-    pub(crate) async fn read_client_request(&mut self) -> Result<ClientRequest<'_>> {
-        match self {
-            Self::V4(reader) => {
-                let payload = reader.read_frame_payload().await?;
-                parse_client_request(payload)
-            }
-            Self::V6(reader) => {
-                let payload = reader.read_frame_payload().await?;
-                parse_client_request(payload)
-            }
-        }
-    }
-
-    pub(crate) async fn read_server_reply(&mut self) -> Result<ServerReply<'_>> {
-        match self {
-            Self::V4(reader) => {
-                let payload = reader.read_frame_payload().await?;
-                parse_server_reply(payload)
-            }
-            Self::V6(reader) => {
-                let payload = reader.read_frame_payload().await?;
-                parse_server_reply(payload)
-            }
-        }
-    }
-
-    pub(crate) fn poll_read_server_reply(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<ServerReply<'_>>> {
-        let payload = ready!(self.poll_read_frame_payload(cx))?;
-        Poll::Ready(parse_server_reply(payload))
-    }
-
     pub(crate) fn take_payload_from(&mut self, offset: usize) -> Bytes {
         match self {
             Self::V4(reader) => reader.take_payload_from(offset),
@@ -462,14 +451,6 @@ where
         match self {
             Self::V4(reader) => reader.compact_buffers_for_reuse(),
             Self::V6(reader) => reader.compact_buffers_for_reuse(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn body_capacity(&self) -> usize {
-        match self {
-            Self::V4(reader) => reader.body_capacity(),
-            Self::V6(reader) => reader.body_capacity(),
         }
     }
 }
@@ -605,7 +586,7 @@ where
             Ok(salt) => salt,
             Err(error) => return DetectionAttempt::Failed(error),
         };
-        let mut decoder = match V6FrameDecoder::new(self.psk, salt) {
+        let mut decoder = match V6FrameDecoder::new(self.psk, salt, self.profile.clone()) {
             Ok(decoder) => decoder,
             Err(error) => return DetectionAttempt::Failed(error),
         };
@@ -695,7 +676,7 @@ where
     ///
     /// The salt is read and the decoder is initialized lazily on the first
     /// frame read.
-    pub fn new(inner: R, psk: &[u8]) -> Result<Self> {
+    pub fn new(inner: R, psk: &[u8]) -> Self {
         Self::with_prefilled_body(
             inner,
             psk,
@@ -703,8 +684,8 @@ where
         )
     }
 
-    fn with_prefilled_body(inner: R, psk: &[u8], body: BytesMut) -> Result<Self> {
-        Ok(Self {
+    fn with_prefilled_body(inner: R, psk: &[u8], body: BytesMut) -> Self {
+        Self {
             inner,
             psk: Zeroizing::new(psk.to_vec()),
             decoder: None,
@@ -713,7 +694,7 @@ where
             pending_header: None,
             payload_start: 0,
             payload_end: 0,
-        })
+        }
     }
 
     // Cancel-safe frame read: a decoded header is cached until the full body is
@@ -786,7 +767,7 @@ where
         Ok(&self.body[self.payload_start..self.payload_end])
     }
 
-    pub(crate) fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+    fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
         ready!(self.poll_read_frame_payload_inner(cx))?;
         Poll::Ready(Ok(&self.body[self.payload_start..self.payload_end]))
     }
@@ -816,11 +797,6 @@ where
         if self.body.is_empty() {
             compact_stream_buffer_for_reuse(&mut self.body);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn body_capacity(&self) -> usize {
-        self.body.capacity()
     }
 
     fn discard_consumed(&mut self) {

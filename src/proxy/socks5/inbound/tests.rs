@@ -13,7 +13,7 @@ use crate::ProtocolVersion;
 use crate::error::{Error, Result};
 use crate::net::dns::DnsResolver;
 use crate::protocol::quic_proxy::decode_init_datagram;
-use crate::protocol::request::ClientRequest;
+use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::protocol::socks5::{parse_udp_packet, write_udp_packet};
 use crate::protocol::udp::AddressRef;
 use crate::protocol::version::DEFAULT_CLIENT_VERSION;
@@ -138,7 +138,8 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
         let (stream, _) = snell_listener.accept().await.unwrap();
         let (server_read, server_write) = stream.into_split();
         let mut reader = test_snell_reader(server_read);
-        let request = reader.read_client_request().await.unwrap();
+        let payload = reader.read_frame_payload().await.unwrap();
+        let request = parse_client_request(payload).unwrap();
         assert_eq!(
             request,
             ClientRequest::Connect {

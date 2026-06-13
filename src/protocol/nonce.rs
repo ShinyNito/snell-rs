@@ -2,12 +2,10 @@
 pub struct Nonce12([u8; 12]);
 
 impl Nonce12 {
-    #[must_use]
     pub const fn new() -> Self {
         Self([0; 12])
     }
 
-    #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 12] {
         &self.0
     }

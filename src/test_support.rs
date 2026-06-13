@@ -7,7 +7,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use crate::ProtocolVersion;
 use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
-use crate::protocol::request::ClientRequest;
+use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::protocol::udp::{AddressRef, UdpPacketRef, parse_udp_request, parse_udp_response};
 use crate::session::udp::stream::UdpServerStream;
 
@@ -45,7 +45,7 @@ pub(crate) fn test_snell_reader_with_version<R>(
 where
     R: AsyncRead + Unpin,
 {
-    SnellStreamReader::new(io, TEST_PSK, version).unwrap()
+    SnellStreamReader::new(io, TEST_PSK, version)
 }
 
 pub(crate) fn test_snell_writer<W>(io: W) -> SnellStreamWriter<W>
@@ -107,8 +107,9 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut reader = SnellStreamReader::new(reader_io, psk, version)?;
-    match reader.read_client_request().await? {
+    let mut reader = SnellStreamReader::new(reader_io, psk, version);
+    let payload = reader.read_frame_payload().await?;
+    match parse_client_request(payload)? {
         ClientRequest::Udp { rest: [], .. } => {}
         ClientRequest::Udp { .. } => return Err(Error::InvalidClientRequest),
         ClientRequest::Ping | ClientRequest::Connect { .. } => {

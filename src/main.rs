@@ -121,7 +121,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 #[cfg(test)]
-mod tests {
+mod main_tests {
     use std::path::PathBuf;
 
     use clap::{CommandFactory, Parser};

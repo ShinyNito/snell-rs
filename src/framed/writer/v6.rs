@@ -321,11 +321,6 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn frame_capacity(&self) -> usize {
-        self.payload.capacity()
-    }
-
-    #[cfg(test)]
     pub(crate) fn has_committed_chunk_record(&self) -> bool {
         self.chunk_sizer.has_committed_record()
     }

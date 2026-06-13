@@ -20,22 +20,18 @@ pub struct QuicProxyInitRef<'a> {
     pub payload: &'a [u8],
 }
 
-#[must_use]
 pub fn is_quic_looking(first_byte: u8) -> bool {
     (0x40..=0x7f).contains(&first_byte) || first_byte >= 0xc0
 }
 
-#[must_use]
 pub fn is_quic_initial(first_byte: u8) -> bool {
     first_byte & 0x80 != 0 && first_byte & 0x40 != 0
 }
 
-#[must_use]
 pub fn is_quic_short_header(first_byte: u8) -> bool {
     first_byte & 0xc0 == 0x40
 }
 
-#[must_use]
 pub fn is_quic_initial_packet(first_byte: u8) -> bool {
     first_byte & 0xf0 == 0xc0
 }
