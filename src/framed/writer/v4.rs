@@ -6,7 +6,7 @@ pub struct V4StreamWriter<W> {
     pub(in crate::framed) record_sizer: RecordSizer,
     pub(in crate::framed) head: BytesMut,
     pub(in crate::framed) payload: BytesMut,
-    wire: BytesMut,
+    pub(in crate::framed) wire: BytesMut,
 }
 
 impl<W> V4StreamWriter<W>
@@ -135,41 +135,6 @@ where
         self.write_control_scratch().await
     }
 
-    pub(crate) async fn try_write_ipv4_udp_response_from_socket(
-        &mut self,
-        socket: &UdpSocket,
-    ) -> Result<Option<(usize, SocketAddr)>> {
-        self.try_write_udp_response_from_socket(socket, UdpResponseIpVersion::V4)
-            .await
-    }
-
-    pub(crate) async fn try_write_ipv6_udp_response_from_socket(
-        &mut self,
-        socket: &UdpSocket,
-    ) -> Result<Option<(usize, SocketAddr)>> {
-        self.try_write_udp_response_from_socket(socket, UdpResponseIpVersion::V6)
-            .await
-    }
-
-    pub(crate) fn start_payload_frame(&mut self) -> &mut BytesMut {
-        self.payload.clear();
-        &mut self.payload
-    }
-
-    pub(crate) async fn finish_udp_payload_message(&mut self, payload_len: usize) -> Result<usize> {
-        self.write_payload_buffer(payload_len, true).await?;
-        Ok(payload_len)
-    }
-
-    pub(crate) async fn write_owned_udp_payload_message(
-        &mut self,
-        mut payload: BytesMut,
-    ) -> Result<usize> {
-        let payload_len = payload.len();
-        std::mem::swap(&mut self.payload, &mut payload);
-        self.write_payload_buffer(payload_len, true).await
-    }
-
     pub async fn write_empty_tunnel_reply(&mut self) -> Result<()> {
         self.payload.clear();
         write_tunnel_reply(&mut self.payload, &[]);
@@ -206,56 +171,6 @@ where
         if self.head.capacity() > STREAM_BUFFER_RETAIN_CAPACITY {
             self.head = BytesMut::with_capacity(FRAME_HEAD_INITIAL_CAPACITY);
         }
-    }
-
-    async fn try_write_udp_response_from_socket(
-        &mut self,
-        socket: &UdpSocket,
-        ip_version: UdpResponseIpVersion,
-    ) -> Result<Option<(usize, SocketAddr)>> {
-        self.payload.clear();
-        let prefix_len = ip_version.prefix_len();
-        let payload_limit = MAX_PACKET_SIZE - prefix_len;
-        self.payload
-            .reserve(MAX_PACKET_SIZE + crate::protocol::crypto::AEAD_TAG_SIZE);
-        self.payload.resize(prefix_len, 0);
-
-        let min_spare = payload_limit + 1;
-        let spare_len = self.payload.chunk_mut().len();
-        if spare_len < min_spare {
-            self.payload.reserve(min_spare);
-        }
-
-        let (payload_len, peer) = match socket.try_recv_buf_from(&mut self.payload) {
-            Ok(result) => result,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                self.payload.clear();
-                return Ok(None);
-            }
-            Err(err) => {
-                self.payload.clear();
-                return Err(err.into());
-            }
-        };
-
-        if payload_len > payload_limit {
-            self.payload.clear();
-            return Err(Error::PayloadTooLarge);
-        }
-        if !ip_version.matches(peer.ip()) {
-            self.payload.clear();
-            return Err(Error::InvalidAddressType);
-        }
-
-        let mut prefix = &mut self.payload[..prefix_len];
-        write_udp_response_prefix(&mut prefix, AddressRef::Ip(peer.ip()), peer.port())?;
-        debug_assert!(prefix.is_empty());
-
-        let wire_len = self
-            .write_payload_buffer(prefix_len + payload_len, true)
-            .await?;
-        tracing::trace!(payload_len, wire_len, "wrote snell v4 udp response frame");
-        Ok(Some((payload_len, peer)))
     }
 
     async fn write_control_scratch(&mut self) -> Result<()> {

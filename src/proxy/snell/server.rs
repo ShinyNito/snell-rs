@@ -1,12 +1,9 @@
-use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
-use std::io::IoSlice;
-use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
-use bytes::{Buf, Bytes};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use bytes::Bytes;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 use crate::MAX_PACKET_SIZE;
@@ -15,6 +12,7 @@ use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::protocol::v6::V6SaltReplayCache;
 use crate::proxy::outbound::{RelayOptions, RelayStats, open_udp};
+use crate::session::tcp::relay::{PlainUploadBatch, relay_tcp_reader_to_plain};
 use crate::session::tcp::{TcpReader, TcpServerStream, TcpServerWriter, TcpTarget};
 use crate::session::udp::association::{
     UDP_ASSOCIATION_IDLE_TIMEOUT, relay_udp_server_stream_prepared,
@@ -36,9 +34,6 @@ pub(crate) const V6_ERROR_FALLBACK: u8 = 0xff;
 const V6_ERROR_DNS_FAILED_MESSAGE: &str = "DNS Failed";
 const V6_ERROR_REMOTE_EOF_MESSAGE: &str = "remote eof";
 const SERVER_FAST_OPEN_BUFFER_LIMIT: usize = 64 * 1024;
-// Coalesces only the plaintext server -> upstream TCP leg; Snell record boundaries stay intact.
-const SERVER_UPSTREAM_COALESCE_LIMIT: usize = 256 * 1024;
-const SERVER_UPSTREAM_COALESCE_MAX_SLICES: usize = 128;
 
 #[cfg(test)]
 pub(crate) async fn serve_server_connection(
@@ -459,7 +454,7 @@ where
     let mut uploaded = 0;
     let mut downloaded = 0;
     let end = {
-        let upload = relay_tcp_reader_to_plain_vectored_counted_with_initial(
+        let upload = relay_tcp_reader_to_plain(
             &mut snell_reader,
             &mut upstream_writer,
             &mut uploaded,
@@ -506,157 +501,6 @@ where
         frame_reader,
         frame_writer,
     ))
-}
-
-async fn relay_tcp_reader_to_plain_vectored_counted_with_initial<R, W>(
-    snell: &mut TcpReader<R>,
-    plain: &mut W,
-    total: &mut u64,
-    early_payload: PlainUploadBatch,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buffered = early_payload;
-
-    loop {
-        match poll_fn(|cx| poll_coalesce_plain_upload(snell, &mut buffered, cx)).await? {
-            PlainUploadPoll::Flush => {
-                flush_plain_upload(plain, total, &mut buffered).await?;
-            }
-            PlainUploadPoll::Done => {
-                flush_plain_upload(plain, total, &mut buffered).await?;
-                plain.shutdown().await?;
-                return Ok(());
-            }
-        }
-    }
-}
-
-enum PlainUploadPoll {
-    Flush,
-    Done,
-}
-
-fn poll_coalesce_plain_upload<R>(
-    snell: &mut TcpReader<R>,
-    buffered: &mut PlainUploadBatch,
-    cx: &mut Context<'_>,
-) -> Poll<Result<PlainUploadPoll>>
-where
-    R: AsyncRead + Unpin,
-{
-    loop {
-        if buffered.len() >= SERVER_UPSTREAM_COALESCE_LIMIT {
-            return Poll::Ready(Ok(PlainUploadPoll::Flush));
-        }
-
-        match snell.poll_take_payload_chunk(cx) {
-            Poll::Pending if buffered.is_empty() => return Poll::Pending,
-            Poll::Pending => return Poll::Ready(Ok(PlainUploadPoll::Flush)),
-            Poll::Ready(Ok(Some(payload))) => {
-                buffered.push(payload);
-            }
-            Poll::Ready(Ok(None)) => return Poll::Ready(Ok(PlainUploadPoll::Done)),
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-        }
-    }
-}
-
-async fn flush_plain_upload<W>(
-    plain: &mut W,
-    total: &mut u64,
-    buffered: &mut PlainUploadBatch,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    poll_fn(|cx| {
-        while !buffered.is_empty() {
-            let n = ready!(buffered.poll_write_to(plain, cx))?;
-            if n == 0 {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write coalesced upstream payload",
-                )
-                .into()));
-            }
-            buffered.advance(n);
-            *total += n as u64;
-        }
-        Poll::Ready(Ok(()))
-    })
-    .await
-}
-
-struct PlainUploadBatch {
-    chunks: VecDeque<Bytes>,
-    len: usize,
-}
-
-impl PlainUploadBatch {
-    fn new() -> Self {
-        Self {
-            chunks: VecDeque::new(),
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, payload: Bytes) {
-        if payload.is_empty() {
-            return;
-        }
-        self.len += payload.len();
-        self.chunks.push_back(payload);
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn poll_write_to<W>(&mut self, plain: &mut W, cx: &mut Context<'_>) -> Poll<Result<usize>>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let mut slices: [IoSlice<'_>; SERVER_UPSTREAM_COALESCE_MAX_SLICES] =
-            std::array::from_fn(|_| IoSlice::new(&[]));
-        let mut slice_count = 0;
-        for chunk in self.chunks.iter().take(SERVER_UPSTREAM_COALESCE_MAX_SLICES) {
-            slices[slice_count] = IoSlice::new(chunk);
-            slice_count += 1;
-        }
-
-        match Pin::new(plain).poll_write_vectored(cx, &slices[..slice_count]) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
-        }
-    }
-
-    fn advance(&mut self, mut n: usize) {
-        while n > 0 {
-            let Some(front) = self.chunks.front_mut() else {
-                debug_assert_eq!(self.len, 0);
-                return;
-            };
-
-            if n < front.len() {
-                front.advance(n);
-                self.len -= n;
-                return;
-            }
-
-            let front_len = front.len();
-            n -= front_len;
-            self.len -= front_len;
-            self.chunks.pop_front();
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -18,6 +18,7 @@ use crate::protocol::v6::{
 
 use super::STREAM_BUFFER_INITIAL_CAPACITY;
 use super::buffer::{compact_stream_buffer_for_reuse, poll_read_ahead_into_spare};
+use super::writer::RecordSizer;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SnellFrameFamily {
@@ -51,6 +52,12 @@ pub struct V4StreamReader<R> {
     /// Header decoded for a frame whose body has not fully arrived yet. Keeps
     /// `read_frame_payload` cancel-safe: the header nonce is only spent once.
     pending_header: Option<DecodedHeader>,
+    record_sizer: Option<RecordSizer>,
+    last_chunk_limit: Option<usize>,
+    pending_udp_eof: bool,
+    pending_udp_record: Option<PendingUdpRecord>,
+    udp_message_state: UdpMessageReadState,
+    udp_message: BytesMut,
     payload_start: usize,
     payload_end: usize,
 }
@@ -70,11 +77,19 @@ pub struct V6StreamReader<R> {
     last_chunk_limit: Option<usize>,
     pending_udp_eof: bool,
     pending_udp_record: Option<PendingUdpRecord>,
+    udp_message_state: UdpMessageReadState,
+    udp_message: BytesMut,
 }
 
 struct PendingUdpRecord {
     payload: Bytes,
     chunk_limit: usize,
+}
+
+enum UdpMessageReadState {
+    Start,
+    NeedNext { first_payload: Bytes },
+    Accumulating,
 }
 
 #[derive(Clone, Copy)]
@@ -146,6 +161,8 @@ where
             last_chunk_limit: None,
             pending_udp_eof: false,
             pending_udp_record: None,
+            udp_message_state: UdpMessageReadState::Start,
+            udp_message: BytesMut::new(),
         }
     }
 
@@ -241,12 +258,13 @@ where
         Poll::Ready(Ok(()))
     }
 
+    #[cfg(test)]
     pub async fn read_frame_payload(&mut self) -> Result<&[u8]> {
         poll_fn(|cx| self.poll_read_frame_payload_inner(cx)).await?;
         Ok(&self.body[self.payload_start..self.payload_end])
     }
 
-    fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+    pub(crate) fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
         ready!(self.poll_read_frame_payload_inner(cx))?;
         Poll::Ready(Ok(&self.body[self.payload_start..self.payload_end]))
     }
@@ -297,6 +315,9 @@ where
         self.discard_consumed();
         if self.body.is_empty() {
             compact_stream_buffer_for_reuse(&mut self.body);
+        }
+        if self.udp_message.is_empty() {
+            compact_stream_buffer_for_reuse(&mut self.udp_message);
         }
     }
 
@@ -409,34 +430,36 @@ where
         }
     }
 
-    pub(crate) async fn read_udp_request_message(
+    pub(crate) fn poll_read_udp_request_message(
         &mut self,
-        scratch: &mut BytesMut,
-    ) -> Result<Option<Bytes>> {
-        self.read_udp_payload_message(scratch, UdpPayloadKind::Request)
-            .await
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>>> {
+        self.poll_read_udp_payload_message(cx, UdpPayloadKind::Request)
     }
 
-    pub(crate) async fn read_udp_response_message(
-        &mut self,
-        scratch: &mut BytesMut,
-    ) -> Result<Option<Bytes>> {
-        self.read_udp_payload_message(scratch, UdpPayloadKind::Response)
-            .await
+    pub(crate) async fn read_udp_request_message(&mut self) -> Result<Option<Bytes>> {
+        poll_fn(|cx| self.poll_read_udp_request_message(cx)).await
     }
 
-    async fn read_udp_payload_message(
+    pub(crate) fn poll_read_udp_response_message(
         &mut self,
-        scratch: &mut BytesMut,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>>> {
+        self.poll_read_udp_payload_message(cx, UdpPayloadKind::Response)
+    }
+
+    pub(crate) async fn read_udp_response_message(&mut self) -> Result<Option<Bytes>> {
+        poll_fn(|cx| self.poll_read_udp_response_message(cx)).await
+    }
+
+    fn poll_read_udp_payload_message(
+        &mut self,
+        cx: &mut Context<'_>,
         kind: UdpPayloadKind,
-    ) -> Result<Option<Bytes>> {
+    ) -> Poll<Result<Option<Bytes>>> {
         match self {
-            Self::V4(reader) => match reader.read_frame_payload().await {
-                Ok(_) => Ok(Some(reader.take_payload_from(0))),
-                Err(Error::ZeroChunk) => Ok(None),
-                Err(err) => Err(err),
-            },
-            Self::V6(reader) => read_v6_udp_payload_message(reader, scratch, kind).await,
+            Self::V4(reader) => poll_read_udp_payload_message_from(reader.as_mut(), cx, kind),
+            Self::V6(reader) => poll_read_udp_payload_message_from(reader.as_mut(), cx, kind),
         }
     }
 
@@ -455,82 +478,255 @@ where
     }
 }
 
-async fn read_v6_udp_payload_message<R>(
-    reader: &mut V6StreamReader<R>,
-    scratch: &mut BytesMut,
-    kind: UdpPayloadKind,
-) -> Result<Option<Bytes>>
-where
-    R: AsyncRead + Unpin,
-{
-    if reader.take_pending_udp_eof() {
-        return Ok(None);
-    }
+trait UdpRecordSource {
+    fn poll_read_udp_record_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>>;
+    fn last_udp_chunk_limit(&self) -> Option<usize>;
+    fn take_udp_payload_from(&mut self, offset: usize) -> Bytes;
+    fn take_pending_udp_eof(&mut self) -> bool;
+    fn set_pending_udp_eof(&mut self);
+    fn take_pending_udp_record(&mut self) -> Option<PendingUdpRecord>;
+    fn set_pending_udp_record(&mut self, record: PendingUdpRecord);
+    fn take_udp_message_state(&mut self) -> UdpMessageReadState;
+    fn set_udp_message_state(&mut self, state: UdpMessageReadState);
+    fn clear_udp_message(&mut self);
+    fn extend_udp_message(&mut self, bytes: &[u8]);
+    fn take_udp_message(&mut self) -> Bytes;
 
-    scratch.clear();
-
-    let (payload, chunk_limit) = match take_or_read_v6_udp_record(reader).await? {
-        Some(record) => record,
-        None => return Ok(None),
-    };
-    let payload_len = payload.len();
-    if payload_len != chunk_limit {
-        return Ok(Some(payload));
-    }
-
-    let first_payload = payload;
-    loop {
-        let Some((payload, chunk_limit)) = take_or_read_v6_udp_record(reader).await? else {
-            reader.set_pending_udp_eof();
-            if scratch.is_empty() {
-                return Ok(Some(first_payload));
-            }
-            let message_len = scratch.len();
-            return Ok(Some(scratch.split_to(message_len).freeze()));
-        };
-        let payload_len = payload.len();
-        if udp_payload_starts_new_message(kind, &payload) {
-            reader.set_pending_udp_record(PendingUdpRecord {
-                payload,
-                chunk_limit,
-            });
-            if scratch.is_empty() {
-                return Ok(Some(first_payload));
-            }
-            let message_len = scratch.len();
-            return Ok(Some(scratch.split_to(message_len).freeze()));
+    fn poll_take_or_read_udp_record(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<PendingUdpRecord>>> {
+        if let Some(record) = self.take_pending_udp_record() {
+            return Poll::Ready(Ok(Some(record)));
         }
-        if scratch.is_empty() {
-            scratch.extend_from_slice(&first_payload);
-        }
-        scratch.extend_from_slice(&payload);
-        if payload_len != chunk_limit {
-            let message_len = scratch.len();
-            return Ok(Some(scratch.split_to(message_len).freeze()));
+
+        match ready!(self.poll_read_udp_record_frame(cx)) {
+            Ok(()) => {
+                let chunk_limit = self.last_udp_chunk_limit().unwrap_or(usize::MAX);
+                let payload = self.take_udp_payload_from(0);
+                Poll::Ready(Ok(Some(PendingUdpRecord {
+                    payload,
+                    chunk_limit,
+                })))
+            }
+            Err(Error::ZeroChunk) => Poll::Ready(Ok(None)),
+            Err(err) => Poll::Ready(Err(err)),
         }
     }
 }
 
-async fn take_or_read_v6_udp_record<R>(
-    reader: &mut V6StreamReader<R>,
-) -> Result<Option<(Bytes, usize)>>
+fn poll_read_udp_payload_message_from<R>(
+    reader: &mut R,
+    cx: &mut Context<'_>,
+    kind: UdpPayloadKind,
+) -> Poll<Result<Option<Bytes>>>
+where
+    R: UdpRecordSource,
+{
+    loop {
+        match reader.take_udp_message_state() {
+            UdpMessageReadState::Start => {
+                if reader.take_pending_udp_eof() {
+                    reader.set_udp_message_state(UdpMessageReadState::Start);
+                    return Poll::Ready(Ok(None));
+                }
+                reader.clear_udp_message();
+                let record = match reader.poll_take_or_read_udp_record(cx) {
+                    Poll::Ready(Ok(Some(record))) => record,
+                    Poll::Ready(Ok(None)) => {
+                        reader.set_udp_message_state(UdpMessageReadState::Start);
+                        return Poll::Ready(Ok(None));
+                    }
+                    Poll::Ready(Err(err)) => {
+                        reader.set_udp_message_state(UdpMessageReadState::Start);
+                        return Poll::Ready(Err(err));
+                    }
+                    Poll::Pending => {
+                        reader.set_udp_message_state(UdpMessageReadState::Start);
+                        return Poll::Pending;
+                    }
+                };
+                let payload_len = record.payload.len();
+                if payload_len != record.chunk_limit {
+                    reader.set_udp_message_state(UdpMessageReadState::Start);
+                    return Poll::Ready(Ok(Some(record.payload)));
+                }
+                reader.set_udp_message_state(UdpMessageReadState::NeedNext {
+                    first_payload: record.payload,
+                });
+            }
+            UdpMessageReadState::NeedNext { first_payload } => {
+                let record = match reader.poll_take_or_read_udp_record(cx) {
+                    Poll::Ready(Ok(record)) => record,
+                    Poll::Ready(Err(err)) => {
+                        reader.set_udp_message_state(UdpMessageReadState::Start);
+                        return Poll::Ready(Err(err));
+                    }
+                    Poll::Pending => {
+                        reader
+                            .set_udp_message_state(UdpMessageReadState::NeedNext { first_payload });
+                        return Poll::Pending;
+                    }
+                };
+                let Some(record) = record else {
+                    reader.set_pending_udp_eof();
+                    reader.set_udp_message_state(UdpMessageReadState::Start);
+                    return Poll::Ready(Ok(Some(first_payload)));
+                };
+                let payload_len = record.payload.len();
+                if udp_payload_starts_new_message(kind, &record.payload) {
+                    reader.set_pending_udp_record(record);
+                    reader.set_udp_message_state(UdpMessageReadState::Start);
+                    return Poll::Ready(Ok(Some(first_payload)));
+                }
+                reader.clear_udp_message();
+                reader.extend_udp_message(&first_payload);
+                reader.extend_udp_message(&record.payload);
+                if payload_len != record.chunk_limit {
+                    reader.set_udp_message_state(UdpMessageReadState::Start);
+                    return Poll::Ready(Ok(Some(reader.take_udp_message())));
+                }
+                reader.set_udp_message_state(UdpMessageReadState::Accumulating);
+            }
+            UdpMessageReadState::Accumulating => {
+                let record = match reader.poll_take_or_read_udp_record(cx) {
+                    Poll::Ready(Ok(record)) => record,
+                    Poll::Ready(Err(err)) => {
+                        reader.set_udp_message_state(UdpMessageReadState::Start);
+                        return Poll::Ready(Err(err));
+                    }
+                    Poll::Pending => {
+                        reader.set_udp_message_state(UdpMessageReadState::Accumulating);
+                        return Poll::Pending;
+                    }
+                };
+                let Some(record) = record else {
+                    reader.set_pending_udp_eof();
+                    reader.set_udp_message_state(UdpMessageReadState::Start);
+                    return Poll::Ready(Ok(Some(reader.take_udp_message())));
+                };
+                let payload_len = record.payload.len();
+                if udp_payload_starts_new_message(kind, &record.payload) {
+                    reader.set_pending_udp_record(record);
+                    reader.set_udp_message_state(UdpMessageReadState::Start);
+                    return Poll::Ready(Ok(Some(reader.take_udp_message())));
+                }
+                reader.extend_udp_message(&record.payload);
+                if payload_len != record.chunk_limit {
+                    reader.set_udp_message_state(UdpMessageReadState::Start);
+                    return Poll::Ready(Ok(Some(reader.take_udp_message())));
+                }
+                reader.set_udp_message_state(UdpMessageReadState::Accumulating);
+            }
+        }
+    }
+}
+
+impl<R> UdpRecordSource for V4StreamReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    if let Some(record) = reader.take_pending_udp_record() {
-        return Ok(Some((record.payload, record.chunk_limit)));
+    fn poll_read_udp_record_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.poll_read_frame_payload_inner(cx)
     }
 
-    match reader.read_frame_payload().await {
-        Ok(payload) => {
-            let payload_len = payload.len();
-            let chunk_limit = reader.last_chunk_limit().unwrap_or(usize::MAX);
-            let payload = reader.take_payload_from(0);
-            debug_assert_eq!(payload.len(), payload_len);
-            Ok(Some((payload, chunk_limit)))
-        }
-        Err(Error::ZeroChunk) => Ok(None),
-        Err(err) => Err(err),
+    fn last_udp_chunk_limit(&self) -> Option<usize> {
+        V4StreamReader::last_chunk_limit(self)
+    }
+
+    fn take_udp_payload_from(&mut self, offset: usize) -> Bytes {
+        V4StreamReader::take_payload_from(self, offset)
+    }
+
+    fn take_pending_udp_eof(&mut self) -> bool {
+        V4StreamReader::take_pending_udp_eof(self)
+    }
+
+    fn set_pending_udp_eof(&mut self) {
+        V4StreamReader::set_pending_udp_eof(self);
+    }
+
+    fn take_pending_udp_record(&mut self) -> Option<PendingUdpRecord> {
+        V4StreamReader::take_pending_udp_record(self)
+    }
+
+    fn set_pending_udp_record(&mut self, record: PendingUdpRecord) {
+        V4StreamReader::set_pending_udp_record(self, record);
+    }
+
+    fn take_udp_message_state(&mut self) -> UdpMessageReadState {
+        std::mem::replace(&mut self.udp_message_state, UdpMessageReadState::Start)
+    }
+
+    fn set_udp_message_state(&mut self, state: UdpMessageReadState) {
+        self.udp_message_state = state;
+    }
+
+    fn clear_udp_message(&mut self) {
+        self.udp_message.clear();
+    }
+
+    fn extend_udp_message(&mut self, bytes: &[u8]) {
+        self.udp_message.extend_from_slice(bytes);
+    }
+
+    fn take_udp_message(&mut self) -> Bytes {
+        let message_len = self.udp_message.len();
+        self.udp_message.split_to(message_len).freeze()
+    }
+}
+
+impl<R> UdpRecordSource for V6StreamReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read_udp_record_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.poll_read_frame_payload_inner(cx)
+    }
+
+    fn last_udp_chunk_limit(&self) -> Option<usize> {
+        V6StreamReader::last_chunk_limit(self)
+    }
+
+    fn take_udp_payload_from(&mut self, offset: usize) -> Bytes {
+        V6StreamReader::take_payload_from(self, offset)
+    }
+
+    fn take_pending_udp_eof(&mut self) -> bool {
+        V6StreamReader::take_pending_udp_eof(self)
+    }
+
+    fn set_pending_udp_eof(&mut self) {
+        V6StreamReader::set_pending_udp_eof(self);
+    }
+
+    fn take_pending_udp_record(&mut self) -> Option<PendingUdpRecord> {
+        V6StreamReader::take_pending_udp_record(self)
+    }
+
+    fn set_pending_udp_record(&mut self, record: PendingUdpRecord) {
+        V6StreamReader::set_pending_udp_record(self, record);
+    }
+
+    fn take_udp_message_state(&mut self) -> UdpMessageReadState {
+        std::mem::replace(&mut self.udp_message_state, UdpMessageReadState::Start)
+    }
+
+    fn set_udp_message_state(&mut self, state: UdpMessageReadState) {
+        self.udp_message_state = state;
+    }
+
+    fn clear_udp_message(&mut self) {
+        self.udp_message.clear();
+    }
+
+    fn extend_udp_message(&mut self, bytes: &[u8]) {
+        self.udp_message.extend_from_slice(bytes);
+    }
+
+    fn take_udp_message(&mut self) -> Bytes {
+        let message_len = self.udp_message.len();
+        self.udp_message.split_to(message_len).freeze()
     }
 }
 
@@ -692,6 +888,12 @@ where
             body,
             consumed: 0,
             pending_header: None,
+            record_sizer: None,
+            last_chunk_limit: None,
+            pending_udp_eof: false,
+            pending_udp_record: None,
+            udp_message_state: UdpMessageReadState::Start,
+            udp_message: BytesMut::new(),
             payload_start: 0,
             payload_end: 0,
         }
@@ -751,23 +953,20 @@ where
             log_frame_decode_error(&err, "v4", "payload", Some(payload_len), Some(body_len));
             return Poll::Ready(Err(err));
         }
+        self.observe_payload_record(header);
         self.payload_start = V4_HEADER_CIPHER_SIZE;
         self.payload_end = V4_HEADER_CIPHER_SIZE + payload_len;
         tracing::trace!(payload_len, body_len, "read snell v4 frame");
         Poll::Ready(Ok(()))
     }
 
-    /// Reads one Snell frame and returns a payload slice borrowed from this reader.
-    ///
-    /// The returned slice is valid until the next frame read or
-    /// `take_payload_from` call on the same reader. A zero chunk is returned as
-    /// `Error::ZeroChunk`.
+    #[cfg(test)]
     pub async fn read_frame_payload(&mut self) -> Result<&[u8]> {
         poll_fn(|cx| self.poll_read_frame_payload_inner(cx)).await?;
         Ok(&self.body[self.payload_start..self.payload_end])
     }
 
-    fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
+    pub(crate) fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
         ready!(self.poll_read_frame_payload_inner(cx))?;
         Poll::Ready(Ok(&self.body[self.payload_start..self.payload_end]))
     }
@@ -792,10 +991,50 @@ where
         pending
     }
 
+    fn observe_payload_record(&mut self, header: DecodedHeader) {
+        if header.payload_len == 0 {
+            self.last_chunk_limit = None;
+            return;
+        }
+
+        let now = Instant::now();
+        let record_sizer = self
+            .record_sizer
+            .get_or_insert_with(|| RecordSizer::new(header.padding_len));
+        let limit = record_sizer.peek_limit(now);
+        self.last_chunk_limit = Some(limit);
+        record_sizer.commit_limit(now, limit);
+    }
+
+    pub(crate) const fn last_chunk_limit(&self) -> Option<usize> {
+        self.last_chunk_limit
+    }
+
+    pub(crate) fn take_pending_udp_eof(&mut self) -> bool {
+        let pending = self.pending_udp_eof;
+        self.pending_udp_eof = false;
+        pending
+    }
+
+    pub(crate) fn set_pending_udp_eof(&mut self) {
+        self.pending_udp_eof = true;
+    }
+
+    fn take_pending_udp_record(&mut self) -> Option<PendingUdpRecord> {
+        self.pending_udp_record.take()
+    }
+
+    fn set_pending_udp_record(&mut self, record: PendingUdpRecord) {
+        self.pending_udp_record = Some(record);
+    }
+
     pub(crate) fn compact_buffers_for_reuse(&mut self) {
         self.discard_consumed();
         if self.body.is_empty() {
             compact_stream_buffer_for_reuse(&mut self.body);
+        }
+        if self.udp_message.is_empty() {
+            compact_stream_buffer_for_reuse(&mut self.udp_message);
         }
     }
 

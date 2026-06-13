@@ -12,7 +12,7 @@ use crate::protocol::socks5::{
     SocksReply, SocksRequest, SocksTarget, parse_udp_packet as parse_socks_udp_packet,
     write_udp_packet as write_socks_udp_packet,
 };
-use crate::protocol::udp::AddressRef;
+use crate::protocol::udp::{AddressRef, parse_udp_response};
 use crate::proxy::outbound::RelayOptions;
 use crate::proxy::snell::server::serve_server_connection;
 use crate::proxy::socks5::inbound::{
@@ -20,8 +20,8 @@ use crate::proxy::socks5::inbound::{
 };
 use crate::session::udp::stream::UdpClientStream;
 use crate::test_support::{
-    TEST_PSK, accept_udp_server_stream, read_udp_response_frame, test_duplex_pair,
-    test_tcp_listener, test_udp_socket, write_snell_udp_packet,
+    TEST_PSK, TestUdpPacket, accept_udp_server_stream, test_duplex_pair, test_tcp_listener,
+    test_udp_socket, write_snell_udp_packet,
 };
 
 fn direct_options(ipv6: bool) -> RelayOptions {
@@ -80,7 +80,8 @@ async fn udp_server_stream_relays_one_datagram_response() {
         .await
         .unwrap();
 
-        let response = read_udp_response_frame(&mut reader).await.unwrap().unwrap();
+        let message = reader.read_udp_response_message().await.unwrap().unwrap();
+        let response = TestUdpPacket::from_ref(parse_udp_response(&message).unwrap());
         assert_eq!(response.payload, b"answer");
         assert_eq!(response.port, target_addr.port());
         writer.write_zero_chunk().await.unwrap();
@@ -157,14 +158,15 @@ async fn udp_stream_does_not_head_of_line_block_on_missing_response() {
         .await
         .unwrap();
 
-        let response = tokio::time::timeout(
+        let message = tokio::time::timeout(
             Duration::from_millis(500),
-            read_udp_response_frame(&mut reader),
+            reader.read_udp_response_message(),
         )
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+        let response = TestUdpPacket::from_ref(parse_udp_response(&message).unwrap());
         assert_eq!(response.payload, b"answer");
         assert_eq!(response.port, reply_addr.port());
         writer.write_zero_chunk().await.unwrap();
@@ -262,7 +264,8 @@ async fn udp_server_relays_datagram_via_upstream_socks5() {
         .await
         .unwrap();
 
-        let response = read_udp_response_frame(&mut reader).await.unwrap().unwrap();
+        let message = reader.read_udp_response_message().await.unwrap().unwrap();
+        let response = TestUdpPacket::from_ref(parse_udp_response(&message).unwrap());
         assert_eq!(response.payload, b"answer");
         assert_eq!(response.port, target_addr.port());
         writer.write_zero_chunk().await.unwrap();
@@ -342,7 +345,7 @@ async fn udp_upstream_socks5_control_close_ends_association() {
         assert!(
             timeout(
                 Duration::from_millis(200),
-                read_udp_response_frame(&mut reader)
+                reader.read_udp_response_message()
             )
             .await
             .unwrap()
@@ -387,7 +390,7 @@ async fn udp_association_idle_timeout_sends_zero_chunk_to_client() {
         assert!(
             timeout(
                 Duration::from_millis(200),
-                read_udp_response_frame(&mut reader)
+                reader.read_udp_response_message()
             )
             .await
             .unwrap()

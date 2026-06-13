@@ -11,10 +11,10 @@ use crate::error::{Error, Result};
 use crate::protocol::socks5::{
     parse_udp_packet as parse_socks_udp_packet, write_udp_packet as write_socks_udp_packet,
 };
-use crate::session::udp::io::recv_udp_datagram_into;
+use crate::session::udp::io::{UdpRecvBatch, UdpSendPacket, send_udp_batch};
 
 use super::socks5::open_udp_associate_via_socks5;
-use super::udp::{resolve_socks5_udp_relay_addr, send_udp_payload};
+use super::udp::resolve_socks5_udp_relay_addr;
 use super::{RelayOptions, UpstreamRelay, address_ref_from_host};
 
 pub(crate) struct QuicProxyRelay {
@@ -90,7 +90,13 @@ impl QuicProxyRelay {
     pub(crate) async fn send_payload(&mut self, payload: &[u8]) -> Result<()> {
         match &self.target {
             QuicProxyRelayTarget::Direct(target) => {
-                send_udp_payload(&self.outbound, payload, *target).await
+                send_udp_batch(
+                    &self.outbound,
+                    &[UdpSendPacket::single(payload, *target)],
+                    MAX_PACKET_SIZE + 512,
+                )
+                .await?;
+                Ok(())
             }
             QuicProxyRelayTarget::Proxy {
                 relay_addr,
@@ -104,7 +110,13 @@ impl QuicProxyRelay {
                     *port,
                     payload,
                 )?;
-                send_udp_payload(&self.outbound, &self.request, *relay_addr).await
+                send_udp_batch(
+                    &self.outbound,
+                    &[UdpSendPacket::single(&self.request, *relay_addr)],
+                    MAX_PACKET_SIZE + 512,
+                )
+                .await?;
+                Ok(())
             }
         }
     }
@@ -127,41 +139,51 @@ pub(crate) async fn run_quic_proxy_response_session(
     client_addr: SocketAddr,
     relay: QuicProxyResponseRelay,
 ) -> Result<()> {
-    let mut response = BytesMut::with_capacity(MAX_PACKET_SIZE + 512);
+    let mut responses = UdpRecvBatch::new(MAX_PACKET_SIZE + 512);
 
     loop {
-        let (n, peer) =
-            match recv_udp_datagram_into(&relay.outbound, &mut response, MAX_PACKET_SIZE + 512)
-                .await
-            {
-                Ok(result) => result,
-                Err(Error::PayloadTooLarge) => {
-                    tracing::debug!("ignored oversized quic proxy response");
-                    continue;
-                }
-                Err(err) => return Err(err),
+        let count = responses.recv_from(&relay.outbound).await?;
+        for index in 0..count {
+            let Some(response) = responses.get(index) else {
+                continue;
             };
-        match &relay.target {
-            QuicProxyRelayTarget::Direct(target) => {
-                if peer != *target {
-                    tracing::debug!(%peer, target = %target, "ignored quic proxy response from unexpected peer");
-                    continue;
-                }
-                send_udp_payload(&server_socket, &response[..n], client_addr).await?;
+            let peer = response.peer();
+            if response.is_oversized() {
+                tracing::debug!("ignored oversized quic proxy response");
+                continue;
             }
-            QuicProxyRelayTarget::Proxy { relay_addr, .. } => {
-                if peer != *relay_addr {
-                    tracing::debug!(%peer, relay_addr = %relay_addr, "ignored quic proxy response from unexpected proxy peer");
-                    continue;
-                }
-                let packet = match parse_socks_udp_packet(&response[..n]) {
-                    Ok(packet) => packet,
-                    Err(err) => {
-                        tracing::debug!(%err, "ignored invalid quic proxy response");
+            match &relay.target {
+                QuicProxyRelayTarget::Direct(target) => {
+                    if peer != *target {
+                        tracing::debug!(%peer, target = %target, "ignored quic proxy response from unexpected peer");
                         continue;
                     }
-                };
-                send_udp_payload(&server_socket, packet.payload, client_addr).await?;
+                    send_udp_batch(
+                        &server_socket,
+                        &[UdpSendPacket::single(response.payload(), client_addr)],
+                        MAX_PACKET_SIZE + 512,
+                    )
+                    .await?;
+                }
+                QuicProxyRelayTarget::Proxy { relay_addr, .. } => {
+                    if peer != *relay_addr {
+                        tracing::debug!(%peer, relay_addr = %relay_addr, "ignored quic proxy response from unexpected proxy peer");
+                        continue;
+                    }
+                    let packet = match parse_socks_udp_packet(response.payload()) {
+                        Ok(packet) => packet,
+                        Err(err) => {
+                            tracing::debug!(%err, "ignored invalid quic proxy response");
+                            continue;
+                        }
+                    };
+                    send_udp_batch(
+                        &server_socket,
+                        &[UdpSendPacket::single(packet.payload, client_addr)],
+                        MAX_PACKET_SIZE + 512,
+                    )
+                    .await?;
+                }
             }
         }
     }

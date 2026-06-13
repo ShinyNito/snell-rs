@@ -13,9 +13,7 @@ pub(crate) mod udp;
 
 pub(crate) use quic::{open_quic_udp, run_quic_proxy_response_session};
 pub(crate) use tcp::open_tcp;
-pub(crate) use udp::{
-    PreparedUdpProxy, PreparedUdpRelay, open_udp, send_udp_payload, validate_proxy_udp_target,
-};
+pub(crate) use udp::{PreparedUdpProxy, PreparedUdpRelay, open_udp, validate_proxy_udp_target};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RelayStats {

@@ -11,9 +11,8 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
 
 use super::{
-    PlainUploadBatch, SERVER_FAST_OPEN_BUFFER_LIMIT, V6_ERROR_DNS_FAILED,
-    V6_ERROR_DNS_FAILED_MESSAGE, V6_ERROR_FALLBACK, buffer_fast_open_payload_until_connected,
-    relay_tcp_reader_to_plain_vectored_counted_with_initial, relay_tcp_server_stream_reusable,
+    SERVER_FAST_OPEN_BUFFER_LIMIT, V6_ERROR_DNS_FAILED, V6_ERROR_DNS_FAILED_MESSAGE,
+    V6_ERROR_FALLBACK, buffer_fast_open_payload_until_connected, relay_tcp_server_stream_reusable,
     v6_server_error_reply,
 };
 use crate::MAX_PACKET_SIZE;
@@ -22,6 +21,7 @@ use crate::protocol::request::{
     ClientRequest, ServerReply, parse_client_request, parse_server_reply,
 };
 use crate::session::tcp::TcpServerStream;
+use crate::session::tcp::relay::{PlainUploadBatch, relay_tcp_reader_to_plain};
 use crate::test_support::{
     test_duplex_pair, test_snell_reader, test_snell_writer, test_tcp_listener,
     write_snell_payload_message,
@@ -97,7 +97,7 @@ async fn server_plain_upload_coalesces_ready_records() {
     let mut coalesced_total = 0;
     let mut early_payload = PlainUploadBatch::new();
     early_payload.push(Bytes::from_static(b"early"));
-    relay_tcp_reader_to_plain_vectored_counted_with_initial(
+    relay_tcp_reader_to_plain(
         &mut coalesced_reader,
         &mut coalesced_plain,
         &mut coalesced_total,

@@ -10,12 +10,12 @@ const UDP_MAX_IPV4_RESPONSE_PAYLOAD: usize = crate::MAX_PACKET_SIZE - UDP_IPV4_R
 const UDP_MAX_IPV6_RESPONSE_PAYLOAD: usize = crate::MAX_PACKET_SIZE - UDP_IPV6_RESPONSE_OVERHEAD;
 
 #[tokio::test]
-async fn udp_response_accepts_largest_payloads_that_fit_frame() {
+async fn udp_response_accepts_largest_payloads_that_fit_application_message() {
     let v4_payload = vec![0x42; UDP_MAX_IPV4_RESPONSE_PAYLOAD];
     let v6_payload = vec![0x43; UDP_MAX_IPV6_RESPONSE_PAYLOAD];
 
     let read_v4 = async {
-        let (writer_io, reader_io) = tokio::io::duplex(crate::MAX_PACKET_SIZE + 2048);
+        let (writer_io, reader_io) = tokio::io::duplex(32 * 1024);
         let mut reader = test_snell_reader(reader_io);
         let mut writer = test_snell_writer(writer_io);
         let write = write_snell_udp_response(
@@ -25,10 +25,10 @@ async fn udp_response_accepts_largest_payloads_that_fit_frame() {
             &v4_payload,
         );
         let read = async {
-            let frame = reader.read_frame_payload().await.unwrap();
-            let response = parse_udp_response(frame).unwrap();
+            let message = reader.read_udp_response_message().await.unwrap().unwrap();
+            let response = parse_udp_response(&message).unwrap();
             assert_eq!(response.payload.len(), UDP_MAX_IPV4_RESPONSE_PAYLOAD);
-            frame.len()
+            message.len()
         };
 
         let (write_result, read_result) = tokio::join!(write, read);
@@ -37,7 +37,7 @@ async fn udp_response_accepts_largest_payloads_that_fit_frame() {
     };
 
     let read_v6 = async {
-        let (writer_io, reader_io) = tokio::io::duplex(crate::MAX_PACKET_SIZE + 2048);
+        let (writer_io, reader_io) = tokio::io::duplex(32 * 1024);
         let mut reader = test_snell_reader(reader_io);
         let mut writer = test_snell_writer(writer_io);
         let write = write_snell_udp_response(
@@ -47,10 +47,10 @@ async fn udp_response_accepts_largest_payloads_that_fit_frame() {
             &v6_payload,
         );
         let read = async {
-            let frame = reader.read_frame_payload().await.unwrap();
-            let response = parse_udp_response(frame).unwrap();
+            let message = reader.read_udp_response_message().await.unwrap().unwrap();
+            let response = parse_udp_response(&message).unwrap();
             assert_eq!(response.payload.len(), UDP_MAX_IPV6_RESPONSE_PAYLOAD);
-            frame.len()
+            message.len()
         };
 
         let (write_result, read_result) = tokio::join!(write, read);
@@ -62,7 +62,7 @@ async fn udp_response_accepts_largest_payloads_that_fit_frame() {
 }
 
 #[tokio::test]
-async fn udp_response_rejects_payload_too_large_for_frame() {
+async fn udp_response_rejects_payload_too_large_for_application_message() {
     let v4_payload = vec![0x42; UDP_MAX_IPV4_RESPONSE_PAYLOAD + 1];
     let v6_payload = vec![0x43; UDP_MAX_IPV6_RESPONSE_PAYLOAD + 1];
     let mut v4_writer = test_snell_writer(tokio::io::sink());
@@ -100,10 +100,4 @@ fn udp_response_payload_limits_leave_room_for_address_headers() {
         UDP_MAX_IPV6_RESPONSE_PAYLOAD + 1 + 16 + 2,
         crate::MAX_PACKET_SIZE
     );
-}
-
-#[test]
-fn udp_send_short_write_is_rejected() {
-    assert!(crate::proxy::outbound::udp::ensure_full_datagram_sent(4, 5).is_err());
-    crate::proxy::outbound::udp::ensure_full_datagram_sent(5, 5).unwrap();
 }

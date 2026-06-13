@@ -15,15 +15,15 @@ use crate::net::dns::DnsResolver;
 use crate::protocol::quic_proxy::decode_init_datagram;
 use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::protocol::socks5::{parse_udp_packet, write_udp_packet};
-use crate::protocol::udp::AddressRef;
+use crate::protocol::udp::{AddressRef, parse_udp_request};
 use crate::protocol::version::DEFAULT_CLIENT_VERSION;
 use crate::proxy::outbound::RelayOptions;
 use crate::proxy::outbound::snell::SnellClientOutbound;
 use crate::proxy::snell::server::serve_server_connection;
 use crate::proxy::socks5::udp::is_allowed_socks_udp_peer;
 use crate::test_support::{
-    TEST_PSK, accept_udp_server_stream, read_udp_request_frame, test_snell_reader,
-    test_snell_writer, test_tcp_listener, test_udp_socket, write_snell_payload_message,
+    TEST_PSK, TestUdpPacket, accept_udp_server_stream, test_snell_reader, test_snell_writer,
+    test_tcp_listener, test_udp_socket, write_snell_payload_message,
     write_snell_tunnel_reply_message, write_snell_udp_response,
 };
 
@@ -326,6 +326,126 @@ async fn socks5_udp_associate_relays_datagram_over_snell() {
 }
 
 #[tokio::test]
+async fn socks5_udp_associate_routes_pending_responses_by_udp_target() {
+    let psk = TEST_PSK;
+    let snell_listener = test_tcp_listener().await;
+    let snell_addr = snell_listener.local_addr().unwrap();
+    let socks_listener = test_tcp_listener().await;
+    let socks_addr = socks_listener.local_addr().unwrap();
+
+    let snell_server = async {
+        let (stream, _) = snell_listener.accept().await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let (mut reader, mut writer) =
+            accept_udp_server_stream(reader, writer, psk, ProtocolVersion::V4)
+                .await
+                .unwrap()
+                .into_parts();
+
+        let first = reader.read_udp_request_message().await.unwrap().unwrap();
+        let first = TestUdpPacket::from_ref(parse_udp_request(&first).unwrap());
+        assert_eq!(first.payload, b"one");
+        assert_eq!(first.port, 5301);
+
+        let second = reader.read_udp_request_message().await.unwrap().unwrap();
+        let second = TestUdpPacket::from_ref(parse_udp_request(&second).unwrap());
+        assert_eq!(second.payload, b"two");
+        assert_eq!(second.port, 5302);
+
+        write_snell_udp_response(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            5301,
+            b"reply-one",
+        )
+        .await
+        .unwrap();
+        write_snell_udp_response(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            5302,
+            b"reply-two",
+        )
+        .await
+        .unwrap();
+
+        std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
+    };
+
+    let socks_server = async {
+        let (stream, _) = socks_listener.accept().await.unwrap();
+        relay_socks5_connection(stream, snell_addr, psk, false)
+            .await
+            .unwrap()
+    };
+
+    let client = async {
+        let mut control = TcpStream::connect(socks_addr).await.unwrap();
+        control
+            .write_all(&[5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+
+        let mut method = [0; 2];
+        control.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+
+        let mut reply = [0; 10];
+        control.read_exact(&mut reply).await.unwrap();
+        let relay_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7])),
+            u16::from_be_bytes([reply[8], reply[9]]),
+        );
+
+        let first_peer = test_udp_socket().await;
+        let second_peer = test_udp_socket().await;
+
+        let mut first = BytesMut::new();
+        write_udp_packet(
+            &mut first,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            5301,
+            b"one",
+        )
+        .unwrap();
+        first_peer.send_to(&first, relay_addr).await.unwrap();
+
+        let mut second = BytesMut::new();
+        write_udp_packet(
+            &mut second,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            5302,
+            b"two",
+        )
+        .unwrap();
+        second_peer.send_to(&second, relay_addr).await.unwrap();
+
+        let mut response = [0; 128];
+        let (n, _) = timeout(Duration::from_secs(1), first_peer.recv_from(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let packet = parse_udp_packet(&response[..n]).unwrap();
+        assert_eq!(packet.payload, b"reply-one");
+        assert_eq!(packet.port, 5301);
+
+        let (n, _) = timeout(Duration::from_secs(1), second_peer.recv_from(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let packet = parse_udp_packet(&response[..n]).unwrap();
+        assert_eq!(packet.payload, b"reply-two");
+        assert_eq!(packet.port, 5302);
+
+        control.shutdown().await.unwrap();
+    };
+
+    let ((), socks_stats, ()) = tokio::join!(snell_server, socks_server, client);
+    assert_eq!(socks_stats.uploaded, 6);
+    assert_eq!(socks_stats.downloaded, 18);
+}
+
+#[tokio::test]
 async fn socks5_v5_quic_first_packet_uses_quic_proxy_udp() {
     let psk = TEST_PSK;
     let snell_udp = test_udp_socket().await;
@@ -501,7 +621,8 @@ async fn socks5_v5_non_quic_udp_falls_back_to_udp_over_tcp() {
                 .await
                 .unwrap()
                 .into_parts();
-        let request = read_udp_request_frame(&mut reader).await.unwrap().unwrap();
+        let message = reader.read_udp_request_message().await.unwrap().unwrap();
+        let request = TestUdpPacket::from_ref(parse_udp_request(&message).unwrap());
         assert_eq!(request.payload, b"query");
         assert_eq!(request.port, 53);
         write_snell_udp_response(
@@ -586,7 +707,8 @@ async fn socks5_v4_udp_ignores_quic_proxy_flag() {
                 .await
                 .unwrap()
                 .into_parts();
-        let request = read_udp_request_frame(&mut reader).await.unwrap().unwrap();
+        let message = reader.read_udp_request_message().await.unwrap().unwrap();
+        let request = TestUdpPacket::from_ref(parse_udp_request(&message).unwrap());
         assert_eq!(request.payload, b"\xc0still-over-tcp");
         assert_eq!(request.port, 443);
         write_snell_udp_response(
@@ -867,7 +989,8 @@ async fn socks5_udp_associate_drops_invalid_snell_responses_without_closing() {
                 .await
                 .unwrap()
                 .into_parts();
-        let request = read_udp_request_frame(&mut reader).await.unwrap().unwrap();
+        let message = reader.read_udp_request_message().await.unwrap().unwrap();
+        let request = TestUdpPacket::from_ref(parse_udp_request(&message).unwrap());
         assert_eq!(request.payload, b"query");
         assert_eq!(request.port, 53);
 

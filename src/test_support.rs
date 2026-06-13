@@ -9,8 +9,7 @@ use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::protocol::udp::{
-    AddressRef, UdpPacketRef, parse_udp_request, parse_udp_response, write_udp_request_prefix,
-    write_udp_response_prefix,
+    AddressRef, UdpPacketRef, write_udp_request_prefix, write_udp_response_prefix,
 };
 use crate::session::udp::stream::UdpServerStream;
 
@@ -110,13 +109,17 @@ pub(crate) async fn write_snell_udp_packet<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let frame_len = {
-        let frame = writer.start_payload_frame();
-        write_udp_request_prefix(frame, address, port)?;
-        frame.extend_from_slice(payload);
-        frame.len()
-    };
-    writer.finish_udp_payload_message(frame_len).await?;
+    let mut plain = BytesMut::new();
+    write_udp_request_prefix(&mut plain, address, port)?;
+    plain.extend_from_slice(payload);
+    let message_len = plain.len();
+    if message_len > writer.max_udp_application_payload_len() {
+        return Err(Error::PayloadTooLarge);
+    }
+    assert_eq!(
+        writer.write_payload_message_from_buffer(&mut plain).await?,
+        Some(message_len)
+    );
     Ok(payload.len())
 }
 
@@ -129,13 +132,17 @@ pub(crate) async fn write_snell_udp_response<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let frame_len = {
-        let frame = writer.start_payload_frame();
-        write_udp_response_prefix(frame, address, port)?;
-        frame.extend_from_slice(payload);
-        frame.len()
-    };
-    writer.finish_udp_payload_message(frame_len).await?;
+    let mut plain = BytesMut::new();
+    write_udp_response_prefix(&mut plain, address, port)?;
+    plain.extend_from_slice(payload);
+    let message_len = plain.len();
+    if message_len > writer.max_udp_application_payload_len() {
+        return Err(Error::PayloadTooLarge);
+    }
+    assert_eq!(
+        writer.write_payload_message_from_buffer(&mut plain).await?,
+        Some(message_len)
+    );
     Ok(payload.len())
 }
 
@@ -162,7 +169,7 @@ impl TestUdpAddress {
 }
 
 impl TestUdpPacket {
-    fn from_ref(packet: UdpPacketRef<'_>) -> Self {
+    pub(crate) fn from_ref(packet: UdpPacketRef<'_>) -> Self {
         Self {
             address: TestUdpAddress::from_ref(packet.address),
             port: packet.port,
@@ -192,30 +199,4 @@ where
     }
     let writer = SnellStreamWriter::new(writer_io, psk, version)?;
     UdpServerStream::accept(reader, writer).await
-}
-
-pub(crate) async fn read_udp_request_frame<R>(
-    reader: &mut SnellStreamReader<R>,
-) -> Result<Option<TestUdpPacket>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut scratch = BytesMut::new();
-    let Some(message) = reader.read_udp_request_message(&mut scratch).await? else {
-        return Ok(None);
-    };
-    Ok(Some(TestUdpPacket::from_ref(parse_udp_request(&message)?)))
-}
-
-pub(crate) async fn read_udp_response_frame<R>(
-    reader: &mut SnellStreamReader<R>,
-) -> Result<Option<TestUdpPacket>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut scratch = BytesMut::new();
-    let Some(message) = reader.read_udp_response_message(&mut scratch).await? else {
-        return Ok(None);
-    };
-    Ok(Some(TestUdpPacket::from_ref(parse_udp_response(&message)?)))
 }

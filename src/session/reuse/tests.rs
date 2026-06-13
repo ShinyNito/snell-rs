@@ -1,8 +1,9 @@
 use core::range::Range;
+use std::future::poll_fn;
 
 use tokio::io::{AsyncReadExt, AsyncWrite};
 
-use super::{ReuseClientConn, ReuseClientWriter};
+use super::{ReuseClientConn, ReuseClientReader, ReuseClientWriter};
 use crate::error::Error;
 use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::test_support::{
@@ -11,9 +12,21 @@ use crate::test_support::{
 
 macro_rules! assert_next_payload {
     ($conn:expr, $expected:expr) => {{
-        let payload = $conn.reader.take_payload_chunk().await.unwrap().unwrap();
+        let payload = take_payload_chunk(&mut $conn.reader)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&payload[..], $expected);
     }};
+}
+
+async fn take_payload_chunk<R>(
+    reader: &mut ReuseClientReader<R>,
+) -> crate::error::Result<Option<bytes::Bytes>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    poll_fn(|cx| reader.poll_take_payload_chunk(cx)).await
 }
 
 async fn write_reuse_payload<W>(
@@ -48,7 +61,12 @@ async fn reuse_conn_requires_both_sides_done_before_reuse() {
         assert_next_payload!(conn, b"pong");
         assert!(!conn.can_reuse());
 
-        assert!(conn.reader.take_payload_chunk().await.unwrap().is_none());
+        assert!(
+            take_payload_chunk(&mut conn.reader)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(!conn.can_reuse());
 
         conn.writer.close_write().await.unwrap();
@@ -94,7 +112,7 @@ async fn reuse_conn_with_pending_payload_is_not_reusable() {
         let writer = test_snell_writer(client_upload);
         let reader = test_snell_reader(client_download);
         let mut conn = ReuseClientConn::from_parts(reader, writer);
-        let payload = conn.reader.take_payload_chunk().await.unwrap().unwrap();
+        let payload = take_payload_chunk(&mut conn.reader).await.unwrap().unwrap();
         assert_eq!(&payload[..2], b"po");
         conn.writer.close_write().await.unwrap();
         assert!(!conn.can_reuse());
@@ -121,7 +139,7 @@ async fn reuse_conn_surfaces_server_error_reply() {
         let reader = test_snell_reader(client_download);
         let mut conn = ReuseClientConn::from_parts(reader, writer);
         assert!(matches!(
-            conn.reader.take_payload_chunk().await,
+            take_payload_chunk(&mut conn.reader).await,
             Err(Error::Server { code: 9, message }) if message == "denied"
         ));
     };
@@ -143,7 +161,7 @@ async fn reuse_conn_error_is_not_reusable() {
         let writer = test_snell_writer(client_upload);
         let reader = test_snell_reader(client_download);
         let mut conn = ReuseClientConn::from_parts(reader, writer);
-        assert!(conn.reader.take_payload_chunk().await.is_err());
+        assert!(take_payload_chunk(&mut conn.reader).await.is_err());
         assert!(!conn.can_reuse());
     };
 

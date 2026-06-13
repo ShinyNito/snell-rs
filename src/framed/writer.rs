@@ -1,16 +1,13 @@
-use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
 #[cfg(test)]
 use crate::protocol::crypto::SALT_SIZE;
 use crate::protocol::header::{COMMAND_TUNNEL, write_tcp_request_header, write_udp_request_header};
 use crate::protocol::request::{write_error_reply, write_pong_reply, write_tunnel_reply};
-use crate::protocol::udp::{AddressRef, write_udp_response_prefix};
 use crate::protocol::v4::frame::V4FrameEncoder;
 use crate::protocol::v6::{V6ChunkSizer, V6FrameEncoder};
 use crate::{MAX_PACKET_SIZE, MAX_V6_RECORD_PAYLOAD_LEN, ProtocolVersion};
@@ -48,7 +45,7 @@ impl RecordSizer {
         limit
     }
 
-    fn peek_limit(&self, now: Instant) -> usize {
+    pub(super) fn peek_limit(&self, now: Instant) -> usize {
         match self.last_record_at {
             None => TCP_RECORD_MSS
                 .saturating_sub(TCP_FIRST_RECORD_OVERHEAD)
@@ -72,28 +69,6 @@ impl RecordSizer {
 
 const fn steady_record_limit() -> usize {
     TCP_RECORD_MSS - TCP_STEADY_RECORD_OVERHEAD
-}
-
-#[derive(Clone, Copy)]
-enum UdpResponseIpVersion {
-    V4,
-    V6,
-}
-
-impl UdpResponseIpVersion {
-    const fn prefix_len(self) -> usize {
-        match self {
-            Self::V4 => 1 + 4 + 2,
-            Self::V6 => 1 + 16 + 2,
-        }
-    }
-
-    const fn matches(self, ip: IpAddr) -> bool {
-        matches!(
-            (self, ip),
-            (Self::V4, IpAddr::V4(_)) | (Self::V6, IpAddr::V6(_))
-        )
-    }
 }
 
 pub(crate) enum SnellStreamWriter<W> {
@@ -164,53 +139,6 @@ where
         match self {
             Self::V4 { writer, version } => writer.write_udp_request(*version).await,
             Self::V6(writer) => writer.write_udp_request().await,
-        }
-    }
-
-    pub(crate) async fn try_write_ipv4_udp_response_from_socket(
-        &mut self,
-        socket: &UdpSocket,
-    ) -> Result<Option<(usize, SocketAddr)>> {
-        match self {
-            Self::V4 { writer, .. } => writer.try_write_ipv4_udp_response_from_socket(socket).await,
-            Self::V6(writer) => writer.try_write_ipv4_udp_response_from_socket(socket).await,
-        }
-    }
-
-    pub(crate) async fn try_write_ipv6_udp_response_from_socket(
-        &mut self,
-        socket: &UdpSocket,
-    ) -> Result<Option<(usize, SocketAddr)>> {
-        match self {
-            Self::V4 { writer, .. } => writer.try_write_ipv6_udp_response_from_socket(socket).await,
-            Self::V6(writer) => writer.try_write_ipv6_udp_response_from_socket(socket).await,
-        }
-    }
-
-    pub(crate) fn start_payload_frame(&mut self) -> &mut BytesMut {
-        match self {
-            Self::V4 { writer, .. } => writer.start_payload_frame(),
-            Self::V6(writer) => writer.start_payload_frame(),
-        }
-    }
-
-    // One UDP application message is address metadata followed by datagram
-    // bytes. V4 writes it as one record; V6 may split it across traffic-shaped
-    // records without adding UDP-layer continuation metadata.
-    pub(crate) async fn finish_udp_payload_message(&mut self, payload_len: usize) -> Result<usize> {
-        match self {
-            Self::V4 { writer, .. } => writer.finish_udp_payload_message(payload_len).await,
-            Self::V6(writer) => writer.finish_udp_payload_message(payload_len).await,
-        }
-    }
-
-    pub(crate) async fn write_owned_udp_payload_message(
-        &mut self,
-        payload: BytesMut,
-    ) -> Result<usize> {
-        match self {
-            Self::V4 { writer, .. } => writer.write_owned_udp_payload_message(payload).await,
-            Self::V6(writer) => writer.write_owned_udp_payload_message(payload).await,
         }
     }
 

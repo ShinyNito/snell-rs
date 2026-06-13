@@ -7,8 +7,8 @@ use crate::proxy::outbound::RelayStats;
 use crate::proxy::outbound::snell::{ReusePool, ReusedSnellTcp, SnellTcpConnect};
 use crate::session::reuse::ReuseClientConn;
 use crate::session::tcp::relay::{
-    relay_plain_to_client_writer, relay_plain_to_reuse_client_writer,
-    relay_reuse_client_reader_to_plain, relay_tcp_reader_to_plain,
+    PlainUploadBatch, relay_plain_to_client_writer, relay_plain_to_reuse_client_writer,
+    relay_tcp_reader_to_plain,
 };
 
 pub(crate) async fn relay_tcp_connect(
@@ -19,10 +19,16 @@ pub(crate) async fn relay_tcp_connect(
         SnellTcpConnect::Fresh(server) => {
             let (mut server_reader, mut server_writer) = server.into_split();
             let (mut local_reader, mut local_writer) = local.into_split();
+            let mut downloaded = 0;
 
-            let (uploaded, downloaded) = tokio::try_join!(
+            let (uploaded, ()) = tokio::try_join!(
                 relay_plain_to_client_writer(&mut local_reader, &mut server_writer),
-                relay_tcp_reader_to_plain(&mut server_reader, &mut local_writer),
+                relay_tcp_reader_to_plain(
+                    &mut server_reader,
+                    &mut local_writer,
+                    &mut downloaded,
+                    PlainUploadBatch::new(),
+                ),
             )?;
 
             Ok(RelayStats {
@@ -43,14 +49,20 @@ async fn relay_reuse_client_connection(
 ) -> Result<RelayStats> {
     let (mut snell_reader, mut snell_writer) = snell.into_split();
     let (mut local_reader, mut local_writer) = local.into_split();
+    let mut downloaded = 0;
 
     let result = tokio::try_join!(
         relay_plain_to_reuse_client_writer(&mut local_reader, &mut snell_writer),
-        relay_reuse_client_reader_to_plain(&mut snell_reader, &mut local_writer),
+        relay_tcp_reader_to_plain(
+            &mut snell_reader,
+            &mut local_writer,
+            &mut downloaded,
+            PlainUploadBatch::new(),
+        ),
     );
 
     match result {
-        Ok((uploaded, downloaded)) => {
+        Ok((uploaded, ())) => {
             pool.put(ReuseClientConn::from_split(snell_reader, snell_writer))
                 .await;
             Ok(RelayStats {

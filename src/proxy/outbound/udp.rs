@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::TcpStream;
 
 use crate::error::{Error, Result};
 use crate::net::dns::DnsResolver;
@@ -77,23 +77,6 @@ pub(crate) fn validate_proxy_udp_target(packet: UdpPacketRef<'_>, ipv6: bool) ->
         return Err(Error::Ipv6Disabled);
     }
     Ok(())
-}
-
-pub(crate) async fn send_udp_payload(
-    socket: &UdpSocket,
-    payload: &[u8],
-    target: SocketAddr,
-) -> Result<()> {
-    let sent = socket.send_to(payload, target).await?;
-    ensure_full_datagram_sent(sent, payload.len())
-}
-
-pub(crate) fn ensure_full_datagram_sent(sent: usize, expected: usize) -> Result<()> {
-    if sent == expected {
-        return Ok(());
-    }
-
-    Err(Error::ShortUdpWrite { sent, expected })
 }
 
 #[cfg(test)]

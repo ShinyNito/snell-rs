@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf, duplex, sink};
-use tokio::net::UdpSocket;
 
 use super::reader::{V4StreamReader, V6StreamReader};
 use super::writer::{RecordSizer, V4StreamWriter, V6StreamWriter};
@@ -134,13 +133,17 @@ async fn write_v4_udp_packet<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let frame_len = {
-        let frame = writer.start_payload_frame();
-        write_udp_request_prefix(frame, address, port)?;
-        frame.extend_from_slice(payload);
-        frame.len()
-    };
-    writer.finish_udp_payload_message(frame_len).await?;
+    let mut plain = BytesMut::new();
+    write_udp_request_prefix(&mut plain, address, port)?;
+    plain.extend_from_slice(payload);
+    let message_len = plain.len();
+    if message_len > crate::MAX_PACKET_SIZE {
+        return Err(Error::PayloadTooLarge);
+    }
+    assert_eq!(
+        writer.write_payload_message_from_buffer(&mut plain).await?,
+        Some(message_len)
+    );
     Ok(payload.len())
 }
 
@@ -153,13 +156,17 @@ async fn write_v4_udp_response<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let frame_len = {
-        let frame = writer.start_payload_frame();
-        write_udp_response_prefix(frame, address, port)?;
-        frame.extend_from_slice(payload);
-        frame.len()
-    };
-    writer.finish_udp_payload_message(frame_len).await?;
+    let mut plain = BytesMut::new();
+    write_udp_response_prefix(&mut plain, address, port)?;
+    plain.extend_from_slice(payload);
+    let message_len = plain.len();
+    if message_len > crate::MAX_PACKET_SIZE {
+        return Err(Error::PayloadTooLarge);
+    }
+    assert_eq!(
+        writer.write_payload_message_from_buffer(&mut plain).await?,
+        Some(message_len)
+    );
     Ok(payload.len())
 }
 
@@ -172,13 +179,17 @@ async fn write_v6_udp_packet<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let frame_len = {
-        let frame = writer.start_payload_frame();
-        write_udp_request_prefix(frame, address, port)?;
-        frame.extend_from_slice(payload);
-        frame.len()
-    };
-    writer.finish_udp_payload_message(frame_len).await?;
+    let mut plain = BytesMut::new();
+    write_udp_request_prefix(&mut plain, address, port)?;
+    plain.extend_from_slice(payload);
+    let message_len = plain.len();
+    if message_len > crate::MAX_V6_RECORD_PAYLOAD_LEN {
+        return Err(Error::PayloadTooLarge);
+    }
+    assert_eq!(
+        writer.write_payload_message_from_buffer(&mut plain).await?,
+        Some(message_len)
+    );
     Ok(payload.len())
 }
 
@@ -191,13 +202,17 @@ async fn write_v6_udp_response<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let frame_len = {
-        let frame = writer.start_payload_frame();
-        write_udp_response_prefix(frame, address, port)?;
-        frame.extend_from_slice(payload);
-        frame.len()
-    };
-    writer.finish_udp_payload_message(frame_len).await?;
+    let mut plain = BytesMut::new();
+    write_udp_response_prefix(&mut plain, address, port)?;
+    plain.extend_from_slice(payload);
+    let message_len = plain.len();
+    if message_len > crate::MAX_V6_RECORD_PAYLOAD_LEN {
+        return Err(Error::PayloadTooLarge);
+    }
+    assert_eq!(
+        writer.write_payload_message_from_buffer(&mut plain).await?,
+        Some(message_len)
+    );
     Ok(payload.len())
 }
 
@@ -492,23 +507,28 @@ async fn compact_for_reuse_retains_bounded_stream_buffers() {
     let mut reader = V4StreamReader::new(reader_io, psk);
 
     let read = async {
-        let payload = reader.read_frame_payload().await.unwrap();
-        assert_eq!(payload.len(), large_payload.len());
+        let mut received = BytesMut::new();
+        while received.len() < large_payload.len() {
+            let payload = reader.read_frame_payload().await.unwrap();
+            received.extend_from_slice(payload);
+        }
+        assert_eq!(received.len(), large_payload.len());
         assert!(reader.body.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
         reader.compact_buffers_for_reuse();
         assert!(reader.body.capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
     };
     let write = async {
-        let slot = writer.start_payload_frame();
-        slot.extend_from_slice(&large_payload);
-        writer
-            .finish_udp_payload_message(large_payload.len())
+        let mut plain = BytesMut::from(&large_payload[..]);
+        let written = writer
+            .write_payload_message_from_buffer(&mut plain)
             .await
             .unwrap();
-        assert!(writer.payload.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
+        assert_eq!(written, Some(large_payload.len()));
+        assert!(plain.is_empty());
+        assert!(writer.wire.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
         writer.compact_buffers_for_reuse();
-        assert!(writer.payload.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
-        assert!(writer.payload.capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
+        assert!(writer.wire.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
+        assert!(writer.wire.capacity() <= STREAM_BUFFER_RETAIN_CAPACITY);
     };
 
     let ((), ()) = tokio::join!(read, write);
@@ -995,19 +1015,19 @@ async fn writes_udp_packet_as_one_frame() {
 }
 
 #[tokio::test]
-async fn write_udp_packet_is_single_frame_and_advances_record_sizer() {
-    let (client, server) = duplex(8192);
+async fn v4_udp_request_message_reader_reassembles_split_records_and_advances_record_sizer() {
+    let (client, server) = duplex(140_000);
     let psk = TEST_PSK;
     let payload = vec![0x61; 3000];
     let expected_payload = payload.clone();
 
     let read = async {
-        let mut reader = V4StreamReader::new(server, psk);
-        let out = reader.read_frame_payload().await.unwrap();
-        let parsed = parse_udp_request(out).unwrap();
+        let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V4);
+        let message = reader.read_udp_request_message().await.unwrap().unwrap();
+        let parsed = parse_udp_request(&message).unwrap();
         assert_eq!(parsed.payload, expected_payload);
         assert_eq!(parsed.port, 53);
-        out.len()
+        message.len()
     };
     let write = async {
         let mut writer = V4StreamWriter::new(client, psk).unwrap();
@@ -1083,12 +1103,7 @@ async fn v6_udp_request_message_reader_reassembles_split_records() {
 
     let read = async {
         let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
-        let mut scratch = BytesMut::new();
-        let message = reader
-            .read_udp_request_message(&mut scratch)
-            .await
-            .unwrap()
-            .unwrap();
+        let message = reader.read_udp_request_message().await.unwrap().unwrap();
         let parsed = parse_udp_request(&message).unwrap();
         assert_eq!(parsed.payload, expected_payload);
         assert_eq!(parsed.port, 53);
@@ -1119,17 +1134,12 @@ async fn v6_udp_exact_limit_message_reader_preserves_following_zero_chunk() {
 
     let read = async {
         let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
-        let mut scratch = BytesMut::new();
-        let message = reader
-            .read_udp_request_message(&mut scratch)
-            .await
-            .unwrap()
-            .unwrap();
+        let message = reader.read_udp_request_message().await.unwrap().unwrap();
         let parsed = parse_udp_request(&message).unwrap();
         assert_eq!(parsed.payload, expected_payload);
         assert_eq!(parsed.port, 53);
 
-        let eof = reader.read_udp_request_message(&mut scratch).await.unwrap();
+        let eof = reader.read_udp_request_message().await.unwrap();
         assert!(eof.is_none());
     };
     let write = async {
@@ -1162,22 +1172,13 @@ async fn v6_udp_exact_limit_request_reader_preserves_following_udp_message() {
 
     let read = async {
         let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
-        let mut scratch = BytesMut::new();
 
-        let first = reader
-            .read_udp_request_message(&mut scratch)
-            .await
-            .unwrap()
-            .unwrap();
+        let first = reader.read_udp_request_message().await.unwrap().unwrap();
         let first = parse_udp_request(&first).unwrap();
         assert_eq!(first.payload, expected_first);
         assert_eq!(first.port, 53);
 
-        let second = reader
-            .read_udp_request_message(&mut scratch)
-            .await
-            .unwrap()
-            .unwrap();
+        let second = reader.read_udp_request_message().await.unwrap().unwrap();
         let second = parse_udp_request(&second).unwrap();
         assert_eq!(second.payload, expected_second);
         assert_eq!(second.port, 54);
@@ -1245,13 +1246,17 @@ async fn v6_udp_response_message_can_split_one_datagram_across_records() {
     };
     let write = async {
         let mut writer = V6StreamWriter::new(client, psk).unwrap();
-        let frame_len = {
-            let frame = writer.start_payload_frame();
-            write_udp_response_prefix(frame, AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)), 53)?;
-            frame.extend_from_slice(&payload);
-            frame.len()
-        };
-        let written = writer.finish_udp_payload_message(frame_len).await?;
+        let mut plain = BytesMut::new();
+        write_udp_response_prefix(
+            &mut plain,
+            AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            53,
+        )?;
+        plain.extend_from_slice(&payload);
+        let written = writer
+            .write_payload_message_from_buffer(&mut plain)
+            .await?
+            .unwrap_or(0);
         assert!(writer.has_committed_chunk_record());
         Ok::<usize, Error>(written)
     };
@@ -1270,12 +1275,7 @@ async fn v6_udp_response_message_reader_reassembles_split_records() {
 
     let read = async {
         let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
-        let mut scratch = BytesMut::new();
-        let message = reader
-            .read_udp_response_message(&mut scratch)
-            .await
-            .unwrap()
-            .unwrap();
+        let message = reader.read_udp_response_message().await.unwrap().unwrap();
         let parsed = parse_udp_response(&message).unwrap();
         assert_eq!(
             parsed.address,
@@ -1312,13 +1312,8 @@ async fn v6_udp_exact_limit_response_reader_preserves_following_udp_message() {
 
     let read = async {
         let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
-        let mut scratch = BytesMut::new();
 
-        let first = reader
-            .read_udp_response_message(&mut scratch)
-            .await
-            .unwrap()
-            .unwrap();
+        let first = reader.read_udp_response_message().await.unwrap().unwrap();
         let first = parse_udp_response(&first).unwrap();
         assert_eq!(
             first.address,
@@ -1327,11 +1322,7 @@ async fn v6_udp_exact_limit_response_reader_preserves_following_udp_message() {
         assert_eq!(first.payload, expected_first);
         assert_eq!(first.port, 53);
 
-        let second = reader
-            .read_udp_response_message(&mut scratch)
-            .await
-            .unwrap()
-            .unwrap();
+        let second = reader.read_udp_response_message().await.unwrap().unwrap();
         let second = parse_udp_response(&second).unwrap();
         assert_eq!(
             second.address,
@@ -1363,35 +1354,39 @@ async fn v6_udp_exact_limit_response_reader_preserves_following_udp_message() {
 }
 
 #[tokio::test]
-async fn writes_udp_response_from_ready_ipv4_socket() {
+async fn writes_udp_response_payload_message() {
     let (client, server) = test_duplex_pair();
     let psk = TEST_PSK;
     let payload = b"udp answer";
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let sender_addr = sender.local_addr().unwrap();
-
-    sender
-        .send_to(payload, socket.local_addr().unwrap())
-        .await
-        .unwrap();
+    let port = 5353;
 
     let read = async {
         let mut reader = V4StreamReader::new(server, psk);
         let frame = reader.read_frame_payload().await.unwrap();
         let response = parse_udp_response(frame).unwrap();
-        assert_eq!(response.address, AddressRef::Ip(sender_addr.ip()));
-        assert_eq!(response.port, sender_addr.port());
+        assert_eq!(
+            response.address,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(response.port, port);
         assert_eq!(response.payload, payload);
     };
     let write = async {
-        socket.readable().await.unwrap();
         let mut writer = V4StreamWriter::new(client, psk).unwrap();
-        let result = writer
-            .try_write_ipv4_udp_response_from_socket(&socket)
+        let mut plain = BytesMut::new();
+        write_udp_response_prefix(
+            &mut plain,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            port,
+        )
+        .unwrap();
+        plain.extend_from_slice(payload);
+        let message_len = plain.len();
+        let written = writer
+            .write_payload_message_from_buffer(&mut plain)
             .await
             .unwrap();
-        assert_eq!(result, Some((payload.len(), sender_addr)));
+        assert_eq!(written, Some(message_len));
         assert!(writer.record_sizer.last_record_at.is_some());
     };
 
@@ -1399,8 +1394,8 @@ async fn writes_udp_response_from_ready_ipv4_socket() {
 }
 
 #[tokio::test]
-async fn rejects_oversized_udp_packet_as_one_frame() {
-    let (client, _server) = test_duplex_pair();
+async fn rejects_v4_udp_packet_that_exceeds_application_message_len() {
+    let client = sink();
     let psk = TEST_PSK;
     let payload = vec![0x61; crate::MAX_PACKET_SIZE];
 
@@ -1418,7 +1413,7 @@ async fn rejects_oversized_udp_packet_as_one_frame() {
 }
 
 #[tokio::test]
-async fn v6_rejects_udp_packet_that_exceeds_record_payload_len() {
+async fn rejects_v6_udp_packet_that_exceeds_application_message_len() {
     let writer = sink();
     let psk = TEST_PSK;
     let payload = vec![0x61; crate::MAX_V6_RECORD_PAYLOAD_LEN];

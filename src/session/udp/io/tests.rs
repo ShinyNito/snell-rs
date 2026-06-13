@@ -4,8 +4,8 @@ use bytes::{Buf, BytesMut};
 
 use super as udp_io;
 use super::{
-    SnellUdpPacketKind, parse_socks_udp_header, recv_socks_udp_datagram_into,
-    reframe_socks_udp_packet,
+    SnellUdpPacketKind, UdpRecvBatch, UdpSendPacket, parse_socks_udp_header,
+    reframe_socks_udp_packet, send_udp_batch,
 };
 use crate::error::Error;
 use crate::protocol::socks5::write_udp_packet as write_socks_udp_packet;
@@ -184,15 +184,14 @@ async fn recv_socks_udp_datagram_reports_peer_and_preserves_bytes() {
         .await
         .unwrap();
 
-    let mut received = BytesMut::new();
-    let (n, peer) =
-        recv_socks_udp_datagram_into(&receiver, &mut received, v4_socks_udp_datagram_limit())
-            .await
-            .unwrap();
+    let mut received = UdpRecvBatch::new(v4_socks_udp_datagram_limit());
+    let n = received.recv_from(&receiver).await.unwrap();
+    let entry = received.get(0).unwrap();
 
-    assert_eq!(peer, sender_addr);
-    assert_eq!(n, sent.len());
-    assert_eq!(&received[..n], &sent[..]);
+    assert_eq!(n, 1);
+    assert_eq!(entry.peer(), sender_addr);
+    assert_eq!(entry.payload_len(), sent.len());
+    assert_eq!(entry.payload(), &sent[..]);
 }
 
 #[test]
@@ -200,6 +199,12 @@ fn recv_oversized_sentinel_marks_datagram_too_large() {
     let v4_limit = v4_socks_udp_datagram_limit();
     assert!(!udp_io::udp_datagram_too_large(v4_limit, v4_limit,));
     assert!(udp_io::udp_datagram_too_large(v4_limit + 1, v4_limit,));
+}
+
+#[test]
+fn send_full_datagram_check_rejects_short_write() {
+    assert!(udp_io::ensure_full_datagram_sent(4, 5).is_err());
+    udp_io::ensure_full_datagram_sent(5, 5).unwrap();
 }
 
 #[test]
@@ -211,27 +216,21 @@ fn socks_udp_datagram_limit_allows_socks_rsv_overhead() {
 }
 
 #[tokio::test]
-async fn send_udp_parts_combines_prefix_and_payload() {
+async fn send_udp_batch_combines_prefix_and_payload() {
     let sender = test_udp_socket().await;
     let receiver = test_udp_socket().await;
-    let mut scratch = BytesMut::new();
 
-    udp_io::send_udp_parts(
+    send_udp_batch(
         &sender,
-        b"header",
-        b"payload",
-        receiver.local_addr().unwrap(),
+        &[UdpSendPacket::parts(
+            b"header",
+            b"payload",
+            receiver.local_addr().unwrap(),
+        )],
         v4_socks_udp_datagram_limit(),
-        &mut scratch,
     )
     .await
     .unwrap();
-
-    #[cfg(unix)]
-    {
-        assert!(scratch.is_empty());
-        assert_eq!(scratch.capacity(), 0);
-    }
 
     let mut received = [0; 64];
     let (n, peer) = receiver.recv_from(&mut received).await.unwrap();
@@ -241,24 +240,21 @@ async fn send_udp_parts_combines_prefix_and_payload() {
 }
 
 #[tokio::test]
-async fn send_udp_parts_rejects_packets_above_call_site_limit() {
+async fn send_udp_batch_rejects_packets_above_call_site_limit() {
     let sender = test_udp_socket().await;
     let receiver = test_udp_socket().await;
-    let mut scratch = BytesMut::with_capacity(8);
-    scratch.extend_from_slice(b"stale");
 
     assert!(matches!(
-        udp_io::send_udp_parts(
+        send_udp_batch(
             &sender,
-            b"header",
-            b"payload",
-            receiver.local_addr().unwrap(),
+            &[UdpSendPacket::parts(
+                b"header",
+                b"payload",
+                receiver.local_addr().unwrap(),
+            )],
             b"header".len() + b"payload".len() - 1,
-            &mut scratch,
         )
         .await,
         Err(Error::PayloadTooLarge)
     ));
-    assert_eq!(scratch.capacity(), 8);
-    assert!(scratch.is_empty());
 }

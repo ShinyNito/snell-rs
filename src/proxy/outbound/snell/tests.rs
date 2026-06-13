@@ -1,4 +1,5 @@
 use core::range::Range;
+use std::future::poll_fn;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,7 @@ use zeroize::Zeroizing;
 
 use super::{ReusePool, ReusedSnellTcp, SharedPsk, SnellClientOutbound};
 use crate::ProtocolVersion;
-use crate::error::Error;
+use crate::error::{Error, Result};
 use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::test_support::{
     TEST_PSK, test_snell_reader, test_snell_reader_with_version, test_snell_writer,
@@ -16,14 +17,13 @@ use crate::test_support::{
 
 macro_rules! assert_next_payload {
     ($conn:expr, $expected:expr) => {{
-        let payload = $conn
-            .reader_mut()
-            .take_payload_chunk()
-            .await
-            .unwrap()
-            .unwrap();
+        let payload = take_reuse_payload($conn).await.unwrap().unwrap();
         assert_eq!(&payload[..], $expected);
     }};
+}
+
+async fn take_reuse_payload(conn: &mut ReusedSnellTcp) -> Result<Option<bytes::Bytes>> {
+    poll_fn(|cx| conn.reader_mut().poll_take_payload_chunk(cx)).await
 }
 
 fn idle_len(pool: &ReusePool) -> usize {
@@ -80,21 +80,10 @@ async fn pool_conn_after_reply(
 
     let client = async {
         let mut conn = pool.open("example.com", 443).await.unwrap();
-        let payload = conn
-            .reader_mut()
-            .take_payload_chunk()
-            .await
-            .unwrap()
-            .unwrap();
+        let payload = take_reuse_payload(&mut conn).await.unwrap().unwrap();
         assert_eq!(payload, reply);
         if read_until_done {
-            assert!(
-                conn.reader_mut()
-                    .take_payload_chunk()
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(take_reuse_payload(&mut conn).await.unwrap().is_none());
         }
         conn.writer_mut().close_write().await.unwrap();
         conn
@@ -110,13 +99,7 @@ async fn completed_pool_conn() -> (ReusePool, ReusedSnellTcp) {
 
 async fn read_ok_and_close(conn: &mut ReusedSnellTcp) {
     assert_next_payload!(conn, b"ok");
-    assert!(
-        conn.reader_mut()
-            .take_payload_chunk()
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(take_reuse_payload(conn).await.unwrap().is_none());
     conn.writer_mut().close_write().await.unwrap();
 }
 
@@ -183,29 +166,15 @@ async fn reuse_pool_reuses_completed_stream() {
 
     let client = async {
         let mut first = pool.open("one.example", 443).await.unwrap();
-        assert_next_payload!(first, b"one");
-        assert!(
-            first
-                .reader_mut()
-                .take_payload_chunk()
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert_next_payload!(&mut first, b"one");
+        assert!(take_reuse_payload(&mut first).await.unwrap().is_none());
         first.writer_mut().close_write().await.unwrap();
         pool.put(first).await;
         assert_eq!(idle_len(&pool), 1);
 
         let mut second = pool.open("two.example", 443).await.unwrap();
-        assert_next_payload!(second, b"two");
-        assert!(
-            second
-                .reader_mut()
-                .take_payload_chunk()
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert_next_payload!(&mut second, b"two");
+        assert!(take_reuse_payload(&mut second).await.unwrap().is_none());
         second.writer_mut().close_write().await.unwrap();
         pool.put(second).await;
         assert_eq!(idle_len(&pool), 1);
@@ -266,29 +235,15 @@ async fn reuse_pool_reuses_completed_v6_stream() {
 
     let client = async {
         let mut first = pool.open("one.example", 443).await.unwrap();
-        assert_next_payload!(first, b"one");
-        assert!(
-            first
-                .reader_mut()
-                .take_payload_chunk()
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert_next_payload!(&mut first, b"one");
+        assert!(take_reuse_payload(&mut first).await.unwrap().is_none());
         first.writer_mut().close_write().await.unwrap();
         pool.put(first).await;
         assert_eq!(idle_len(&pool), 1);
 
         let mut second = pool.open("two.example", 443).await.unwrap();
-        assert_next_payload!(second, b"two");
-        assert!(
-            second
-                .reader_mut()
-                .take_payload_chunk()
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert_next_payload!(&mut second, b"two");
+        assert!(take_reuse_payload(&mut second).await.unwrap().is_none());
         second.writer_mut().close_write().await.unwrap();
         pool.put(second).await;
         assert_eq!(idle_len(&pool), 1);

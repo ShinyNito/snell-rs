@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{Error, Result};
@@ -89,34 +90,30 @@ where
         }
     }
 
-    async fn read_tunnel_reply(&mut self) -> Result<()> {
-        if self.reply_read {
-            return Ok(());
-        }
-        match self.payload.read_tunnel_reply().await {
-            Ok(()) => self.reply_read = true,
-            Err(err) => {
-                self.broken = true;
-                return Err(err);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn take_payload_chunk(&mut self) -> Result<Option<Bytes>> {
+    pub(crate) fn poll_take_payload_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>>> {
         if self.payload.is_done() {
-            return Ok(None);
+            return Poll::Ready(Ok(None));
         }
         if !self.reply_read {
-            self.read_tunnel_reply().await?;
+            match ready!(self.payload.poll_read_tunnel_reply(cx)) {
+                Ok(()) => self.reply_read = true,
+                Err(err) => {
+                    self.broken = true;
+                    return Poll::Ready(Err(err));
+                }
+            }
         }
 
-        match self.payload.take_payload_chunk_strict().await {
-            Ok(payload) => Ok(payload),
-            Err(err) => {
+        match self.payload.poll_take_payload_chunk_strict(cx) {
+            Poll::Ready(Ok(payload)) => Poll::Ready(Ok(payload)),
+            Poll::Ready(Err(err)) => {
                 self.broken = true;
-                Err(err)
+                Poll::Ready(Err(err))
             }
+            Poll::Pending => Poll::Pending,
         }
     }
 

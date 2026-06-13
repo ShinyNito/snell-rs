@@ -16,6 +16,7 @@ use crate::MAX_PACKET_SIZE;
 use crate::error::Result;
 use crate::protocol::quic_proxy::{decode_init_datagram, is_quic_looking};
 use crate::proxy::outbound::{RelayOptions, open_quic_udp, run_quic_proxy_response_session};
+use crate::session::udp::io::UdpRecvBatch;
 
 pub const QUIC_PROXY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -36,89 +37,103 @@ pub(crate) async fn serve_quic_proxy_socket(
     let psk = Zeroizing::new(psk);
     let socket = Arc::new(socket);
     let mut sessions = HashMap::<SocketAddr, QuicProxySession>::new();
-    let mut buf = BytesMut::with_capacity(RECV_BUFFER_CAPACITY);
+    let mut recv_batch = UdpRecvBatch::new(RECV_BUFFER_CAPACITY);
     let mut scratch = BytesMut::with_capacity(PAYLOAD_SCRATCH_CAPACITY);
     let cleanup = sleep(idle_timeout);
     tokio::pin!(cleanup);
 
     loop {
-        buf.clear();
         tokio::select! {
             () = shutdown.cancelled() => break,
-            recv_result = socket.recv_buf_from(&mut buf) => {
-                let (n, client_addr) = recv_result?;
-                if n == 0 {
-                    continue;
-                }
-                let first_byte = buf[0];
-                if sessions
-                    .get(&client_addr)
-                    .is_some_and(QuicProxySession::is_closed)
-                {
-                    sessions.remove(&client_addr);
-                }
-                if let Some(session) = sessions.get_mut(&client_addr) {
-                    let payload = if is_quic_looking(first_byte) {
-                        copy_payload(&mut scratch, &buf[..n])
-                    } else {
-                        let init = match decode_init_datagram(&psk, &mut buf[..n]) {
+            recv_result = recv_batch.recv_from(&socket) => {
+                let count = recv_result?;
+                for index in 0..count {
+                    let Some(entry) = recv_batch.get(index) else {
+                        continue;
+                    };
+                    if entry.is_oversized() || entry.payload_len() == 0 {
+                        continue;
+                    }
+                    let client_addr = entry.peer();
+                    let first_byte = entry.payload()[0];
+                    if sessions
+                        .get(&client_addr)
+                        .is_some_and(QuicProxySession::is_closed)
+                    {
+                        sessions.remove(&client_addr);
+                    }
+                    if sessions.contains_key(&client_addr) {
+                        let payload = if is_quic_looking(first_byte) {
+                            copy_payload(&mut scratch, entry.payload())
+                        } else {
+                            let mut entry = recv_batch
+                                .get_mut(index)
+                                .expect("checked UDP batch index must exist");
+                            let init = match decode_init_datagram(&psk, entry.payload_mut()) {
+                                Ok(init) => init,
+                                Err(err) => {
+                                    tracing::debug!(%err, %client_addr, "ignored invalid quic proxy datagram");
+                                    continue;
+                                }
+                            };
+                            let span = init.payload_span;
+                            copy_payload(&mut scratch, &entry.payload_mut()[span.start..span.end])
+                        };
+                        let Some(session) = sessions.get_mut(&client_addr) else {
+                            continue;
+                        };
+                        session.last_activity = Instant::now();
+                        match session.queue.try_send(payload) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::debug!(%client_addr, "quic proxy session queue full, dropped datagram");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                sessions.remove(&client_addr);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if is_quic_looking(first_byte) {
+                        tracing::debug!(%client_addr, "dropped raw quic proxy packet without session");
+                        continue;
+                    }
+
+                    let (host, port, first_payload) = {
+                        let mut entry = recv_batch
+                            .get_mut(index)
+                            .expect("checked UDP batch index must exist");
+                        let init = match decode_init_datagram(&psk, entry.payload_mut()) {
                             Ok(init) => init,
                             Err(err) => {
-                                tracing::debug!(%err, %client_addr, "ignored invalid quic proxy datagram");
+                                tracing::debug!(%err, %client_addr, "ignored invalid quic proxy init");
                                 continue;
                             }
                         };
                         let span = init.payload_span;
-                        copy_payload(&mut scratch, &buf[span.start..span.end])
+                        (
+                            init.host.to_owned(),
+                            init.port,
+                            copy_payload(&mut scratch, &entry.payload_mut()[span.start..span.end]),
+                        )
                     };
-                    session.last_activity = Instant::now();
-                    match session.queue.try_send(payload) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::debug!(%client_addr, "quic proxy session queue full, dropped datagram");
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            sessions.remove(&client_addr);
-                        }
-                    }
-                    continue;
+                    let (queue, payloads) = mpsc::channel(SESSION_QUEUE_CAPACITY);
+                    let task = tokio::spawn(run_quic_proxy_session(
+                        socket.clone(),
+                        client_addr,
+                        host,
+                        port,
+                        options.clone(),
+                        first_payload,
+                        payloads,
+                    ));
+                    sessions.insert(client_addr, QuicProxySession {
+                        queue,
+                        task,
+                        last_activity: Instant::now(),
+                    });
                 }
-
-                if is_quic_looking(first_byte) {
-                    tracing::debug!(%client_addr, "dropped raw quic proxy packet without session");
-                    continue;
-                }
-
-                let (host, port, first_payload) = {
-                    let init = match decode_init_datagram(&psk, &mut buf[..n]) {
-                        Ok(init) => init,
-                        Err(err) => {
-                            tracing::debug!(%err, %client_addr, "ignored invalid quic proxy init");
-                            continue;
-                        }
-                    };
-                    let span = init.payload_span;
-                    (
-                        init.host.to_owned(),
-                        init.port,
-                        copy_payload(&mut scratch, &buf[span.start..span.end]),
-                    )
-                };
-                let (queue, payloads) = mpsc::channel(SESSION_QUEUE_CAPACITY);
-                let task = tokio::spawn(run_quic_proxy_session(
-                    socket.clone(),
-                    client_addr,
-                    host,
-                    port,
-                    options.clone(),
-                    first_payload,
-                    payloads,
-                ));
-                sessions.insert(client_addr, QuicProxySession {
-                    queue,
-                    task,
-                    last_activity: Instant::now(),
-                });
             }
             _ = &mut cleanup => {
                 let now = Instant::now();

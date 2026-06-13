@@ -82,11 +82,7 @@ where
         }
     }
 
-    pub(crate) async fn read_tunnel_reply(&mut self) -> Result<()> {
-        poll_fn(|cx| self.poll_read_tunnel_reply(cx)).await
-    }
-
-    fn poll_read_tunnel_reply(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+    pub(crate) fn poll_read_tunnel_reply(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let payload_start = {
             let payload = ready!(self.reader.poll_read_frame_payload(cx))?;
             match parse_server_reply(payload)? {
@@ -131,8 +127,11 @@ where
         }
     }
 
-    pub(crate) async fn take_payload_chunk_strict(&mut self) -> Result<Option<Bytes>> {
-        poll_fn(|cx| self.poll_take_payload_chunk_with_transport_eof(cx, false)).await
+    pub(crate) fn poll_take_payload_chunk_strict(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>>> {
+        self.poll_take_payload_chunk_with_transport_eof(cx, false)
     }
 
     pub(crate) fn reset(&mut self) {
