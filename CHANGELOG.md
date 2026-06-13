@@ -2,6 +2,14 @@
 
 All notable changes to this project are maintained manually.
 
+## [0.4.4] - 2026-06-14
+
+## Release Notes
+
+  * v4 对齐官方 message-level 分块：大消息按 RecordSizer 的 chunk_limit 切成多个 record 聚合输出，reader 新增跨 record 重组，30s idle reset 阈值与官方一致
+  * Linux UDP 收发改用 recvmmsg/sendmmsg（cap 20，scatter/gather），对齐官方 libuv 批量路径；非 Linux 保留单 datagram 回退
+  * 提取共享的 payload 编码与 UDP/会话中继逻辑：v4/v6 写路径经 MessageRecordEncoder 合并，TcpClient/TcpServer/Reuse 复用统一的 plain batch 填充与写入，两个 socks5 UDP relay 合并为参数化函数
+
 ## [0.4.3] - 2026-06-14
 
 ## Release Notes
