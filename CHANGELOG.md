@@ -2,6 +2,15 @@
 
 All notable changes to this project are maintained manually.
 
+## [0.4.7] - 2026-06-15
+
+## Release Notes
+
+  * socks5 connect 在服务端 tunnel reply 返回后再回 success：服务端报错时按 snell v6 错误码、IO error kind、DNS 错误映射到对应的 SocksReply（新增 NetworkUnreachable / HostUnreachable / ConnectionRefused / TtlExpired），不再一律 GeneralFailure；read_client_request 对不支持命令、地址类型与空域名也返回具体 reply
+  * UDP 关联改为复用上游 socks5 会话：控制连接关闭或空闲超时仅关闭当前关联，下一条消息到达时重新打开，不再结束整条 snell 会话
+  * 收敛多处局部 buffer 到 `Box<struct>` 降低栈分配；拆分 lazy quic UDP relay 的接收首包 / snell 路径 / quic-proxy 主循环为三个职责函数
+  * 修复 Linux 上 UDP relay 因 `recvmmsg` 裸调未消费 tokio 可读标记导致 select 饥饿、关联无法正常关闭的问题：`try_recv_from` 改用 `socket.try_io(Interest::READABLE, ...)` 正确清除 readiness
+
 ## [0.4.6] - 2026-06-14
 
 ## Release Notes
