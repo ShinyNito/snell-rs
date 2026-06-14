@@ -83,6 +83,11 @@ pub enum SocksReply {
 ///
 /// Domain names and payload slices borrow from the original datagram.
 /// `payload_span` is the payload range in that datagram.
+///
+/// # Errors
+///
+/// Returns an error if the packet has an invalid SOCKS5 UDP header, unsupported
+/// address type, truncated address, empty domain, or invalid UTF-8 domain.
 pub fn parse_udp_packet(packet: &[u8]) -> Result<SocksUdpPacketRef<'_>> {
     let mut input = packet;
     let header = take_bytes(&mut input, 3, Error::InvalidSocksRequest)?;
@@ -93,6 +98,12 @@ pub fn parse_udp_packet(packet: &[u8]) -> Result<SocksUdpPacketRef<'_>> {
     parse_address(&mut input, 3)
 }
 
+/// Writes a SOCKS5 UDP packet.
+///
+/// # Errors
+///
+/// Returns an error if a domain address is empty or exceeds the SOCKS5
+/// one-byte domain length limit.
 pub fn write_udp_packet(
     out: &mut impl BufMut,
     address: AddressRef<'_>,
@@ -222,7 +233,7 @@ pub(crate) fn write_address(
                 return Err(Error::HostTooLong);
             }
             out.put_u8(ATYP_DOMAIN);
-            out.put_u8(host.len() as u8);
+            out.put_u8(u8::try_from(host.len()).map_err(|_| Error::HostTooLong)?);
             out.put_slice(host.as_bytes());
         }
         AddressRef::Ip(IpAddr::V4(ip)) => {

@@ -18,6 +18,11 @@ pub struct DecodedHeader {
 }
 
 impl DecodedHeader {
+    /// Returns the encrypted body length described by this decoded header.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the invalid zero-payload-with-padding header shape.
     pub const fn body_len(self) -> Result<usize> {
         if self.payload_len == 0 {
             if self.padding_len != 0 {
@@ -38,6 +43,11 @@ pub struct V4FrameEncoder {
 }
 
 impl V4FrameEncoder {
+    /// Creates a v4 frame encoder using a random salt and initial padding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if random generation or key derivation fails.
     pub fn new(psk: &[u8]) -> Result<Self> {
         let mut salt = [0; SALT_SIZE];
         fill_random(&mut salt)?;
@@ -77,14 +87,21 @@ impl V4FrameEncoder {
         })
     }
 
+    #[must_use]
     pub const fn salt(&self) -> &[u8; SALT_SIZE] {
         &self.salt
     }
 
+    #[must_use]
     pub const fn initial_padding_len(&self) -> usize {
         self.initial_padding_len
     }
 
+    /// Encodes an empty v4 frame into `head`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if header encryption fails.
     pub fn encode_empty_frame(&mut self, head: &mut BytesMut) -> Result<usize> {
         let start_len = head.len();
         let salt_len = if self.salt_sent { 0 } else { SALT_SIZE };
@@ -99,6 +116,12 @@ impl V4FrameEncoder {
         Ok(head.len() - start_len)
     }
 
+    /// Encodes a payload frame using `payload` as the in-place payload buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload length is invalid, the frame would be too
+    /// large, or encryption fails.
     pub fn encode_payload_in_place(
         &mut self,
         payload: &mut BytesMut,
@@ -141,6 +164,12 @@ impl V4FrameEncoder {
         Ok(head.len() - start_len + payload.len())
     }
 
+    /// Encodes prefix and payload slices into `out` as one v4 frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the combined payload is empty or too large, or if
+    /// encryption fails.
     pub fn encode_payload_parts_into(
         &mut self,
         prefix: &[u8],
@@ -202,8 +231,16 @@ impl V4FrameEncoder {
     ) -> Result<()> {
         let mut header = [0u8; V4_HEADER_PLAIN_SIZE];
         header[0] = 4;
-        header[3..5].copy_from_slice(&(padding_len as u16).to_be_bytes());
-        header[5..7].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        header[3..5].copy_from_slice(
+            &u16::try_from(padding_len)
+                .map_err(|_| Error::PayloadTooLarge)?
+                .to_be_bytes(),
+        );
+        header[5..7].copy_from_slice(
+            &u16::try_from(payload_len)
+                .map_err(|_| Error::PayloadTooLarge)?
+                .to_be_bytes(),
+        );
 
         let tag = self
             .crypto
@@ -221,6 +258,11 @@ pub struct V4FrameDecoder {
 }
 
 impl V4FrameDecoder {
+    /// Creates a v4 frame decoder for a PSK and peer salt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key derivation fails.
     pub fn new(psk: &[u8], salt: [u8; SALT_SIZE]) -> Result<Self> {
         Ok(Self {
             crypto: Aes128GcmCrypto::from_psk_and_salt(psk, &salt)?,
@@ -228,6 +270,12 @@ impl V4FrameDecoder {
         })
     }
 
+    /// Decrypts and validates a v4 frame header.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authentication fails, the header marker is invalid,
+    /// or decoded lengths exceed the protocol maximum.
     pub fn decode_header(
         &mut self,
         header_cipher: &mut [u8; V4_HEADER_CIPHER_SIZE],
@@ -253,6 +301,12 @@ impl V4FrameDecoder {
         })
     }
 
+    /// Decrypts a v4 frame body in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the body length does not match the header, the frame
+    /// is a malformed zero chunk, or authentication fails.
     pub fn decode_payload_in_place<'a>(
         &mut self,
         header: DecodedHeader,
@@ -333,7 +387,7 @@ fn select_v4_padding_target_ones(
         return Ok(None);
     }
 
-    let ratio = payload_ones as f64 / payload_zeros as f64;
+    let ratio = f64_from_usize(payload_ones) / f64_from_usize(payload_zeros);
     if ratio <= 0.5 || ratio >= 1.6 {
         return Ok(None);
     }
@@ -360,19 +414,9 @@ fn v4_padding_target_ones_for_ratio(
 ) -> Option<usize> {
     let total_bits = (padding_len + payload_cipher_len) * 8;
     let padding_bits = padding_len * 8;
-    let target_ones = (total_bits as f64 * (target_ratio / (target_ratio + 1.0))
-        - payload_ones as f64)
-        .trunc() as isize;
-
-    if target_ones < 0 {
-        return None;
-    }
-
-    let target_ones = target_ones as usize;
-    if target_ones > padding_bits {
-        return None;
-    }
-    Some(target_ones)
+    let target_ones = f64_from_usize(total_bits) * (target_ratio / (target_ratio + 1.0))
+        - f64_from_usize(payload_ones);
+    floor_f64_with_upper_bound(target_ones, padding_bits)
 }
 
 fn fill_padding_with_sampled_bits(padding: &mut [u8], target_ones: usize) {
@@ -439,7 +483,36 @@ fn random_unit_f64() -> Result<f64> {
     let mut bytes = [0; 8];
     fill_random(&mut bytes)?;
     let value = u64::from_le_bytes(bytes) >> 11;
-    Ok(value as f64 / ((1u64 << 53) as f64))
+    let high = u32::try_from(value >> 32).expect("shifted 53-bit random value fits u32");
+    let low = low_u32(value);
+    Ok((f64::from(high) * 4_294_967_296.0 + f64::from(low)) / 9_007_199_254_740_992.0)
+}
+
+fn floor_f64_with_upper_bound(value: f64, upper: usize) -> Option<usize> {
+    if !value.is_finite() || value < 0.0 || value > f64_from_usize(upper) {
+        return None;
+    }
+
+    let mut lo = 0;
+    let mut hi = upper;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if f64_from_usize(mid) <= value {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(lo)
+}
+
+fn f64_from_usize(value: usize) -> f64 {
+    f64::from(u32::try_from(value).expect("v4 frame bit count fits u32"))
+}
+
+fn low_u32(value: u64) -> u32 {
+    let bytes = value.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 #[cfg(test)]

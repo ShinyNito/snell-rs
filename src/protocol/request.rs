@@ -42,6 +42,11 @@ pub enum ServerReply<'a> {
 /// `host`, `rest`, and spans refer to the original frame payload. Convert the
 /// fields that must survive another read or await boundary to owned values at
 /// the runtime edge.
+///
+/// # Errors
+///
+/// Returns an error if the request is truncated, has an unsupported protocol
+/// version or command, has an empty host, or contains invalid UTF-8.
 pub fn parse_client_request(input: &[u8]) -> Result<ClientRequest<'_>> {
     let original_len = input.len();
     let mut input = input;
@@ -96,6 +101,11 @@ pub fn parse_client_request(input: &[u8]) -> Result<ClientRequest<'_>> {
 /// Parses a server reply as a borrowed view into `input`.
 ///
 /// `payload` and `message` borrow from the original frame payload.
+///
+/// # Errors
+///
+/// Returns an error if the reply is truncated, has an invalid command, or
+/// contains invalid UTF-8 in an error message.
 pub fn parse_server_reply(input: &[u8]) -> Result<ServerReply<'_>> {
     let original_len = input.len();
     let mut input = input;
@@ -133,11 +143,11 @@ pub fn write_pong_reply(out: &mut impl BufMut) {
 
 pub fn write_error_reply(out: &mut impl BufMut, code: u8, message: &str) {
     let bytes = message.as_bytes();
-    let msg_len = bytes.len().min(u8::MAX as usize);
+    let msg_len = u8::try_from(bytes.len()).unwrap_or(u8::MAX);
     out.put_u8(COMMAND_ERROR);
     out.put_u8(code);
-    out.put_u8(msg_len as u8);
-    out.put_slice(&bytes[..msg_len]);
+    out.put_u8(msg_len);
+    out.put_slice(&bytes[..usize::from(msg_len)]);
 }
 
 #[cfg(test)]

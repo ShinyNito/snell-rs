@@ -19,6 +19,13 @@ pub struct Aes128GcmCrypto {
 }
 
 impl Aes128GcmCrypto {
+    /// Builds an AES-128-GCM wrapper from a raw AES-128 key.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if ring rejects a fixed-size AES-128 key, which would
+    /// indicate a programming error or unsupported crypto backend.
+    #[allow(clippy::must_use_candidate)]
     pub fn new(key: [u8; AES_128_KEY_SIZE]) -> Self {
         let key = UnboundKey::new(&AES_128_GCM, &key)
             .expect("Aes128GcmCrypto::new received a fixed-size AES-128 key");
@@ -27,14 +34,29 @@ impl Aes128GcmCrypto {
         }
     }
 
+    /// Derives an AES-128-GCM key from a Snell PSK and salt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Argon2 key derivation fails.
     pub fn from_psk_and_salt(psk: &[u8], salt: &[u8; SALT_SIZE]) -> Result<Self> {
         Ok(Self::new(derive_aes128_key(psk, salt)?))
     }
 
+    /// Encrypts `data` in place and returns the detached authentication tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if AES-GCM sealing fails.
     pub fn encrypt_detached(&self, nonce: &[u8; 12], data: &mut [u8]) -> Result<[u8; 16]> {
         self.encrypt_detached_with_aad(nonce, data, &[])
     }
 
+    /// Encrypts `data` in place with additional authenticated data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if AES-GCM sealing fails.
     pub fn encrypt_detached_with_aad(
         &self,
         nonce: &[u8; 12],
@@ -50,6 +72,12 @@ impl Aes128GcmCrypto {
         Ok(out)
     }
 
+    /// Decrypts a ciphertext-and-tag range in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authentication fails or the range is invalid for
+    /// ring's in-place opening operation.
     pub fn decrypt_within<'a>(
         &self,
         nonce: &[u8; 12],
@@ -59,6 +87,13 @@ impl Aes128GcmCrypto {
         self.decrypt_within_with_aad(nonce, data_and_tag, ciphertext_and_tag, &[])
     }
 
+    /// Decrypts a ciphertext-and-tag range in place with additional
+    /// authenticated data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authentication fails or the range is invalid for
+    /// ring's in-place opening operation.
     pub fn decrypt_within_with_aad<'a>(
         &self,
         nonce: &[u8; 12],
@@ -77,6 +112,11 @@ impl Aes128GcmCrypto {
     }
 }
 
+/// Derives the Snell AES-128 key for a PSK and salt.
+///
+/// # Errors
+///
+/// Returns an error if Argon2 key derivation fails.
 pub fn derive_aes128_key(psk: &[u8], salt: &[u8; SALT_SIZE]) -> Result<[u8; AES_128_KEY_SIZE]> {
     let params = Params::new(
         SNELL_ARGON2_MEMORY_KIB,

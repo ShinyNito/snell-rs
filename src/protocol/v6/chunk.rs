@@ -1,4 +1,4 @@
-use super::*;
+use super::{Instant, V6Profile};
 
 #[derive(Clone, Debug)]
 pub struct V6ChunkSizer {
@@ -7,6 +7,7 @@ pub struct V6ChunkSizer {
 }
 
 impl V6ChunkSizer {
+    #[allow(clippy::must_use_candidate)]
     pub const fn new() -> Self {
         Self {
             current_chunk_size: 0,
@@ -14,6 +15,7 @@ impl V6ChunkSizer {
         }
     }
 
+    #[must_use]
     pub fn peek_limit(&self, profile: &V6Profile, seq: u32, now: Instant) -> usize {
         let current = if self
             .last_record_at

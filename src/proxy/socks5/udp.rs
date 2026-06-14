@@ -28,7 +28,7 @@ use crate::session::udp::outbound::write_zero_chunk;
 use crate::session::udp::stream::UdpClientStream;
 use crate::{MAX_PACKET_SIZE, ProtocolVersion};
 
-pub(super) const SOCKS5_UDP_ASSOCIATION_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const SOCKS5_UDP_ASSOCIATION_TIMEOUT: Duration = Duration::from_mins(1);
 const SOCKS5_UDP_BUFFER_SIZE: usize = MAX_PACKET_SIZE + 512;
 const MAX_QUIC_SOCKS_UDP_DATAGRAM: usize = MAX_SOCKS_UDP_HEADER + SOCKS5_UDP_BUFFER_SIZE;
 type ClientPeerByUdpTarget = HashMap<OwnedUdpTarget, SocketAddr>;
@@ -82,6 +82,7 @@ pub(crate) async fn relay_socks5_udp_association(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn relay_socks5_udp_association_lazy_quic(
     mut control: TcpStream,
     server_addr: SocketAddr,
@@ -134,7 +135,7 @@ async fn relay_socks5_udp_association_lazy_quic(
                 let first_datagram = BytesMut::from(first_entry.payload());
                 break (peer, target, payload_start, payload_len, first_datagram);
             }
-            _ = &mut idle => {
+            () = &mut idle => {
                 tracing::debug!("snell socks5 udp association idle timed out");
                 return Ok(RelayStats::default());
             }
@@ -325,7 +326,7 @@ async fn relay_socks5_udp_association_lazy_quic(
                     idle.as_mut().reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
                 }
             }
-            _ = &mut idle => {
+            () = &mut idle => {
                 tracing::debug!("snell socks5 udp association idle timed out");
                 break;
             }
@@ -374,13 +375,10 @@ where
                 break;
             }
             result = forward_socks_udp_socket_packets(snell_writer, udp_socket, control_peer_ip, &mut socks_in_batch, &mut state.client_peer_by_target) => {
-                match result? {
-                    Some((batch_uploaded, peer)) => {
-                        state.client_addr = Some(peer);
-                        state.uploaded += batch_uploaded as u64;
-                        idle.as_mut().reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
-                    }
-                    None => continue,
+                if let Some((batch_uploaded, peer)) = result? {
+                    state.client_addr = Some(peer);
+                    state.uploaded += batch_uploaded as u64;
+                    idle.as_mut().reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
                 }
             }
             packet = snell_reader.read_udp_response_message() => {
@@ -415,12 +413,11 @@ where
                     Ok(None) => break,
                     Err(err) if err.is_invalid_udp_packet() => {
                         tracing::debug!(%err, "ignored invalid snell udp response");
-                        continue;
                     }
                     Err(err) => return Err(err),
                 }
             }
-            _ = &mut idle => {
+            () = &mut idle => {
                 tracing::debug!("snell socks5 udp association idle timed out");
                 break;
             }

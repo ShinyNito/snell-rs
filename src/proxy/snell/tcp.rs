@@ -11,7 +11,7 @@ use crate::proxy::outbound::snell::SnellTcpConnect;
 use crate::session::activity::{RelayActivity, RelayActivityTimeouts, wait_relay_idle};
 use crate::session::tcp::relay::relay_bidirectional;
 
-const CLIENT_TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const CLIENT_TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 const CLIENT_TCP_ACTIVITY_TIMEOUTS: RelayActivityTimeouts =
     RelayActivityTimeouts::new(CLIENT_TCP_RELAY_IDLE_TIMEOUT, CLIENT_TCP_RELAY_IDLE_TIMEOUT);
 

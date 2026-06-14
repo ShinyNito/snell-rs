@@ -12,6 +12,12 @@ use crate::proxy::outbound::snell::SnellClientOutbound;
 use crate::proxy::socks5::inbound::relay_socks5_connection;
 use crate::server::shutdown::{SHUTDOWN_DRAIN_TIMEOUT, bind_tcp_listener, drain_connection_tasks};
 
+/// Binds the configured SOCKS5 client listener and serves it until shutdown.
+///
+/// # Errors
+///
+/// Returns an error if the listener cannot bind, the configured Snell version
+/// is unsupported, a relay connection fails, or listener shutdown fails.
 pub async fn bind_configured_socks5_client_with_shutdown(
     config: ClientConfig,
     shutdown: CancellationToken,
@@ -72,6 +78,6 @@ async fn serve_socks5_listener(
     drop(listener);
 
     drain_connection_tasks(tasks, SHUTDOWN_DRAIN_TIMEOUT).await;
-    outbound.close_idle_connections().await;
+    outbound.close_idle_connections();
     Ok(())
 }

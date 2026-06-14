@@ -231,7 +231,8 @@ const fn splitmix64(mut x: u64) -> u64 {
 }
 
 const fn fold_u64_to_u32(x: u64) -> u32 {
-    (x ^ (x >> 32)) as u32
+    let bytes = (x ^ (x >> 32)).to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 fn derive_namespace(profile_secret: &[u8; 32], label: u32, seed_const: u64) -> u64 {
@@ -239,7 +240,7 @@ fn derive_namespace(profile_secret: &[u8; 32], label: u32, seed_const: u64) -> u
     let s1 = read_le_u64(profile_secret, 8);
     let s2 = read_le_u64(profile_secret, 16);
     let s3 = read_le_u64(profile_secret, 24);
-    let mixed = (label as u64).wrapping_mul(DOMAIN_MUL)
+    let mixed = u64::from(label).wrapping_mul(DOMAIN_MUL)
         ^ seed_const.wrapping_add(NAMESPACE_SEED_ADD)
         ^ s0
         ^ s1.wrapping_add(GOLDEN_RATIO_64)

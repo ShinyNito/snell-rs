@@ -92,8 +92,7 @@ where
         {
             WriteBackStatus::Written(n) => state.add_received(n as u64),
             WriteBackStatus::Closed => return Ok(()),
-            WriteBackStatus::Dropped => {}
-            WriteBackStatus::WouldBlock => {}
+            WriteBackStatus::Dropped | WriteBackStatus::WouldBlock => {}
         }
     }
 }
@@ -115,8 +114,7 @@ where
                 match write_udp_responses(writer, &sockets.v4, &mut recv_v4, UdpResponseIpVersion::V4).await? {
                     WriteBackStatus::Written(n) => state.add_received(n as u64),
                     WriteBackStatus::Closed => return Ok(()),
-                    WriteBackStatus::Dropped => {}
-                    WriteBackStatus::WouldBlock => continue,
+                    WriteBackStatus::Dropped | WriteBackStatus::WouldBlock => {}
                 }
             }
             ready_result = readable_optional(sockets.v6.as_deref()), if sockets.v6.is_some() => {
@@ -127,8 +125,7 @@ where
                 match write_udp_responses(writer, socket, &mut recv_v6, UdpResponseIpVersion::V6).await? {
                     WriteBackStatus::Written(n) => state.add_received(n as u64),
                     WriteBackStatus::Closed => return Ok(()),
-                    WriteBackStatus::Dropped => {}
-                    WriteBackStatus::WouldBlock => continue,
+                    WriteBackStatus::Dropped | WriteBackStatus::WouldBlock => {}
                 }
             }
         }

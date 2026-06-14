@@ -1,4 +1,7 @@
-use super::*;
+use super::{MIX_HANDSHAKE_DOMAIN, SALT_SIZE, salt_shuffle_prf};
+
+#[cfg(test)]
+use super::{Error, Result, V6Profile};
 
 #[cfg(test)]
 pub(crate) fn split_salt_block<'a>(
@@ -21,8 +24,13 @@ pub(in crate::protocol::v6) fn salt_positions(
     let mut arr = (0..salt_block_len).collect::<Vec<_>>();
     for round in 0..mix_rounds_handshake {
         for i in 0..salt_block_len {
-            let raw = salt_shuffle_prf(ns_salt, MIX_HANDSHAKE_DOMAIN + round, i as u32);
-            let j = i + raw as usize % (salt_block_len - i);
+            let raw = salt_shuffle_prf(
+                ns_salt,
+                MIX_HANDSHAKE_DOMAIN + round,
+                u32::try_from(i).expect("salt position index fits u32"),
+            );
+            let j = i + usize::try_from(raw).expect("u32 fits usize on supported targets")
+                % (salt_block_len - i);
             arr.swap(i, j);
         }
     }

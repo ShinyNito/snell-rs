@@ -13,6 +13,7 @@ pub enum ProtocolVersion {
 pub const DEFAULT_CLIENT_VERSION: ProtocolVersion = ProtocolVersion::V4;
 
 impl ProtocolVersion {
+    #[must_use]
     pub const fn as_u8(self) -> u8 {
         match self {
             Self::V1 => 1,
@@ -24,14 +25,17 @@ impl ProtocolVersion {
         }
     }
 
+    #[must_use]
     pub const fn supports_udp(self) -> bool {
         matches!(self, Self::V3 | Self::V4 | Self::V5 | Self::V6)
     }
 
+    #[must_use]
     pub const fn uses_v6_frames(self) -> bool {
         matches!(self, Self::V6)
     }
 
+    #[must_use]
     pub const fn uses_quic_proxy(self) -> bool {
         matches!(self, Self::V5)
     }

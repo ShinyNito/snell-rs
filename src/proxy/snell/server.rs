@@ -41,7 +41,7 @@ const V6_ERROR_DNS_FAILED_MESSAGE: &str = "DNS Failed";
 const V6_ERROR_REMOTE_EOF_MESSAGE: &str = "remote eof";
 const SERVER_FAST_OPEN_BUFFER_LIMIT: usize = 64 * 1024;
 const SERVER_TCP_INITIAL_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-const SERVER_TCP_ESTABLISHED_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const SERVER_TCP_ESTABLISHED_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 pub(crate) const SERVER_TCP_ACTIVITY_TIMEOUTS: RelayActivityTimeouts = RelayActivityTimeouts::new(
     SERVER_TCP_INITIAL_IDLE_TIMEOUT,
     SERVER_TCP_ESTABLISHED_IDLE_TIMEOUT,
@@ -90,6 +90,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_server_connection<F, Fut>(
     client: TcpStream,
     secret: SnellPsk,
@@ -105,7 +106,7 @@ where
     let (client_reader, client_writer) = client.into_split();
     let (mut frame_reader, frame_family) =
         SnellStreamReader::auto_detect_server(client_reader, &secret, v6_salt_replay_cache, || {
-            activity.record()
+            activity.record();
         })
         .await?;
     let mut frame_writer =

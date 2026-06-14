@@ -38,6 +38,12 @@ pub struct TcpBrutalConfig {
 }
 
 impl ServerConfig {
+    /// Loads and validates a `snell-server.conf` file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, the INI is invalid, a
+    /// required field is missing, or any server option fails validation.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
         let config = Ini::load_from_file(path).map_err(|err| Error::Config(err.to_string()))?;
         Self::from_ini(&config)
@@ -105,6 +111,12 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
+    /// Loads and validates a `snell-client.conf` file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, the INI is invalid, a
+    /// required field is missing, or any client option fails validation.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
         let config = Ini::load_from_file(path).map_err(|err| Error::Config(err.to_string()))?;
         Self::from_ini(&config)

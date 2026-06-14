@@ -1,4 +1,6 @@
-use super::*;
+use super::{
+    Arc, Error, HashSet, Mutex, Result, SALT_SIZE, V6_SALT_REPLAY_CACHE_CAPACITY, VecDeque,
+};
 
 #[derive(Clone, Debug)]
 pub struct V6SaltReplayCache {
@@ -13,6 +15,7 @@ struct V6SaltReplayCacheInner {
 }
 
 impl V6SaltReplayCache {
+    #[allow(clippy::must_use_candidate)]
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(V6SaltReplayCacheInner {
@@ -23,12 +26,17 @@ impl V6SaltReplayCache {
         }
     }
 
+    /// Records a salt and rejects recent replays.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the salt is already present in the replay cache.
     pub fn remember(&self, salt: [u8; SALT_SIZE]) -> Result<()> {
         {
             let mut inner = self
                 .inner
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if inner.salts.contains(&salt) {
                 return Err(Error::SaltReplay);
             }

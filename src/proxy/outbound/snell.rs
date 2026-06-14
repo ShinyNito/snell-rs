@@ -70,7 +70,7 @@ impl SnellClientOutbound {
         self.version
     }
 
-    pub(crate) async fn close_idle_connections(&self) {
+    pub(crate) fn close_idle_connections(&self) {
         if let Some(pool) = &self.pool {
             pool.close_idle();
         }

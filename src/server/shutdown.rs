@@ -42,7 +42,9 @@ fn try_enable_tcp_fast_open(socket: &TcpSocket) {
     use std::mem::size_of_val;
     use std::os::fd::AsRawFd;
 
-    let value: libc::c_int = SERVER_LISTEN_BACKLOG as libc::c_int;
+    let value: libc::c_int = SERVER_LISTEN_BACKLOG.cast_signed();
+    let value_len = libc::socklen_t::try_from(size_of_val(&value))
+        .expect("c_int socket option length fits socklen_t");
     // SAFETY: `value` is a live c_int for the duration of the setsockopt call,
     // and the socket raw fd comes from Tokio's TcpSocket.
     let result = unsafe {
@@ -50,8 +52,8 @@ fn try_enable_tcp_fast_open(socket: &TcpSocket) {
             socket.as_raw_fd(),
             libc::IPPROTO_TCP,
             libc::TCP_FASTOPEN,
-            (&value as *const libc::c_int).cast(),
-            size_of_val(&value) as libc::socklen_t,
+            (&raw const value).cast(),
+            value_len,
         )
     };
     if result == -1 {

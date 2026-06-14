@@ -1,6 +1,28 @@
 use std::sync::LazyLock;
 
-use super::*;
+use super::{
+    AEAD_TAG_SIZE, BytesMut, Duration, Error, HANDSHAKE_DOMAIN, LABEL_BIT_MAX, LABEL_BIT_MIN,
+    LABEL_BIT_PERCENT, LABEL_CHUNK_BUCKET, LABEL_CHUNK_INITIAL, LABEL_CHUNK_JITTER,
+    LABEL_CHUNK_JITTER_VALUE, LABEL_CHUNK_MAX, LABEL_CHUNK_POLICY, LABEL_CHUNK_SIZE,
+    LABEL_CHUNK_STEP, LABEL_GENERATOR, LABEL_IDLE_RESET, LABEL_MIX_BLOCK, LABEL_MIX_MODE,
+    LABEL_MIX_OFFSET_BASE, LABEL_MIX_ROUNDS, LABEL_MIX_STRIDE, LABEL_MOTIF, LABEL_PAD_COUNT,
+    LABEL_PAD_INTERVAL, LABEL_PAD_MAX, LABEL_PAD_MIN, LABEL_PADDING, LABEL_PAYLOAD_PADDING,
+    LABEL_PREFIX_MAX, LABEL_PREFIX_MIN, LABEL_PROFILE_ID, LABEL_RECORD_PREFIX, LABEL_SMALL_LIMIT,
+    LABEL_WRITE_BUCKET, LABEL_WRITE_FIRST, LABEL_WRITE_JITTER, LABEL_WRITE_JITTER_VALUE,
+    LABEL_WRITE_NEXT, LABEL_WRITE_POLICY, LABEL_WRITE_SEQ, LABEL_WRITE_TARGET,
+    MAX_EXTRA_TARGET_PADDING, MIX_HANDSHAKE_DOMAIN, NS_SEED_CHUNK, NS_SEED_MIX, NS_SEED_MOTIF,
+    NS_SEED_PREFIX, NS_SEED_PROFILE, NS_SEED_SALT, NS_SEED_WRITE, PROFILE_SEED, Range, Result,
+    SALT_SIZE, V6_CHUNK_MAX_RAW_BOUND, V6_HEADER_CIPHER_SIZE, V6_TARGET_DIRECT_LIMIT,
+    V6_TARGET_U16_LIMIT, V6_TRAFFIC_SHAPING_MTU_CAP, blake2b_256_from_slices, clamp_usize,
+    derive_namespace, expand_stream, expand_stream_array, pick_u32, pick_usize, prf32_mix,
+    salt_positions,
+};
+
+#[cfg(test)]
+use super::{
+    DOMAIN_MUL, GOLDEN_RATIO_64, LABEL_MIX_OFFSET, STREAM_INITIAL_STATE, STREAM_LABEL_MUL,
+    STREAM_LEN_ADD, STREAM_LEN_MUL, splitmix64,
+};
 
 static GENERATOR0_BYTE_TABLE: LazyLock<[[[u8; 256]; 8]; 8]> =
     LazyLock::new(build_generator0_byte_table);
@@ -34,7 +56,6 @@ impl V6Namespaces {
             0 | 1 | 14 | 15 | 33 | 34 => self.prefix,
             2 => self.motif,
             3 | 16..=20 => self.mix,
-            4..=13 | 27 => self.profile,
             21..=26 | 38 | 39 => self.chunk,
             28..=32 | 35..=37 => self.write,
             _ => self.profile,
@@ -102,6 +123,8 @@ pub struct V6Profile {
 }
 
 impl V6Profile {
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn derive(psk: &[u8]) -> Self {
         let profile_secret = blake2b_256_from_slices(&[PROFILE_SEED, psk]);
         let namespaces = V6Namespaces::derive(&profile_secret);
@@ -192,7 +215,7 @@ impl V6Profile {
         let mut write_seq = [0; 8];
         for i in 0..8 {
             let chunk_bucket = pick_usize(
-                namespaces.prf_static(LABEL_CHUNK_BUCKET, i as u32),
+                namespaces.prf_static(LABEL_CHUNK_BUCKET, u32_from_usize(i)),
                 0x1000,
                 chunk_max,
             );
@@ -205,7 +228,7 @@ impl V6Profile {
             };
             write_buckets[i] = clamp_usize(
                 pick_usize(
-                    namespaces.prf_static(LABEL_WRITE_BUCKET, i as u32),
+                    namespaces.prf_static(LABEL_WRITE_BUCKET, u32_from_usize(i)),
                     0x140,
                     V6_TRAFFIC_SHAPING_MTU_CAP,
                 ),
@@ -214,7 +237,7 @@ impl V6Profile {
             );
             write_seq[i] = clamp_usize(
                 pick_usize(
-                    namespaces.prf_static(LABEL_WRITE_SEQ, i as u32),
+                    namespaces.prf_static(LABEL_WRITE_SEQ, u32_from_usize(i)),
                     0x168,
                     V6_TRAFFIC_SHAPING_MTU_CAP,
                 ),
@@ -277,10 +300,12 @@ impl V6Profile {
         }
     }
 
+    #[must_use]
     pub const fn salt_block_len(&self) -> usize {
         self.salt_block_len
     }
 
+    #[must_use]
     pub const fn record_prefix_len(&self, seq: u32) -> usize {
         self.pick(
             LABEL_RECORD_PREFIX,
@@ -303,6 +328,12 @@ impl V6Profile {
         block
     }
 
+    /// Extracts the v6 salt from a shuffled salt block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `block` does not match this profile's salt block
+    /// length.
     pub fn extract_salt(&self, block: &[u8]) -> Result<[u8; SALT_SIZE]> {
         if block.len() != self.salt_block_len {
             return Err(Error::FrameLengthMismatch);
@@ -334,6 +365,7 @@ impl V6Profile {
         start..end
     }
 
+    #[must_use]
     pub fn final_padding_len(&self, seq: u32, payload_len: usize, first_frame: bool) -> usize {
         let prefix_len = self.record_prefix_len(seq);
         let mut base_pad = 0;
@@ -344,7 +376,7 @@ impl V6Profile {
             base_pad = self.pick(
                 LABEL_PAYLOAD_PADDING,
                 seq,
-                payload_len as u32,
+                u32_from_usize(payload_len),
                 self.pad_min,
                 self.pad_max,
             );
@@ -370,6 +402,7 @@ impl V6Profile {
         base_pad
     }
 
+    #[must_use]
     pub fn chunk_limit(&self, seq: u32, current_chunk_size: usize) -> usize {
         let mut cur = if current_chunk_size != 0 {
             current_chunk_size
@@ -378,15 +411,19 @@ impl V6Profile {
         };
         match self.chunk_policy {
             1 => {
-                cur = self.chunk_buckets[(self.prf32(LABEL_CHUNK_SIZE, seq, cur as u32) as usize)
-                    % self.chunk_buckets.len()];
+                cur = self.chunk_buckets[usize_from_u32(self.prf32(
+                    LABEL_CHUNK_SIZE,
+                    seq,
+                    u32_from_usize(cur),
+                )) % self.chunk_buckets.len()];
             }
             2 => {
                 let span = 2 * self.chunk_jitter + 1;
-                let j = (self.prf32(LABEL_CHUNK_JITTER_VALUE, seq, cur as u32) as usize % span)
-                    as isize
-                    - self.chunk_jitter as isize;
-                cur = (cur as isize + j).max(0x40) as usize;
+                let j = isize_from_usize(
+                    usize_from_u32(self.prf32(LABEL_CHUNK_JITTER_VALUE, seq, u32_from_usize(cur)))
+                        % span,
+                ) - isize_from_usize(self.chunk_jitter);
+                cur = usize_from_isize((isize_from_usize(cur) + j).max(0x40));
             }
             _ => {}
         }
@@ -422,31 +459,37 @@ impl V6Profile {
         }
 
         let mut target = if seq < self.write_first {
-            self.write_seq[seq as usize]
+            self.write_seq[usize_from_u32(seq)]
         } else {
-            self.write_buckets[(self.prf32(LABEL_WRITE_TARGET, seq, current_len as u32) as usize)
-                % self.write_buckets.len()]
+            self.write_buckets[usize_from_u32(self.prf32(
+                LABEL_WRITE_TARGET,
+                seq,
+                u32_from_usize(current_len),
+            )) % self.write_buckets.len()]
         };
 
         if self.write_policy == 2 {
             let span = 2 * self.write_jitter + 1;
-            let j = (self.prf32(LABEL_WRITE_JITTER_VALUE, seq, 0) as usize % span) as isize
-                - self.write_jitter as isize;
-            target = (target as isize + j).max(1) as usize;
+            let j = isize_from_usize(
+                usize_from_u32(self.prf32(LABEL_WRITE_JITTER_VALUE, seq, 0)) % span,
+            ) - isize_from_usize(self.write_jitter);
+            target = usize_from_isize((isize_from_usize(target) + j).max(1));
         }
 
         let jitter_bound =
             MAX_EXTRA_TARGET_PADDING.min(self.write_jitter_percent * current_len / 100);
-        if self.prf32(LABEL_WRITE_TARGET, seq, jitter_bound as u32) & 1 == 0 {
+        if self.prf32(LABEL_WRITE_TARGET, seq, u32_from_usize(jitter_bound)) & 1 == 0 {
             target = target.saturating_add(jitter_bound);
         } else if target > jitter_bound / 2 {
             target -= jitter_bound / 2;
         }
 
         while current_len > target {
-            let cand = self.write_buckets[(self.prf32(LABEL_WRITE_NEXT, seq, target as u32)
-                as usize)
-                % self.write_buckets.len()];
+            let cand = self.write_buckets[usize_from_u32(self.prf32(
+                LABEL_WRITE_NEXT,
+                seq,
+                u32_from_usize(target),
+            )) % self.write_buckets.len()];
             if target < cand {
                 target = cand;
             } else {
@@ -469,15 +512,15 @@ impl V6Profile {
             self.bit_max as usize,
         );
         let scaled = percent * 8;
-        let target_bits = if scaled <= 49 {
+        let target_bits = u32_from_usize(if scaled <= 49 {
             1
         } else if scaled > 749 {
             7
         } else {
             (scaled + 50) / 100
-        } as u32;
+        });
 
-        let table = &GENERATOR0_BYTE_TABLE[target_bits as usize];
+        let table = &GENERATOR0_BYTE_TABLE[usize_from_u32(target_bits)];
         for (i, byte) in out.iter_mut().enumerate() {
             *byte = table[i & 7][usize::from(*byte)];
         }
@@ -489,11 +532,11 @@ impl V6Profile {
             let b = *byte;
             let r = usize::from(b) % total;
             *byte = if r < self.g1 {
-                0x20 + b.wrapping_add(i as u8) % 0x5f
+                0x20 + b.wrapping_add(low_u8(i)) % 0x5f
             } else if r < self.g1 + self.g2 {
-                0x80 + ((b ^ i as u8) % 0x40)
+                0x80 + ((b ^ low_u8(i)) % 0x40)
             } else {
-                0xc0 + b.wrapping_add((7 * i) as u8) % 0x40
+                0xc0 + b.wrapping_add(low_u8(7 * i)) % 0x40
             };
         }
     }
@@ -501,9 +544,9 @@ impl V6Profile {
     fn apply_generator_2(&self, out: &mut [u8]) {
         for (i, byte) in out.iter_mut().enumerate() {
             let b = *byte;
-            let hi = (((b >> 4).wrapping_add((i & 3) as u8).wrapping_add(3)) << 4) & 0xf0;
+            let hi = (((b >> 4).wrapping_add(low_u8(i & 3)).wrapping_add(3)) << 4) & 0xf0;
             let lo = ((b & 0x0f) as usize + self.g4 + (i & 1)) % 10;
-            *byte = hi | lo as u8;
+            *byte = hi | u8_from_usize(lo);
         }
     }
 
@@ -515,7 +558,7 @@ impl V6Profile {
             let b = *byte;
             let r = i % interval;
             *byte = if r < interval - 3 {
-                ((self.g5 + 3) * i) as u8 ^ motif[i % motif_len]
+                low_u8((self.g5 + 3) * i) ^ motif[i % motif_len]
             } else if r < interval - 1 {
                 0x30 + b % 10
             } else {
@@ -524,14 +567,14 @@ impl V6Profile {
         }
     }
 
-    const fn salt_mask(&self, i: usize) -> u8 {
+    fn salt_mask(&self, i: usize) -> u8 {
         let raw = prf32_mix(
             self.namespaces.salt,
             LABEL_MOTIF,
             MIX_HANDSHAKE_DOMAIN,
-            i as u32,
+            u32_from_usize(i),
         );
-        (i as u8).wrapping_mul(self.mix_stride_handshake as u8) ^ raw as u8
+        low_u8(i).wrapping_mul(low_u8(self.mix_stride_handshake)) ^ low_u8_u32(raw)
     }
 }
 
@@ -540,11 +583,40 @@ fn build_generator0_byte_table() -> [[[u8; 256]; 8]; 8] {
     for (target_bits, target_table) in table.iter_mut().enumerate() {
         for (index_mod, index_table) in target_table.iter_mut().enumerate() {
             for (byte, slot) in index_table.iter_mut().enumerate() {
-                *slot = generator0_byte(byte as u8, index_mod, target_bits as u32);
+                *slot =
+                    generator0_byte(u8_from_usize(byte), index_mod, u32_from_usize(target_bits));
             }
         }
     }
     table
+}
+
+fn u8_from_usize(value: usize) -> u8 {
+    u8::try_from(value).expect("v6 profile value fits u8")
+}
+
+fn u32_from_usize(value: usize) -> u32 {
+    u32::try_from(value).expect("v6 profile value fits u32")
+}
+
+fn usize_from_u32(value: u32) -> usize {
+    usize::try_from(value).expect("u32 fits usize on supported targets")
+}
+
+fn isize_from_usize(value: usize) -> isize {
+    isize::try_from(value).expect("v6 profile value fits isize")
+}
+
+fn usize_from_isize(value: isize) -> usize {
+    usize::try_from(value).expect("v6 profile value is non-negative")
+}
+
+fn low_u8(value: usize) -> u8 {
+    value.to_le_bytes()[0]
+}
+
+fn low_u8_u32(value: u32) -> u8 {
+    value.to_le_bytes()[0]
 }
 
 fn generator0_byte(orig: u8, index_mod: usize, target_bits: u32) -> u8 {

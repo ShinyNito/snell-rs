@@ -15,6 +15,12 @@ pub const COMMAND_UDP_FORWARD: u8 = 1;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// Writes a Snell TCP request header.
+///
+/// # Errors
+///
+/// Returns an error if `host` is empty or exceeds the protocol's one-byte host
+/// length limit.
 pub fn write_tcp_request_header(
     out: &mut impl BufMut,
     host: &str,
@@ -36,12 +42,17 @@ pub fn write_tcp_request_header(
         out.put_u8(COMMAND_CONNECT);
     }
     out.put_u8(0);
-    out.put_u8(host.len() as u8);
+    out.put_u8(u8::try_from(host.len()).map_err(|_| Error::HostTooLong)?);
     out.put_slice(host.as_bytes());
     out.put_u16(port);
     Ok(())
 }
 
+/// Writes a Snell UDP request header.
+///
+/// # Errors
+///
+/// Returns an error if `snell_version` does not support UDP.
 pub fn write_udp_request_header(
     out: &mut impl BufMut,
     snell_version: ProtocolVersion,

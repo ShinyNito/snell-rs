@@ -4,7 +4,7 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ServerConfig, TcpBrutalConfig};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::net::dns::DnsResolver;
 use crate::net::tcp_brutal::validate_tcp_brutal_available;
 use crate::protocol::psk::SnellPsk;
@@ -22,6 +22,13 @@ pub(crate) use listener::{
     serve_tcp_listener_with_shutdown_and_timeout, serve_tcp_listeners_with_shutdown_and_timeout,
 };
 
+/// Binds the configured Snell TCP server and serves it until shutdown.
+///
+/// # Errors
+///
+/// Returns an error if DNS setup fails, TCP brutal is unavailable for the
+/// requested configuration, a TCP or UDP socket cannot bind, or a listener task
+/// exits with an error.
 pub async fn bind_configured_tcp_server_with_shutdown(
     config: ServerConfig,
     shutdown: CancellationToken,
@@ -40,7 +47,7 @@ pub async fn bind_configured_tcp_server_with_shutdown(
         .collect::<std::io::Result<Vec<_>>>()?;
     validate_tcp_brutal_available(config.tcp_brutal).await?;
     let secret = SnellPsk::new(config.psk);
-    let quic_psk = config.quic_proxy.then(|| secret.as_bytes().to_vec());
+    let quic_psk = secret.as_bytes().to_vec();
     let tcp_runtime = TcpServerRuntime {
         secret,
         options,
@@ -54,14 +61,15 @@ pub async fn bind_configured_tcp_server_with_shutdown(
     }
 
     let listen_addr = config.listen[0];
-    let listener = listeners
-        .into_iter()
-        .next()
-        .expect("config validation keeps one listener for quic_proxy");
+    let Some(listener) = listeners.into_iter().next() else {
+        return Err(Error::Config(
+            "snell-server.listen is required for quic_proxy".to_owned(),
+        ));
+    };
     let udp_socket = UdpSocket::bind(listen_addr).await?;
     let udp = serve_quic_proxy_socket(
         udp_socket,
-        quic_psk.expect("quic_proxy psk is prepared when enabled"),
+        quic_psk,
         tcp_runtime.options.clone(),
         QUIC_PROXY_SESSION_IDLE_TIMEOUT,
         shutdown.clone(),

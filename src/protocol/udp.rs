@@ -25,6 +25,12 @@ enum AddressWire {
     Response,
 }
 
+/// Writes the Snell UDP request address prefix.
+///
+/// # Errors
+///
+/// Returns an error if a domain address is empty or exceeds the protocol's
+/// one-byte domain length limit.
 pub fn write_udp_request_prefix(
     out: &mut impl BufMut,
     address: AddressRef<'_>,
@@ -34,6 +40,12 @@ pub fn write_udp_request_prefix(
     write_address(out, address, port, AddressWire::Request)
 }
 
+/// Writes the Snell UDP response address prefix.
+///
+/// # Errors
+///
+/// Returns an error if a domain address is empty or exceeds the protocol's
+/// one-byte domain length limit.
 pub fn write_udp_response_prefix(
     out: &mut impl BufMut,
     address: AddressRef<'_>,
@@ -45,6 +57,11 @@ pub fn write_udp_response_prefix(
 /// Parses a Snell UDP request packet as a borrowed view into `packet`.
 ///
 /// Domain names and payload slices borrow from the original frame payload.
+///
+/// # Errors
+///
+/// Returns an error if the packet is malformed, truncated, has an unsupported
+/// address type, or contains invalid UTF-8 in a domain.
 pub fn parse_udp_request(packet: &[u8]) -> Result<UdpPacketRef<'_>> {
     let mut input = packet;
     let command = read_u8(&mut input, Error::InvalidUdpPacket)?;
@@ -63,6 +80,11 @@ pub fn parse_udp_request(packet: &[u8]) -> Result<UdpPacketRef<'_>> {
 /// Parses a Snell UDP response packet as a borrowed view into `packet`.
 ///
 /// Domain names and payload slices borrow from the original frame payload.
+///
+/// # Errors
+///
+/// Returns an error if the packet is malformed, truncated, has an unsupported
+/// address type, or contains invalid UTF-8 in a domain.
 pub fn parse_udp_response(packet: &[u8]) -> Result<UdpPacketRef<'_>> {
     let mut input = packet;
     match read_u8(&mut input, Error::InvalidUdpPacket)? {
@@ -93,7 +115,7 @@ fn write_address(
             if wire == AddressWire::Response {
                 out.put_u8(0x03);
             }
-            out.put_u8(host.len() as u8);
+            out.put_u8(u8::try_from(host.len()).map_err(|_| Error::HostTooLong)?);
             out.put_slice(host.as_bytes());
         }
         AddressRef::Ip(IpAddr::V4(ip)) => {

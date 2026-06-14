@@ -255,7 +255,7 @@ impl<'a> UdpRecvDatagram<'a> {
     }
 }
 
-impl<'a> UdpRecvDatagramMut<'a> {
+impl UdpRecvDatagramMut<'_> {
     pub(crate) const fn datagram_mut(&mut self) -> &mut BytesMut {
         &mut self.slot.datagram
     }

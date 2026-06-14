@@ -18,7 +18,7 @@ use crate::protocol::quic_proxy::{decode_init_datagram, is_quic_looking};
 use crate::proxy::outbound::{RelayOptions, open_quic_udp, run_quic_proxy_response_session};
 use crate::session::udp::io::UdpRecvBatch;
 
-pub const QUIC_PROXY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const QUIC_PROXY_SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Per-session queue of payloads awaiting the session task. A full queue drops
 /// the datagram (UDP loss semantics) instead of stalling every other client on
@@ -27,6 +27,7 @@ const SESSION_QUEUE_CAPACITY: usize = 256;
 const RECV_BUFFER_CAPACITY: usize = MAX_PACKET_SIZE + 512;
 const PAYLOAD_SCRATCH_CAPACITY: usize = 64 * 1024;
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn serve_quic_proxy_socket(
     socket: UdpSocket,
     psk: Vec<u8>,
@@ -135,7 +136,7 @@ pub(crate) async fn serve_quic_proxy_socket(
                     });
                 }
             }
-            _ = &mut cleanup => {
+            () = &mut cleanup => {
                 let now = Instant::now();
                 sessions.retain(|_, session| {
                     let keep = now.duration_since(session.last_activity) <= idle_timeout

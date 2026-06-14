@@ -170,29 +170,28 @@ where
             .as_ref()
             .expect("decoder initialized before prefix length")
             .next_prefix_len(&self.profile);
-        let header = match self.pending_header {
-            Some(header) => header,
-            None => {
-                ready!(self.poll_fill_to(cx, prefix_len + V6_HEADER_CIPHER_SIZE))?;
-                let prefix = &self.body[..prefix_len];
-                let mut header_bytes = [0; V6_HEADER_CIPHER_SIZE];
-                header_bytes
-                    .copy_from_slice(&self.body[prefix_len..prefix_len + V6_HEADER_CIPHER_SIZE]);
-                let header = match self
-                    .decoder
-                    .as_mut()
-                    .expect("decoder initialized before v6 header decode")
-                    .decode_header(prefix, &mut header_bytes)
-                {
-                    Ok(header) => header,
-                    Err(err) => {
-                        log_frame_decode_error(&err, "v6", "header", None, None);
-                        return Poll::Ready(Err(err));
-                    }
-                };
-                self.pending_header = Some(header);
-                header
-            }
+        let header = if let Some(header) = self.pending_header {
+            header
+        } else {
+            ready!(self.poll_fill_to(cx, prefix_len + V6_HEADER_CIPHER_SIZE))?;
+            let prefix = &self.body[..prefix_len];
+            let mut header_bytes = [0; V6_HEADER_CIPHER_SIZE];
+            header_bytes
+                .copy_from_slice(&self.body[prefix_len..prefix_len + V6_HEADER_CIPHER_SIZE]);
+            let header = match self
+                .decoder
+                .as_mut()
+                .expect("decoder initialized before v6 header decode")
+                .decode_header(prefix, &mut header_bytes)
+            {
+                Ok(header) => header,
+                Err(err) => {
+                    log_frame_decode_error(&err, "v6", "header", None, None);
+                    return Poll::Ready(Err(err));
+                }
+            };
+            self.pending_header = Some(header);
+            header
         };
 
         let body_start = prefix_len + V6_HEADER_CIPHER_SIZE;
@@ -881,29 +880,28 @@ where
             self.secret = None;
         }
 
-        let header = match self.pending_header {
-            Some(header) => header,
-            None => {
-                ready!(self.poll_fill_to(cx, V4_HEADER_CIPHER_SIZE))?;
-                let header_bytes: &mut [u8; V4_HEADER_CIPHER_SIZE] = (&mut self.body
-                    [..V4_HEADER_CIPHER_SIZE])
-                    .try_into()
-                    .expect("header slice has cipher header length");
-                let header = match self
-                    .decoder
-                    .as_mut()
-                    .expect("decoder initialized before header decode")
-                    .decode_header(header_bytes)
-                {
-                    Ok(header) => header,
-                    Err(err) => {
-                        log_frame_decode_error(&err, "v4", "header", None, None);
-                        return Poll::Ready(Err(err));
-                    }
-                };
-                self.pending_header = Some(header);
-                header
-            }
+        let header = if let Some(header) = self.pending_header {
+            header
+        } else {
+            ready!(self.poll_fill_to(cx, V4_HEADER_CIPHER_SIZE))?;
+            let header_bytes: &mut [u8; V4_HEADER_CIPHER_SIZE] = (&mut self.body
+                [..V4_HEADER_CIPHER_SIZE])
+                .try_into()
+                .expect("header slice has cipher header length");
+            let header = match self
+                .decoder
+                .as_mut()
+                .expect("decoder initialized before header decode")
+                .decode_header(header_bytes)
+            {
+                Ok(header) => header,
+                Err(err) => {
+                    log_frame_decode_error(&err, "v4", "header", None, None);
+                    return Poll::Ready(Err(err));
+                }
+            };
+            self.pending_header = Some(header);
+            header
         };
 
         let body_len = header.body_len()?;

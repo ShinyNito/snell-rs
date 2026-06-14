@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    AEAD_TAG_SIZE, Aes128GcmCrypto, BytesMut, Error, MAX_V6_RECORD_PAYLOAD_LEN, Nonce12, Result,
+    SALT_SIZE, V6_HEADER_CIPHER_SIZE, V6_HEADER_PLAIN_SIZE, V6Profile, fill_random,
+    mix_padding_payload,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct V6DecodedHeader {
@@ -7,6 +11,12 @@ pub struct V6DecodedHeader {
 }
 
 impl V6DecodedHeader {
+    /// Returns the encrypted body length described by this decoded header.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoded padding or payload lengths exceed the v6
+    /// record payload limit.
     pub const fn body_len(self) -> Result<usize> {
         if self.padding_len > MAX_V6_RECORD_PAYLOAD_LEN
             || self.payload_len > MAX_V6_RECORD_PAYLOAD_LEN
@@ -31,6 +41,11 @@ pub struct V6FrameEncoder {
 }
 
 impl V6FrameEncoder {
+    /// Creates a v6 frame encoder using a random salt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if random generation or key derivation fails.
     pub fn new(psk: &[u8]) -> Result<Self> {
         let mut salt = [0; SALT_SIZE];
         fill_random(&mut salt)?;
@@ -53,14 +68,21 @@ impl V6FrameEncoder {
         })
     }
 
+    #[must_use]
     pub const fn salt(&self) -> &[u8; SALT_SIZE] {
         &self.salt
     }
 
+    #[must_use]
     pub const fn seq(&self) -> u32 {
         self.seq
     }
 
+    /// Encodes an empty v6 frame into `head`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if header encryption fails.
     pub fn encode_empty_frame(
         &mut self,
         profile: &V6Profile,
@@ -69,6 +91,12 @@ impl V6FrameEncoder {
         self.encode_payload_in_place(profile, &mut BytesMut::new(), 0, head)
     }
 
+    /// Encodes a payload frame using `payload` as the in-place payload buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload length is invalid, the frame would be too
+    /// large, or encryption fails.
     pub fn encode_payload_in_place(
         &mut self,
         profile: &V6Profile,
@@ -106,8 +134,16 @@ impl V6FrameEncoder {
 
         let mut header = [0u8; V6_HEADER_PLAIN_SIZE];
         header[0] = 4;
-        header[3..5].copy_from_slice(&(padding_len as u16).to_be_bytes());
-        header[5..7].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        header[3..5].copy_from_slice(
+            &u16::try_from(padding_len)
+                .map_err(|_| Error::PayloadTooLarge)?
+                .to_be_bytes(),
+        );
+        header[5..7].copy_from_slice(
+            &u16::try_from(payload_len)
+                .map_err(|_| Error::PayloadTooLarge)?
+                .to_be_bytes(),
+        );
         let header_tag = self.crypto.encrypt_detached_with_aad(
             self.nonce.as_bytes(),
             &mut header,
@@ -135,6 +171,12 @@ impl V6FrameEncoder {
         Ok(head.len() - start_len + payload.len())
     }
 
+    /// Encodes prefix and payload slices into `out` as one v6 frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the combined payload is empty or too large, or if
+    /// encryption fails.
     pub fn encode_payload_parts_into(
         &mut self,
         profile: &V6Profile,
@@ -172,8 +214,16 @@ impl V6FrameEncoder {
 
         let mut header = [0u8; V6_HEADER_PLAIN_SIZE];
         header[0] = 4;
-        header[3..5].copy_from_slice(&(padding_len as u16).to_be_bytes());
-        header[5..7].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        header[3..5].copy_from_slice(
+            &u16::try_from(padding_len)
+                .map_err(|_| Error::PayloadTooLarge)?
+                .to_be_bytes(),
+        );
+        header[5..7].copy_from_slice(
+            &u16::try_from(payload_len)
+                .map_err(|_| Error::PayloadTooLarge)?
+                .to_be_bytes(),
+        );
         let header_tag = self.crypto.encrypt_detached_with_aad(
             self.nonce.as_bytes(),
             &mut header,
@@ -218,6 +268,11 @@ pub struct V6FrameDecoder {
 }
 
 impl V6FrameDecoder {
+    /// Creates a v6 frame decoder for a PSK and peer salt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key derivation fails.
     pub fn new(psk: &[u8], salt: [u8; SALT_SIZE]) -> Result<Self> {
         Ok(Self {
             crypto: Aes128GcmCrypto::from_psk_and_salt(psk, &salt)?,
@@ -226,14 +281,22 @@ impl V6FrameDecoder {
         })
     }
 
+    #[must_use]
     pub const fn seq(&self) -> u32 {
         self.seq
     }
 
+    #[must_use]
     pub fn next_prefix_len(&self, profile: &V6Profile) -> usize {
         profile.record_prefix_len(self.seq)
     }
 
+    /// Decrypts and validates a v6 frame header using the record prefix as AAD.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if authentication fails, the header marker is invalid,
+    /// or decoded lengths exceed the protocol maximum.
     pub fn decode_header(
         &mut self,
         prefix: &[u8],
@@ -260,6 +323,12 @@ impl V6FrameDecoder {
         })
     }
 
+    /// Decrypts a v6 frame body in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the body length does not match the header, the frame
+    /// is malformed, or authentication fails.
     pub fn decode_payload_in_place<'a>(
         &mut self,
         profile: &V6Profile,

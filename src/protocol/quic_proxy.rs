@@ -20,22 +20,31 @@ pub struct QuicProxyInitRef<'a> {
     pub payload: &'a [u8],
 }
 
+#[must_use]
 pub fn is_quic_looking(first_byte: u8) -> bool {
     (0x40..=0x7f).contains(&first_byte) || first_byte >= 0xc0
 }
 
+#[must_use]
 pub const fn is_quic_initial(first_byte: u8) -> bool {
     first_byte & 0x80 != 0 && first_byte & 0x40 != 0
 }
 
+#[must_use]
 pub const fn is_quic_short_header(first_byte: u8) -> bool {
     first_byte & 0xc0 == 0x40
 }
 
+#[must_use]
 pub const fn is_quic_initial_packet(first_byte: u8) -> bool {
     first_byte & 0xf0 == 0xc0
 }
 
+/// Fills a salt that cannot be mistaken for a QUIC-looking first byte.
+///
+/// # Errors
+///
+/// Returns an error if the OS random source fails.
 pub fn fill_quic_proxy_salt(salt: &mut [u8; SALT_SIZE]) -> Result<()> {
     loop {
         fill_random(salt)?;
@@ -58,7 +67,11 @@ fn write_init_prefix(out: &mut BytesMut, host: &str, port: u16) -> Result<usize>
     }
 
     let start = out.len();
-    out.extend_from_slice(&[PROTOCOL_VERSION, 0, host.len() as u8]);
+    out.extend_from_slice(&[
+        PROTOCOL_VERSION,
+        0,
+        u8::try_from(host.len()).map_err(|_| Error::HostTooLong)?,
+    ]);
     out.extend_from_slice(host.as_bytes());
     out.extend_from_slice(&port.to_be_bytes());
     Ok(out.len() - start)
@@ -149,7 +162,11 @@ impl QuicProxyEncoder {
 
         let mut header = [0u8; V4_HEADER_PLAIN_SIZE];
         header[0] = 4;
-        header[5..7].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        header[5..7].copy_from_slice(
+            &u16::try_from(payload_len)
+                .map_err(|_| Error::PayloadTooLarge)?
+                .to_be_bytes(),
+        );
 
         let header_tag = self
             .crypto
@@ -228,6 +245,12 @@ impl QuicProxyDecoder {
     }
 }
 
+/// Encodes the first QUIC proxy datagram.
+///
+/// # Errors
+///
+/// Returns an error if the host is invalid, the encoded payload is too large,
+/// random salt generation fails, key derivation fails, or encryption fails.
 pub fn encode_init_datagram(
     psk: &[u8],
     host: &str,
@@ -247,6 +270,12 @@ pub fn encode_init_datagram(
     encoder.encode_init_frame_parts(&[&plaintext[..], payload], out)
 }
 
+/// Decodes the first QUIC proxy datagram in place.
+///
+/// # Errors
+///
+/// Returns an error if the datagram is too short, authentication fails, the
+/// decrypted request is malformed, or the embedded host is invalid UTF-8.
 pub fn decode_init_datagram<'a>(
     psk: &[u8],
     datagram: &'a mut [u8],
