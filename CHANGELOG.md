@@ -2,6 +2,14 @@
 
 All notable changes to this project are maintained manually.
 
+## [0.4.5] - 2026-06-14
+
+## Release Notes
+
+  * 统一 TCP 中继和活动超时编排，复用连接、客户端/服务端 relay 与测试辅助代码改用共享的会话状态路径，减少重复生命周期处理
+  * 收紧协议长度字段、FFI 参数和 v4/v6 profile 派生中的窄化转换，避免依赖隐式 `as` 截断；保留协议低位混洗语义并补充边界表达
+  * 补充公开 `Result` API 的 `# Errors` 文档，并清理 `cargo clippy -- -W clippy::pedantic` 告警
+
 ## [0.4.4] - 2026-06-14
 
 ## Release Notes
