@@ -440,6 +440,20 @@ where
 
 trait UdpRecordSource {
     fn poll_read_udp_record_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>>;
+    fn decoder_initialized(&self) -> bool;
+    fn has_pending_header(&self) -> bool;
+    fn body_is_empty(&self) -> bool;
+
+    fn is_clean_frame_eof(&self, err: &Error) -> bool {
+        // Only reached after `discard_consumed`, so `consumed` and payload bounds
+        // are already zero; the frame-boundary signal is decoder initialized,
+        // no pending header, and an empty read buffer.
+        matches!(err, Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
+            && self.decoder_initialized()
+            && !self.has_pending_header()
+            && self.body_is_empty()
+    }
+
     fn last_udp_chunk_limit(&self) -> Option<usize>;
     fn take_udp_payload_from(&mut self, offset: usize) -> Bytes;
     fn take_pending_udp_eof(&mut self) -> bool;
@@ -470,6 +484,7 @@ trait UdpRecordSource {
                 })))
             }
             Err(Error::ZeroChunk) => Poll::Ready(Ok(None)),
+            Err(err) if self.is_clean_frame_eof(&err) => Poll::Ready(Ok(None)),
             Err(err) => Poll::Ready(Err(err)),
         }
     }
@@ -590,6 +605,18 @@ where
         self.poll_read_frame_payload_inner(cx)
     }
 
+    fn decoder_initialized(&self) -> bool {
+        self.decoder.is_some()
+    }
+
+    fn has_pending_header(&self) -> bool {
+        self.pending_header.is_some()
+    }
+
+    fn body_is_empty(&self) -> bool {
+        self.body.is_empty()
+    }
+
     fn last_udp_chunk_limit(&self) -> Option<usize> {
         V4StreamReader::last_chunk_limit(self)
     }
@@ -642,6 +669,18 @@ where
 {
     fn poll_read_udp_record_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.poll_read_frame_payload_inner(cx)
+    }
+
+    fn decoder_initialized(&self) -> bool {
+        self.decoder.is_some()
+    }
+
+    fn has_pending_header(&self) -> bool {
+        self.pending_header.is_some()
+    }
+
+    fn body_is_empty(&self) -> bool {
+        self.body.is_empty()
     }
 
     fn last_udp_chunk_limit(&self) -> Option<usize> {

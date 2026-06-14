@@ -1,12 +1,16 @@
 use std::net::{IpAddr, Ipv4Addr};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use super::relay_udp_server_stream;
 use crate::error::Error;
+use crate::framed::SnellStreamWriter;
 use crate::net::dns::DnsResolver;
 use crate::protocol::socks5::{
     SocksReply, SocksRequest, SocksTarget, parse_udp_packet as parse_socks_udp_packet,
@@ -59,7 +63,7 @@ async fn udp_server_stream_relays_one_datagram_response() {
         )
         .await
         .unwrap();
-        relay_udp_server_stream(stream, direct_options(false), Duration::from_secs(1))
+        relay_udp_server_stream(stream, direct_options(false))
             .await
             .unwrap()
     };
@@ -130,7 +134,7 @@ async fn udp_stream_does_not_head_of_line_block_on_missing_response() {
         )
         .await
         .unwrap();
-        relay_udp_server_stream(stream, direct_options(false), Duration::from_secs(2))
+        relay_udp_server_stream(stream, direct_options(false))
             .await
             .unwrap()
     };
@@ -394,10 +398,11 @@ async fn udp_upstream_socks5_control_close_ends_association() {
 }
 
 #[tokio::test]
-async fn udp_association_idle_timeout_sends_zero_chunk_to_client() {
+async fn udp_association_transport_eof_closes_without_zero_chunk() {
     let psk = TEST_PSK;
     let (client_upload, server_upload) = test_duplex_pair();
-    let (server_download, client_download) = test_duplex_pair();
+    let server_download = RecordingWrite::default();
+    let recorded_download = server_download.clone();
 
     let server = async {
         let stream = accept_udp_server_stream(
@@ -408,37 +413,58 @@ async fn udp_association_idle_timeout_sends_zero_chunk_to_client() {
         )
         .await
         .unwrap();
-        relay_udp_server_stream(stream, direct_options(false), Duration::from_millis(20))
+        let bytes_after_accept = recorded_download.len();
+        let stats = relay_udp_server_stream(stream, direct_options(false))
             .await
-            .unwrap()
+            .unwrap();
+        assert_eq!(recorded_download.len(), bytes_after_accept);
+        stats
     };
 
     let client = async {
         let secret = shared_secret(psk);
-        let (mut reader, _writer) = UdpClientStream::open_io(
-            client_download,
-            client_upload,
-            &secret,
-            crate::ProtocolVersion::V4,
-        )
-        .await
-        .unwrap()
-        .into_parts();
-        assert!(
-            timeout(
-                Duration::from_millis(200),
-                reader.read_udp_response_message()
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .is_none()
-        );
+        let mut writer =
+            SnellStreamWriter::new(client_upload, &secret, crate::ProtocolVersion::V4).unwrap();
+        writer.write_udp_request().await.unwrap();
+        sleep(Duration::from_millis(100)).await;
     };
 
     let (stats, ()) = tokio::join!(server, client);
     assert_eq!(stats.packets_sent, 0);
     assert_eq!(stats.packets_received, 0);
+}
+
+#[derive(Clone, Default)]
+struct RecordingWrite {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl RecordingWrite {
+    fn len(&self) -> usize {
+        self.bytes.lock().expect("recording writer poisoned").len()
+    }
+}
+
+impl AsyncWrite for RecordingWrite {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.bytes
+            .lock()
+            .expect("recording writer poisoned")
+            .extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 #[tokio::test]
@@ -458,7 +484,7 @@ async fn client_zero_chunk_ends_udp_association_without_waiting_for_idle() {
         .unwrap();
         timeout(
             Duration::from_millis(200),
-            relay_udp_server_stream(stream, direct_options(false), Duration::from_secs(60)),
+            relay_udp_server_stream(stream, direct_options(false)),
         )
         .await
         .unwrap()
@@ -510,7 +536,7 @@ async fn udp_to_snell_stops_when_snell_writer_is_closed() {
         .unwrap();
         timeout(
             Duration::from_millis(500),
-            relay_udp_server_stream(stream, direct_options(false), Duration::from_secs(60)),
+            relay_udp_server_stream(stream, direct_options(false)),
         )
         .await
         .unwrap()

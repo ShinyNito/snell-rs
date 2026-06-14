@@ -20,9 +20,7 @@ use crate::session::tcp::TcpTarget;
 use crate::session::tcp::relay::{
     PlainUploadBatch, PrefixedRead, relay_bidirectional_until_right_closed,
 };
-use crate::session::udp::association::{
-    UDP_ASSOCIATION_IDLE_TIMEOUT, relay_udp_server_stream_prepared,
-};
+use crate::session::udp::association::relay_udp_server_stream_prepared;
 use crate::session::udp::stream::UdpServerStream;
 
 pub(crate) const CONNECT_FAILED_CODE: u8 = 1;
@@ -197,25 +195,19 @@ where
                 };
                 let udp = UdpServerStream::accept(frame_reader, frame_writer).await?;
                 activity.record();
-                let stats = match relay_udp_server_stream_prepared(
-                    udp,
-                    options,
-                    UDP_ASSOCIATION_IDLE_TIMEOUT,
-                    prepared,
-                    &activity,
-                )
-                .await
-                {
-                    Ok(stats) => stats,
-                    Err(err) => {
-                        tracing::debug!(
-                            %err,
-                            duration_ms = started.elapsed().as_millis(),
-                            "snell udp server relay failed"
-                        );
-                        return Err(err);
-                    }
-                };
+                let stats =
+                    match relay_udp_server_stream_prepared(udp, options, prepared, &activity).await
+                    {
+                        Ok(stats) => stats,
+                        Err(err) => {
+                            tracing::debug!(
+                                %err,
+                                duration_ms = started.elapsed().as_millis(),
+                                "snell udp server relay failed"
+                            );
+                            return Err(err);
+                        }
+                    };
                 tracing::debug!(
                     packets_sent = stats.packets_sent,
                     packets_received = stats.packets_received,
