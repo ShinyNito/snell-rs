@@ -4,7 +4,6 @@ mod reader;
 mod tests;
 mod writer;
 
-pub(crate) use buffer::poll_read_ahead_into_spare_with_capacity;
 pub(crate) use reader::SnellStreamReader;
 pub(crate) use writer::SnellStreamWriter;
 

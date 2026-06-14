@@ -1,10 +1,11 @@
-use bytes::Bytes;
+use std::io;
+use std::pin::Pin;
 use std::task::{Context, Poll, ready};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
-use crate::session::tcp::{PlainReadBatch, TcpPayloadReader};
+use crate::session::tcp::{PlainReadBatch, TcpPayloadReader, error_into_io, poll_result_into_io};
 
 pub(crate) struct ReuseClientConn<R, W> {
     reader: ReuseClientReader<R>,
@@ -28,7 +29,7 @@ where
         self.writer.write_reuse_request(host, port).await
     }
 
-    pub(crate) fn can_reuse(&self) -> bool {
+    pub(crate) const fn can_reuse(&self) -> bool {
         self.writer.write_closed
             && self.reader.payload.is_done()
             && !self.reader.payload.has_pending()
@@ -48,31 +49,45 @@ where
         self.reader.compact_buffers_for_reuse();
         self.writer.compact_buffers_for_reuse();
     }
+}
 
-    pub(crate) async fn close_whole_connection(mut self) {
-        self.writer.shutdown().await;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reader_mut(&mut self) -> &mut ReuseClientReader<R> {
-        &mut self.reader
-    }
-
-    #[cfg(test)]
-    pub(crate) fn writer_mut(&mut self) -> &mut ReuseClientWriter<W> {
-        &mut self.writer
-    }
-
-    pub(crate) fn into_split(self) -> (ReuseClientReader<R>, ReuseClientWriter<W>) {
-        (self.reader, self.writer)
-    }
-
-    pub(crate) fn from_split(reader: ReuseClientReader<R>, writer: ReuseClientWriter<W>) -> Self {
-        Self { reader, writer }
+impl<R, W> AsyncRead for ReuseClientConn<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().reader).poll_read(cx, out)
     }
 }
 
-pub(crate) struct ReuseClientReader<R> {
+impl<R, W> AsyncWrite for ReuseClientConn<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
+    }
+}
+
+struct ReuseClientReader<R> {
     payload: TcpPayloadReader<R>,
     reply_read: bool,
     broken: bool,
@@ -82,38 +97,11 @@ impl<R> ReuseClientReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    fn new(reader: SnellStreamReader<R>) -> Self {
+    const fn new(reader: SnellStreamReader<R>) -> Self {
         Self {
             payload: TcpPayloadReader::client(reader),
             reply_read: false,
             broken: false,
-        }
-    }
-
-    pub(crate) fn poll_take_payload_chunk(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<Bytes>>> {
-        if self.payload.is_done() {
-            return Poll::Ready(Ok(None));
-        }
-        if !self.reply_read {
-            match ready!(self.payload.poll_read_tunnel_reply(cx)) {
-                Ok(()) => self.reply_read = true,
-                Err(err) => {
-                    self.broken = true;
-                    return Poll::Ready(Err(err));
-                }
-            }
-        }
-
-        match self.payload.poll_take_payload_chunk_strict(cx) {
-            Poll::Ready(Ok(payload)) => Poll::Ready(Ok(payload)),
-            Poll::Ready(Err(err)) => {
-                self.broken = true;
-                Poll::Ready(Err(err))
-            }
-            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -122,9 +110,45 @@ where
     }
 }
 
-pub(crate) struct ReuseClientWriter<W> {
+impl<R> AsyncRead for ReuseClientReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.payload.is_done() {
+            return Poll::Ready(Ok(()));
+        }
+
+        if !this.reply_read {
+            match ready!(this.payload.poll_read_tunnel_reply(cx)) {
+                Ok(()) => this.reply_read = true,
+                Err(err) => {
+                    this.broken = true;
+                    return Poll::Ready(Err(error_into_io(err)));
+                }
+            }
+        }
+
+        match this.payload.poll_read_payload(cx, out, false) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(err)) => {
+                this.broken = true;
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct ReuseClientWriter<W> {
     frame_writer: SnellStreamWriter<W>,
     plain_batch: PlainReadBatch,
+    pending_write_len: Option<usize>,
     write_closed: bool,
     broken: bool,
 }
@@ -137,6 +161,7 @@ where
         Self {
             frame_writer: writer,
             plain_batch: PlainReadBatch::new(),
+            pending_write_len: None,
             write_closed: false,
             broken: false,
         }
@@ -152,49 +177,102 @@ where
         }
     }
 
-    pub(crate) async fn write_payload_message_from_reader<P>(
-        &mut self,
-        plain: &mut P,
-    ) -> Result<Option<usize>>
-    where
-        P: AsyncRead + Unpin,
-    {
-        if self.write_closed {
-            return Err(Error::WriteClosed);
+    fn poll_close_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if !self.write_closed {
+            ready!(self.poll_flush_payload(cx))?;
+            match self.frame_writer.poll_write_zero_chunk(cx) {
+                Poll::Ready(Ok(())) => self.write_closed = true,
+                Poll::Ready(Err(err)) => {
+                    self.broken = true;
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_write_payload(&mut self, buf: &[u8], cx: &mut Context<'_>) -> Poll<Result<usize>> {
+        if let Some(n) = self.pending_write_len {
+            ready!(self.poll_flush_payload(cx))?;
+            self.pending_write_len = None;
+            return Poll::Ready(Ok(n));
+        }
+
+        ready!(self.poll_flush_payload(cx))?;
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let n = buf
+            .len()
+            .min(crate::session::tcp::SERVER_PLAIN_READ_AHEAD_CAPACITY);
+        self.plain_batch.buffer.extend_from_slice(&buf[..n]);
+        self.pending_write_len = Some(n);
+        ready!(self.poll_flush_payload(cx))?;
+        self.pending_write_len = None;
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         match self
             .plain_batch
-            .write_payload_message_from_reader(&mut self.frame_writer, plain)
-            .await
+            .poll_flush_payload(&mut self.frame_writer, cx)
         {
-            Ok(n) => Ok(n),
-            Err(err) => {
+            Poll::Ready(Ok(())) => {
+                self.pending_write_len = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => {
                 self.broken = true;
-                Err(err)
+                Poll::Ready(Err(err))
             }
+            Poll::Pending => Poll::Pending,
         }
     }
 
-    pub(crate) async fn close_write(&mut self) -> Result<()> {
-        if !self.write_closed {
-            match self.frame_writer.write_zero_chunk().await {
-                Ok(()) => self.write_closed = true,
-                Err(err) => {
-                    self.broken = true;
-                    return Err(err);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn shutdown(&mut self) {
-        let _ = self.frame_writer.shutdown().await;
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        ready!(self.poll_flush_payload(cx))?;
+        self.frame_writer.poll_flush(cx)
     }
 
     fn compact_buffers_for_reuse(&mut self) {
         self.frame_writer.compact_buffers_for_reuse();
         self.plain_batch.compact_for_reuse();
+        self.pending_write_len = None;
+    }
+}
+
+impl<W> AsyncWrite for ReuseClientWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.write_closed {
+            return Poll::Ready(Err(error_into_io(Error::WriteClosed)));
+        }
+
+        match this.poll_write_payload(buf, cx) {
+            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
+            Poll::Ready(Err(err)) => {
+                this.broken = true;
+                Poll::Ready(Err(error_into_io(err)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        poll_result_into_io(self.get_mut().poll_flush(cx))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        poll_result_into_io(self.get_mut().poll_close_write(cx))
     }
 }
 

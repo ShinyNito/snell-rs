@@ -10,6 +10,7 @@ pub mod protocol {
     pub mod crypto;
     pub mod header;
     pub mod nonce;
+    pub(crate) mod psk;
     pub mod quic_proxy;
     pub(crate) mod random;
     pub mod request;
@@ -25,6 +26,7 @@ pub mod protocol {
 pub(crate) mod framed;
 
 pub(crate) mod session {
+    pub(crate) mod activity;
     pub(crate) mod quic_proxy;
     pub(crate) mod reuse;
     pub(crate) mod tcp;

@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
 use snell_rs::client::bind_configured_socks5_client_with_shutdown;
 use snell_rs::config::{ClientConfig, ServerConfig};
 use snell_rs::server::bind_configured_tcp_server_with_shutdown;
-use tracing_subscriber::EnvFilter;
+use thiserror::Error;
+use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
 
 #[derive(Debug, Parser)]
 #[command(name = "snell-rs", version, about = "Snell proxy")]
@@ -27,6 +28,18 @@ enum Command {
     Version,
 }
 
+type Result<T> = std::result::Result<T, CliError>;
+
+#[derive(Debug, Error)]
+enum CliError {
+    #[error(transparent)]
+    Snell(#[from] snell_rs::error::Error),
+    #[error(transparent)]
+    Signal(#[from] std::io::Error),
+    #[error(transparent)]
+    TracingInit(#[from] tracing_subscriber::util::TryInitError),
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     match run().await {
@@ -38,7 +51,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing()?;
 
@@ -107,7 +120,7 @@ fn version_text() -> String {
     )
 }
 
-fn init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn init_tracing() -> Result<()> {
     let filter = EnvFilter::try_from_env("SNELL_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
         .unwrap_or_else(|_| EnvFilter::new("warn,snell_rs=info"));
@@ -115,6 +128,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .compact()
+        .finish()
         .try_init()?;
 
     Ok(())

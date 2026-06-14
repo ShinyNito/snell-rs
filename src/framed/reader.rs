@@ -4,15 +4,15 @@ use std::time::Instant;
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::AsyncRead;
-use zeroize::Zeroizing;
 
 use crate::ProtocolVersion;
 use crate::error::{Error, Result};
 use crate::protocol::crypto::SALT_SIZE;
+use crate::protocol::psk::SnellPsk;
 use crate::protocol::udp::{parse_udp_request, parse_udp_response};
 use crate::protocol::v4::frame::{DecodedHeader, V4_HEADER_CIPHER_SIZE, V4FrameDecoder};
 use crate::protocol::v6::{
-    V6_HEADER_CIPHER_SIZE, V6ChunkSizer, V6DecodedHeader, V6FrameDecoder, V6Profile,
+    SharedV6Profile, V6_HEADER_CIPHER_SIZE, V6ChunkSizer, V6DecodedHeader, V6FrameDecoder,
     V6SaltReplayCache,
 };
 
@@ -41,7 +41,7 @@ impl SnellFrameFamily {
 
 pub struct V4StreamReader<R> {
     inner: R,
-    pub(super) psk: Zeroizing<Vec<u8>>,
+    pub(super) secret: Option<SnellPsk>,
     decoder: Option<V4FrameDecoder>,
     /// Raw ciphertext accumulation buffer. Reads pull as much as the spare
     /// capacity allows, so several frames can be parsed per syscall.
@@ -64,8 +64,8 @@ pub struct V4StreamReader<R> {
 
 pub struct V6StreamReader<R> {
     inner: R,
-    pub(super) psk: Zeroizing<Vec<u8>>,
-    profile: Option<V6Profile>,
+    secret: Option<SnellPsk>,
+    profile: SharedV6Profile,
     chunk_sizer: V6ChunkSizer,
     salt_replay_cache: Option<V6SaltReplayCache>,
     decoder: Option<V6FrameDecoder>,
@@ -102,55 +102,34 @@ impl<R> V6StreamReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    pub fn new(inner: R, psk: &[u8]) -> Self {
-        Self::with_salt_replay_cache(inner, psk, None)
+    pub fn new(inner: R, secret: &SnellPsk) -> Self {
+        Self::with_salt_replay_cache(inner, secret, None)
     }
 
     pub(crate) fn with_salt_replay_cache(
         inner: R,
-        psk: &[u8],
+        secret: &SnellPsk,
         salt_replay_cache: Option<V6SaltReplayCache>,
     ) -> Self {
-        Self::with_body_and_salt_replay_cache(
+        Self::with_body_salt_replay_cache(
             inner,
-            psk,
+            secret,
             BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY),
             salt_replay_cache,
         )
     }
 
-    fn with_prefilled_body_and_profile(
+    fn with_body_salt_replay_cache(
         inner: R,
-        psk: &[u8],
-        body: BytesMut,
-        profile: V6Profile,
-    ) -> Self {
-        Self::with_body_salt_replay_cache_and_profile(inner, psk, body, None, profile)
-    }
-
-    fn with_body_and_salt_replay_cache(
-        inner: R,
-        psk: &[u8],
+        secret: &SnellPsk,
         body: BytesMut,
         salt_replay_cache: Option<V6SaltReplayCache>,
     ) -> Self {
-        let profile = V6Profile::derive(psk);
-        Self::with_body_salt_replay_cache_and_profile(inner, psk, body, salt_replay_cache, profile)
-    }
-
-    fn with_body_salt_replay_cache_and_profile(
-        inner: R,
-        psk: &[u8],
-        body: BytesMut,
-        salt_replay_cache: Option<V6SaltReplayCache>,
-        profile: V6Profile,
-    ) -> Self {
-        let chunk_sizer = V6ChunkSizer::new(profile.clone());
         Self {
             inner,
-            psk: Zeroizing::new(psk.to_vec()),
-            profile: Some(profile),
-            chunk_sizer,
+            secret: Some(secret.clone()),
+            profile: secret.clone_v6_profile(),
+            chunk_sizer: V6ChunkSizer::new(),
             salt_replay_cache,
             decoder: None,
             body,
@@ -171,34 +150,26 @@ where
     fn poll_read_frame_payload_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.discard_consumed();
         if self.decoder.is_none() {
-            let salt_block_len = self
-                .profile
-                .as_ref()
-                .expect("v6 profile is present before decoder initialization")
-                .salt_block_len();
+            let salt_block_len = self.profile.salt_block_len();
             ready!(self.poll_fill_to(cx, salt_block_len))?;
-            let salt = self
-                .profile
-                .as_ref()
-                .expect("v6 profile is present before decoder initialization")
-                .extract_salt(&self.body[..salt_block_len])?;
+            let salt = self.profile.extract_salt(&self.body[..salt_block_len])?;
             if let Some(cache) = &self.salt_replay_cache {
                 cache.remember(salt)?;
             }
             self.body.advance(salt_block_len);
-            let profile = self
-                .profile
-                .take()
-                .expect("v6 profile is present before decoder initialization");
-            self.decoder = Some(V6FrameDecoder::new(&self.psk, salt, profile)?);
-            self.psk.clear();
+            let secret = self
+                .secret
+                .as_ref()
+                .expect("v6 reader secret is kept until decoder initialization");
+            self.decoder = Some(V6FrameDecoder::new(secret.as_bytes(), salt)?);
+            self.secret = None;
         }
 
         let prefix_len = self
             .decoder
             .as_ref()
             .expect("decoder initialized before prefix length")
-            .next_prefix_len();
+            .next_prefix_len(&self.profile);
         let header = match self.pending_header {
             Some(header) => header,
             None => {
@@ -238,30 +209,24 @@ where
             .as_ref()
             .expect("decoder initialized before v6 payload limit")
             .seq();
-        let chunk_limit = self.chunk_sizer.peek_limit(seq, now);
+        let chunk_limit = self.chunk_sizer.peek_limit(&self.profile, seq, now);
         if let Err(err) = self
             .decoder
             .as_mut()
             .expect("decoder initialized before v6 payload decode")
-            .decode_payload_in_place(header, &mut self.body[body_start..frame_len])
+            .decode_payload_in_place(&self.profile, header, &mut self.body[body_start..frame_len])
         {
             log_frame_decode_error(&err, "v6", "payload", Some(payload_len), Some(body_len));
             return Poll::Ready(Err(err));
         }
         self.last_chunk_limit = Some(chunk_limit);
         if payload_len != 0 {
-            self.chunk_sizer.commit_record(now);
+            self.chunk_sizer.commit_record(&self.profile, now);
         }
         self.payload_start = body_start + header.padding_len;
         self.payload_end = self.payload_start + payload_len;
         tracing::trace!(payload_len, body_len, "read snell v6 frame");
         Poll::Ready(Ok(()))
-    }
-
-    #[cfg(test)]
-    pub async fn read_frame_payload(&mut self) -> Result<&[u8]> {
-        poll_fn(|cx| self.poll_read_frame_payload_inner(cx)).await?;
-        Ok(&self.body[self.payload_start..self.payload_end])
     }
 
     pub(crate) fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
@@ -293,17 +258,17 @@ where
         self.last_chunk_limit
     }
 
-    pub(crate) fn take_pending_udp_eof(&mut self) -> bool {
+    pub(crate) const fn take_pending_udp_eof(&mut self) -> bool {
         let pending = self.pending_udp_eof;
         self.pending_udp_eof = false;
         pending
     }
 
-    pub(crate) fn set_pending_udp_eof(&mut self) {
+    pub(crate) const fn set_pending_udp_eof(&mut self) {
         self.pending_udp_eof = true;
     }
 
-    fn take_pending_udp_record(&mut self) -> Option<PendingUdpRecord> {
+    const fn take_pending_udp_record(&mut self) -> Option<PendingUdpRecord> {
         self.pending_udp_record.take()
     }
 
@@ -352,46 +317,50 @@ where
 }
 
 pub(crate) enum SnellStreamReader<R> {
-    V4(Box<V4StreamReader<R>>),
-    V6(Box<V6StreamReader<R>>),
+    V4(V4StreamReader<R>),
+    V6(V6StreamReader<R>),
 }
 
 impl<R> SnellStreamReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    pub(crate) fn new(inner: R, psk: &[u8], version: ProtocolVersion) -> Self {
+    pub(crate) fn new(inner: R, secret: &SnellPsk, version: ProtocolVersion) -> Self {
         if version.uses_v6_frames() {
-            Self::V6(Box::new(V6StreamReader::new(inner, psk)))
+            Self::V6(V6StreamReader::new(inner, secret))
         } else {
-            Self::V4(Box::new(V4StreamReader::new(inner, psk)))
+            Self::V4(V4StreamReader::new(inner, secret))
         }
     }
 
-    pub(crate) async fn auto_detect_server(
+    pub(crate) async fn auto_detect_server<F>(
         inner: R,
-        psk: &[u8],
+        secret: &SnellPsk,
         v6_salt_replay_cache: V6SaltReplayCache,
-    ) -> Result<(Self, SnellFrameFamily)> {
-        let mut detector = ServerFrameFamilyDetector::new(inner, psk);
+        mut record_activity: F,
+    ) -> Result<(Self, SnellFrameFamily)>
+    where
+        F: FnMut(),
+    {
+        let mut detector = ServerFrameFamilyDetector::new(inner, secret);
         loop {
             let v6_attempt = detector.try_detect_v6();
             let v4_attempt = detector.try_detect_v4();
             match (v6_attempt, v4_attempt) {
                 (DetectionAttempt::Authenticated(salt), _) => {
                     v6_salt_replay_cache.remember(salt)?;
-                    let reader = V6StreamReader::with_prefilled_body_and_profile(
+                    let reader = V6StreamReader::with_body_salt_replay_cache(
                         detector.inner,
-                        psk,
+                        secret,
                         detector.body,
-                        detector.profile,
+                        None,
                     );
-                    return Ok((Self::V6(Box::new(reader)), SnellFrameFamily::V6));
+                    return Ok((Self::V6(reader), SnellFrameFamily::V6));
                 }
                 (_, DetectionAttempt::Authenticated(())) => {
                     let reader =
-                        V4StreamReader::with_prefilled_body(detector.inner, psk, detector.body);
-                    return Ok((Self::V4(Box::new(reader)), SnellFrameFamily::V4));
+                        V4StreamReader::with_prefilled_body(detector.inner, secret, detector.body);
+                    return Ok((Self::V4(reader), SnellFrameFamily::V4));
                 }
                 (DetectionAttempt::Failed(v6_error), DetectionAttempt::Failed(v4_error)) => {
                     tracing::debug!(
@@ -409,17 +378,9 @@ where
                         .chain(v4_attempt.needed_len())
                         .min()
                         .expect("at least one detection attempt needs more bytes");
-                    detector.fill_to(needed).await?;
+                    detector.fill_to(needed, &mut record_activity).await?;
                 }
             }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn read_frame_payload(&mut self) -> Result<&[u8]> {
-        match self {
-            Self::V4(reader) => reader.read_frame_payload().await,
-            Self::V6(reader) => reader.read_frame_payload().await,
         }
     }
 
@@ -458,8 +419,8 @@ where
         kind: UdpPayloadKind,
     ) -> Poll<Result<Option<Bytes>>> {
         match self {
-            Self::V4(reader) => poll_read_udp_payload_message_from(reader.as_mut(), cx, kind),
-            Self::V6(reader) => poll_read_udp_payload_message_from(reader.as_mut(), cx, kind),
+            Self::V4(reader) => poll_read_udp_payload_message_from(reader, cx, kind),
+            Self::V6(reader) => poll_read_udp_payload_message_from(reader, cx, kind),
         }
     }
 
@@ -755,7 +716,7 @@ impl<T> DetectionAttempt<T> {
 struct ServerFrameFamilyDetector<'a, R> {
     inner: R,
     psk: &'a [u8],
-    profile: V6Profile,
+    profile: SharedV6Profile,
     body: BytesMut,
 }
 
@@ -763,11 +724,11 @@ impl<'a, R> ServerFrameFamilyDetector<'a, R>
 where
     R: AsyncRead + Unpin,
 {
-    fn new(inner: R, psk: &'a [u8]) -> Self {
+    fn new(inner: R, secret: &'a SnellPsk) -> Self {
         Self {
             inner,
-            psk,
-            profile: V6Profile::derive(psk),
+            psk: secret.as_bytes(),
+            profile: secret.clone_v6_profile(),
             body: BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY),
         }
     }
@@ -782,11 +743,11 @@ where
             Ok(salt) => salt,
             Err(error) => return DetectionAttempt::Failed(error),
         };
-        let mut decoder = match V6FrameDecoder::new(self.psk, salt, self.profile.clone()) {
+        let mut decoder = match V6FrameDecoder::new(self.psk, salt) {
             Ok(decoder) => decoder,
             Err(error) => return DetectionAttempt::Failed(error),
         };
-        let prefix_len = decoder.next_prefix_len();
+        let prefix_len = decoder.next_prefix_len(&self.profile);
         let needed = salt_block_len + prefix_len + V6_HEADER_CIPHER_SIZE;
         if self.body.len() < needed {
             return DetectionAttempt::Need(needed);
@@ -824,7 +785,10 @@ where
         }
     }
 
-    async fn fill_to(&mut self, needed: usize) -> Result<()> {
+    async fn fill_to<F>(&mut self, needed: usize, record_activity: &mut F) -> Result<()>
+    where
+        F: FnMut(),
+    {
         while self.body.len() < needed {
             let min_spare = needed - self.body.len();
             let n = poll_fn(|cx| {
@@ -838,6 +802,7 @@ where
                 )
                 .into());
             }
+            record_activity();
         }
         Ok(())
     }
@@ -872,18 +837,18 @@ where
     ///
     /// The salt is read and the decoder is initialized lazily on the first
     /// frame read.
-    pub fn new(inner: R, psk: &[u8]) -> Self {
+    pub fn new(inner: R, secret: &SnellPsk) -> Self {
         Self::with_prefilled_body(
             inner,
-            psk,
+            secret,
             BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY),
         )
     }
 
-    fn with_prefilled_body(inner: R, psk: &[u8], body: BytesMut) -> Self {
+    fn with_prefilled_body(inner: R, secret: &SnellPsk, body: BytesMut) -> Self {
         Self {
             inner,
-            psk: Zeroizing::new(psk.to_vec()),
+            secret: Some(secret.clone()),
             decoder: None,
             body,
             consumed: 0,
@@ -908,8 +873,12 @@ where
             let mut salt = [0; SALT_SIZE];
             salt.copy_from_slice(&self.body[..SALT_SIZE]);
             self.body.advance(SALT_SIZE);
-            self.decoder = Some(V4FrameDecoder::new(&self.psk, salt)?);
-            self.psk.clear();
+            let secret = self
+                .secret
+                .as_ref()
+                .expect("v4 reader secret is kept until decoder initialization");
+            self.decoder = Some(V4FrameDecoder::new(secret.as_bytes(), salt)?);
+            self.secret = None;
         }
 
         let header = match self.pending_header {
@@ -960,12 +929,6 @@ where
         Poll::Ready(Ok(()))
     }
 
-    #[cfg(test)]
-    pub async fn read_frame_payload(&mut self) -> Result<&[u8]> {
-        poll_fn(|cx| self.poll_read_frame_payload_inner(cx)).await?;
-        Ok(&self.body[self.payload_start..self.payload_end])
-    }
-
     pub(crate) fn poll_read_frame_payload(&mut self, cx: &mut Context<'_>) -> Poll<Result<&[u8]>> {
         ready!(self.poll_read_frame_payload_inner(cx))?;
         Poll::Ready(Ok(&self.body[self.payload_start..self.payload_end]))
@@ -1010,17 +973,17 @@ where
         self.last_chunk_limit
     }
 
-    pub(crate) fn take_pending_udp_eof(&mut self) -> bool {
+    pub(crate) const fn take_pending_udp_eof(&mut self) -> bool {
         let pending = self.pending_udp_eof;
         self.pending_udp_eof = false;
         pending
     }
 
-    pub(crate) fn set_pending_udp_eof(&mut self) {
+    pub(crate) const fn set_pending_udp_eof(&mut self) {
         self.pending_udp_eof = true;
     }
 
-    fn take_pending_udp_record(&mut self) -> Option<PendingUdpRecord> {
+    const fn take_pending_udp_record(&mut self) -> Option<PendingUdpRecord> {
         self.pending_udp_record.take()
     }
 

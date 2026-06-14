@@ -31,29 +31,42 @@ pub(crate) async fn relay_socks5_connection(
         }
     };
     match request {
-        SocksRequest::Connect(target) => {
-            let connect = outbound.open_tcp(&target.host, target.port).await;
-            let connect = match connect {
-                Ok(connect) => connect,
-                Err(err) => {
-                    write_reply_and_shutdown(&mut local, SocksReply::GeneralFailure).await;
-                    return Err(err);
-                }
-            };
-            write_reply(&mut local, SocksReply::Succeeded).await?;
-            relay_tcp_connect(local, connect).await
-        }
+        SocksRequest::Connect(target) => relay_socks5_tcp_connect(local, outbound, target).await,
         SocksRequest::UdpAssociate(_) => {
-            Box::pin(relay_socks5_udp_association(
-                local,
-                outbound.server_addr(),
-                outbound.psk(),
-                outbound.version(),
-                quic_proxy,
-            ))
-            .await
+            relay_socks5_udp_associate(local, outbound, quic_proxy).await
         }
     }
+}
+
+async fn relay_socks5_tcp_connect(
+    mut local: TcpStream,
+    outbound: Arc<SnellClientOutbound>,
+    target: SocksTarget,
+) -> Result<RelayStats> {
+    let connect = match outbound.open_tcp(&target.host, target.port).await {
+        Ok(connect) => connect,
+        Err(err) => {
+            write_reply_and_shutdown(&mut local, SocksReply::GeneralFailure).await;
+            return Err(err);
+        }
+    };
+    write_reply(&mut local, SocksReply::Succeeded).await?;
+    relay_tcp_connect(local, connect).await
+}
+
+async fn relay_socks5_udp_associate(
+    local: TcpStream,
+    outbound: Arc<SnellClientOutbound>,
+    quic_proxy: bool,
+) -> Result<RelayStats> {
+    relay_socks5_udp_association(
+        local,
+        outbound.server_addr(),
+        outbound.secret(),
+        outbound.version(),
+        quic_proxy,
+    )
+    .await
 }
 
 pub(crate) async fn read_client_request<S>(stream: &mut S) -> Result<SocksRequest>
@@ -92,13 +105,18 @@ pub(crate) async fn write_reply_with_bind<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    let out = reply_bytes(reply, bind_addr)?;
+    stream.write_all(&out).await?;
+    Ok(())
+}
+
+fn reply_bytes(reply: SocksReply, bind_addr: SocketAddr) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(262);
     out.put_u8(SOCKS_VERSION);
     out.put_u8(reply as u8);
     out.put_u8(0);
     write_address(&mut out, AddressRef::Ip(bind_addr.ip()), bind_addr.port())?;
-    stream.write_all(&out).await?;
-    Ok(())
+    Ok(out)
 }
 
 async fn read_greeting<S>(stream: &mut S) -> Result<()>

@@ -186,6 +186,7 @@ fn benchmark_v6_frame_encode(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(BenchmarkId::new("first_frame", size), &size, |b, _| {
+            let profile = V6Profile::derive(PSK);
             b.iter_batched(
                 || {
                     (
@@ -197,7 +198,12 @@ fn benchmark_v6_frame_encode(c: &mut Criterion) {
                 |(mut encoder, mut head, mut body)| {
                     let payload_len = body.len();
                     let written = encoder
-                        .encode_payload_in_place(black_box(&mut body), payload_len, &mut head)
+                        .encode_payload_in_place(
+                            black_box(&profile),
+                            black_box(&mut body),
+                            payload_len,
+                            &mut head,
+                        )
                         .unwrap();
                     black_box(written);
                     black_box(head);
@@ -208,11 +214,12 @@ fn benchmark_v6_frame_encode(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("steady_frame", size), &size, |b, _| {
+            let profile = V6Profile::derive(PSK);
             let mut encoder = V6FrameEncoder::new(PSK).unwrap();
             let mut head = BytesMut::with_capacity(2048);
             let mut body = BytesMut::from(payload.as_slice());
             encoder
-                .encode_payload_in_place(&mut body, payload.len(), &mut head)
+                .encode_payload_in_place(&profile, &mut body, payload.len(), &mut head)
                 .unwrap();
 
             b.iter_batched(
@@ -221,7 +228,12 @@ fn benchmark_v6_frame_encode(c: &mut Criterion) {
                     head.clear();
                     let payload_len = body.len();
                     let written = encoder
-                        .encode_payload_in_place(black_box(&mut body), payload_len, &mut head)
+                        .encode_payload_in_place(
+                            black_box(&profile),
+                            black_box(&mut body),
+                            payload_len,
+                            &mut head,
+                        )
                         .unwrap();
                     black_box(written);
                     black_box(head.len() + body.len());
@@ -245,8 +257,7 @@ fn benchmark_v6_frame_decode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("first_frame", size), &size, |b, _| {
             b.iter_batched(
                 || {
-                    let decoder =
-                        V6FrameDecoder::new(PSK, first.salt, first.profile.clone()).unwrap();
+                    let decoder = V6FrameDecoder::new(PSK, first.salt).unwrap();
                     let prefix = first.prefix.clone();
                     let header = first.header;
                     let body = first.body.clone();
@@ -254,7 +265,9 @@ fn benchmark_v6_frame_decode(c: &mut Criterion) {
                 },
                 |(mut decoder, prefix, mut header, mut body)| {
                     let decoded = decoder.decode_header(&prefix, &mut header).unwrap();
-                    let payload = decoder.decode_payload_in_place(decoded, &mut body).unwrap();
+                    let payload = decoder
+                        .decode_payload_in_place(&first.profile, decoded, &mut body)
+                        .unwrap();
                     black_box(payload.len());
                 },
                 BatchSize::SmallInput,
@@ -264,15 +277,14 @@ fn benchmark_v6_frame_decode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("steady_frame", size), &size, |b, _| {
             b.iter_batched(
                 || {
-                    let mut decoder =
-                        V6FrameDecoder::new(PSK, steady.salt, steady.profile.clone()).unwrap();
+                    let mut decoder = V6FrameDecoder::new(PSK, steady.salt).unwrap();
                     let mut warm_header = steady.warmup.header;
                     let mut warm_body = steady.warmup.body.clone();
                     let warm_decoded = decoder
                         .decode_header(&steady.warmup.prefix, &mut warm_header)
                         .unwrap();
                     decoder
-                        .decode_payload_in_place(warm_decoded, &mut warm_body)
+                        .decode_payload_in_place(&steady.profile, warm_decoded, &mut warm_body)
                         .unwrap();
 
                     let prefix = steady.measured.prefix.clone();
@@ -282,7 +294,9 @@ fn benchmark_v6_frame_decode(c: &mut Criterion) {
                 },
                 |(mut decoder, prefix, mut header, mut body)| {
                     let decoded = decoder.decode_header(&prefix, &mut header).unwrap();
-                    let payload = decoder.decode_payload_in_place(decoded, &mut body).unwrap();
+                    let payload = decoder
+                        .decode_payload_in_place(&steady.profile, decoded, &mut body)
+                        .unwrap();
                     black_box(payload.len());
                 },
                 BatchSize::SmallInput,
@@ -358,6 +372,7 @@ fn steady_frame(payload: &[u8]) -> SteadyFrame {
 }
 
 fn encode_v6_frame_in_place(
+    profile: &V6Profile,
     encoder: &mut V6FrameEncoder,
     payload: &[u8],
     out: &mut BytesMut,
@@ -366,7 +381,7 @@ fn encode_v6_frame_in_place(
     let mut head = BytesMut::new();
     let mut body = BytesMut::from(payload);
     encoder
-        .encode_payload_in_place(&mut body, payload.len(), &mut head)
+        .encode_payload_in_place(profile, &mut body, payload.len(), &mut head)
         .unwrap();
     out.extend_from_slice(&head);
     out.extend_from_slice(&body);
@@ -374,11 +389,11 @@ fn encode_v6_frame_in_place(
 }
 
 fn v6_first_frame(payload: &[u8]) -> V6FrameParts {
+    let profile = V6Profile::derive(PSK);
     let mut encoder = V6FrameEncoder::new(PSK).unwrap();
     let mut wire = BytesMut::new();
-    encode_v6_frame_in_place(&mut encoder, payload, &mut wire);
+    encode_v6_frame_in_place(&profile, &mut encoder, payload, &mut wire);
 
-    let profile = V6Profile::derive(PSK);
     let (salt, frame) = split_v6_salt_block(&profile, &wire);
     let (prefix, header, body) = split_v6_frame(frame, profile.record_prefix_len(0));
     V6FrameParts {
@@ -395,13 +410,13 @@ fn v6_steady_frame(payload: &[u8]) -> V6SteadyFrame {
     let profile = V6Profile::derive(PSK);
 
     let mut warmup_wire = BytesMut::new();
-    encode_v6_frame_in_place(&mut encoder, payload, &mut warmup_wire);
+    encode_v6_frame_in_place(&profile, &mut encoder, payload, &mut warmup_wire);
     let (salt, warmup_frame) = split_v6_salt_block(&profile, &warmup_wire);
     let (warmup_prefix, warmup_header, warmup_body) =
         split_v6_frame(warmup_frame, profile.record_prefix_len(0));
 
     let mut measured_wire = BytesMut::new();
-    encode_v6_frame_in_place(&mut encoder, payload, &mut measured_wire);
+    encode_v6_frame_in_place(&profile, &mut encoder, payload, &mut measured_wire);
     let (measured_prefix, measured_header, measured_body) =
         split_v6_frame(&measured_wire, profile.record_prefix_len(1));
 

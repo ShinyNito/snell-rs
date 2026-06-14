@@ -8,12 +8,17 @@ use super::{
 use crate::error::Error;
 use crate::test_support::TEST_PSK;
 
-fn encode_test_frame(encoder: &mut V6FrameEncoder, payload: &[u8], wire: &mut BytesMut) -> usize {
+fn encode_test_frame(
+    profile: &V6Profile,
+    encoder: &mut V6FrameEncoder,
+    payload: &[u8],
+    wire: &mut BytesMut,
+) -> usize {
     let start_len = wire.len();
     let mut head = BytesMut::new();
     let mut body = BytesMut::from(payload);
     encoder
-        .encode_payload_in_place(&mut body, payload.len(), &mut head)
+        .encode_payload_in_place(profile, &mut body, payload.len(), &mut head)
         .unwrap();
     wire.extend_from_slice(&head);
     wire.extend_from_slice(&body);
@@ -215,25 +220,27 @@ fn encodes_and_decodes_payload_frame() {
     let psk = TEST_PSK;
     let salt = [3u8; 16];
     let payload = b"GET / HTTP/1.1\r\n\r\n";
+    let profile = V6Profile::derive(psk);
     let mut encoder = V6FrameEncoder::with_salt(psk, salt).unwrap();
     let mut wire = BytesMut::with_capacity(512);
 
-    let written = encode_test_frame(&mut encoder, payload, &mut wire);
+    let written = encode_test_frame(&profile, &mut encoder, payload, &mut wire);
     assert_eq!(written, wire.len());
 
-    let profile = V6Profile::derive(psk);
     let (decoded_salt, frame) = split_salt_block(&profile, &wire).unwrap();
     assert_eq!(decoded_salt, salt);
 
     let mut frame = BytesMut::from(frame);
-    let mut decoder = V6FrameDecoder::new(psk, decoded_salt, profile).unwrap();
-    let prefix_len = decoder.next_prefix_len();
+    let mut decoder = V6FrameDecoder::new(psk, decoded_salt).unwrap();
+    let prefix_len = decoder.next_prefix_len(&profile);
     let prefix = frame.split_to(prefix_len);
     let mut header_cipher = [0; V6_HEADER_CIPHER_SIZE];
     header_cipher.copy_from_slice(&frame[..V6_HEADER_CIPHER_SIZE]);
     let header = decoder.decode_header(&prefix, &mut header_cipher).unwrap();
     let mut body = frame.split_off(V6_HEADER_CIPHER_SIZE);
-    let decoded = decoder.decode_payload_in_place(header, &mut body).unwrap();
+    let decoded = decoder
+        .decode_payload_in_place(&profile, header, &mut body)
+        .unwrap();
 
     assert_eq!(decoded, payload);
     assert_eq!(encoder.seq(), 1);
@@ -244,15 +251,15 @@ fn encodes_and_decodes_payload_frame() {
 fn rejects_header_when_prefix_aad_changes() {
     let psk = TEST_PSK;
     let salt = [9u8; 16];
+    let profile = V6Profile::derive(psk);
     let mut encoder = V6FrameEncoder::with_salt(psk, salt).unwrap();
     let mut wire = BytesMut::new();
 
-    encode_test_frame(&mut encoder, b"hello", &mut wire);
-    let profile = V6Profile::derive(psk);
+    encode_test_frame(&profile, &mut encoder, b"hello", &mut wire);
     let (decoded_salt, frame) = split_salt_block(&profile, &wire).unwrap();
     let mut frame = BytesMut::from(frame);
-    let mut decoder = V6FrameDecoder::new(psk, decoded_salt, profile).unwrap();
-    let prefix_len = decoder.next_prefix_len();
+    let mut decoder = V6FrameDecoder::new(psk, decoded_salt).unwrap();
+    let prefix_len = decoder.next_prefix_len(&profile);
     let mut prefix = frame.split_to(prefix_len);
     prefix[0] ^= 0xff;
     let mut header_cipher = [0; V6_HEADER_CIPHER_SIZE];
@@ -268,15 +275,15 @@ fn rejects_header_when_prefix_aad_changes() {
 fn decodes_zero_payload_as_zero_chunk_even_with_padding() {
     let psk = TEST_PSK;
     let salt = [2u8; 16];
+    let profile = V6Profile::derive(psk);
     let mut encoder = V6FrameEncoder::with_salt(psk, salt).unwrap();
     let mut wire = BytesMut::new();
 
-    encode_test_frame(&mut encoder, b"", &mut wire);
-    let profile = V6Profile::derive(psk);
+    encode_test_frame(&profile, &mut encoder, b"", &mut wire);
     let (decoded_salt, frame) = split_salt_block(&profile, &wire).unwrap();
     let mut frame = BytesMut::from(frame);
-    let mut decoder = V6FrameDecoder::new(psk, decoded_salt, profile).unwrap();
-    let prefix_len = decoder.next_prefix_len();
+    let mut decoder = V6FrameDecoder::new(psk, decoded_salt).unwrap();
+    let prefix_len = decoder.next_prefix_len(&profile);
     let prefix = frame.split_to(prefix_len);
     let mut header_cipher = [0; V6_HEADER_CIPHER_SIZE];
     header_cipher.copy_from_slice(&frame[..V6_HEADER_CIPHER_SIZE]);
@@ -285,7 +292,7 @@ fn decodes_zero_payload_as_zero_chunk_even_with_padding() {
 
     assert!(header.padding_len > 0);
     assert!(matches!(
-        decoder.decode_payload_in_place(header, &mut body),
+        decoder.decode_payload_in_place(&profile, header, &mut body),
         Err(Error::ZeroChunk)
     ));
 }

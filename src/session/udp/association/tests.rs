@@ -13,15 +13,18 @@ use crate::protocol::socks5::{
     write_udp_packet as write_socks_udp_packet,
 };
 use crate::protocol::udp::{AddressRef, parse_udp_response};
+use crate::protocol::v6::V6SaltReplayCache;
 use crate::proxy::outbound::RelayOptions;
-use crate::proxy::snell::server::serve_server_connection;
+use crate::proxy::snell::server::{
+    SERVER_TCP_ACTIVITY_TIMEOUTS, open_tcp_target, serve_server_connection,
+};
 use crate::proxy::socks5::inbound::{
     read_client_request as read_socks_client_request, write_reply_with_bind,
 };
 use crate::session::udp::stream::UdpClientStream;
 use crate::test_support::{
-    TEST_PSK, TestUdpPacket, accept_udp_server_stream, test_duplex_pair, test_tcp_listener,
-    test_udp_socket, write_snell_udp_packet,
+    TEST_PSK, TestUdpPacket, accept_udp_server_stream, shared_secret, test_duplex_pair,
+    test_tcp_listener, test_udp_socket, write_snell_udp_packet,
 };
 
 fn direct_options(ipv6: bool) -> RelayOptions {
@@ -62,10 +65,11 @@ async fn udp_server_stream_relays_one_datagram_response() {
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let (mut reader, mut writer) = UdpClientStream::open_io(
             client_download,
             client_upload,
-            psk,
+            &secret,
             crate::ProtocolVersion::V4,
         )
         .await
@@ -132,10 +136,11 @@ async fn udp_stream_does_not_head_of_line_block_on_missing_response() {
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let (mut reader, mut writer) = UdpClientStream::open_io(
             client_download,
             client_upload,
-            psk,
+            &secret,
             crate::ProtocolVersion::V4,
         )
         .await
@@ -242,16 +247,24 @@ async fn udp_server_relays_datagram_via_upstream_socks5() {
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection(client, psk, socks5_options(false, socks_addr))
-            .await
-            .unwrap()
+        serve_server_connection(
+            client,
+            shared_secret(psk),
+            socks5_options(false, socks_addr),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
+        .unwrap()
     };
 
     let client = async {
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
+        let secret = shared_secret(psk);
         let (mut reader, mut writer) =
-            UdpClientStream::open_io(reader, writer, psk, crate::ProtocolVersion::V4)
+            UdpClientStream::open_io(reader, writer, &secret, crate::ProtocolVersion::V4)
                 .await
                 .unwrap()
                 .into_parts();
@@ -289,14 +302,29 @@ async fn udp_upstream_socks5_failure_returns_server_error_before_tunnel_success(
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection(client, psk, socks5_options(false, socks_addr)).await
+        serve_server_connection(
+            client,
+            shared_secret(psk),
+            socks5_options(false, socks_addr),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
     };
 
     let client = async {
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
+        let secret = shared_secret(psk);
         assert!(matches!(
-            UdpClientStream::open_io(reader, writer, psk, crate::ProtocolVersion::V4).await,
+            UdpClientStream::open_io(
+                reader,
+                writer,
+                &secret,
+                crate::ProtocolVersion::V4,
+            )
+            .await,
             Err(Error::Server { code: 1, message }) if message == "connect failed"
         ));
     };
@@ -329,16 +357,24 @@ async fn udp_upstream_socks5_control_close_ends_association() {
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection(client, psk, socks5_options(false, socks_addr))
-            .await
-            .unwrap()
+        serve_server_connection(
+            client,
+            shared_secret(psk),
+            socks5_options(false, socks_addr),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
+        .unwrap()
     };
 
     let client = async {
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
+        let secret = shared_secret(psk);
         let (mut reader, _) =
-            UdpClientStream::open_io(reader, writer, psk, crate::ProtocolVersion::V4)
+            UdpClientStream::open_io(reader, writer, &secret, crate::ProtocolVersion::V4)
                 .await
                 .unwrap()
                 .into_parts();
@@ -378,10 +414,11 @@ async fn udp_association_idle_timeout_sends_zero_chunk_to_client() {
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let (mut reader, _writer) = UdpClientStream::open_io(
             client_download,
             client_upload,
-            psk,
+            &secret,
             crate::ProtocolVersion::V4,
         )
         .await
@@ -429,10 +466,11 @@ async fn client_zero_chunk_ends_udp_association_without_waiting_for_idle() {
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let (_, mut writer) = UdpClientStream::open_io(
             client_download,
             client_upload,
-            psk,
+            &secret,
             crate::ProtocolVersion::V4,
         )
         .await
@@ -480,10 +518,11 @@ async fn udp_to_snell_stops_when_snell_writer_is_closed() {
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let (reader, mut writer) = UdpClientStream::open_io(
             client_download,
             client_upload,
-            psk,
+            &secret,
             crate::ProtocolVersion::V4,
         )
         .await
@@ -517,14 +556,23 @@ async fn udp_tcp_connection_rejects_ipv6_when_disabled() {
 
     let server = async {
         let (client, _) = listener.accept().await.unwrap();
-        serve_server_connection(client, psk, direct_options(false)).await
+        serve_server_connection(
+            client,
+            shared_secret(psk),
+            direct_options(false),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
     };
 
     let client = async {
         let stream = TcpStream::connect(server_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
+        let secret = shared_secret(psk);
         let (_, mut writer) =
-            UdpClientStream::open_io(reader, writer, psk, crate::ProtocolVersion::V4)
+            UdpClientStream::open_io(reader, writer, &secret, crate::ProtocolVersion::V4)
                 .await
                 .unwrap()
                 .into_parts();

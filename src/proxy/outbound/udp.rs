@@ -69,7 +69,7 @@ fn select_socks5_udp_relay_addr(
         .unwrap_or(first))
 }
 
-pub(crate) fn validate_proxy_udp_target(packet: UdpPacketRef<'_>, ipv6: bool) -> Result<()> {
+pub(crate) const fn validate_proxy_udp_target(packet: UdpPacketRef<'_>, ipv6: bool) -> Result<()> {
     if let AddressRef::Ip(ip) = packet.address
         && !ipv6
         && ip.is_ipv6()

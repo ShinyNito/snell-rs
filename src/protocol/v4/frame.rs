@@ -18,7 +18,7 @@ pub struct DecodedHeader {
 }
 
 impl DecodedHeader {
-    pub fn body_len(self) -> Result<usize> {
+    pub const fn body_len(self) -> Result<usize> {
         if self.payload_len == 0 {
             if self.padding_len != 0 {
                 return Err(Error::ZeroChunkWithPadding);
@@ -186,7 +186,7 @@ impl V4FrameEncoder {
         Ok(out.len() - start_len)
     }
 
-    fn next_padding_len(&self, payload_len: usize) -> usize {
+    const fn next_padding_len(&self, payload_len: usize) -> usize {
         if self.salt_sent || payload_len == 0 {
             0
         } else {

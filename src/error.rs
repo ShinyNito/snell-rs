@@ -71,6 +71,10 @@ pub enum Error {
     WriteClosed,
     #[error("short udp datagram write: sent {sent} of {expected} bytes")]
     ShortUdpWrite { sent: usize, expected: usize },
+    #[error("snell tcp server idle timed out")]
+    SnellServerTcpIdleTimeout,
+    #[error("snell tcp client idle timed out")]
+    SnellClientTcpIdleTimeout,
     #[error("{0} timed out")]
     Timeout(&'static str),
     #[error("dns resolution timed out")]
@@ -99,7 +103,7 @@ impl Error {
     }
 
     #[must_use]
-    pub fn is_invalid_udp_packet(&self) -> bool {
+    pub const fn is_invalid_udp_packet(&self) -> bool {
         matches!(
             self,
             Self::InvalidUdpPacket
@@ -110,7 +114,7 @@ impl Error {
     }
 
     #[must_use]
-    pub fn is_closed_io_kind(kind: std::io::ErrorKind) -> bool {
+    pub const fn is_closed_io_kind(kind: std::io::ErrorKind) -> bool {
         matches!(
             kind,
             ErrorKind::BrokenPipe

@@ -18,7 +18,9 @@ pub(crate) fn bind_tcp_listener(
         TcpSocket::new_v6()?
     };
     socket.set_reuseaddr(true)?;
-    try_set_tcp_fast_open(&socket, tcp_fast_open);
+    if tcp_fast_open {
+        try_enable_tcp_fast_open(&socket);
+    }
     socket.bind(listen_addr)?;
     socket.listen(SERVER_LISTEN_BACKLOG)
 }
@@ -36,11 +38,7 @@ pub(crate) fn bind_tcp_listener(
     target_os = "watchos",
     target_os = "visionos"
 ))]
-fn try_set_tcp_fast_open(socket: &TcpSocket, enabled: bool) {
-    if !enabled {
-        return;
-    }
-
+fn try_enable_tcp_fast_open(socket: &TcpSocket) {
     use std::mem::size_of_val;
     use std::os::fd::AsRawFd;
 
@@ -75,10 +73,8 @@ fn try_set_tcp_fast_open(socket: &TcpSocket, enabled: bool) {
     target_os = "watchos",
     target_os = "visionos"
 )))]
-fn try_set_tcp_fast_open(_socket: &TcpSocket, enabled: bool) {
-    if enabled {
-        tracing::warn!("snell tcp_fast_open is unsupported on this platform");
-    }
+fn try_enable_tcp_fast_open(_socket: &TcpSocket) {
+    tracing::warn!("snell tcp_fast_open is unsupported on this platform");
 }
 
 pub(crate) async fn drain_connection_tasks(mut tasks: JoinSet<()>, drain_timeout: Duration) {

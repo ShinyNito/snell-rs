@@ -1,9 +1,9 @@
 use std::future::poll_fn;
 use std::io::IoSlice;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::Result;
@@ -64,31 +64,70 @@ where
     .await
 }
 
-pub(super) async fn write_all_contiguous<W>(writer: &mut W, mut buffer: &[u8]) -> Result<()>
+pub(super) fn poll_write_all_vectored<W>(
+    writer: &mut W,
+    cx: &mut Context<'_>,
+    first: &mut BytesMut,
+    second: &mut BytesMut,
+) -> Poll<Result<()>>
 where
     W: AsyncWrite + Unpin,
 {
-    poll_fn(|cx| {
-        while !buffer.is_empty() {
-            let n = match Pin::new(&mut *writer).poll_write(cx, buffer) {
-                Poll::Ready(result) => result?,
-                Poll::Pending => return Poll::Pending,
-            };
+    while !first.is_empty() || !second.is_empty() {
+        let n = if first.is_empty() {
+            let bufs = [IoSlice::new(second)];
+            ready!(Pin::new(&mut *writer).poll_write_vectored(cx, &bufs))?
+        } else if second.is_empty() {
+            let bufs = [IoSlice::new(first)];
+            ready!(Pin::new(&mut *writer).poll_write_vectored(cx, &bufs))?
+        } else {
+            let bufs = [IoSlice::new(first), IoSlice::new(second)];
+            ready!(Pin::new(&mut *writer).poll_write_vectored(cx, &bufs))?
+        };
 
-            if n == 0 {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write snell frame batch",
-                )
-                .into()));
-            }
-
-            buffer = &buffer[n..];
+        if n == 0 {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write snell frame",
+            )
+            .into()));
         }
 
-        Poll::Ready(Ok(()))
-    })
-    .await
+        if n < first.len() {
+            first.advance(n);
+        } else {
+            let rest = n - first.len();
+            first.clear();
+            second.advance(rest.min(second.len()));
+        }
+    }
+
+    Poll::Ready(Ok(()))
+}
+
+pub(super) fn poll_write_all_contiguous<W>(
+    writer: &mut W,
+    cx: &mut Context<'_>,
+    buffer: &mut BytesMut,
+) -> Poll<Result<()>>
+where
+    W: AsyncWrite + Unpin,
+{
+    while !buffer.is_empty() {
+        let n = ready!(Pin::new(&mut *writer).poll_write(cx, buffer))?;
+
+        if n == 0 {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write snell frame batch",
+            )
+            .into()));
+        }
+
+        buffer.advance(n);
+    }
+
+    Poll::Ready(Ok(()))
 }
 
 /// Like `poll_read_into_spare`, but offers the reader the whole spare capacity

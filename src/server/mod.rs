@@ -7,6 +7,7 @@ use crate::config::{ServerConfig, TcpBrutalConfig};
 use crate::error::Result;
 use crate::net::dns::DnsResolver;
 use crate::net::tcp_brutal::validate_tcp_brutal_available;
+use crate::protocol::psk::SnellPsk;
 use crate::protocol::v6::V6SaltReplayCache;
 use crate::proxy::outbound::{RelayOptions, UpstreamRelay};
 use crate::server::shutdown::{SHUTDOWN_DRAIN_TIMEOUT, bind_tcp_listener};
@@ -38,8 +39,10 @@ pub async fn bind_configured_tcp_server_with_shutdown(
         .map(|addr| bind_tcp_listener(addr, config.tcp_fast_open))
         .collect::<std::io::Result<Vec<_>>>()?;
     validate_tcp_brutal_available(config.tcp_brutal).await?;
+    let secret = SnellPsk::new(config.psk);
+    let quic_psk = config.quic_proxy.then(|| secret.as_bytes().to_vec());
     let tcp_runtime = TcpServerRuntime {
-        psk: config.psk.to_vec(),
+        secret,
         options,
         tcp_brutal: config.tcp_brutal,
         v6_salt_replay_cache: V6SaltReplayCache::default(),
@@ -58,7 +61,7 @@ pub async fn bind_configured_tcp_server_with_shutdown(
     let udp_socket = UdpSocket::bind(listen_addr).await?;
     let udp = serve_quic_proxy_socket(
         udp_socket,
-        config.psk.to_vec(),
+        quic_psk.expect("quic_proxy psk is prepared when enabled"),
         tcp_runtime.options.clone(),
         QUIC_PROXY_SESSION_IDLE_TIMEOUT,
         shutdown.clone(),
@@ -84,7 +87,7 @@ pub async fn bind_configured_tcp_server_with_shutdown(
 
 #[derive(Clone)]
 pub(crate) struct TcpServerRuntime {
-    pub(in crate::server) psk: Vec<u8>,
+    pub(in crate::server) secret: SnellPsk,
     pub(in crate::server) options: RelayOptions,
     pub(in crate::server) tcp_brutal: Option<TcpBrutalConfig>,
     pub(in crate::server) v6_salt_replay_cache: V6SaltReplayCache,

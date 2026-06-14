@@ -1,4 +1,5 @@
 use core::range::Range;
+use std::io;
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -23,13 +24,16 @@ use crate::protocol::v4::frame::V4FrameEncoder;
 use crate::protocol::v6::V6SaltReplayCache;
 use crate::proxy::outbound::RelayOptions;
 use crate::proxy::snell::server::{
-    V6_ERROR_CONNECTION_REFUSED, serve_server_connection,
-    serve_server_connection_with_salt_replay_cache, serve_server_connection_with_target_opener,
+    SERVER_TCP_ACTIVITY_TIMEOUTS, V6_ERROR_CONNECTION_REFUSED, open_tcp_target,
+    serve_server_connection,
 };
 use crate::proxy::socks5::inbound::{read_client_request, write_reply_with_bind};
 use crate::server::shutdown::bind_tcp_listener;
-use crate::session::tcp::{TcpClientStream, TcpClientWriter};
-use crate::test_support::{TEST_PSK, test_tcp_listener, write_snell_payload_message};
+use crate::session::tcp::{TcpClientOpenOptions, TcpClientStream};
+use crate::test_support::{
+    TEST_PSK, read_snell_frame_payload, shared_secret, test_tcp_listener,
+    write_snell_payload_message,
+};
 
 fn direct_options(ipv6: bool) -> RelayOptions {
     RelayOptions::direct(ipv6, DnsResolver::system())
@@ -46,7 +50,7 @@ fn tcp_server_runtime(
     drain_timeout: Duration,
 ) -> TcpServerRuntime {
     TcpServerRuntime {
-        psk: psk.to_vec(),
+        secret: shared_secret(psk),
         options,
         tcp_brutal: None,
         v6_salt_replay_cache: V6SaltReplayCache::default(),
@@ -55,18 +59,20 @@ fn tcp_server_runtime(
     }
 }
 
-async fn write_client_payload<W>(
-    writer: &mut TcpClientWriter<W>,
-    payload: &[u8],
-) -> crate::error::Result<usize>
+async fn write_client_payload<W>(writer: &mut W, payload: &[u8]) -> io::Result<usize>
 where
     W: AsyncWrite + Unpin,
 {
-    let mut plain = payload;
-    Ok(writer
-        .write_payload_message_from_reader(&mut plain)
-        .await?
-        .unwrap_or(0))
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(payload.len())
+}
+
+async fn close_client_writer<W>(writer: &mut W) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.shutdown().await
 }
 
 async fn write_v4_test_frame_with_salt<W>(
@@ -90,13 +96,14 @@ where
 async fn assert_snell_ping(addr: std::net::SocketAddr, psk: &[u8], version: ProtocolVersion) {
     let stream = TcpStream::connect(addr).await.unwrap();
     let (snell_reader_io, snell_writer_io) = stream.into_split();
-    let mut writer = SnellStreamWriter::new(snell_writer_io, psk, version).unwrap();
+    let secret = shared_secret(psk);
+    let mut writer = SnellStreamWriter::new(snell_writer_io, &secret, version).unwrap();
     write_snell_payload_message(&mut writer, &[PROTOCOL_VERSION, COMMAND_PING])
         .await
         .unwrap();
-    let mut reader = SnellStreamReader::new(snell_reader_io, psk, version);
-    let payload = reader.read_frame_payload().await.unwrap();
-    assert_eq!(parse_server_reply(payload).unwrap(), ServerReply::Pong);
+    let mut reader = SnellStreamReader::new(snell_reader_io, &secret, version);
+    let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+    assert_eq!(parse_server_reply(&payload).unwrap(), ServerReply::Pong);
 }
 
 #[tokio::test]
@@ -118,44 +125,47 @@ async fn serve_server_connection_relays_to_connected_target() {
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection_with_target_opener(
+        serve_server_connection(
             client,
-            psk,
+            shared_secret(psk),
             direct_options(true),
+            V6SaltReplayCache::default(),
             move |target, _options| async move {
                 assert_eq!(target.host, "example.com");
                 assert_eq!(target.port, 443);
                 Ok(TcpStream::connect(echo_addr).await?)
             },
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
         )
         .await
         .unwrap()
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let snell = TcpClientStream::open_io(
             reader,
             writer,
-            psk,
-            "example.com",
-            443,
-            ProtocolVersion::V4,
-            false,
+            TcpClientOpenOptions {
+                secret: &secret,
+                host: "example.com",
+                port: 443,
+                version: ProtocolVersion::V4,
+                reuse: false,
+            },
         )
         .await
         .unwrap();
-        let (mut snell_reader, mut snell_writer) = snell.into_split();
+        let mut snell = snell;
 
-        write_client_payload(&mut snell_writer, b"ping")
-            .await
-            .unwrap();
-        snell_writer.close_write().await.unwrap();
+        write_client_payload(&mut snell, b"ping").await.unwrap();
+        close_client_writer(&mut snell).await.unwrap();
 
-        let payload = snell_reader.take_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(&payload[..], b"pong");
-        assert!(snell_reader.take_payload_chunk().await.unwrap().is_none());
+        let mut payload = Vec::new();
+        snell.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload, b"pong");
     };
 
     let ((), (), ()) = tokio::join!(server, client, echo);
@@ -180,44 +190,47 @@ async fn serve_server_connection_relays_v5_family_to_connected_target() {
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection_with_target_opener(
+        serve_server_connection(
             client,
-            psk,
+            shared_secret(psk),
             direct_options(true),
+            V6SaltReplayCache::default(),
             move |target, _options| async move {
                 assert_eq!(target.host, "v5.example.com");
                 assert_eq!(target.port, 443);
                 Ok(TcpStream::connect(echo_addr).await?)
             },
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
         )
         .await
         .unwrap()
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let snell = TcpClientStream::open_io(
             reader,
             writer,
-            psk,
-            "v5.example.com",
-            443,
-            ProtocolVersion::V5,
-            false,
+            TcpClientOpenOptions {
+                secret: &secret,
+                host: "v5.example.com",
+                port: 443,
+                version: ProtocolVersion::V5,
+                reuse: false,
+            },
         )
         .await
         .unwrap();
-        let (mut snell_reader, mut snell_writer) = snell.into_split();
+        let mut snell = snell;
 
-        write_client_payload(&mut snell_writer, b"v5 ping")
-            .await
-            .unwrap();
-        snell_writer.close_write().await.unwrap();
+        write_client_payload(&mut snell, b"v5 ping").await.unwrap();
+        close_client_writer(&mut snell).await.unwrap();
 
-        let payload = snell_reader.take_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(&payload[..], b"v5 pong");
-        assert!(snell_reader.take_payload_chunk().await.unwrap().is_none());
+        let mut payload = Vec::new();
+        snell.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload, b"v5 pong");
     };
 
     let ((), (), ()) = tokio::join!(server, client, echo);
@@ -242,44 +255,47 @@ async fn serve_server_connection_relays_v6_to_connected_target() {
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection_with_target_opener(
+        serve_server_connection(
             client,
-            psk,
+            shared_secret(psk),
             direct_options(true),
+            V6SaltReplayCache::default(),
             move |target, _options| async move {
                 assert_eq!(target.host, "v6.example.com");
                 assert_eq!(target.port, 443);
                 Ok(TcpStream::connect(echo_addr).await?)
             },
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
         )
         .await
         .unwrap()
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let snell = TcpClientStream::open_io(
             reader,
             writer,
-            psk,
-            "v6.example.com",
-            443,
-            ProtocolVersion::V6,
-            false,
+            TcpClientOpenOptions {
+                secret: &secret,
+                host: "v6.example.com",
+                port: 443,
+                version: ProtocolVersion::V6,
+                reuse: false,
+            },
         )
         .await
         .unwrap();
-        let (mut snell_reader, mut snell_writer) = snell.into_split();
+        let mut snell = snell;
 
-        write_client_payload(&mut snell_writer, b"v6 ping")
-            .await
-            .unwrap();
-        snell_writer.close_write().await.unwrap();
+        write_client_payload(&mut snell, b"v6 ping").await.unwrap();
+        close_client_writer(&mut snell).await.unwrap();
 
-        let payload = snell_reader.take_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(&payload[..], b"v6 pong");
-        assert!(snell_reader.take_payload_chunk().await.unwrap().is_none());
+        let mut payload = Vec::new();
+        snell.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload, b"v6 pong");
     };
 
     let ((), (), ()) = tokio::join!(server, client, echo);
@@ -295,22 +311,32 @@ async fn v4_family_detection_does_not_pollute_v6_replay_cache() {
 
     let server = async {
         let (first, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection_with_salt_replay_cache(
+        serve_server_connection(
             first,
-            psk,
+            shared_secret(psk),
             direct_options(false),
             cache.clone(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
         )
         .await
         .unwrap();
 
         let (second, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection_with_salt_replay_cache(second, psk, direct_options(false), cache)
-            .await
-            .unwrap();
+        serve_server_connection(
+            second,
+            shared_secret(psk),
+            direct_options(false),
+            cache,
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
+        .unwrap();
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, mut snell_writer_io) = stream.into_split();
         write_v4_test_frame_with_salt(
@@ -321,19 +347,20 @@ async fn v4_family_detection_does_not_pollute_v6_replay_cache() {
         )
         .await
         .unwrap();
-        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V4);
-        let payload = reader.read_frame_payload().await.unwrap();
-        assert_eq!(parse_server_reply(payload).unwrap(), ServerReply::Pong);
+        let mut reader = SnellStreamReader::new(snell_reader_io, &secret, ProtocolVersion::V4);
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+        assert_eq!(parse_server_reply(&payload).unwrap(), ServerReply::Pong);
 
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
-        let mut writer = SnellStreamWriter::new_with_v6_salt(snell_writer_io, psk, salt).unwrap();
+        let mut writer =
+            SnellStreamWriter::new_with_v6_salt(snell_writer_io, &secret, salt).unwrap();
         write_snell_payload_message(&mut writer, &[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
-        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
-        let payload = reader.read_frame_payload().await.unwrap();
-        assert_eq!(parse_server_reply(payload).unwrap(), ServerReply::Pong);
+        let mut reader = SnellStreamReader::new(snell_reader_io, &secret, ProtocolVersion::V6);
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+        assert_eq!(parse_server_reply(&payload).unwrap(), ServerReply::Pong);
     };
 
     let ((), ()) = tokio::join!(server, client);
@@ -347,23 +374,32 @@ async fn serve_server_connection_handles_v6_ping() {
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection(client, psk, direct_options(false))
-            .await
-            .unwrap()
+        serve_server_connection(
+            client,
+            shared_secret(psk),
+            direct_options(false),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
+        .unwrap()
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
         let mut snell_writer =
-            SnellStreamWriter::new(snell_writer_io, psk, ProtocolVersion::V6).unwrap();
+            SnellStreamWriter::new(snell_writer_io, &secret, ProtocolVersion::V6).unwrap();
         write_snell_payload_message(&mut snell_writer, &[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
 
-        let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
-        let payload = snell_reader.read_frame_payload().await.unwrap();
-        assert_eq!(parse_server_reply(payload).unwrap(), ServerReply::Pong);
+        let mut snell_reader =
+            SnellStreamReader::new(snell_reader_io, &secret, ProtocolVersion::V6);
+        let payload = read_snell_frame_payload(&mut snell_reader).await.unwrap();
+        assert_eq!(parse_server_reply(&payload).unwrap(), ServerReply::Pong);
     };
 
     let ((), ()) = tokio::join!(server, client);
@@ -379,22 +415,26 @@ async fn serve_server_connection_v6_rejects_replayed_client_salt() {
 
     let server = async {
         let (first, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection_with_salt_replay_cache(
+        serve_server_connection(
             first,
-            psk,
+            shared_secret(psk),
             direct_options(false),
             cache.clone(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
         )
         .await
         .unwrap();
 
         let (second, _) = snell_listener.accept().await.unwrap();
         assert!(matches!(
-            serve_server_connection_with_salt_replay_cache(
+            serve_server_connection(
                 second,
-                psk,
+                shared_secret(psk),
                 direct_options(false),
                 cache,
+                open_tcp_target,
+                SERVER_TCP_ACTIVITY_TIMEOUTS,
             )
             .await,
             Err(Error::SaltReplay)
@@ -402,24 +442,27 @@ async fn serve_server_connection_v6_rejects_replayed_client_salt() {
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
-        let mut writer = SnellStreamWriter::new_with_v6_salt(snell_writer_io, psk, salt).unwrap();
+        let mut writer =
+            SnellStreamWriter::new_with_v6_salt(snell_writer_io, &secret, salt).unwrap();
         write_snell_payload_message(&mut writer, &[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
-        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
-        let payload = reader.read_frame_payload().await.unwrap();
-        assert_eq!(parse_server_reply(payload).unwrap(), ServerReply::Pong);
+        let mut reader = SnellStreamReader::new(snell_reader_io, &secret, ProtocolVersion::V6);
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+        assert_eq!(parse_server_reply(&payload).unwrap(), ServerReply::Pong);
 
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
-        let mut writer = SnellStreamWriter::new_with_v6_salt(snell_writer_io, psk, salt).unwrap();
+        let mut writer =
+            SnellStreamWriter::new_with_v6_salt(snell_writer_io, &secret, salt).unwrap();
         write_snell_payload_message(&mut writer, &[PROTOCOL_VERSION, COMMAND_PING])
             .await
             .unwrap();
-        let mut reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
-        let err = reader.read_frame_payload().await.unwrap_err();
+        let mut reader = SnellStreamReader::new(snell_reader_io, &secret, ProtocolVersion::V6);
+        let err = read_snell_frame_payload(&mut reader).await.unwrap_err();
         assert!(err.is_closed_io(), "{err:?}");
     };
 
@@ -470,35 +513,43 @@ async fn serve_server_connection_relays_via_upstream_socks5() {
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection(client, psk, socks5_options(true, socks_addr))
-            .await
-            .unwrap()
+        serve_server_connection(
+            client,
+            shared_secret(psk),
+            socks5_options(true, socks_addr),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
+        .unwrap()
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let snell = TcpClientStream::open_io(
             reader,
             writer,
-            psk,
-            "example.com",
-            443,
-            ProtocolVersion::V4,
-            false,
+            TcpClientOpenOptions {
+                secret: &secret,
+                host: "example.com",
+                port: 443,
+                version: ProtocolVersion::V4,
+                reuse: false,
+            },
         )
         .await
         .unwrap();
-        let (mut snell_reader, mut snell_writer) = snell.into_split();
+        let mut snell = snell;
 
-        write_client_payload(&mut snell_writer, b"ping")
-            .await
-            .unwrap();
-        snell_writer.close_write().await.unwrap();
+        write_client_payload(&mut snell, b"ping").await.unwrap();
+        close_client_writer(&mut snell).await.unwrap();
 
-        let payload = snell_reader.take_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(&payload[..], b"pong");
-        assert!(snell_reader.take_payload_chunk().await.unwrap().is_none());
+        let mut payload = Vec::new();
+        snell.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload, b"pong");
     };
 
     let ((), (), (), ()) = tokio::join!(echo, socks, server, client);
@@ -527,31 +578,41 @@ async fn serve_server_connection_closes_when_upstream_socks5_rejects_after_fast_
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection(client, psk, socks5_options(true, socks_addr)).await
+        serve_server_connection(
+            client,
+            shared_secret(psk),
+            socks5_options(true, socks_addr),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let snell = TcpClientStream::open_io(
             reader,
             writer,
-            psk,
-            "example.com",
-            443,
-            ProtocolVersion::V4,
-            false,
+            TcpClientOpenOptions {
+                secret: &secret,
+                host: "example.com",
+                port: 443,
+                version: ProtocolVersion::V4,
+                reuse: false,
+            },
         )
         .await
         .unwrap();
-        let (mut snell_reader, _) = snell.into_split();
-        assert!(
-            timeout(Duration::from_secs(1), snell_reader.take_payload_chunk())
-                .await
-                .unwrap()
-                .unwrap()
-                .is_none()
-        );
+        let mut snell = snell;
+        let mut out = [0; 1];
+        let n = timeout(Duration::from_secs(1), snell.read(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0);
     };
 
     let ((), server_result, ()) = tokio::join!(socks, server, client);
@@ -579,10 +640,11 @@ async fn serve_server_connection_fast_open_accepts_before_target_connects() {
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
         let mut connect_rx = Some(connect_rx);
-        serve_server_connection_with_target_opener(
+        serve_server_connection(
             client,
-            psk,
+            shared_secret(psk),
             direct_options(true),
+            V6SaltReplayCache::default(),
             move |target, _options| {
                 let connect_rx = connect_rx.take().unwrap();
                 async move {
@@ -592,17 +654,20 @@ async fn serve_server_connection_fast_open_accepts_before_target_connects() {
                     Ok(TcpStream::connect(echo_addr).await?)
                 }
             },
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
         )
         .await
         .unwrap()
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
-        let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V4);
+        let mut snell_reader =
+            SnellStreamReader::new(snell_reader_io, &secret, ProtocolVersion::V4);
         let mut snell_writer =
-            SnellStreamWriter::new(snell_writer_io, psk, ProtocolVersion::V4).unwrap();
+            SnellStreamWriter::new(snell_writer_io, &secret, ProtocolVersion::V4).unwrap();
         snell_writer
             .write_tcp_request("example.com", 443, false)
             .await
@@ -610,13 +675,13 @@ async fn serve_server_connection_fast_open_accepts_before_target_connects() {
 
         let payload = timeout(
             Duration::from_millis(200),
-            snell_reader.read_frame_payload(),
+            read_snell_frame_payload(&mut snell_reader),
         )
         .await
         .unwrap()
         .unwrap();
         assert_eq!(
-            parse_server_reply(payload).unwrap(),
+            parse_server_reply(&payload).unwrap(),
             ServerReply::Tunnel {
                 payload_span: Range { start: 1, end: 1 },
                 payload: b"",
@@ -629,10 +694,10 @@ async fn serve_server_connection_fast_open_accepts_before_target_connects() {
         snell_writer.write_zero_chunk().await.unwrap();
         connect_tx.send(()).unwrap();
 
-        let payload = snell_reader.read_frame_payload().await.unwrap();
-        assert_eq!(payload, b"pong");
+        let payload = read_snell_frame_payload(&mut snell_reader).await.unwrap();
+        assert_eq!(&payload[..], b"pong");
         assert!(matches!(
-            snell_reader.read_frame_payload().await,
+            read_snell_frame_payload(&mut snell_reader).await,
             Err(Error::ZeroChunk)
         ));
     };
@@ -755,33 +820,34 @@ async fn serve_tcp_listener_with_shutdown_drains_active_connection() {
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let snell = TcpClientStream::open_io(
             reader,
             writer,
-            psk,
-            "127.0.0.1",
-            echo_addr.port(),
-            ProtocolVersion::V4,
-            false,
+            TcpClientOpenOptions {
+                secret: &secret,
+                host: "127.0.0.1",
+                port: echo_addr.port(),
+                version: ProtocolVersion::V4,
+                reuse: false,
+            },
         )
         .await
         .unwrap();
-        let (mut snell_reader, mut snell_writer) = snell.into_split();
+        let mut snell = snell;
 
-        write_client_payload(&mut snell_writer, b"ping")
-            .await
-            .unwrap();
-        snell_writer.close_write().await.unwrap();
+        write_client_payload(&mut snell, b"ping").await.unwrap();
+        close_client_writer(&mut snell).await.unwrap();
         echo_ready_rx.await.unwrap();
 
         shutdown.cancel();
         echo_continue_tx.send(()).unwrap();
 
-        let payload = snell_reader.take_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(&payload[..], b"pong");
-        assert!(snell_reader.take_payload_chunk().await.unwrap().is_none());
+        let mut payload = Vec::new();
+        snell.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload, b"pong");
     };
 
     let ((), ()) = tokio::join!(client, echo);
@@ -843,40 +909,46 @@ async fn serve_server_connection_closes_after_fast_open_connect_failure() {
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection_with_target_opener(
+        serve_server_connection(
             client,
-            psk,
+            shared_secret(psk),
             direct_options(true),
+            V6SaltReplayCache::default(),
             |_target, _options| async move {
                 Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     "test refusal",
                 )))
             },
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
         )
         .await
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
         let mut snell_writer =
-            SnellStreamWriter::new(snell_writer_io, psk, ProtocolVersion::V4).unwrap();
+            SnellStreamWriter::new(snell_writer_io, &secret, ProtocolVersion::V4).unwrap();
         snell_writer
             .write_tcp_request("blocked.example", 443, false)
             .await
             .unwrap();
 
-        let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V4);
-        let payload = snell_reader.read_frame_payload().await.unwrap();
+        let mut snell_reader =
+            SnellStreamReader::new(snell_reader_io, &secret, ProtocolVersion::V4);
+        let payload = read_snell_frame_payload(&mut snell_reader).await.unwrap();
         assert_eq!(
-            parse_server_reply(payload).unwrap(),
+            parse_server_reply(&payload).unwrap(),
             ServerReply::Tunnel {
                 payload_span: Range { start: 1, end: 1 },
                 payload: b"",
             }
         );
-        let err = snell_reader.read_frame_payload().await.unwrap_err();
+        let err = read_snell_frame_payload(&mut snell_reader)
+            .await
+            .unwrap_err();
         assert!(err.is_closed_io(), "{err:?}");
     };
 
@@ -892,34 +964,38 @@ async fn serve_server_connection_v6_returns_error_reply_on_connect_failure() {
 
     let server = async {
         let (client, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection_with_target_opener(
+        serve_server_connection(
             client,
-            psk,
+            shared_secret(psk),
             direct_options(true),
+            V6SaltReplayCache::default(),
             |_target, _options| async move {
                 Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     "test refusal",
                 )))
             },
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
         )
         .await
     };
 
     let client = async {
+        let secret = shared_secret(psk);
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (snell_reader_io, snell_writer_io) = stream.into_split();
         let mut snell_writer =
-            SnellStreamWriter::new(snell_writer_io, psk, ProtocolVersion::V6).unwrap();
+            SnellStreamWriter::new(snell_writer_io, &secret, ProtocolVersion::V6).unwrap();
         snell_writer
             .write_tcp_request("blocked.example", 443, false)
             .await
             .unwrap();
 
-        let mut snell_reader = SnellStreamReader::new(snell_reader_io, psk, ProtocolVersion::V6);
-        let payload = snell_reader.read_frame_payload().await.unwrap();
+        let mut snell_reader =
+            SnellStreamReader::new(snell_reader_io, &secret, ProtocolVersion::V6);
+        let payload = read_snell_frame_payload(&mut snell_reader).await.unwrap();
         assert_eq!(
-            parse_server_reply(payload).unwrap(),
+            parse_server_reply(&payload).unwrap(),
             ServerReply::Error {
                 code: V6_ERROR_CONNECTION_REFUSED,
                 message: "test refusal",

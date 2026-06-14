@@ -349,7 +349,7 @@ impl UdpResponseIpVersion {
         }
     }
 
-    fn matches(self, ip: std::net::IpAddr) -> bool {
+    const fn matches(self, ip: std::net::IpAddr) -> bool {
         matches!(
             (self, ip),
             (Self::V4, std::net::IpAddr::V4(_)) | (Self::V6, std::net::IpAddr::V6(_))

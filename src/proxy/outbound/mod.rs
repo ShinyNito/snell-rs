@@ -31,7 +31,7 @@ pub struct RelayOptions {
 
 impl RelayOptions {
     #[cfg(test)]
-    pub(crate) fn direct(ipv6: bool, resolver: DnsResolver) -> Self {
+    pub(crate) const fn direct(ipv6: bool, resolver: DnsResolver) -> Self {
         Self {
             ipv6,
             dns_ip_preference: DnsIpPreference::Default,
@@ -41,7 +41,7 @@ impl RelayOptions {
     }
 
     #[cfg(test)]
-    pub(crate) fn socks5(ipv6: bool, proxy_addr: SocketAddr, resolver: DnsResolver) -> Self {
+    pub(crate) const fn socks5(ipv6: bool, proxy_addr: SocketAddr, resolver: DnsResolver) -> Self {
         Self {
             ipv6,
             dns_ip_preference: DnsIpPreference::Default,

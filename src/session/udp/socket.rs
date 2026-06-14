@@ -65,7 +65,7 @@ pub(super) async fn resolve_udp_target(
     }
 }
 
-pub(super) fn relay_bind_ip(relay_addr: SocketAddr) -> IpAddr {
+pub(super) const fn relay_bind_ip(relay_addr: SocketAddr) -> IpAddr {
     if relay_addr.is_ipv4() {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {

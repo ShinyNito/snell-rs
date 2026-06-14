@@ -19,7 +19,7 @@ enum Socks5Command {
 }
 
 impl Socks5Command {
-    fn code(self) -> u8 {
+    const fn code(self) -> u8 {
         match self {
             Self::Connect => COMMAND_CONNECT,
             Self::UdpAssociate => COMMAND_UDP_ASSOCIATE,
@@ -128,7 +128,7 @@ where
     Ok(())
 }
 
-fn command_request_capacity(address: AddressRef<'_>) -> Result<usize> {
+const fn command_request_capacity(address: AddressRef<'_>) -> Result<usize> {
     const PREFIX_LEN: usize = 3;
     const ATYP_LEN: usize = 1;
     const PORT_LEN: usize = 2;

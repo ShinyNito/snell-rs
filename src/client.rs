@@ -3,11 +3,11 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroizing;
 
 use crate::ProtocolVersion;
 use crate::config::ClientConfig;
 use crate::error::Result;
+use crate::protocol::psk::SnellPsk;
 use crate::proxy::outbound::snell::SnellClientOutbound;
 use crate::proxy::socks5::inbound::relay_socks5_connection;
 use crate::server::shutdown::{SHUTDOWN_DRAIN_TIMEOUT, bind_tcp_listener, drain_connection_tasks};
@@ -17,10 +17,11 @@ pub async fn bind_configured_socks5_client_with_shutdown(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let listener = bind_tcp_listener(config.listen, false)?;
+    let secret = SnellPsk::new(config.psk);
     serve_socks5_listener(
         listener,
         config.server,
-        config.psk,
+        secret,
         config.reuse,
         config.version,
         config.quic_proxy,
@@ -32,7 +33,7 @@ pub async fn bind_configured_socks5_client_with_shutdown(
 async fn serve_socks5_listener(
     listener: TcpListener,
     server_addr: std::net::SocketAddr,
-    psk: Zeroizing<Vec<u8>>,
+    secret: SnellPsk,
     reuse: bool,
     version: ProtocolVersion,
     quic_proxy: bool,
@@ -40,7 +41,7 @@ async fn serve_socks5_listener(
 ) -> Result<()> {
     let outbound = Arc::new(SnellClientOutbound::new(
         server_addr,
-        psk.to_vec(),
+        secret,
         reuse,
         version,
     )?);

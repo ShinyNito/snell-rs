@@ -16,15 +16,18 @@ use crate::protocol::quic_proxy::decode_init_datagram;
 use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::protocol::socks5::{parse_udp_packet, write_udp_packet};
 use crate::protocol::udp::{AddressRef, parse_udp_request};
+use crate::protocol::v6::V6SaltReplayCache;
 use crate::protocol::version::DEFAULT_CLIENT_VERSION;
 use crate::proxy::outbound::RelayOptions;
 use crate::proxy::outbound::snell::SnellClientOutbound;
-use crate::proxy::snell::server::serve_server_connection;
+use crate::proxy::snell::server::{
+    SERVER_TCP_ACTIVITY_TIMEOUTS, open_tcp_target, serve_server_connection,
+};
 use crate::proxy::socks5::udp::is_allowed_socks_udp_peer;
 use crate::test_support::{
-    TEST_PSK, TestUdpPacket, accept_udp_server_stream, test_snell_reader, test_snell_writer,
-    test_tcp_listener, test_udp_socket, write_snell_payload_message,
-    write_snell_tunnel_reply_message, write_snell_udp_response,
+    TEST_PSK, TestUdpPacket, accept_udp_server_stream, read_snell_frame_payload, shared_secret,
+    test_snell_reader, test_snell_writer, test_tcp_listener, test_udp_socket,
+    write_snell_payload_message, write_snell_tunnel_reply_message, write_snell_udp_response,
 };
 
 fn direct_options(ipv6: bool) -> RelayOptions {
@@ -58,7 +61,7 @@ async fn relay_socks5_connection_with_options(
 ) -> Result<crate::proxy::outbound::RelayStats> {
     let outbound = Arc::new(SnellClientOutbound::new(
         server_addr,
-        psk.to_vec(),
+        shared_secret(psk),
         reuse,
         version,
     )?);
@@ -86,9 +89,16 @@ async fn socks5_connection_relays_tcp_over_snell() {
 
     let snell_server = async {
         let (stream, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection(stream, psk, direct_options(false))
-            .await
-            .unwrap()
+        serve_server_connection(
+            stream,
+            shared_secret(psk),
+            direct_options(false),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
+        .unwrap()
     };
 
     let socks_server = async {
@@ -139,8 +149,8 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
         let (stream, _) = snell_listener.accept().await.unwrap();
         let (server_read, server_write) = stream.into_split();
         let mut reader = test_snell_reader(server_read);
-        let payload = reader.read_frame_payload().await.unwrap();
-        let request = parse_client_request(payload).unwrap();
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+        let request = parse_client_request(&payload).unwrap();
         assert_eq!(
             request,
             ClientRequest::Connect {
@@ -152,8 +162,8 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
             }
         );
 
-        let payload = reader.read_frame_payload().await.unwrap();
-        assert_eq!(payload, request_payload);
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+        assert_eq!(&payload[..], request_payload);
 
         let mut server_writer = test_snell_writer(server_write);
         write_snell_tunnel_reply_message(&mut server_writer, response_payload)
@@ -266,9 +276,16 @@ async fn socks5_udp_associate_relays_datagram_over_snell() {
 
     let snell_server = async {
         let (stream, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection(stream, psk, direct_options(false))
-            .await
-            .unwrap();
+        serve_server_connection(
+            stream,
+            shared_secret(psk),
+            direct_options(false),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
+        .unwrap();
     };
 
     let socks_server = async {
@@ -369,7 +386,10 @@ async fn socks5_udp_associate_routes_pending_responses_by_udp_target() {
         .await
         .unwrap();
 
-        std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
+        std::assert_matches!(
+            read_snell_frame_payload(&mut reader).await,
+            Err(Error::ZeroChunk)
+        );
     };
 
     let socks_server = async {
@@ -633,7 +653,10 @@ async fn socks5_v5_non_quic_udp_falls_back_to_udp_over_tcp() {
         )
         .await
         .unwrap();
-        std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
+        std::assert_matches!(
+            read_snell_frame_payload(&mut reader).await,
+            Err(Error::ZeroChunk)
+        );
     };
 
     let socks_server = async {
@@ -719,7 +742,10 @@ async fn socks5_v4_udp_ignores_quic_proxy_flag() {
         )
         .await
         .unwrap();
-        std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
+        std::assert_matches!(
+            read_snell_frame_payload(&mut reader).await,
+            Err(Error::ZeroChunk)
+        );
     };
 
     let socks_server = async {
@@ -799,9 +825,16 @@ async fn socks5_udp_associate_allows_same_ip_different_udp_port() {
 
     let snell_server = async {
         let (stream, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection(stream, psk, direct_options(false))
-            .await
-            .unwrap();
+        serve_server_connection(
+            stream,
+            shared_secret(psk),
+            direct_options(false),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
+        .unwrap();
     };
 
     let socks_server = async {
@@ -912,9 +945,16 @@ async fn socks5_udp_associate_drops_invalid_datagrams_without_closing() {
 
     let snell_server = async {
         let (stream, _) = snell_listener.accept().await.unwrap();
-        serve_server_connection(stream, psk, direct_options(false))
-            .await
-            .unwrap();
+        serve_server_connection(
+            stream,
+            shared_secret(psk),
+            direct_options(false),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
+        .unwrap();
     };
 
     let socks_server = async {
@@ -1006,7 +1046,10 @@ async fn socks5_udp_associate_drops_invalid_snell_responses_without_closing() {
         .await
         .unwrap();
 
-        std::assert_matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk));
+        std::assert_matches!(
+            read_snell_frame_payload(&mut reader).await,
+            Err(Error::ZeroChunk)
+        );
     };
 
     let socks_server = async {

@@ -7,7 +7,7 @@ pub struct V6DecodedHeader {
 }
 
 impl V6DecodedHeader {
-    pub fn body_len(self) -> Result<usize> {
+    pub const fn body_len(self) -> Result<usize> {
         if self.padding_len > MAX_V6_RECORD_PAYLOAD_LEN
             || self.payload_len > MAX_V6_RECORD_PAYLOAD_LEN
         {
@@ -23,7 +23,6 @@ impl V6DecodedHeader {
 }
 
 pub struct V6FrameEncoder {
-    profile: V6Profile,
     crypto: Aes128GcmCrypto,
     nonce: Nonce12,
     salt: [u8; SALT_SIZE],
@@ -44,10 +43,8 @@ impl V6FrameEncoder {
     }
 
     fn from_salt(psk: &[u8], salt: [u8; SALT_SIZE]) -> Result<Self> {
-        let profile = V6Profile::derive(psk);
         let crypto = Aes128GcmCrypto::from_psk_and_salt(psk, &salt)?;
         Ok(Self {
-            profile,
             crypto,
             nonce: Nonce12::new(),
             salt,
@@ -60,20 +57,21 @@ impl V6FrameEncoder {
         &self.salt
     }
 
-    pub const fn profile(&self) -> &V6Profile {
-        &self.profile
-    }
-
     pub const fn seq(&self) -> u32 {
         self.seq
     }
 
-    pub fn encode_empty_frame(&mut self, head: &mut BytesMut) -> Result<usize> {
-        self.encode_payload_in_place(&mut BytesMut::new(), 0, head)
+    pub fn encode_empty_frame(
+        &mut self,
+        profile: &V6Profile,
+        head: &mut BytesMut,
+    ) -> Result<usize> {
+        self.encode_payload_in_place(profile, &mut BytesMut::new(), 0, head)
     }
 
     pub fn encode_payload_in_place(
         &mut self,
+        profile: &V6Profile,
         payload: &mut BytesMut,
         payload_len: usize,
         head: &mut BytesMut,
@@ -87,28 +85,24 @@ impl V6FrameEncoder {
 
         let start_len = head.len();
         let first_frame = !self.salt_sent;
-        let prefix_len = self.profile.record_prefix_len(self.seq);
-        let padding_len = self
-            .profile
-            .final_padding_len(self.seq, payload_len, first_frame);
+        let prefix_len = profile.record_prefix_len(self.seq);
+        let padding_len = profile.final_padding_len(self.seq, payload_len, first_frame);
         if padding_len > u16::MAX as usize || payload_len > u16::MAX as usize {
             return Err(Error::PayloadTooLarge);
         }
 
         head.reserve(
-            usize::from(first_frame) * self.profile.salt_block_len()
+            usize::from(first_frame) * profile.salt_block_len()
                 + prefix_len
                 + V6_HEADER_CIPHER_SIZE
                 + padding_len,
         );
         if first_frame {
-            self.profile.append_salt_block(&self.salt, head);
+            profile.append_salt_block(&self.salt, head);
             self.salt_sent = true;
         }
 
-        let prefix = self
-            .profile
-            .append_official_fill(self.seq, prefix_len, head);
+        let prefix = profile.append_official_fill(self.seq, prefix_len, head);
 
         let mut header = [0u8; V6_HEADER_PLAIN_SIZE];
         header[0] = 4;
@@ -123,9 +117,7 @@ impl V6FrameEncoder {
         head.extend_from_slice(&header);
         head.extend_from_slice(&header_tag);
 
-        let padding = self
-            .profile
-            .append_official_fill(self.seq, padding_len, head);
+        let padding = profile.append_official_fill(self.seq, padding_len, head);
         let padding = &mut head[padding];
 
         if payload_len > 0 {
@@ -136,7 +128,7 @@ impl V6FrameEncoder {
             )?;
             self.nonce.increment();
             payload.extend_from_slice(&payload_tag);
-            mix_padding_payload(&self.profile, self.seq, padding, payload);
+            mix_padding_payload(profile, self.seq, padding, payload);
         }
 
         self.seq = self.seq.wrapping_add(1);
@@ -145,6 +137,7 @@ impl V6FrameEncoder {
 
     pub fn encode_payload_parts_into(
         &mut self,
+        profile: &V6Profile,
         prefix_payload: &[u8],
         payload: &[u8],
         out: &mut BytesMut,
@@ -156,16 +149,14 @@ impl V6FrameEncoder {
 
         let start_len = out.len();
         let first_frame = !self.salt_sent;
-        let prefix_len = self.profile.record_prefix_len(self.seq);
-        let padding_len = self
-            .profile
-            .final_padding_len(self.seq, payload_len, first_frame);
+        let prefix_len = profile.record_prefix_len(self.seq);
+        let padding_len = profile.final_padding_len(self.seq, payload_len, first_frame);
         if padding_len > u16::MAX as usize || payload_len > u16::MAX as usize {
             return Err(Error::PayloadTooLarge);
         }
 
         out.reserve(
-            usize::from(first_frame) * self.profile.salt_block_len()
+            usize::from(first_frame) * profile.salt_block_len()
                 + prefix_len
                 + V6_HEADER_CIPHER_SIZE
                 + padding_len
@@ -173,11 +164,11 @@ impl V6FrameEncoder {
                 + usize::from(payload_len > 0) * AEAD_TAG_SIZE,
         );
         if first_frame {
-            self.profile.append_salt_block(&self.salt, out);
+            profile.append_salt_block(&self.salt, out);
             self.salt_sent = true;
         }
 
-        let prefix = self.profile.append_official_fill(self.seq, prefix_len, out);
+        let prefix = profile.append_official_fill(self.seq, prefix_len, out);
 
         let mut header = [0u8; V6_HEADER_PLAIN_SIZE];
         header[0] = 4;
@@ -192,9 +183,7 @@ impl V6FrameEncoder {
         out.extend_from_slice(&header);
         out.extend_from_slice(&header_tag);
 
-        let padding = self
-            .profile
-            .append_official_fill(self.seq, padding_len, out);
+        let padding = profile.append_official_fill(self.seq, padding_len, out);
         let payload_start = out.len();
         out.extend_from_slice(prefix_payload);
         out.extend_from_slice(payload);
@@ -214,7 +203,7 @@ impl V6FrameEncoder {
             let body = &mut out[padding.start..payload_end + AEAD_TAG_SIZE];
             let padding_len = padding.end - padding.start;
             let (padding, payload_cipher) = body.split_at_mut(padding_len);
-            mix_padding_payload(&self.profile, self.seq, padding, payload_cipher);
+            mix_padding_payload(profile, self.seq, padding, payload_cipher);
         }
 
         self.seq = self.seq.wrapping_add(1);
@@ -223,32 +212,26 @@ impl V6FrameEncoder {
 }
 
 pub struct V6FrameDecoder {
-    profile: V6Profile,
     crypto: Aes128GcmCrypto,
     nonce: Nonce12,
     seq: u32,
 }
 
 impl V6FrameDecoder {
-    pub fn new(psk: &[u8], salt: [u8; SALT_SIZE], profile: V6Profile) -> Result<Self> {
+    pub fn new(psk: &[u8], salt: [u8; SALT_SIZE]) -> Result<Self> {
         Ok(Self {
-            profile,
             crypto: Aes128GcmCrypto::from_psk_and_salt(psk, &salt)?,
             nonce: Nonce12::new(),
             seq: 0,
         })
     }
 
-    pub const fn profile(&self) -> &V6Profile {
-        &self.profile
-    }
-
     pub const fn seq(&self) -> u32 {
         self.seq
     }
 
-    pub fn next_prefix_len(&self) -> usize {
-        self.profile.record_prefix_len(self.seq)
+    pub fn next_prefix_len(&self, profile: &V6Profile) -> usize {
+        profile.record_prefix_len(self.seq)
     }
 
     pub fn decode_header(
@@ -279,6 +262,7 @@ impl V6FrameDecoder {
 
     pub fn decode_payload_in_place<'a>(
         &mut self,
+        profile: &V6Profile,
         header: V6DecodedHeader,
         body: &'a mut [u8],
     ) -> Result<&'a mut [u8]> {
@@ -293,7 +277,7 @@ impl V6FrameDecoder {
         }
 
         let (padding, payload_cipher_and_tag) = body.split_at_mut(header.padding_len);
-        mix_padding_payload(&self.profile, self.seq, padding, payload_cipher_and_tag);
+        mix_padding_payload(profile, self.seq, padding, payload_cipher_and_tag);
         let decrypt_result = self.crypto.decrypt_within_with_aad(
             self.nonce.as_bytes(),
             payload_cipher_and_tag,

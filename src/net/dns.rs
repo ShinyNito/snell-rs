@@ -41,14 +41,33 @@ impl DnsIpPreference {
     }
 
     pub(crate) fn select_addrs(self, addrs: &[SocketAddr], ipv6_enabled: bool) -> Vec<SocketAddr> {
-        if self == Self::Default {
-            return addrs
+        match self {
+            Self::Default => addrs
                 .iter()
                 .copied()
                 .filter(|addr| ipv6_enabled || addr.is_ipv4())
-                .collect();
+                .collect(),
+            Self::PreferIpv4 => {
+                let (mut v4, v6) = Self::partition_by_family(addrs, ipv6_enabled);
+                v4.extend(v6);
+                v4
+            }
+            Self::PreferIpv6 => {
+                let (v4, mut v6) = Self::partition_by_family(addrs, ipv6_enabled);
+                v6.extend(v4);
+                v6
+            }
+            Self::Ipv4Only => Self::partition_by_family(addrs, ipv6_enabled).0,
+            Self::Ipv6Only => Self::partition_by_family(addrs, ipv6_enabled).1,
         }
+    }
 
+    /// Splits addresses by family, dropping IPv6 entries when `ipv6_enabled` is
+    /// false. `Default` does not use this — it preserves resolver order.
+    fn partition_by_family(
+        addrs: &[SocketAddr],
+        ipv6_enabled: bool,
+    ) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
         for &addr in addrs {
@@ -58,20 +77,7 @@ impl DnsIpPreference {
                 IpAddr::V6(_) => {}
             }
         }
-
-        match self {
-            Self::Default => unreachable!("default returns before sorting"),
-            Self::PreferIpv4 => {
-                v4.extend(v6);
-                v4
-            }
-            Self::PreferIpv6 => {
-                v6.extend(v4);
-                v6
-            }
-            Self::Ipv4Only => v4,
-            Self::Ipv6Only => v6,
-        }
+        (v4, v6)
     }
 }
 
@@ -121,7 +127,7 @@ impl DnsResolver {
                 if let Some(resolver) = slot.get() {
                     return Ok(resolver.clone());
                 }
-                let resolver = Arc::new(build_system_resolver()?);
+                let resolver = Arc::new(build_tuned(Resolver::builder_tokio()?)?);
                 match slot.set(resolver.clone()) {
                     Ok(()) => Ok(resolver),
                     Err(_) => slot.get().cloned().ok_or(Error::DnsUnavailable),
@@ -138,10 +144,6 @@ impl std::fmt::Debug for DnsResolver {
             ResolverSource::Ready(_) => f.write_str("DnsResolver::Configured"),
         }
     }
-}
-
-fn build_system_resolver() -> std::result::Result<TokioResolver, NetError> {
-    build_tuned(Resolver::builder_tokio()?)
 }
 
 fn build_resolver_with_name_server(

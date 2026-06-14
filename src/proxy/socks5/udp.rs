@@ -11,6 +11,7 @@ use tokio::time::{Instant, sleep};
 use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::net::connect::connect_tcp;
+use crate::protocol::psk::SnellPsk;
 use crate::protocol::quic_proxy::{
     encode_init_datagram, is_quic_initial, is_quic_initial_packet, is_quic_looking,
     is_quic_short_header,
@@ -35,12 +36,12 @@ type ClientPeerByUdpTarget = HashMap<OwnedUdpTarget, SocketAddr>;
 pub(crate) async fn relay_socks5_udp_association(
     mut control: TcpStream,
     server_addr: SocketAddr,
-    psk: &[u8],
+    secret: SnellPsk,
     version: ProtocolVersion,
     quic_proxy: bool,
 ) -> Result<RelayStats> {
     if quic_proxy && version == ProtocolVersion::V5 {
-        return relay_socks5_udp_association_lazy_quic(control, server_addr, psk).await;
+        return relay_socks5_udp_association_lazy_quic(control, server_addr, secret).await;
     }
 
     let control_peer_ip = control.peer_addr()?.ip();
@@ -57,14 +58,14 @@ pub(crate) async fn relay_socks5_udp_association(
         }
     };
     let (snell_reader_io, snell_writer_io) = snell_tcp.into_split();
-    let snell = match UdpClientStream::open_io(snell_reader_io, snell_writer_io, psk, version).await
-    {
-        Ok(snell) => snell,
-        Err(err) => {
-            write_reply_and_shutdown(&mut control, SocksReply::GeneralFailure).await;
-            return Err(err);
-        }
-    };
+    let snell =
+        match UdpClientStream::open_io(snell_reader_io, snell_writer_io, &secret, version).await {
+            Ok(snell) => snell,
+            Err(err) => {
+                write_reply_and_shutdown(&mut control, SocksReply::GeneralFailure).await;
+                return Err(err);
+            }
+        };
 
     write_reply_with_bind(&mut control, SocksReply::Succeeded, udp_bind_addr).await?;
 
@@ -84,7 +85,7 @@ pub(crate) async fn relay_socks5_udp_association(
 async fn relay_socks5_udp_association_lazy_quic(
     mut control: TcpStream,
     server_addr: SocketAddr,
-    psk: &[u8],
+    secret: SnellPsk,
 ) -> Result<RelayStats> {
     let control_peer_ip = control.peer_addr()?.ip();
     let udp_socket = bind_socks5_udp_socket(control.local_addr()?).await?;
@@ -150,9 +151,13 @@ async fn relay_socks5_udp_association_lazy_quic(
         let snell_tcp = connect_tcp(server_addr).await?;
         snell_tcp.set_nodelay(true)?;
         let (snell_reader_io, snell_writer_io) = snell_tcp.into_split();
-        let snell =
-            UdpClientStream::open_io(snell_reader_io, snell_writer_io, psk, ProtocolVersion::V5)
-                .await?;
+        let snell = UdpClientStream::open_io(
+            snell_reader_io,
+            snell_writer_io,
+            &secret,
+            ProtocolVersion::V5,
+        )
+        .await?;
         let (mut snell_reader, mut snell_writer) = snell.into_parts();
         let mut socks_header = BytesMut::with_capacity(MAX_SOCKS_UDP_HEADER);
         let mut client_peer_by_target = ClientPeerByUdpTarget::new();
@@ -209,7 +214,7 @@ async fn relay_socks5_udp_association_lazy_quic(
         .first()
         .is_some_and(|first| is_quic_short_header(*first));
     encode_init_datagram(
-        psk,
+        secret.as_bytes(),
         target.quic_init_host(&mut quic_host_scratch),
         target.port,
         first_payload,
@@ -273,7 +278,7 @@ async fn relay_socks5_udp_association_lazy_quic(
                     .await?;
                 } else if !packet.payload.is_empty() {
                     encode_init_datagram(
-                        psk,
+                        secret.as_bytes(),
                         quic_init_host(packet.address, &mut quic_host_scratch),
                         packet.port,
                         packet.payload,

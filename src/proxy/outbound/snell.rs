@@ -4,19 +4,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use zeroize::Zeroizing;
 
 use crate::ProtocolVersion;
 use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::net::connect::connect_tcp;
+use crate::protocol::psk::SnellPsk;
 use crate::session::reuse::ReuseClientConn;
-use crate::session::tcp::TcpClientStream;
+use crate::session::tcp::{TcpClientOpenOptions, TcpClientStream};
 
 const REUSE_POOL_MAX_SIZE: usize = 10;
 const REUSE_POOL_MAX_IDLE_AGE: Duration = Duration::from_secs(15);
 
-type SharedPsk = Arc<Zeroizing<Vec<u8>>>;
 type FreshSnellTcp = TcpClientStream<OwnedReadHalf, OwnedWriteHalf>;
 pub(crate) type ReusedSnellTcp = ReuseClientConn<OwnedReadHalf, OwnedWriteHalf>;
 
@@ -30,7 +29,7 @@ pub(crate) enum SnellTcpConnect {
 
 pub(crate) struct SnellClientOutbound {
     server_addr: SocketAddr,
-    psk: SharedPsk,
+    secret: SnellPsk,
     version: ProtocolVersion,
     pool: Option<Arc<ReusePool>>,
 }
@@ -38,53 +37,58 @@ pub(crate) struct SnellClientOutbound {
 impl SnellClientOutbound {
     pub(crate) fn new(
         server_addr: SocketAddr,
-        psk: Vec<u8>,
+        secret: SnellPsk,
         reuse: bool,
         version: ProtocolVersion,
     ) -> Result<Self> {
-        let psk = Arc::new(Zeroizing::new(psk));
         let pool = if reuse {
-            Some(Arc::new(ReusePool::new(server_addr, psk.clone(), version)?))
+            Some(Arc::new(ReusePool::new(
+                server_addr,
+                secret.clone(),
+                version,
+            )?))
         } else {
             None
         };
         Ok(Self {
             server_addr,
-            psk,
+            secret,
             version,
             pool,
         })
     }
 
-    pub(crate) async fn open_tcp(&self, host: &str, port: u16) -> Result<SnellTcpConnect> {
-        match &self.pool {
-            Some(pool) => open_reuse_tcp_connect(host, port, pool.clone()).await,
-            None => open_tcp_connect(host, port, self.server_addr, self.psk(), self.version).await,
-        }
-    }
-
-    pub(crate) fn server_addr(&self) -> SocketAddr {
+    pub(crate) const fn server_addr(&self) -> SocketAddr {
         self.server_addr
     }
 
-    pub(crate) fn psk(&self) -> &[u8] {
-        self.psk.as_slice()
+    pub(crate) fn secret(&self) -> SnellPsk {
+        self.secret.clone()
     }
 
-    pub(crate) fn version(&self) -> ProtocolVersion {
+    pub(crate) const fn version(&self) -> ProtocolVersion {
         self.version
     }
 
     pub(crate) async fn close_idle_connections(&self) {
         if let Some(pool) = &self.pool {
-            pool.close_idle().await;
+            pool.close_idle();
+        }
+    }
+
+    pub(crate) async fn open_tcp(&self, host: &str, port: u16) -> Result<SnellTcpConnect> {
+        match &self.pool {
+            Some(pool) => open_reuse_tcp_connect(host, port, pool.clone()).await,
+            None => {
+                open_tcp_connect(host, port, self.server_addr, &self.secret, self.version).await
+            }
         }
     }
 }
 
 pub(crate) struct ReusePool {
     server_addr: SocketAddr,
-    psk: SharedPsk,
+    secret: SnellPsk,
     version: ProtocolVersion,
     max_size: usize,
     max_idle_age: Duration,
@@ -110,10 +114,10 @@ impl IdleReuseConn {
 }
 
 impl ReusePool {
-    fn new(server_addr: SocketAddr, psk: SharedPsk, version: ProtocolVersion) -> Result<Self> {
+    fn new(server_addr: SocketAddr, secret: SnellPsk, version: ProtocolVersion) -> Result<Self> {
         Self::with_limits(
             server_addr,
-            psk,
+            secret,
             version,
             REUSE_POOL_MAX_SIZE,
             REUSE_POOL_MAX_IDLE_AGE,
@@ -122,7 +126,7 @@ impl ReusePool {
 
     fn with_limits(
         server_addr: SocketAddr,
-        psk: SharedPsk,
+        secret: SnellPsk,
         version: ProtocolVersion,
         max_size: usize,
         max_idle_age: Duration,
@@ -135,7 +139,7 @@ impl ReusePool {
         }
         Ok(Self {
             server_addr,
-            psk,
+            secret,
             version,
             max_size,
             max_idle_age,
@@ -143,12 +147,12 @@ impl ReusePool {
         })
     }
 
-    pub(crate) async fn open(&self, host: &str, port: u16) -> Result<ReusedSnellTcp> {
-        if let Some(mut conn) = self.take().await {
+    async fn open(&self, host: &str, port: u16) -> Result<ReusedSnellTcp> {
+        if let Some(mut conn) = self.take() {
             match conn.start_request(host, port).await {
                 Ok(()) => return Ok(conn),
                 Err(err) if err.is_closed_io() => {
-                    conn.close_whole_connection().await;
+                    drop(conn);
                 }
                 Err(err) => return Err(err),
             }
@@ -163,40 +167,31 @@ impl ReusePool {
         let stream = connect_tcp(self.server_addr).await?;
         stream.set_nodelay(true)?;
         let (reader_io, writer_io) = stream.into_split();
-        let reader = SnellStreamReader::new(reader_io, self.psk.as_slice(), self.version);
-        let writer = SnellStreamWriter::new(writer_io, self.psk.as_slice(), self.version)?;
+        let reader = SnellStreamReader::new(reader_io, &self.secret, self.version);
+        let writer = SnellStreamWriter::new(writer_io, &self.secret, self.version)?;
         Ok(ReuseClientConn::from_parts(reader, writer))
     }
 
-    pub(crate) async fn put(&self, mut conn: ReusedSnellTcp) {
+    pub(crate) fn put(&self, mut conn: ReusedSnellTcp) {
         if !conn.can_reuse() {
-            conn.close_whole_connection().await;
             return;
         }
 
         conn.reset_request_state();
         conn.compact_buffers_for_reuse();
         let (close_conn, expired) = self.push_idle_pruning_expired(conn);
-        for conn in expired {
-            conn.close_whole_connection().await;
-        }
-        if let Some(conn) = close_conn {
-            conn.close_whole_connection().await;
-        }
+        drop(expired);
+        drop(close_conn);
     }
 
-    async fn take(&self) -> Option<ReusedSnellTcp> {
+    fn take(&self) -> Option<ReusedSnellTcp> {
         let (reusable, expired) = self.take_idle();
-        for conn in expired {
-            conn.close_whole_connection().await;
-        }
+        drop(expired);
         reusable
     }
 
-    pub(crate) async fn close_idle(&self) {
-        for conn in self.drain_idle() {
-            conn.close_whole_connection().await;
-        }
+    fn close_idle(&self) {
+        drop(self.drain_idle());
     }
 
     // The idle mutex only protects queue state. Connection I/O must happen after
@@ -209,8 +204,10 @@ impl ReusePool {
         let expired = self.drain_expired_front_locked(&mut idle);
         if idle.len() < self.max_size {
             idle.push_back(IdleReuseConn::new(conn));
+            drop(idle);
             (None, expired)
         } else {
+            drop(idle);
             (Some(conn), expired)
         }
     }
@@ -219,6 +216,7 @@ impl ReusePool {
         let mut idle = self.idle.lock().expect("reuse pool mutex poisoned");
         let expired = self.drain_expired_front_locked(&mut idle);
         let reusable = idle.pop_front().map(|idle_conn| idle_conn.conn);
+        drop(idle);
         (reusable, expired)
     }
 
@@ -241,21 +239,21 @@ impl ReusePool {
     }
 }
 
-pub(crate) async fn open_tcp_connect(
+async fn open_tcp_connect(
     host: &str,
     port: u16,
     server_addr: SocketAddr,
-    psk: &[u8],
+    secret: &SnellPsk,
     version: ProtocolVersion,
 ) -> Result<SnellTcpConnect> {
-    open_tcp_client_stream(server_addr, psk, host, port, version)
+    open_tcp_client_stream(server_addr, secret, host, port, version)
         .await
         .map(SnellTcpConnect::Fresh)
 }
 
 async fn open_tcp_client_stream(
     server_addr: SocketAddr,
-    psk: &[u8],
+    secret: &SnellPsk,
     host: &str,
     port: u16,
     version: ProtocolVersion,
@@ -263,10 +261,21 @@ async fn open_tcp_client_stream(
     let stream = connect_tcp(server_addr).await?;
     stream.set_nodelay(true)?;
     let (reader, writer) = stream.into_split();
-    TcpClientStream::open_io(reader, writer, psk, host, port, version, false).await
+    TcpClientStream::open_io(
+        reader,
+        writer,
+        TcpClientOpenOptions {
+            secret,
+            host,
+            port,
+            version,
+            reuse: false,
+        },
+    )
+    .await
 }
 
-pub(crate) async fn open_reuse_tcp_connect(
+async fn open_reuse_tcp_connect(
     host: &str,
     port: u16,
     pool: Arc<ReusePool>,

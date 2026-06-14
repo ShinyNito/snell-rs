@@ -1,6 +1,6 @@
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use core::range::Range;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io::{self, Cursor};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
@@ -26,7 +26,50 @@ use crate::protocol::udp::{
 };
 use crate::protocol::v4::frame::V4FrameEncoder;
 use crate::protocol::v6::{V6ChunkSizer, V6Profile, V6SaltReplayCache};
-use crate::test_support::{TEST_PSK, test_duplex_pair};
+use crate::test_support::{TEST_PSK, shared_secret, test_duplex_pair, test_secret};
+
+trait TestFrameReader {
+    fn poll_test_frame_payload<'a>(&'a mut self, cx: &mut Context<'_>) -> Poll<Result<&'a [u8]>>;
+}
+
+impl<R> TestFrameReader for V4StreamReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_test_frame_payload<'a>(&'a mut self, cx: &mut Context<'_>) -> Poll<Result<&'a [u8]>> {
+        self.poll_read_frame_payload(cx)
+    }
+}
+
+impl<R> TestFrameReader for V6StreamReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_test_frame_payload<'a>(&'a mut self, cx: &mut Context<'_>) -> Poll<Result<&'a [u8]>> {
+        self.poll_read_frame_payload(cx)
+    }
+}
+
+impl<R> TestFrameReader for SnellStreamReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_test_frame_payload<'a>(&'a mut self, cx: &mut Context<'_>) -> Poll<Result<&'a [u8]>> {
+        self.poll_read_frame_payload(cx)
+    }
+}
+
+async fn read_frame_payload<R>(reader: &mut R) -> Result<Bytes>
+where
+    R: TestFrameReader,
+{
+    poll_fn(|cx| match reader.poll_test_frame_payload(cx) {
+        Poll::Ready(Ok(payload)) => Poll::Ready(Ok(Bytes::copy_from_slice(payload))),
+        Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        Poll::Pending => Poll::Pending,
+    })
+    .await
+}
 
 #[test]
 fn record_sizer_applies_first_idle_and_continuous_limits() {
@@ -66,10 +109,11 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut plain = BytesMut::from(payload);
-    Ok(writer
-        .write_payload_message_from_buffer(&mut plain)
-        .await?
-        .unwrap_or(0))
+    Ok(
+        poll_fn(|cx| writer.poll_write_payload_message_from_buffer(&mut plain, cx))
+            .await?
+            .unwrap_or(0),
+    )
 }
 
 async fn write_v4_tunnel_reply_message<W>(
@@ -85,10 +129,11 @@ where
     }
 
     let mut plain = BytesMut::from(payload);
-    Ok(writer
-        .write_tunnel_reply_message_from_buffer(&mut plain)
-        .await?
-        .unwrap_or(0))
+    Ok(
+        poll_fn(|cx| writer.poll_write_tunnel_reply_message_from_buffer(&mut plain, cx))
+            .await?
+            .unwrap_or(0),
+    )
 }
 
 async fn write_snell_payload_message<W>(
@@ -118,10 +163,11 @@ where
     }
 
     let mut plain = BytesMut::from(payload);
-    Ok(writer
-        .write_tunnel_reply_message_from_buffer(&mut plain)
-        .await?
-        .unwrap_or(0))
+    Ok(
+        poll_fn(|cx| writer.poll_write_tunnel_reply_message_from_buffer(&mut plain, cx))
+            .await?
+            .unwrap_or(0),
+    )
 }
 
 async fn write_v4_udp_packet<W>(
@@ -141,7 +187,7 @@ where
         return Err(Error::PayloadTooLarge);
     }
     assert_eq!(
-        writer.write_payload_message_from_buffer(&mut plain).await?,
+        poll_fn(|cx| writer.poll_write_payload_message_from_buffer(&mut plain, cx)).await?,
         Some(message_len)
     );
     Ok(payload.len())
@@ -164,7 +210,7 @@ where
         return Err(Error::PayloadTooLarge);
     }
     assert_eq!(
-        writer.write_payload_message_from_buffer(&mut plain).await?,
+        poll_fn(|cx| writer.poll_write_payload_message_from_buffer(&mut plain, cx)).await?,
         Some(message_len)
     );
     Ok(payload.len())
@@ -187,7 +233,7 @@ where
         return Err(Error::PayloadTooLarge);
     }
     assert_eq!(
-        writer.write_payload_message_from_buffer(&mut plain).await?,
+        poll_fn(|cx| writer.poll_write_payload_message_from_buffer(&mut plain, cx)).await?,
         Some(message_len)
     );
     Ok(payload.len())
@@ -210,7 +256,7 @@ where
         return Err(Error::PayloadTooLarge);
     }
     assert_eq!(
-        writer.write_payload_message_from_buffer(&mut plain).await?,
+        poll_fn(|cx| writer.poll_write_payload_message_from_buffer(&mut plain, cx)).await?,
         Some(message_len)
     );
     Ok(payload.len())
@@ -256,11 +302,12 @@ async fn collect_v4_message_path_wire(payload: &[u8]) -> Vec<u8> {
         let encoder = V4FrameEncoder::with_salt_and_initial_padding(TEST_PSK, SALT, 0).unwrap();
         let mut writer = V4StreamWriter::from_parts(client, encoder);
         let mut plain = BytesMut::from(payload);
-        writer
-            .write_payload_message_from_buffer(&mut plain)
+        poll_fn(|cx| writer.poll_write_payload_message_from_buffer(&mut plain, cx))
             .await
             .unwrap();
-        writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     })
     .await
 }
@@ -268,26 +315,27 @@ async fn collect_v4_message_path_wire(payload: &[u8]) -> Vec<u8> {
 fn collect_v6_reference_wire(payload: &[u8]) -> Vec<u8> {
     const SALT: [u8; 16] = [0x46; 16];
 
+    let profile = V6Profile::derive(TEST_PSK);
     let mut encoder = crate::protocol::v6::V6FrameEncoder::with_salt(TEST_PSK, SALT).unwrap();
-    let mut chunk_sizer = V6ChunkSizer::new(encoder.profile().clone());
+    let mut chunk_sizer = V6ChunkSizer::new();
     let mut plain = payload;
     let mut wire = BytesMut::new();
     while !plain.is_empty() {
         let now = Instant::now();
-        let limit = chunk_sizer.peek_limit(encoder.seq(), now);
+        let limit = chunk_sizer.peek_limit(&profile, encoder.seq(), now);
         let chunk_len = plain.len().min(limit);
         let mut head = BytesMut::new();
         let mut body = BytesMut::from(&plain[..chunk_len]);
         encoder
-            .encode_payload_in_place(&mut body, chunk_len, &mut head)
+            .encode_payload_in_place(&profile, &mut body, chunk_len, &mut head)
             .unwrap();
         wire.extend_from_slice(&head);
         wire.extend_from_slice(&body);
-        chunk_sizer.commit_record(now);
+        chunk_sizer.commit_record(&profile, now);
         plain = &plain[chunk_len..];
     }
     let mut head = BytesMut::new();
-    encoder.encode_empty_frame(&mut head).unwrap();
+    encoder.encode_empty_frame(&profile, &mut head).unwrap();
     wire.extend_from_slice(&head);
     wire.to_vec()
 }
@@ -296,7 +344,8 @@ async fn collect_v6_message_path_wire(payload: &[u8]) -> Vec<u8> {
     const SALT: [u8; 16] = [0x46; 16];
 
     collect_wire(|client| async move {
-        let mut writer = SnellStreamWriter::new_with_v6_salt(client, TEST_PSK, SALT).unwrap();
+        let secret = test_secret();
+        let mut writer = SnellStreamWriter::new_with_v6_salt(client, &secret, SALT).unwrap();
         let mut plain = BytesMut::from(payload);
         writer
             .write_payload_message_from_buffer(&mut plain)
@@ -408,19 +457,18 @@ async fn message_writer_uses_current_record_limit() {
     writer.record_sizer.last_record_at =
         Some(Instant::now() - TCP_RECORD_IDLE_TIMEOUT - Duration::from_millis(1));
     let mut plain = BytesMut::from(vec![0x51; continuous].as_slice());
+    let secret = shared_secret(PSK);
 
     let write = async {
-        let n = writer
-            .write_payload_message_from_buffer(&mut plain)
+        let n = poll_fn(|cx| writer.poll_write_payload_message_from_buffer(&mut plain, cx))
             .await
             .unwrap();
-
         assert_eq!(n, Some(continuous));
         assert!(plain.is_empty());
     };
     let read = async {
-        let mut reader = V4StreamReader::new(server, PSK);
-        assert_eq!(reader.read_frame_payload().await.unwrap().len(), steady);
+        let mut reader = V4StreamReader::new(server, &secret);
+        assert_eq!(read_frame_payload(&mut reader).await.unwrap().len(), steady);
     };
 
     let ((), ()) = tokio::join!(write, read);
@@ -436,8 +484,7 @@ async fn message_writer_uses_one_write_for_multiple_records() {
         V4StreamWriter::from_parts(RecordingWriteSink::new(v4_writes.clone()), encoder);
     let mut v4_plain = BytesMut::from(payload.as_slice());
     assert_eq!(
-        v4_writer
-            .write_payload_message_from_buffer(&mut v4_plain)
+        poll_fn(|cx| v4_writer.poll_write_payload_message_from_buffer(&mut v4_plain, cx))
             .await
             .unwrap(),
         Some(payload.len())
@@ -446,16 +493,16 @@ async fn message_writer_uses_one_write_for_multiple_records() {
     assert_eq!(v4_writes.lock().unwrap().len(), 1);
 
     let v6_writes = Arc::new(Mutex::new(Vec::new()));
+    let secret = test_secret();
     let mut v6_writer = V6StreamWriter::new_with_salt(
         RecordingWriteSink::new(v6_writes.clone()),
-        TEST_PSK,
+        &secret,
         [0x46; 16],
     )
     .unwrap();
     let mut v6_plain = BytesMut::from(payload.as_slice());
     assert_eq!(
-        v6_writer
-            .write_payload_message_from_buffer(&mut v6_plain)
+        poll_fn(|cx| v6_writer.poll_write_payload_message_from_buffer(&mut v6_plain, cx))
             .await
             .unwrap(),
         Some(payload.len())
@@ -467,8 +514,9 @@ async fn message_writer_uses_one_write_for_multiple_records() {
 #[test]
 fn stream_buffers_start_with_small_capacity() {
     let psk = TEST_PSK;
-    let reader = V4StreamReader::new(tokio::io::empty(), psk);
-    let writer = V4StreamWriter::new(sink(), psk).unwrap();
+    let secret = shared_secret(psk);
+    let reader = V4StreamReader::new(tokio::io::empty(), &secret);
+    let writer = V4StreamWriter::new(sink(), &secret).unwrap();
 
     assert_eq!(reader.body.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
     assert_eq!(writer.payload.capacity(), STREAM_BUFFER_INITIAL_CAPACITY);
@@ -486,9 +534,10 @@ async fn stream_reader_uses_large_read_ahead_window() {
 
     let observed = Arc::new(Mutex::new(Vec::new()));
     let source = RecordingReadWindow::new(wire, observed.clone());
-    let mut reader = V4StreamReader::new(source, PSK);
+    let secret = shared_secret(PSK);
+    let mut reader = V4StreamReader::new(source, &secret);
 
-    assert_eq!(reader.read_frame_payload().await.unwrap(), b"tiny");
+    assert_eq!(&read_frame_payload(&mut reader).await.unwrap()[..], b"tiny");
     assert!(
         observed
             .lock()
@@ -501,16 +550,17 @@ async fn stream_reader_uses_large_read_ahead_window() {
 #[tokio::test]
 async fn compact_for_reuse_retains_bounded_stream_buffers() {
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let large_payload = vec![0x51; 4096];
     let (writer_io, reader_io) = duplex(8192);
-    let mut writer = V4StreamWriter::new(writer_io, psk).unwrap();
-    let mut reader = V4StreamReader::new(reader_io, psk);
+    let mut writer = V4StreamWriter::new(writer_io, &secret).unwrap();
+    let mut reader = V4StreamReader::new(reader_io, &secret);
 
     let read = async {
         let mut received = BytesMut::new();
         while received.len() < large_payload.len() {
-            let payload = reader.read_frame_payload().await.unwrap();
-            received.extend_from_slice(payload);
+            let payload = read_frame_payload(&mut reader).await.unwrap();
+            received.extend_from_slice(&payload);
         }
         assert_eq!(received.len(), large_payload.len());
         assert!(reader.body.capacity() > STREAM_BUFFER_INITIAL_CAPACITY);
@@ -519,8 +569,7 @@ async fn compact_for_reuse_retains_bounded_stream_buffers() {
     };
     let write = async {
         let mut plain = BytesMut::from(&large_payload[..]);
-        let written = writer
-            .write_payload_message_from_buffer(&mut plain)
+        let written = poll_fn(|cx| writer.poll_write_payload_message_from_buffer(&mut plain, cx))
             .await
             .unwrap();
         assert_eq!(written, Some(large_payload.len()));
@@ -537,8 +586,9 @@ async fn compact_for_reuse_retains_bounded_stream_buffers() {
 #[test]
 fn compact_for_reuse_resets_oversized_stream_buffers() {
     let psk = TEST_PSK;
-    let mut reader = V4StreamReader::new(tokio::io::empty(), psk);
-    let mut writer = V4StreamWriter::new(sink(), psk).unwrap();
+    let secret = shared_secret(psk);
+    let mut reader = V4StreamReader::new(tokio::io::empty(), &secret);
+    let mut writer = V4StreamWriter::new(sink(), &secret).unwrap();
 
     reader.body.reserve(STREAM_BUFFER_RETAIN_CAPACITY + 1);
     writer.payload.reserve(STREAM_BUFFER_RETAIN_CAPACITY + 1);
@@ -555,8 +605,9 @@ fn compact_for_reuse_resets_oversized_stream_buffers() {
 #[test]
 fn compact_for_reuse_does_not_copy_buffered_reader_bytes() {
     let psk = TEST_PSK;
-    let mut v4_reader = V4StreamReader::new(tokio::io::empty(), psk);
-    let mut v6_reader = V6StreamReader::new(tokio::io::empty(), psk);
+    let secret = shared_secret(psk);
+    let mut v4_reader = V4StreamReader::new(tokio::io::empty(), &secret);
+    let mut v6_reader = V6StreamReader::new(tokio::io::empty(), &secret);
 
     v4_reader.body.extend_from_slice(b"prefetched-v4");
     v4_reader.body.reserve(STREAM_BUFFER_RETAIN_CAPACITY + 1);
@@ -586,13 +637,14 @@ async fn tunnel_reply_from_buffer_counts_prefix_in_first_record_limit() {
     let first_limit = TCP_RECORD_MSS - TCP_FIRST_RECORD_OVERHEAD - initial_padding_len;
     let payload = vec![0x51; first_limit + 10];
     let (server, client) = test_duplex_pair();
+    let secret = shared_secret(PSK);
 
     let read = async {
-        let mut reader = V4StreamReader::new(client, PSK);
-        let frame = reader.read_frame_payload().await.unwrap();
+        let mut reader = V4StreamReader::new(client, &secret);
+        let frame = read_frame_payload(&mut reader).await.unwrap();
         assert_eq!(frame.len(), first_limit);
 
-        let reply = parse_server_reply(frame).unwrap();
+        let reply = parse_server_reply(&frame).unwrap();
         assert_eq!(
             reply,
             ServerReply::Tunnel {
@@ -609,8 +661,7 @@ async fn tunnel_reply_from_buffer_counts_prefix_in_first_record_limit() {
             V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, initial_padding_len).unwrap();
         let mut writer = V4StreamWriter::from_parts(server, encoder);
         let mut plain = BytesMut::from(&payload[..]);
-        let n = writer
-            .write_tunnel_reply_message_from_buffer(&mut plain)
+        let n = poll_fn(|cx| writer.poll_write_tunnel_reply_message_from_buffer(&mut plain, cx))
             .await
             .unwrap();
         assert_eq!(n, Some(payload.len()));
@@ -626,10 +677,11 @@ async fn control_frames_advance_record_sizer() {
     let first_limit = TCP_RECORD_MSS - TCP_FIRST_RECORD_OVERHEAD - initial_padding_len;
 
     let mut writer = writer_with_initial_padding(initial_padding_len);
-    writer
-        .write_tcp_request("example.com", 443, crate::ProtocolVersion::V4, false)
-        .await
-        .unwrap();
+    poll_fn(|cx| {
+        writer.poll_write_tcp_request("example.com", 443, crate::ProtocolVersion::V4, false, cx)
+    })
+    .await
+    .unwrap();
     assert_first_record_sized(&writer, first_limit);
 
     let mut writer = writer_with_initial_padding(initial_padding_len);
@@ -684,16 +736,17 @@ async fn datagram_frames_advance_record_sizer() {
 async fn transfers_frames_without_spawn_or_channel() {
     let (client, server) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = b"hello over tokio";
 
     let read = async {
-        let mut reader = V4StreamReader::new(server, psk);
-        let out = reader.read_frame_payload().await.unwrap();
-        assert_eq!(out, payload);
+        let mut reader = V4StreamReader::new(server, &secret);
+        let out = read_frame_payload(&mut reader).await.unwrap();
+        assert_eq!(&out[..], payload);
         out.len()
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(client, psk).unwrap();
+        let mut writer = V4StreamWriter::new(client, &secret).unwrap();
         write_payload(&mut writer, payload).await
     };
 
@@ -706,12 +759,13 @@ async fn transfers_frames_without_spawn_or_channel() {
 async fn snell_stream_v6_reads_tcp_request_and_payload_frames() {
     let (client, server) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = b"hello over snell v6";
 
     let read = async {
-        let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
-        let request_payload = reader.read_frame_payload().await.unwrap();
-        let request = parse_client_request(request_payload).unwrap();
+        let mut reader = SnellStreamReader::new(server, &secret, crate::ProtocolVersion::V6);
+        let request_payload = read_frame_payload(&mut reader).await.unwrap();
+        let request = parse_client_request(&request_payload).unwrap();
         assert_eq!(
             request,
             ClientRequest::Connect {
@@ -723,11 +777,12 @@ async fn snell_stream_v6_reads_tcp_request_and_payload_frames() {
             }
         );
 
-        let out = reader.read_frame_payload().await.unwrap();
-        assert_eq!(out, payload);
+        let out = read_frame_payload(&mut reader).await.unwrap();
+        assert_eq!(&out[..], payload);
     };
     let write = async {
-        let mut writer = SnellStreamWriter::new(client, psk, crate::ProtocolVersion::V6).unwrap();
+        let mut writer =
+            SnellStreamWriter::new(client, &secret, crate::ProtocolVersion::V6).unwrap();
         writer
             .write_tcp_request("example.com", 443, false)
             .await
@@ -744,12 +799,13 @@ async fn snell_stream_v6_reads_tcp_request_and_payload_frames() {
 async fn snell_stream_v6_reads_tunnel_reply_tail_and_zero_chunk() {
     let (server, client) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = b"first v6 bytes";
 
     let read = async {
-        let mut reader = SnellStreamReader::new(client, psk, crate::ProtocolVersion::V6);
-        let frame_payload = reader.read_frame_payload().await.unwrap();
-        let payload_start = match parse_server_reply(frame_payload).unwrap() {
+        let mut reader = SnellStreamReader::new(client, &secret, crate::ProtocolVersion::V6);
+        let frame_payload = read_frame_payload(&mut reader).await.unwrap();
+        let payload_start = match parse_server_reply(&frame_payload).unwrap() {
             ServerReply::Tunnel { payload_span, .. } => {
                 assert_eq!(
                     payload_span,
@@ -765,12 +821,13 @@ async fn snell_stream_v6_reads_tunnel_reply_tail_and_zero_chunk() {
         let pending = reader.take_payload_from(payload_start);
         assert_eq!(&pending[..], payload);
         assert!(matches!(
-            reader.read_frame_payload().await,
+            read_frame_payload(&mut reader).await,
             Err(Error::ZeroChunk)
         ));
     };
     let write = async {
-        let mut writer = SnellStreamWriter::new(server, psk, crate::ProtocolVersion::V6).unwrap();
+        let mut writer =
+            SnellStreamWriter::new(server, &secret, crate::ProtocolVersion::V6).unwrap();
         write_snell_tunnel_reply_message(&mut writer, payload)
             .await
             .unwrap();
@@ -783,17 +840,21 @@ async fn snell_stream_v6_reads_tunnel_reply_tail_and_zero_chunk() {
 #[tokio::test]
 async fn v6_reader_rejects_replayed_salt_from_shared_cache() {
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let salt = [0x77; 16];
     let cache = V6SaltReplayCache::new(16);
 
     let (first_client, first_server) = test_duplex_pair();
     let first_read = async {
         let mut reader =
-            V6StreamReader::with_salt_replay_cache(first_server, psk, Some(cache.clone()));
-        assert_eq!(reader.read_frame_payload().await.unwrap(), b"first");
+            V6StreamReader::with_salt_replay_cache(first_server, &secret, Some(cache.clone()));
+        assert_eq!(
+            &read_frame_payload(&mut reader).await.unwrap()[..],
+            b"first"
+        );
     };
     let first_write = async {
-        let mut writer = SnellStreamWriter::new_with_v6_salt(first_client, psk, salt).unwrap();
+        let mut writer = SnellStreamWriter::new_with_v6_salt(first_client, &secret, salt).unwrap();
         write_snell_payload_message(&mut writer, b"first")
             .await
             .unwrap();
@@ -802,14 +863,15 @@ async fn v6_reader_rejects_replayed_salt_from_shared_cache() {
 
     let (second_client, second_server) = test_duplex_pair();
     let second_read = async {
-        let mut reader = V6StreamReader::with_salt_replay_cache(second_server, psk, Some(cache));
+        let mut reader =
+            V6StreamReader::with_salt_replay_cache(second_server, &secret, Some(cache));
         assert!(matches!(
-            reader.read_frame_payload().await,
+            read_frame_payload(&mut reader).await,
             Err(Error::SaltReplay)
         ));
     };
     let second_write = async {
-        let mut writer = SnellStreamWriter::new_with_v6_salt(second_client, psk, salt).unwrap();
+        let mut writer = SnellStreamWriter::new_with_v6_salt(second_client, &secret, salt).unwrap();
         write_snell_payload_message(&mut writer, b"second")
             .await
             .unwrap();
@@ -821,17 +883,18 @@ async fn v6_reader_rejects_replayed_salt_from_shared_cache() {
 async fn reader_new_does_not_wait_for_peer_salt() {
     let (client, server) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = b"hello after lazy reader";
 
-    let mut reader = V4StreamReader::new(server, psk);
+    let mut reader = V4StreamReader::new(server, &secret);
 
     let read = async {
-        let out = reader.read_frame_payload().await.unwrap();
-        assert_eq!(out, payload);
+        let out = read_frame_payload(&mut reader).await.unwrap();
+        assert_eq!(&out[..], payload);
         out.len()
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(client, psk).unwrap();
+        let mut writer = V4StreamWriter::new(client, &secret).unwrap();
         write_payload(&mut writer, payload).await
     };
 
@@ -841,20 +904,21 @@ async fn reader_new_does_not_wait_for_peer_salt() {
 }
 
 #[tokio::test]
-async fn reader_drops_psk_after_decoder_initialization() {
+async fn reader_drops_secret_after_decoder_initialization() {
     let (client, server) = test_duplex_pair();
     let psk = TEST_PSK;
-    let payload = b"hello after psk clear";
+    let secret = shared_secret(psk);
+    let payload = b"hello after secret drop";
 
     let read = async {
-        let mut reader = V4StreamReader::new(server, psk);
-        assert_eq!(&reader.psk[..], psk);
-        let out = reader.read_frame_payload().await.unwrap();
-        assert_eq!(out, payload);
-        assert!(reader.psk.is_empty());
+        let mut reader = V4StreamReader::new(server, &secret);
+        assert!(reader.secret.is_some());
+        let out = read_frame_payload(&mut reader).await.unwrap();
+        assert_eq!(&out[..], payload);
+        assert!(reader.secret.is_none());
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(client, psk).unwrap();
+        let mut writer = V4StreamWriter::new(client, &secret).unwrap();
         write_payload(&mut writer, payload).await
     };
 
@@ -866,14 +930,17 @@ async fn reader_drops_psk_after_decoder_initialization() {
 async fn transfers_zero_chunk_as_protocol_eof_signal() {
     let (client, server) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
 
     let read = async {
-        let mut reader = V4StreamReader::new(server, psk);
-        matches!(reader.read_frame_payload().await, Err(Error::ZeroChunk))
+        let mut reader = V4StreamReader::new(server, &secret);
+        matches!(read_frame_payload(&mut reader).await, Err(Error::ZeroChunk))
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(client, psk).unwrap();
-        writer.write_zero_chunk().await.unwrap();
+        let mut writer = V4StreamWriter::new(client, &secret).unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     };
 
     let (read_result, _) = tokio::join!(read, write);
@@ -884,20 +951,22 @@ async fn transfers_zero_chunk_as_protocol_eof_signal() {
 async fn writes_tcp_request_without_external_header_allocation() {
     let (client, server) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
 
     let read = async {
-        let mut reader = V4StreamReader::new(server, psk);
-        let out = reader.read_frame_payload().await.unwrap();
+        let mut reader = V4StreamReader::new(server, &secret);
+        let out = read_frame_payload(&mut reader).await.unwrap();
         assert_eq!(out[0], crate::protocol::header::PROTOCOL_VERSION);
         assert_eq!(out[1], crate::protocol::header::COMMAND_CONNECT);
         assert_eq!(out[3], b"example.com".len() as u8);
         out.len()
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(client, psk).unwrap();
-        writer
-            .write_tcp_request("example.com", 443, crate::ProtocolVersion::V4, false)
-            .await
+        let mut writer = V4StreamWriter::new(client, &secret).unwrap();
+        poll_fn(|cx| {
+            writer.poll_write_tcp_request("example.com", 443, crate::ProtocolVersion::V4, false, cx)
+        })
+        .await
     };
 
     let (read_result, write_result) = tokio::join!(read, write);
@@ -915,20 +984,21 @@ async fn write_payload_uses_record_sizer_for_tcp_chunks() {
     let second_limit = first_limit + (TCP_RECORD_MSS - TCP_STEADY_RECORD_OVERHEAD);
     let payload = vec![0x51; first_limit + second_limit + 10];
     let (client, server) = duplex(8192);
+    let secret = shared_secret(PSK);
 
     let read = async {
-        let mut reader = V4StreamReader::new(server, PSK);
-        let out = reader.read_frame_payload().await.unwrap();
+        let mut reader = V4StreamReader::new(server, &secret);
+        let out = read_frame_payload(&mut reader).await.unwrap();
         let first = out.len();
         assert_eq!(first, first_limit);
         assert_eq!(out.len(), first_limit);
 
-        let out = reader.read_frame_payload().await.unwrap();
+        let out = read_frame_payload(&mut reader).await.unwrap();
         let second = out.len();
         assert_eq!(second, second_limit);
         assert_eq!(out.len(), second_limit);
 
-        let out = reader.read_frame_payload().await.unwrap();
+        let out = read_frame_payload(&mut reader).await.unwrap();
         let third = out.len();
         assert_eq!(third, 10);
         assert_eq!(out.len(), 10);
@@ -954,17 +1024,18 @@ async fn write_payload_continues_record_sizer_after_tcp_request() {
     let second_limit = first_limit + (TCP_RECORD_MSS - TCP_STEADY_RECORD_OVERHEAD);
     let payload = vec![0x51; second_limit + 10];
     let (client, server) = duplex(8192);
+    let secret = shared_secret(PSK);
 
     let read = async {
-        let mut reader = V4StreamReader::new(server, PSK);
-        reader.read_frame_payload().await.unwrap();
+        let mut reader = V4StreamReader::new(server, &secret);
+        read_frame_payload(&mut reader).await.unwrap();
 
-        let out = reader.read_frame_payload().await.unwrap();
+        let out = read_frame_payload(&mut reader).await.unwrap();
         let first_payload_frame = out.len();
         assert_eq!(first_payload_frame, second_limit);
         assert_eq!(out.len(), second_limit);
 
-        let out = reader.read_frame_payload().await.unwrap();
+        let out = read_frame_payload(&mut reader).await.unwrap();
         let second_payload_frame = out.len();
         assert_eq!(second_payload_frame, 10);
         assert_eq!(out.len(), 10);
@@ -973,10 +1044,11 @@ async fn write_payload_continues_record_sizer_after_tcp_request() {
         let encoder =
             V4FrameEncoder::with_salt_and_initial_padding(PSK, SALT, initial_padding_len).unwrap();
         let mut writer = V4StreamWriter::from_parts(client, encoder);
-        writer
-            .write_tcp_request("example.com", 443, crate::ProtocolVersion::V4, false)
-            .await
-            .unwrap();
+        poll_fn(|cx| {
+            writer.poll_write_tcp_request("example.com", 443, crate::ProtocolVersion::V4, false, cx)
+        })
+        .await
+        .unwrap();
         write_payload(&mut writer, &payload).await
     };
 
@@ -988,18 +1060,19 @@ async fn write_payload_continues_record_sizer_after_tcp_request() {
 async fn writes_udp_packet_as_one_frame() {
     let (client, server) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = b"hello udp";
 
     let read = async {
-        let mut reader = V4StreamReader::new(server, psk);
-        let out = reader.read_frame_payload().await.unwrap();
-        let parsed = parse_udp_request(out).unwrap();
+        let mut reader = V4StreamReader::new(server, &secret);
+        let out = read_frame_payload(&mut reader).await.unwrap();
+        let parsed = parse_udp_request(&out).unwrap();
         assert_eq!(parsed.payload, payload);
         assert_eq!(parsed.port, 53);
         out.len()
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(client, psk).unwrap();
+        let mut writer = V4StreamWriter::new(client, &secret).unwrap();
         write_v4_udp_packet(
             &mut writer,
             AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
@@ -1018,11 +1091,12 @@ async fn writes_udp_packet_as_one_frame() {
 async fn v4_udp_request_message_reader_reassembles_split_records_and_advances_record_sizer() {
     let (client, server) = duplex(140_000);
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = vec![0x61; 3000];
     let expected_payload = payload.clone();
 
     let read = async {
-        let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V4);
+        let mut reader = SnellStreamReader::new(server, &secret, crate::ProtocolVersion::V4);
         let message = reader.read_udp_request_message().await.unwrap().unwrap();
         let parsed = parse_udp_request(&message).unwrap();
         assert_eq!(parsed.payload, expected_payload);
@@ -1030,7 +1104,7 @@ async fn v4_udp_request_message_reader_reassembles_split_records_and_advances_re
         message.len()
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(client, psk).unwrap();
+        let mut writer = V4StreamWriter::new(client, &secret).unwrap();
         let written = write_v4_udp_packet(
             &mut writer,
             AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
@@ -1051,23 +1125,24 @@ async fn v4_udp_request_message_reader_reassembles_split_records_and_advances_re
 async fn v6_udp_packet_splits_across_chunk_records_and_advances_chunk_state() {
     let (client, server) = duplex(140_000);
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = vec![0x61; 60_000];
     let expected_payload = payload.clone();
     let expected_len = payload.len() + 9;
 
     let read = async {
-        let mut reader = V6StreamReader::new(server, psk);
+        let mut reader = V6StreamReader::new(server, &secret);
         let mut records = 0;
         let mut concat = BytesMut::with_capacity(expected_len);
         while concat.len() < expected_len {
-            let frame = reader.read_frame_payload().await.unwrap();
+            let frame = read_frame_payload(&mut reader).await.unwrap();
             if records == 0 {
-                let first = parse_udp_request(frame).unwrap();
+                let first = parse_udp_request(&frame).unwrap();
                 assert_eq!(first.port, 53);
                 assert!(first.payload.len() < expected_payload.len());
                 assert_eq!(first.payload, &expected_payload[..first.payload.len()]);
             }
-            concat.extend_from_slice(frame);
+            concat.extend_from_slice(&frame);
             records += 1;
         }
 
@@ -1077,7 +1152,7 @@ async fn v6_udp_packet_splits_across_chunk_records_and_advances_chunk_state() {
         records
     };
     let write = async {
-        let mut writer = V6StreamWriter::new(client, psk).unwrap();
+        let mut writer = V6StreamWriter::new(client, &secret).unwrap();
         let written = write_v6_udp_packet(
             &mut writer,
             AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
@@ -1098,18 +1173,19 @@ async fn v6_udp_packet_splits_across_chunk_records_and_advances_chunk_state() {
 async fn v6_udp_request_message_reader_reassembles_split_records() {
     let (client, server) = duplex(140_000);
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = vec![0x63; 60_000];
     let expected_payload = payload.clone();
 
     let read = async {
-        let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
+        let mut reader = SnellStreamReader::new(server, &secret, crate::ProtocolVersion::V6);
         let message = reader.read_udp_request_message().await.unwrap().unwrap();
         let parsed = parse_udp_request(&message).unwrap();
         assert_eq!(parsed.payload, expected_payload);
         assert_eq!(parsed.port, 53);
     };
     let write = async {
-        let mut writer = V6StreamWriter::new(client, psk).unwrap();
+        let mut writer = V6StreamWriter::new(client, &secret).unwrap();
         write_v6_udp_packet(
             &mut writer,
             AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
@@ -1127,13 +1203,15 @@ async fn v6_udp_request_message_reader_reassembles_split_records() {
 async fn v6_udp_exact_limit_message_reader_preserves_following_zero_chunk() {
     let (client, server) = duplex(140_000);
     let psk = TEST_PSK;
-    let chunk_sizer = V6ChunkSizer::new(V6Profile::derive(psk));
-    let first_limit = chunk_sizer.peek_limit(0, Instant::now());
+    let secret = shared_secret(psk);
+    let profile = V6Profile::derive(psk);
+    let chunk_sizer = V6ChunkSizer::new();
+    let first_limit = chunk_sizer.peek_limit(&profile, 0, Instant::now());
     let payload = vec![0x65; first_limit - 9];
     let expected_payload = payload.clone();
 
     let read = async {
-        let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
+        let mut reader = SnellStreamReader::new(server, &secret, crate::ProtocolVersion::V6);
         let message = reader.read_udp_request_message().await.unwrap().unwrap();
         let parsed = parse_udp_request(&message).unwrap();
         assert_eq!(parsed.payload, expected_payload);
@@ -1143,7 +1221,7 @@ async fn v6_udp_exact_limit_message_reader_preserves_following_zero_chunk() {
         assert!(eof.is_none());
     };
     let write = async {
-        let mut writer = V6StreamWriter::new(client, psk).unwrap();
+        let mut writer = V6StreamWriter::new(client, &secret).unwrap();
         let written = write_v6_udp_packet(
             &mut writer,
             AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
@@ -1151,7 +1229,7 @@ async fn v6_udp_exact_limit_message_reader_preserves_following_zero_chunk() {
             &payload,
         )
         .await?;
-        writer.write_zero_chunk().await?;
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx)).await?;
         Ok::<usize, Error>(written)
     };
 
@@ -1163,15 +1241,17 @@ async fn v6_udp_exact_limit_message_reader_preserves_following_zero_chunk() {
 async fn v6_udp_exact_limit_request_reader_preserves_following_udp_message() {
     let (client, server) = duplex(140_000);
     let psk = TEST_PSK;
-    let chunk_sizer = V6ChunkSizer::new(V6Profile::derive(psk));
-    let first_limit = chunk_sizer.peek_limit(0, Instant::now());
+    let secret = shared_secret(psk);
+    let profile = V6Profile::derive(psk);
+    let chunk_sizer = V6ChunkSizer::new();
+    let first_limit = chunk_sizer.peek_limit(&profile, 0, Instant::now());
     let first_payload = vec![0x65; first_limit - 9];
     let second_payload = vec![0x66; 32];
     let expected_first = first_payload.clone();
     let expected_second = second_payload.clone();
 
     let read = async {
-        let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
+        let mut reader = SnellStreamReader::new(server, &secret, crate::ProtocolVersion::V6);
 
         let first = reader.read_udp_request_message().await.unwrap().unwrap();
         let first = parse_udp_request(&first).unwrap();
@@ -1184,7 +1264,7 @@ async fn v6_udp_exact_limit_request_reader_preserves_following_udp_message() {
         assert_eq!(second.port, 54);
     };
     let write = async {
-        let mut writer = V6StreamWriter::new(client, psk).unwrap();
+        let mut writer = V6StreamWriter::new(client, &secret).unwrap();
         write_v6_udp_packet(
             &mut writer,
             AddressRef::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
@@ -1209,6 +1289,7 @@ async fn v6_udp_exact_limit_request_reader_preserves_following_udp_message() {
 async fn v6_udp_response_message_can_split_one_datagram_across_records() {
     let (client, server) = duplex(140_000);
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = vec![0x62; 60_000];
     let expected_payload = payload.clone();
     // IPv6 source header plus payload only; no UDP-layer datagram id,
@@ -1216,13 +1297,13 @@ async fn v6_udp_response_message_can_split_one_datagram_across_records() {
     let expected_len = payload.len() + 19;
 
     let read = async {
-        let mut reader = V6StreamReader::new(server, psk);
+        let mut reader = V6StreamReader::new(server, &secret);
         let mut records = 0;
         let mut concat = BytesMut::with_capacity(expected_len);
         while concat.len() < expected_len {
-            let frame = reader.read_frame_payload().await.unwrap();
+            let frame = read_frame_payload(&mut reader).await.unwrap();
             if records == 0 {
-                let first = parse_udp_response(frame).unwrap();
+                let first = parse_udp_response(&frame).unwrap();
                 assert_eq!(
                     first.address,
                     AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST))
@@ -1231,7 +1312,7 @@ async fn v6_udp_response_message_can_split_one_datagram_across_records() {
                 assert!(first.payload.len() < expected_payload.len());
                 assert_eq!(first.payload, &expected_payload[..first.payload.len()]);
             }
-            concat.extend_from_slice(frame);
+            concat.extend_from_slice(&frame);
             records += 1;
         }
 
@@ -1245,7 +1326,7 @@ async fn v6_udp_response_message_can_split_one_datagram_across_records() {
         records
     };
     let write = async {
-        let mut writer = V6StreamWriter::new(client, psk).unwrap();
+        let mut writer = V6StreamWriter::new(client, &secret).unwrap();
         let mut plain = BytesMut::new();
         write_udp_response_prefix(
             &mut plain,
@@ -1253,8 +1334,7 @@ async fn v6_udp_response_message_can_split_one_datagram_across_records() {
             53,
         )?;
         plain.extend_from_slice(&payload);
-        let written = writer
-            .write_payload_message_from_buffer(&mut plain)
+        let written = poll_fn(|cx| writer.poll_write_payload_message_from_buffer(&mut plain, cx))
             .await?
             .unwrap_or(0);
         assert!(writer.has_committed_chunk_record());
@@ -1270,11 +1350,12 @@ async fn v6_udp_response_message_can_split_one_datagram_across_records() {
 async fn v6_udp_response_message_reader_reassembles_split_records() {
     let (client, server) = duplex(140_000);
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = vec![0x64; 60_000];
     let expected_payload = payload.clone();
 
     let read = async {
-        let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
+        let mut reader = SnellStreamReader::new(server, &secret, crate::ProtocolVersion::V6);
         let message = reader.read_udp_response_message().await.unwrap().unwrap();
         let parsed = parse_udp_response(&message).unwrap();
         assert_eq!(
@@ -1285,7 +1366,7 @@ async fn v6_udp_response_message_reader_reassembles_split_records() {
         assert_eq!(parsed.payload, expected_payload);
     };
     let write = async {
-        let mut writer = V6StreamWriter::new(client, psk).unwrap();
+        let mut writer = V6StreamWriter::new(client, &secret).unwrap();
         write_v6_udp_response(
             &mut writer,
             AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
@@ -1303,15 +1384,17 @@ async fn v6_udp_response_message_reader_reassembles_split_records() {
 async fn v6_udp_exact_limit_response_reader_preserves_following_udp_message() {
     let (client, server) = duplex(140_000);
     let psk = TEST_PSK;
-    let chunk_sizer = V6ChunkSizer::new(V6Profile::derive(psk));
-    let first_limit = chunk_sizer.peek_limit(0, Instant::now());
+    let secret = shared_secret(psk);
+    let profile = V6Profile::derive(psk);
+    let chunk_sizer = V6ChunkSizer::new();
+    let first_limit = chunk_sizer.peek_limit(&profile, 0, Instant::now());
     let first_payload = vec![0x67; first_limit - 19];
     let second_payload = vec![0x68; 32];
     let expected_first = first_payload.clone();
     let expected_second = second_payload.clone();
 
     let read = async {
-        let mut reader = SnellStreamReader::new(server, psk, crate::ProtocolVersion::V6);
+        let mut reader = SnellStreamReader::new(server, &secret, crate::ProtocolVersion::V6);
 
         let first = reader.read_udp_response_message().await.unwrap().unwrap();
         let first = parse_udp_response(&first).unwrap();
@@ -1332,7 +1415,7 @@ async fn v6_udp_exact_limit_response_reader_preserves_following_udp_message() {
         assert_eq!(second.port, 54);
     };
     let write = async {
-        let mut writer = V6StreamWriter::new(client, psk).unwrap();
+        let mut writer = V6StreamWriter::new(client, &secret).unwrap();
         write_v6_udp_response(
             &mut writer,
             AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
@@ -1357,13 +1440,14 @@ async fn v6_udp_exact_limit_response_reader_preserves_following_udp_message() {
 async fn writes_udp_response_payload_message() {
     let (client, server) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = b"udp answer";
     let port = 5353;
 
     let read = async {
-        let mut reader = V4StreamReader::new(server, psk);
-        let frame = reader.read_frame_payload().await.unwrap();
-        let response = parse_udp_response(frame).unwrap();
+        let mut reader = V4StreamReader::new(server, &secret);
+        let frame = read_frame_payload(&mut reader).await.unwrap();
+        let response = parse_udp_response(&frame).unwrap();
         assert_eq!(
             response.address,
             AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
@@ -1372,7 +1456,7 @@ async fn writes_udp_response_payload_message() {
         assert_eq!(response.payload, payload);
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(client, psk).unwrap();
+        let mut writer = V4StreamWriter::new(client, &secret).unwrap();
         let mut plain = BytesMut::new();
         write_udp_response_prefix(
             &mut plain,
@@ -1382,8 +1466,7 @@ async fn writes_udp_response_payload_message() {
         .unwrap();
         plain.extend_from_slice(payload);
         let message_len = plain.len();
-        let written = writer
-            .write_payload_message_from_buffer(&mut plain)
+        let written = poll_fn(|cx| writer.poll_write_payload_message_from_buffer(&mut plain, cx))
             .await
             .unwrap();
         assert_eq!(written, Some(message_len));
@@ -1397,9 +1480,10 @@ async fn writes_udp_response_payload_message() {
 async fn rejects_v4_udp_packet_that_exceeds_application_message_len() {
     let client = sink();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = vec![0x61; crate::MAX_PACKET_SIZE];
 
-    let mut writer = V4StreamWriter::new(client, psk).unwrap();
+    let mut writer = V4StreamWriter::new(client, &secret).unwrap();
     assert!(matches!(
         write_v4_udp_packet(
             &mut writer,
@@ -1416,9 +1500,10 @@ async fn rejects_v4_udp_packet_that_exceeds_application_message_len() {
 async fn rejects_v6_udp_packet_that_exceeds_application_message_len() {
     let writer = sink();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = vec![0x61; crate::MAX_V6_RECORD_PAYLOAD_LEN];
 
-    let mut writer = V6StreamWriter::new(writer, psk).unwrap();
+    let mut writer = V6StreamWriter::new(writer, &secret).unwrap();
     assert!(matches!(
         write_v6_udp_packet(
             &mut writer,
@@ -1435,11 +1520,12 @@ async fn rejects_v6_udp_packet_that_exceeds_application_message_len() {
 async fn reads_client_connect_request() {
     let (client, server) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
 
     let read = async {
-        let mut reader = V4StreamReader::new(server, psk);
-        let payload = reader.read_frame_payload().await.unwrap();
-        let request = parse_client_request(payload).unwrap();
+        let mut reader = V4StreamReader::new(server, &secret);
+        let payload = read_frame_payload(&mut reader).await.unwrap();
+        let request = parse_client_request(&payload).unwrap();
         assert_eq!(
             request,
             ClientRequest::Connect {
@@ -1452,10 +1538,11 @@ async fn reads_client_connect_request() {
         );
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(client, psk).unwrap();
-        writer
-            .write_tcp_request("example.com", 443, crate::ProtocolVersion::V4, true)
-            .await
+        let mut writer = V4StreamWriter::new(client, &secret).unwrap();
+        poll_fn(|cx| {
+            writer.poll_write_tcp_request("example.com", 443, crate::ProtocolVersion::V4, true, cx)
+        })
+        .await
     };
 
     let ((), write_result) = tokio::join!(read, write);
@@ -1466,12 +1553,13 @@ async fn reads_client_connect_request() {
 async fn reads_tunnel_reply_with_first_payload() {
     let (server, client) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = b"first bytes";
 
     let read = async {
-        let mut reader = V4StreamReader::new(client, psk);
-        let frame_payload = reader.read_frame_payload().await.unwrap();
-        let reply = parse_server_reply(frame_payload).unwrap();
+        let mut reader = V4StreamReader::new(client, &secret);
+        let frame_payload = read_frame_payload(&mut reader).await.unwrap();
+        let reply = parse_server_reply(&frame_payload).unwrap();
         assert_eq!(
             reply,
             ServerReply::Tunnel {
@@ -1484,7 +1572,7 @@ async fn reads_tunnel_reply_with_first_payload() {
         );
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(server, psk).unwrap();
+        let mut writer = V4StreamWriter::new(server, &secret).unwrap();
         write_v4_tunnel_reply_message(&mut writer, payload).await
     };
 
@@ -1496,13 +1584,14 @@ async fn reads_tunnel_reply_with_first_payload() {
 async fn takes_control_payload_tail_without_padding_or_tag() {
     let (server, client) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
     let payload = b"early payload";
 
     let read = async {
-        let mut reader = V4StreamReader::new(client, psk);
+        let mut reader = V4StreamReader::new(client, &secret);
         let payload_start = {
-            let frame_payload = reader.read_frame_payload().await.unwrap();
-            let reply = parse_server_reply(frame_payload).unwrap();
+            let frame_payload = read_frame_payload(&mut reader).await.unwrap();
+            let reply = parse_server_reply(&frame_payload).unwrap();
             assert_eq!(
                 reply,
                 ServerReply::Tunnel {
@@ -1544,9 +1633,10 @@ async fn taking_payload_keeps_prefetched_next_frame() {
     encode_test_frame(&mut encoder, &reply, &mut wire);
     encode_test_frame(&mut encoder, b"next frame", &mut wire);
 
-    let mut reader = V4StreamReader::new(Cursor::new(wire), PSK);
-    let payload = reader.read_frame_payload().await.unwrap();
-    let payload_start = match parse_server_reply(payload).unwrap() {
+    let secret = shared_secret(PSK);
+    let mut reader = V4StreamReader::new(Cursor::new(wire), &secret);
+    let payload = read_frame_payload(&mut reader).await.unwrap();
+    let payload_start = match parse_server_reply(&payload).unwrap() {
         ServerReply::Tunnel { payload_span, .. } => payload_span.start,
         ServerReply::Pong | ServerReply::Error { .. } => unreachable!(),
     };
@@ -1555,19 +1645,20 @@ async fn taking_payload_keeps_prefetched_next_frame() {
     assert_eq!(&pending[..], b"early");
     assert!(!reader.body.is_empty());
 
-    let next = reader.read_frame_payload().await.unwrap();
-    assert_eq!(next, b"next frame");
+    let next = read_frame_payload(&mut reader).await.unwrap();
+    assert_eq!(&next[..], b"next frame");
 }
 
 #[tokio::test]
 async fn reads_server_error_reply() {
     let (server, client) = test_duplex_pair();
     let psk = TEST_PSK;
+    let secret = shared_secret(psk);
 
     let read = async {
-        let mut reader = V4StreamReader::new(client, psk);
-        let payload = reader.read_frame_payload().await.unwrap();
-        let reply = parse_server_reply(payload).unwrap();
+        let mut reader = V4StreamReader::new(client, &secret);
+        let payload = read_frame_payload(&mut reader).await.unwrap();
+        let reply = parse_server_reply(&payload).unwrap();
         assert_eq!(
             reply,
             ServerReply::Error {
@@ -1577,7 +1668,7 @@ async fn reads_server_error_reply() {
         );
     };
     let write = async {
-        let mut writer = V4StreamWriter::new(server, psk).unwrap();
+        let mut writer = V4StreamWriter::new(server, &secret).unwrap();
         writer.write_error_reply(3, "blocked").await
     };
 

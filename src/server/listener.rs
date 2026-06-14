@@ -1,10 +1,11 @@
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
-use zeroize::Zeroizing;
 
 use crate::error::Result;
 use crate::net::tcp_brutal::apply_tcp_brutal;
-use crate::proxy::snell::server::serve_server_connection_with_salt_replay_cache;
+use crate::proxy::snell::server::{
+    SERVER_TCP_ACTIVITY_TIMEOUTS, open_tcp_target, serve_server_connection,
+};
 use crate::server::shutdown::{drain_connection_tasks, log_connection_task_result};
 
 use crate::server::TcpServerRuntime;
@@ -56,14 +57,13 @@ pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
     runtime: TcpServerRuntime,
 ) -> Result<()> {
     let TcpServerRuntime {
-        psk,
+        secret,
         options,
         tcp_brutal,
         v6_salt_replay_cache,
         shutdown,
         drain_timeout,
     } = runtime;
-    let psk = std::sync::Arc::new(Zeroizing::new(psk));
     let mut tasks = JoinSet::new();
 
     loop {
@@ -71,7 +71,7 @@ pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
             () = shutdown.cancelled() => break,
             result = listener.accept() => {
                 let (client, peer_addr) = result?;
-                let psk = psk.clone();
+                let secret = secret.clone();
                 let options = options.clone();
                 let v6_salt_replay_cache = v6_salt_replay_cache.clone();
                 tasks.spawn(async move {
@@ -79,11 +79,13 @@ pub(crate) async fn serve_tcp_listener_with_shutdown_and_timeout(
                         tracing::warn!(%err, %peer_addr, "snell tcp_brutal could not be enabled");
                         return;
                     }
-                    let result = serve_server_connection_with_salt_replay_cache(
+                    let result = serve_server_connection(
                         client,
-                        &psk,
+                        secret,
                         options,
                         v6_salt_replay_cache,
+                        open_tcp_target,
+                        SERVER_TCP_ACTIVITY_TIMEOUTS,
                     )
                     .await;
                     if let Err(err) = result {

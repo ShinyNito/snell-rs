@@ -1,12 +1,15 @@
+use std::future::poll_fn;
 use std::net::IpAddr;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, duplex};
 use tokio::net::{TcpListener, UdpSocket};
+use zeroize::Zeroizing;
 
 use crate::ProtocolVersion;
 use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
+use crate::protocol::psk::SnellPsk;
 use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::protocol::udp::{
     AddressRef, UdpPacketRef, write_udp_request_prefix, write_udp_response_prefix,
@@ -19,6 +22,14 @@ pub(crate) const TEST_DUPLEX_CAPACITY: usize = 4096;
 
 pub(crate) fn test_duplex_pair() -> (DuplexStream, DuplexStream) {
     duplex(TEST_DUPLEX_CAPACITY)
+}
+
+pub(crate) fn shared_secret(psk: &[u8]) -> SnellPsk {
+    SnellPsk::new(Zeroizing::new(psk.to_vec()))
+}
+
+pub(crate) fn test_secret() -> SnellPsk {
+    shared_secret(TEST_PSK)
 }
 
 pub(crate) async fn test_tcp_listener() -> TcpListener {
@@ -47,7 +58,7 @@ pub(crate) fn test_snell_reader_with_version<R>(
 where
     R: AsyncRead + Unpin,
 {
-    SnellStreamReader::new(io, TEST_PSK, version)
+    SnellStreamReader::new(io, &test_secret(), version)
 }
 
 pub(crate) fn test_snell_writer<W>(io: W) -> SnellStreamWriter<W>
@@ -64,7 +75,21 @@ pub(crate) fn test_snell_writer_with_version<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    SnellStreamWriter::new(io, TEST_PSK, version).unwrap()
+    SnellStreamWriter::new(io, &test_secret(), version).unwrap()
+}
+
+pub(crate) async fn read_snell_frame_payload<R>(reader: &mut SnellStreamReader<R>) -> Result<Bytes>
+where
+    R: AsyncRead + Unpin,
+{
+    poll_fn(|cx| match reader.poll_read_frame_payload(cx) {
+        std::task::Poll::Ready(Ok(payload)) => {
+            std::task::Poll::Ready(Ok(Bytes::copy_from_slice(payload)))
+        }
+        std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
+        std::task::Poll::Pending => std::task::Poll::Pending,
+    })
+    .await
 }
 
 pub(crate) async fn write_snell_payload_message<W>(
@@ -94,10 +119,11 @@ where
     }
 
     let mut plain = BytesMut::from(payload);
-    Ok(writer
-        .write_tunnel_reply_message_from_buffer(&mut plain)
-        .await?
-        .unwrap_or(0))
+    Ok(
+        poll_fn(|cx| writer.poll_write_tunnel_reply_message_from_buffer(&mut plain, cx))
+            .await?
+            .unwrap_or(0),
+    )
 }
 
 pub(crate) async fn write_snell_udp_packet<W>(
@@ -188,15 +214,16 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut reader = SnellStreamReader::new(reader_io, psk, version);
-    let payload = reader.read_frame_payload().await?;
-    match parse_client_request(payload)? {
+    let secret = shared_secret(psk);
+    let mut reader = SnellStreamReader::new(reader_io, &secret, version);
+    let payload = read_snell_frame_payload(&mut reader).await?;
+    match parse_client_request(&payload)? {
         ClientRequest::Udp { rest: [], .. } => {}
         ClientRequest::Udp { .. } => return Err(Error::InvalidClientRequest),
         ClientRequest::Ping | ClientRequest::Connect { .. } => {
             return Err(Error::InvalidClientRequest);
         }
     }
-    let writer = SnellStreamWriter::new(writer_io, psk, version)?;
+    let writer = SnellStreamWriter::new(writer_io, &secret, version)?;
     UdpServerStream::accept(reader, writer).await
 }

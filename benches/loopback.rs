@@ -24,32 +24,34 @@ fn benchmark_loopback_tcp(c: &mut Criterion) {
     let no_reuse = runtime.block_on(LoopbackHarness::start(false)).unwrap();
     let reuse = runtime.block_on(LoopbackHarness::start(true)).unwrap();
 
-    let mut group = c.benchmark_group("loopback/tcp_echo");
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(5));
-    group.sample_size(10);
+    {
+        let mut group = c.benchmark_group("loopback/tcp_echo");
+        group.warm_up_time(Duration::from_secs(1));
+        group.measurement_time(Duration::from_secs(5));
+        group.sample_size(10);
 
-    for (mode, harness) in [("reuse_off", &no_reuse), ("reuse_on", &reuse)] {
-        for size in PAYLOAD_SIZES {
-            let payload = Arc::new(vec![0x42; size]);
-            group.throughput(Throughput::Bytes(size as u64));
-            group.bench_with_input(BenchmarkId::new(mode, size), &size, |b, _| {
-                let payload = payload.clone();
-                b.to_async(&runtime).iter(|| {
+        for (mode, harness) in [("reuse_off", &no_reuse), ("reuse_on", &reuse)] {
+            for size in PAYLOAD_SIZES {
+                let payload = Arc::new(vec![0x42; size]);
+                group.throughput(Throughput::Bytes(size as u64));
+                group.bench_with_input(BenchmarkId::new(mode, size), &size, |b, _| {
                     let payload = payload.clone();
-                    async move {
-                        let received =
-                            transfer_once(harness.socks_addr, harness.echo_addr, &payload)
-                                .await
-                                .unwrap();
-                        black_box(received);
-                    }
+                    b.to_async(&runtime).iter(|| {
+                        let payload = payload.clone();
+                        async move {
+                            let received =
+                                transfer_once(harness.socks_addr, harness.echo_addr, &payload)
+                                    .await
+                                    .unwrap();
+                            black_box(received);
+                        }
+                    });
                 });
-            });
+            }
         }
-    }
 
-    group.finish();
+        group.finish();
+    }
     no_reuse.shutdown();
     reuse.shutdown();
     runtime.block_on(async {
@@ -261,7 +263,7 @@ async fn write_socks5_connect(stream: &mut TcpStream, target_addr: SocketAddr) -
     Ok(())
 }
 
-fn is_closed_io_kind(kind: io::ErrorKind) -> bool {
+const fn is_closed_io_kind(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
         io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
@@ -292,7 +294,7 @@ fn available_loopback_addr() -> io::Result<SocketAddr> {
     listener.local_addr()
 }
 
-fn loopback_addr(port: u16) -> SocketAddr {
+const fn loopback_addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 

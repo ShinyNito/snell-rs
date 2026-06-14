@@ -27,30 +27,32 @@ fn benchmark_loopback_udp(c: &mut Criterion) {
     let harness = runtime.block_on(UdpLoopbackHarness::start()).unwrap();
     let association = Arc::new(runtime.block_on(harness.open_association()).unwrap());
 
-    let mut group = c.benchmark_group("loopback/udp_echo");
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(5));
-    group.sample_size(10);
+    {
+        let mut group = c.benchmark_group("loopback/udp_echo");
+        group.warm_up_time(Duration::from_secs(1));
+        group.measurement_time(Duration::from_secs(5));
+        group.sample_size(10);
 
-    for size in PAYLOAD_SIZES {
-        let payload = Arc::new(vec![0x42; size]);
-        group.throughput(Throughput::Bytes((size * BATCH) as u64));
-        group.bench_with_input(BenchmarkId::new("batch16", size), &size, |b, _| {
-            let payload = payload.clone();
-            let association = association.clone();
-            let echo_addr = harness.echo_addr;
-            b.to_async(&runtime).iter(move || {
+        for size in PAYLOAD_SIZES {
+            let payload = Arc::new(vec![0x42; size]);
+            group.throughput(Throughput::Bytes((size * BATCH) as u64));
+            group.bench_with_input(BenchmarkId::new("batch16", size), &size, |b, _| {
                 let payload = payload.clone();
                 let association = association.clone();
-                async move {
-                    let received = association.echo_batch(&payload, echo_addr).await.unwrap();
-                    black_box(received);
-                }
+                let echo_addr = harness.echo_addr;
+                b.to_async(&runtime).iter(move || {
+                    let payload = payload.clone();
+                    let association = association.clone();
+                    async move {
+                        let received = association.echo_batch(&payload, echo_addr).await.unwrap();
+                        black_box(received);
+                    }
+                });
             });
-        });
-    }
+        }
 
-    group.finish();
+        group.finish();
+    }
     drop(association);
     harness.shutdown();
     runtime.block_on(async {
@@ -272,7 +274,7 @@ fn available_loopback_addr() -> io::Result<SocketAddr> {
     listener.local_addr()
 }
 
-fn loopback_addr(port: u16) -> SocketAddr {
+const fn loopback_addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 

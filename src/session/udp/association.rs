@@ -8,6 +8,7 @@ use tokio::time::sleep;
 
 use crate::error::Result;
 use crate::proxy::outbound::{PreparedUdpProxy, PreparedUdpRelay, RelayOptions};
+use crate::session::activity::RelayActivity;
 use crate::session::udp::stream::UdpServerStream;
 
 use super::outbound::{
@@ -37,7 +38,8 @@ where
     W: AsyncWrite + Unpin,
 {
     let prepared = crate::proxy::outbound::open_udp(options.clone()).await?;
-    relay_udp_server_stream_prepared(stream, options, idle_timeout, prepared).await
+    let (activity, _last_activity) = RelayActivity::new();
+    relay_udp_server_stream_prepared(stream, options, idle_timeout, prepared, &activity).await
 }
 
 pub(crate) async fn relay_udp_server_stream_prepared<R, W>(
@@ -45,6 +47,7 @@ pub(crate) async fn relay_udp_server_stream_prepared<R, W>(
     options: RelayOptions,
     idle_timeout: Duration,
     prepared: PreparedUdpRelay,
+    activity: &RelayActivity,
 ) -> Result<UdpRelayStats>
 where
     R: AsyncRead + Unpin,
@@ -52,10 +55,10 @@ where
 {
     match prepared {
         PreparedUdpRelay::Direct => {
-            relay_udp_server_stream_direct(stream, options, idle_timeout).await
+            relay_udp_server_stream_direct(stream, options, idle_timeout, activity).await
         }
         PreparedUdpRelay::Proxy(proxy) => {
-            relay_udp_server_stream_proxy(stream, options, idle_timeout, proxy).await
+            relay_udp_server_stream_proxy(stream, options, idle_timeout, proxy, activity).await
         }
     }
 }
@@ -64,6 +67,7 @@ async fn relay_udp_server_stream_direct<R, W>(
     stream: UdpServerStream<R, W>,
     options: RelayOptions,
     idle_timeout: Duration,
+    activity: &RelayActivity,
 ) -> Result<UdpRelayStats>
 where
     R: AsyncRead + Unpin,
@@ -71,7 +75,7 @@ where
 {
     let (mut reader, mut writer) = stream.into_parts();
     let sockets = UdpSockets::bind(options.ipv6).await?;
-    let state = Arc::new(UdpAssociationState::default());
+    let state = Arc::new(UdpAssociationState::new(activity.clone()));
 
     let end = {
         let snell_to_udp = relay_snell_to_udp(&mut reader, sockets.clone(), options, state.clone());
@@ -108,6 +112,7 @@ async fn relay_udp_server_stream_proxy<R, W>(
     options: RelayOptions,
     idle_timeout: Duration,
     proxy: PreparedUdpProxy,
+    activity: &RelayActivity,
 ) -> Result<UdpRelayStats>
 where
     R: AsyncRead + Unpin,
@@ -118,7 +123,7 @@ where
     let relay_addr = proxy.relay_addr;
     let socket = Arc::new(bind_udp_socket(SocketAddr::new(relay_bind_ip(relay_addr), 0)).await?);
     let (mut control_reader, control_writer) = control.into_split();
-    let state = Arc::new(UdpAssociationState::default());
+    let state = Arc::new(UdpAssociationState::new(activity.clone()));
 
     let end = {
         let snell_to_proxy = relay_snell_to_proxy_udp(
@@ -178,8 +183,8 @@ async fn wait_udp_association_idle(state: Arc<UdpAssociationState>, timeout: Dur
     }
 }
 
-#[derive(Default)]
 pub(super) struct UdpAssociationState {
+    activity: RelayActivity,
     generation: AtomicU64,
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
@@ -196,6 +201,17 @@ enum UdpAssociationEnd {
 }
 
 impl UdpAssociationState {
+    const fn new(activity: RelayActivity) -> Self {
+        Self {
+            activity,
+            generation: AtomicU64::new(0),
+            packets_sent: AtomicU64::new(0),
+            packets_received: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+        }
+    }
+
     pub(super) fn add_sent(&self, bytes: u64) {
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
@@ -210,6 +226,7 @@ impl UdpAssociationState {
 
     fn mark_active(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.activity.record();
     }
 
     fn stats(&self) -> UdpRelayStats {

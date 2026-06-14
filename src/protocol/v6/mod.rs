@@ -113,6 +113,7 @@ pub use chunk::V6ChunkSizer;
 pub use frame::{V6DecodedHeader, V6FrameDecoder, V6FrameEncoder};
 pub use profile::V6Profile;
 pub use replay::V6SaltReplayCache;
+pub(crate) type SharedV6Profile = Arc<V6Profile>;
 pub(in crate::protocol::v6) use salt::salt_positions;
 #[cfg(test)]
 pub(crate) use salt::split_salt_block;
@@ -139,7 +140,7 @@ fn mix_padding_payload(
     }
 }
 
-fn mix_round_delta(round: u32) -> u32 {
+const fn mix_round_delta(round: u32) -> u32 {
     let quotient = (MIX_ROUND_MOD3_RECIPROCAL * round) >> MIX_ROUND_MOD3_SHIFT;
     (round - 3 * quotient) & MIX_ROUND_BYTE_MASK
 }
@@ -221,7 +222,7 @@ fn read_le_u64(input: &[u8; 32], offset: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-fn splitmix64(mut x: u64) -> u64 {
+const fn splitmix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(SPLITMIX64_FINALIZER_MUL1);
     x ^= x >> 27;
@@ -229,7 +230,7 @@ fn splitmix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-fn fold_u64_to_u32(x: u64) -> u32 {
+const fn fold_u64_to_u32(x: u64) -> u32 {
     (x ^ (x >> 32)) as u32
 }
 
@@ -247,7 +248,7 @@ fn derive_namespace(profile_secret: &[u8; 32], label: u32, seed_const: u64) -> u
     splitmix64(mixed)
 }
 
-fn prf32_mix(namespace: u64, label: u32, a: u32, b: u32) -> u32 {
+const fn prf32_mix(namespace: u64, label: u32, a: u32, b: u32) -> u32 {
     let mixed = namespace
         ^ (b as u64).wrapping_mul(PRF_B_MUL).wrapping_add(PRF_B_ADD)
         ^ (label as u64).wrapping_mul(GOLDEN_RATIO_64)
@@ -306,7 +307,7 @@ fn expand_stream_array<const N: usize>(namespace: u64, label: u32, seq: u32) -> 
 }
 
 #[inline]
-fn stream_initial_state(namespace: u64, label: u32, seq: u32, len: usize) -> u64 {
+const fn stream_initial_state(namespace: u64, label: u32, seq: u32, len: usize) -> u64 {
     STREAM_INITIAL_STATE.wrapping_add((seq as u64).wrapping_mul(DOMAIN_MUL))
         ^ (label as u64).wrapping_mul(STREAM_LABEL_MUL)
         ^ (len as u64)
@@ -315,7 +316,7 @@ fn stream_initial_state(namespace: u64, label: u32, seq: u32, len: usize) -> u64
         ^ namespace
 }
 
-fn salt_shuffle_prf(ns_salt: u64, domain_round: u32, index: u32) -> u32 {
+const fn salt_shuffle_prf(ns_salt: u64, domain_round: u32, index: u32) -> u32 {
     let index_part = (index as u64)
         .wrapping_mul(PRF_B_MUL)
         .wrapping_add(PRF_B_ADD)
@@ -327,7 +328,7 @@ fn salt_shuffle_prf(ns_salt: u64, domain_round: u32, index: u32) -> u32 {
     fold_u64_to_u32(splitmix64(mixed))
 }
 
-fn pick_u32(raw: u32, lo: u32, hi: u32) -> u32 {
+const fn pick_u32(raw: u32, lo: u32, hi: u32) -> u32 {
     if hi <= lo {
         lo
     } else {
@@ -335,7 +336,7 @@ fn pick_u32(raw: u32, lo: u32, hi: u32) -> u32 {
     }
 }
 
-fn pick_usize(raw: u32, lo: usize, hi: usize) -> usize {
+const fn pick_usize(raw: u32, lo: usize, hi: usize) -> usize {
     if hi <= lo {
         lo
     } else {

@@ -29,7 +29,7 @@ impl V6Namespaces {
         }
     }
 
-    fn for_label(self, label: u32) -> u64 {
+    const fn for_label(self, label: u32) -> u64 {
         match label {
             0 | 1 | 14 | 15 | 33 | 34 => self.prefix,
             2 => self.motif,
@@ -41,11 +41,11 @@ impl V6Namespaces {
         }
     }
 
-    fn prf32(self, label: u32, a: u32, b: u32) -> u32 {
+    const fn prf32(self, label: u32, a: u32, b: u32) -> u32 {
         prf32_mix(self.for_label(label), label, a, b)
     }
 
-    fn prf_static(self, label: u32, domain: u32) -> u32 {
+    const fn prf_static(self, label: u32, domain: u32) -> u32 {
         self.prf32(label, 0, domain)
     }
 
@@ -281,7 +281,7 @@ impl V6Profile {
         self.salt_block_len
     }
 
-    pub fn record_prefix_len(&self, seq: u32) -> usize {
+    pub const fn record_prefix_len(&self, seq: u32) -> usize {
         self.pick(
             LABEL_RECORD_PREFIX,
             seq,
@@ -404,11 +404,11 @@ impl V6Profile {
         }
     }
 
-    pub(in crate::protocol::v6) fn prf32(&self, label: u32, a: u32, b: u32) -> u32 {
+    pub(in crate::protocol::v6) const fn prf32(&self, label: u32, a: u32, b: u32) -> u32 {
         self.namespaces.prf32(label, a, b)
     }
 
-    fn pick(&self, label: u32, a: u32, b: u32, lo: usize, hi: usize) -> usize {
+    const fn pick(&self, label: u32, a: u32, b: u32, lo: usize, hi: usize) -> usize {
         pick_usize(self.prf32(label, a, b), lo, hi)
     }
 
@@ -524,7 +524,7 @@ impl V6Profile {
         }
     }
 
-    fn salt_mask(&self, i: usize) -> u8 {
+    const fn salt_mask(&self, i: usize) -> u8 {
         let raw = prf32_mix(
             self.namespaces.salt,
             LABEL_MOTIF,

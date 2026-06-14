@@ -125,7 +125,7 @@ impl SocksUdpHeader {
         Ok((address, port))
     }
 
-    fn snell_prefix_len(&self, kind: SnellUdpPacketKind) -> usize {
+    const fn snell_prefix_len(&self, kind: SnellUdpPacketKind) -> usize {
         match (&self.address, kind) {
             (SocksUdpAddress::Domain(host), _) => 1 + 1 + (host.end - host.start) + 2,
             (SocksUdpAddress::Ipv4, SnellUdpPacketKind::Request) => 1 + 1 + 1 + 4 + 2,
@@ -226,7 +226,7 @@ impl UdpRecvBatch {
 }
 
 impl UdpRecvSlot {
-    fn set_received(&mut self, payload_len: usize, peer: SocketAddr, payload_limit: usize) {
+    const fn set_received(&mut self, payload_len: usize, peer: SocketAddr, payload_limit: usize) {
         self.payload_len = payload_len;
         self.peer = Some(peer);
         self.oversized = udp_datagram_too_large(payload_len, payload_limit);
@@ -234,7 +234,7 @@ impl UdpRecvSlot {
 }
 
 impl<'a> UdpRecvDatagram<'a> {
-    pub(crate) fn peer(&self) -> SocketAddr {
+    pub(crate) const fn peer(&self) -> SocketAddr {
         self.slot.peer.expect("received UDP slot has peer")
     }
 
@@ -256,7 +256,7 @@ impl<'a> UdpRecvDatagram<'a> {
 }
 
 impl<'a> UdpRecvDatagramMut<'a> {
-    pub(crate) fn datagram_mut(&mut self) -> &mut BytesMut {
+    pub(crate) const fn datagram_mut(&mut self) -> &mut BytesMut {
         &mut self.slot.datagram
     }
 
@@ -313,7 +313,7 @@ pub(crate) const fn max_socks_udp_datagram_len(max_snell_udp_payload_len: usize)
     max_snell_udp_payload_len + SOCKS_UDP_RSV_FRAG_LEN
 }
 
-fn ensure_full_datagram_sent(sent: usize, expected: usize) -> Result<()> {
+const fn ensure_full_datagram_sent(sent: usize, expected: usize) -> Result<()> {
     if sent == expected {
         return Ok(());
     }
@@ -321,7 +321,7 @@ fn ensure_full_datagram_sent(sent: usize, expected: usize) -> Result<()> {
     Err(Error::ShortUdpWrite { sent, expected })
 }
 
-fn udp_datagram_too_large(n: usize, max_datagram_len: usize) -> bool {
+const fn udp_datagram_too_large(n: usize, max_datagram_len: usize) -> bool {
     n > max_datagram_len
 }
 

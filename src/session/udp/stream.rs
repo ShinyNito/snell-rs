@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::ProtocolVersion;
 use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
+use crate::protocol::psk::SnellPsk;
 use crate::protocol::request::{ServerReply, parse_server_reply};
 
 pub(crate) struct UdpClientStream<R, W> {
@@ -21,12 +22,12 @@ where
     pub(crate) async fn open_io(
         reader_io: R,
         writer_io: W,
-        psk: &[u8],
+        secret: &SnellPsk,
         snell_version: ProtocolVersion,
     ) -> Result<Self> {
-        let mut writer = SnellStreamWriter::new(writer_io, psk, snell_version)?;
+        let mut writer = SnellStreamWriter::new(writer_io, secret, snell_version)?;
         writer.write_udp_request().await?;
-        let reader = SnellStreamReader::new(reader_io, psk, snell_version);
+        let reader = SnellStreamReader::new(reader_io, secret, snell_version);
         Self::finish_open(reader, writer).await
     }
 
@@ -38,7 +39,7 @@ where
         Ok(Self::from_parts(reader, writer))
     }
 
-    fn from_parts(reader: SnellStreamReader<R>, writer: SnellStreamWriter<W>) -> Self {
+    const fn from_parts(reader: SnellStreamReader<R>, writer: SnellStreamWriter<W>) -> Self {
         Self { reader, writer }
     }
 
@@ -85,7 +86,7 @@ where
         Ok(Self::from_parts(reader, frame_writer))
     }
 
-    fn from_parts(reader: SnellStreamReader<R>, writer: SnellStreamWriter<W>) -> Self {
+    const fn from_parts(reader: SnellStreamReader<R>, writer: SnellStreamWriter<W>) -> Self {
         Self { reader, writer }
     }
 

@@ -1,18 +1,25 @@
+use std::future::poll_fn;
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use bytes::{Buf, BytesMut};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWrite;
 
 use crate::error::{Error, Result};
 #[cfg(test)]
 use crate::protocol::crypto::SALT_SIZE;
 use crate::protocol::header::{COMMAND_TUNNEL, write_tcp_request_header, write_udp_request_header};
+use crate::protocol::psk::SnellPsk;
 use crate::protocol::request::{write_error_reply, write_pong_reply, write_tunnel_reply};
 use crate::protocol::v4::frame::V4FrameEncoder;
-use crate::protocol::v6::{V6ChunkSizer, V6FrameEncoder};
+use crate::protocol::v6::{SharedV6Profile, V6ChunkSizer, V6FrameEncoder};
 use crate::{MAX_PACKET_SIZE, MAX_V6_RECORD_PAYLOAD_LEN, ProtocolVersion};
 
-use super::buffer::{compact_stream_buffer_for_reuse, write_all_contiguous, write_all_vectored};
+use super::buffer::{
+    compact_stream_buffer_for_reuse, poll_write_all_contiguous, poll_write_all_vectored,
+    write_all_vectored,
+};
 use super::{
     FRAME_HEAD_INITIAL_CAPACITY, STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY,
     TCP_FIRST_RECORD_OVERHEAD, TCP_RECORD_IDLE_TIMEOUT, TCP_RECORD_MSS, TCP_STEADY_RECORD_OVERHEAD,
@@ -61,7 +68,7 @@ impl RecordSizer {
         }
     }
 
-    pub(super) fn commit_limit(&mut self, now: Instant, limit: usize) {
+    pub(super) const fn commit_limit(&mut self, now: Instant, limit: usize) {
         self.last_limit = limit;
         self.last_record_at = Some(now);
     }
@@ -123,51 +130,88 @@ where
 
 pub(crate) enum SnellStreamWriter<W> {
     V4 {
-        writer: Box<V4StreamWriter<W>>,
+        writer: V4StreamWriter<W>,
         version: ProtocolVersion,
     },
-    V6(Box<V6StreamWriter<W>>),
+    V6(V6StreamWriter<W>),
 }
 
 impl<W> SnellStreamWriter<W>
 where
     W: AsyncWrite + Unpin,
 {
-    pub(crate) fn new(inner: W, psk: &[u8], version: ProtocolVersion) -> Result<Self> {
+    pub(crate) fn new(inner: W, secret: &SnellPsk, version: ProtocolVersion) -> Result<Self> {
         if version.uses_v6_frames() {
-            Ok(Self::V6(Box::new(V6StreamWriter::new(inner, psk)?)))
+            Ok(Self::V6(V6StreamWriter::new(inner, secret)?))
         } else {
             Ok(Self::V4 {
-                writer: Box::new(V4StreamWriter::new(inner, psk)?),
+                writer: V4StreamWriter::new(inner, secret)?,
                 version,
             })
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_v6_salt(inner: W, psk: &[u8], salt: [u8; SALT_SIZE]) -> Result<Self> {
-        Ok(Self::V6(Box::new(V6StreamWriter::new_with_salt(
-            inner, psk, salt,
-        )?)))
+    pub(crate) fn new_with_v6_salt(
+        inner: W,
+        secret: &SnellPsk,
+        salt: [u8; SALT_SIZE],
+    ) -> Result<Self> {
+        Ok(Self::V6(V6StreamWriter::new_with_salt(
+            inner, secret, salt,
+        )?))
     }
 
     pub(crate) async fn write_payload_message_from_buffer(
         &mut self,
         plain: &mut BytesMut,
     ) -> Result<Option<usize>> {
+        poll_fn(|cx| self.poll_write_payload_message_from_buffer(plain, cx)).await
+    }
+
+    pub(crate) fn poll_write_payload_message_from_buffer(
+        &mut self,
+        plain: &mut BytesMut,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<usize>>> {
         match self {
-            Self::V4 { writer, .. } => writer.write_payload_message_from_buffer(plain).await,
-            Self::V6(writer) => writer.write_payload_message_from_buffer(plain).await,
+            Self::V4 { writer, .. } => writer.poll_write_payload_message_from_buffer(plain, cx),
+            Self::V6(writer) => writer.poll_write_payload_message_from_buffer(plain, cx),
         }
     }
 
-    pub(crate) async fn write_tunnel_reply_message_from_buffer(
+    pub(crate) fn poll_write_tunnel_reply_message_from_buffer(
         &mut self,
         plain: &mut BytesMut,
-    ) -> Result<Option<usize>> {
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<usize>>> {
         match self {
-            Self::V4 { writer, .. } => writer.write_tunnel_reply_message_from_buffer(plain).await,
-            Self::V6(writer) => writer.write_tunnel_reply_message_from_buffer(plain).await,
+            Self::V4 { writer, .. } => {
+                writer.poll_write_tunnel_reply_message_from_buffer(plain, cx)
+            }
+            Self::V6(writer) => writer.poll_write_tunnel_reply_message_from_buffer(plain, cx),
+        }
+    }
+
+    pub(crate) const fn has_pending_message_write(&self) -> bool {
+        match self {
+            Self::V4 { writer, .. } => writer.has_pending_message_write(),
+            Self::V6(writer) => writer.has_pending_message_write(),
+        }
+    }
+
+    fn poll_write_tcp_request(
+        &mut self,
+        host: &str,
+        port: u16,
+        reuse: bool,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>> {
+        match self {
+            Self::V4 { writer, version } => {
+                writer.poll_write_tcp_request(host, port, *version, reuse, cx)
+            }
+            Self::V6(writer) => writer.poll_write_tcp_request(host, port, reuse, cx),
         }
     }
 
@@ -177,12 +221,7 @@ where
         port: u16,
         reuse: bool,
     ) -> Result<()> {
-        match self {
-            Self::V4 { writer, version } => {
-                writer.write_tcp_request(host, port, *version, reuse).await
-            }
-            Self::V6(writer) => writer.write_tcp_request(host, port, reuse).await,
-        }
+        poll_fn(|cx| self.poll_write_tcp_request(host, port, reuse, cx)).await
     }
 
     pub(crate) async fn write_udp_request(&mut self) -> Result<()> {
@@ -206,6 +245,16 @@ where
         }
     }
 
+    pub(crate) fn poll_write_empty_tunnel_reply(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>> {
+        match self {
+            Self::V4 { writer, .. } => writer.poll_write_empty_tunnel_reply(cx),
+            Self::V6(writer) => writer.poll_write_empty_tunnel_reply(cx),
+        }
+    }
+
     pub(crate) async fn write_pong_reply(&mut self) -> Result<()> {
         match self {
             Self::V4 { writer, .. } => writer.write_pong_reply().await,
@@ -221,16 +270,20 @@ where
     }
 
     pub(crate) async fn write_zero_chunk(&mut self) -> Result<()> {
+        poll_fn(|cx| self.poll_write_zero_chunk(cx)).await
+    }
+
+    pub(crate) fn poll_write_zero_chunk(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         match self {
-            Self::V4 { writer, .. } => writer.write_zero_chunk().await,
-            Self::V6(writer) => writer.write_zero_chunk().await,
+            Self::V4 { writer, .. } => writer.poll_write_zero_chunk(cx),
+            Self::V6(writer) => writer.poll_write_zero_chunk(cx),
         }
     }
 
-    pub(crate) async fn shutdown(&mut self) -> Result<()> {
+    pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         match self {
-            Self::V4 { writer, .. } => writer.shutdown().await,
-            Self::V6(writer) => writer.shutdown().await,
+            Self::V4 { writer, .. } => writer.poll_flush(cx),
+            Self::V6(writer) => writer.poll_flush(cx),
         }
     }
 

@@ -212,7 +212,7 @@ async fn resolve_udp_target(
     select_udp_target(&addrs, ipv6, dns_ip_preference)
 }
 
-fn relay_bind_ip(relay_addr: SocketAddr) -> IpAddr {
+const fn relay_bind_ip(relay_addr: SocketAddr) -> IpAddr {
     if relay_addr.is_ipv4() {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {

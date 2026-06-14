@@ -1,12 +1,14 @@
 use core::range::Range;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::io;
+use std::io::ErrorKind;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{SERVER_PLAIN_READ_AHEAD_CAPACITY, TcpClientStream, TcpServerStream, TcpTarget};
+use super::{
+    SERVER_PLAIN_READ_AHEAD_CAPACITY, TcpClientOpenOptions, TcpClientStream, TcpServerStream,
+    TcpTarget,
+};
 use crate::ProtocolVersion;
 use crate::error::Error;
 use crate::protocol::header::write_tcp_request_header;
@@ -14,66 +16,40 @@ use crate::protocol::request::{
     ClientRequest, ServerReply, parse_client_request, parse_server_reply,
 };
 use crate::test_support::{
-    TEST_PSK, test_duplex_pair, test_snell_reader, test_snell_writer, write_snell_payload_message,
-    write_snell_tunnel_reply_message,
+    TEST_PSK, read_snell_frame_payload, shared_secret, test_duplex_pair, test_snell_reader,
+    test_snell_writer, write_snell_payload_message, write_snell_tunnel_reply_message,
 };
 
-struct RecordingPlainReadWindow {
-    payload: Vec<u8>,
-    observed: Arc<Mutex<Vec<usize>>>,
-}
-
-impl RecordingPlainReadWindow {
-    fn new(payload: &'static [u8], observed: Arc<Mutex<Vec<usize>>>) -> Self {
-        Self {
-            payload: payload.to_vec(),
-            observed,
-        }
-    }
-}
-
-impl AsyncRead for RecordingPlainReadWindow {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        self.observed.lock().unwrap().push(buf.remaining());
-        let n = self.payload.len().min(buf.remaining());
-        if n != 0 {
-            buf.put_slice(&self.payload[..n]);
-            self.payload.drain(..n);
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
-async fn write_client_payload<W>(
-    writer: &mut super::TcpClientWriter<W>,
-    payload: &[u8],
-) -> crate::error::Result<usize>
+async fn write_client_payload<W>(writer: &mut W, payload: &[u8]) -> io::Result<usize>
 where
     W: AsyncWrite + Unpin,
 {
-    let mut plain = payload;
-    Ok(writer
-        .write_payload_message_from_reader(&mut plain)
-        .await?
-        .unwrap_or(0))
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(payload.len())
 }
 
-async fn write_server_payload<W>(
-    writer: &mut super::TcpServerWriter<W>,
-    payload: &[u8],
-) -> crate::error::Result<usize>
+async fn write_server_payload<W>(writer: &mut W, payload: &[u8]) -> io::Result<usize>
 where
     W: AsyncWrite + Unpin,
 {
-    let mut plain = payload;
-    Ok(writer
-        .write_payload_message_from_reader(&mut plain)
-        .await?
-        .unwrap_or(0))
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(payload.len())
+}
+
+async fn close_client_writer<W>(writer: &mut W) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.shutdown().await
+}
+
+async fn close_server_writer<W>(writer: &mut W) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.shutdown().await
 }
 
 async fn accept_client_connect<R, W>(
@@ -85,9 +61,10 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut reader = crate::framed::SnellStreamReader::new(reader_io, psk, ProtocolVersion::V4);
-    let payload = reader.read_frame_payload().await?;
-    let (target, rest_start) = match parse_client_request(payload)? {
+    let secret = shared_secret(psk);
+    let mut reader = crate::framed::SnellStreamReader::new(reader_io, &secret, ProtocolVersion::V4);
+    let payload = read_snell_frame_payload(&mut reader).await?;
+    let (target, rest_start) = match parse_client_request(&payload)? {
         ClientRequest::Connect {
             reuse,
             host,
@@ -107,7 +84,7 @@ where
         }
     };
     let pending = reader.take_payload_from(rest_start);
-    let writer = crate::framed::SnellStreamWriter::new(writer_io, psk, ProtocolVersion::V4)?;
+    let writer = crate::framed::SnellStreamWriter::new(writer_io, &secret, ProtocolVersion::V4)?;
     Ok((
         target,
         TcpServerStream::from_parts_with_pending(reader, writer, pending),
@@ -138,24 +115,27 @@ async fn client_open_writes_connect_request() {
     let (client_upload, server_upload) = test_duplex_pair();
 
     let client = async {
+        let secret = shared_secret(TEST_PSK);
         let stream = TcpClientStream::open_io(
             tokio::io::empty(),
             client_upload,
-            TEST_PSK,
-            "example.com",
-            443,
-            ProtocolVersion::V4,
-            false,
+            TcpClientOpenOptions {
+                secret: &secret,
+                host: "example.com",
+                port: 443,
+                version: ProtocolVersion::V4,
+                reuse: false,
+            },
         )
         .await
         .unwrap();
-        let _ = stream.into_split();
+        drop(stream);
     };
 
     let server = async {
         let mut reader = test_snell_reader(server_upload);
-        let payload = reader.read_frame_payload().await.unwrap();
-        let request = parse_client_request(payload).unwrap();
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+        let request = parse_client_request(&payload).unwrap();
         assert_eq!(
             request,
             ClientRequest::Connect {
@@ -179,10 +159,9 @@ async fn client_reader_maps_transport_eof_after_tunnel_to_eof() {
         let frame_reader = test_snell_reader(client_download);
         let mut reader = super::TcpReader::client(frame_reader);
 
-        let reply = reader.take_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(&reply[..], b"accepted");
-
-        assert!(reader.take_payload_chunk().await.unwrap().is_none());
+        let mut reply = Vec::new();
+        reader.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply, b"accepted");
     };
 
     let server = async {
@@ -190,7 +169,7 @@ async fn client_reader_maps_transport_eof_after_tunnel_to_eof() {
         write_snell_tunnel_reply_message(&mut server_writer, b"accepted")
             .await
             .unwrap();
-        server_writer.shutdown().await.unwrap();
+        drop(server_writer);
     };
 
     let ((), ()) = tokio::join!(client, server);
@@ -203,7 +182,8 @@ async fn server_reader_maps_transport_eof_to_eof() {
 
     let frame_reader = test_snell_reader(server_upload);
     let mut reader = super::TcpReader::server(frame_reader, Bytes::new());
-    assert!(reader.take_payload_chunk().await.unwrap().is_none());
+    let mut out = [0; 1];
+    assert_eq!(reader.read(&mut out).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -223,8 +203,8 @@ async fn server_stream_preserves_early_data_and_coalesces_first_reply() {
             .unwrap();
 
         let mut reader = test_snell_reader(client_download);
-        let payload = reader.read_frame_payload().await.unwrap();
-        let reply = parse_server_reply(payload).unwrap();
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+        let reply = parse_server_reply(&payload).unwrap();
         assert_eq!(
             reply,
             ServerReply::Tunnel {
@@ -247,12 +227,13 @@ async fn server_stream_preserves_early_data_and_coalesces_first_reply() {
             }
         );
 
-        let (mut reader, mut writer) = stream.into_split();
-        let early = reader.take_payload_chunk().await.unwrap().unwrap();
-        assert_eq!(&early[..], b"early");
+        let mut stream = stream;
+        let mut early = [0; 5];
+        stream.read_exact(&mut early).await.unwrap();
+        assert_eq!(&early, b"early");
 
         assert_eq!(
-            write_server_payload(&mut writer, b"first").await.unwrap(),
+            write_server_payload(&mut stream, b"first").await.unwrap(),
             5
         );
     };
@@ -275,8 +256,8 @@ async fn server_writer_coalesces_tunnel_with_first_reader_payload() {
 
     let client = async {
         let mut reader = test_snell_reader(client_download);
-        let payload = reader.read_frame_payload().await.unwrap();
-        let reply = parse_server_reply(payload).unwrap();
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+        let reply = parse_server_reply(&payload).unwrap();
 
         assert_eq!(
             reply,
@@ -298,16 +279,12 @@ async fn server_writer_batch_drains_plain_buffer_across_records() {
     let server = async {
         let writer = test_snell_writer(server_download);
         let mut writer = super::TcpServerWriter::new(writer);
-        let mut plain = payload.as_slice();
 
         assert_eq!(
-            writer
-                .write_payload_message_from_reader(&mut plain)
-                .await
-                .unwrap(),
-            Some(payload.len())
+            write_server_payload(&mut writer, &payload).await.unwrap(),
+            payload.len()
         );
-        writer.close_write().await.unwrap();
+        close_server_writer(&mut writer).await.unwrap();
     };
 
     let client = async {
@@ -315,40 +292,12 @@ async fn server_writer_batch_drains_plain_buffer_across_records() {
         let mut reader = super::TcpReader::client(frame_reader);
         let mut received = Vec::with_capacity(payload.len());
 
-        while received.len() < payload.len() {
-            let chunk = reader.take_payload_chunk().await.unwrap().unwrap();
-            received.extend_from_slice(&chunk);
-        }
+        reader.read_to_end(&mut received).await.unwrap();
 
         assert_eq!(received, payload);
-        assert!(reader.take_payload_chunk().await.unwrap().is_none());
     };
 
     let ((), ()) = tokio::join!(client, server);
-}
-
-#[tokio::test]
-async fn server_writer_plain_batch_uses_large_read_ahead_window() {
-    let (server_download, _client_download) = test_duplex_pair();
-    let writer = test_snell_writer(server_download);
-    let mut writer = super::TcpServerWriter::new(writer);
-    let observed = Arc::new(Mutex::new(Vec::new()));
-    let mut plain = RecordingPlainReadWindow::new(b"tiny", observed.clone());
-
-    assert_eq!(
-        writer
-            .write_payload_message_from_reader(&mut plain)
-            .await
-            .unwrap(),
-        Some(4)
-    );
-    assert!(
-        observed
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|remaining| *remaining >= SERVER_PLAIN_READ_AHEAD_CAPACITY)
-    );
 }
 
 #[tokio::test]
@@ -357,26 +306,30 @@ async fn split_halves_can_read_and_write_concurrently() {
     let (server_download, client_download) = test_duplex_pair();
 
     let client = async {
+        let secret = shared_secret(TEST_PSK);
         let stream = TcpClientStream::open_io(
             client_download,
             client_upload,
-            TEST_PSK,
-            "example.com",
-            443,
-            ProtocolVersion::V4,
-            false,
+            TcpClientOpenOptions {
+                secret: &secret,
+                host: "example.com",
+                port: 443,
+                version: ProtocolVersion::V4,
+                reuse: false,
+            },
         )
         .await
         .unwrap();
-        let (mut reader, mut writer) = stream.into_split();
+        let (mut reader, mut writer) = tokio::io::split(stream);
 
         let write = async {
             write_client_payload(&mut writer, b"ping").await.unwrap();
-            writer.close_write().await.unwrap();
+            close_client_writer(&mut writer).await.unwrap();
         };
         let read = async {
-            let payload = reader.take_payload_chunk().await.unwrap().unwrap();
-            assert_eq!(&payload[..], b"pong");
+            let mut payload = [0; 4];
+            reader.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"pong");
         };
 
         tokio::join!(read, write);
@@ -387,15 +340,16 @@ async fn split_halves_can_read_and_write_concurrently() {
             .await
             .unwrap();
         assert_eq!(target.host, "example.com");
-        let (mut reader, mut writer) = stream.into_split();
+        let (mut reader, mut writer) = tokio::io::split(stream);
 
         let read = async {
-            let payload = reader.take_payload_chunk().await.unwrap().unwrap();
-            assert_eq!(&payload[..], b"ping");
+            let mut payload = [0; 4];
+            reader.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
         };
         let write = async {
             write_server_payload(&mut writer, b"pong").await.unwrap();
-            writer.close_write().await.unwrap();
+            close_server_writer(&mut writer).await.unwrap();
         };
 
         tokio::join!(read, write);
@@ -409,10 +363,10 @@ async fn client_writer_rejects_write_after_close() {
     let frame_writer = test_snell_writer(tokio::io::sink());
     let mut writer = super::TcpClientWriter::new(frame_writer);
 
-    writer.close_write().await.unwrap();
+    close_client_writer(&mut writer).await.unwrap();
     assert!(matches!(
         write_client_payload(&mut writer, b"after close").await,
-        Err(Error::WriteClosed)
+        Err(err) if err.kind() == ErrorKind::BrokenPipe
     ));
 }
 
@@ -421,10 +375,10 @@ async fn server_writer_rejects_write_after_close() {
     let frame_writer = test_snell_writer(tokio::io::sink());
     let mut writer = super::TcpServerWriter::new(frame_writer);
 
-    writer.close_write().await.unwrap();
+    close_server_writer(&mut writer).await.unwrap();
     assert!(matches!(
         write_server_payload(&mut writer, b"after close").await,
-        Err(Error::WriteClosed)
+        Err(err) if err.kind() == ErrorKind::BrokenPipe
     ));
 }
 
@@ -434,9 +388,9 @@ async fn server_stream_can_reject_before_opening_tunnel() {
 
     let read = async {
         let mut reader = test_snell_reader(client_download);
-        let payload = reader.read_frame_payload().await.unwrap();
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
         assert!(matches!(
-            parse_server_reply(payload),
+            parse_server_reply(&payload),
             Ok(ServerReply::Error {
                 code: 9,
                 message: "blocked"
@@ -447,7 +401,7 @@ async fn server_stream_can_reject_before_opening_tunnel() {
     let reject = async {
         let reader = test_snell_reader(tokio::io::empty());
         let writer = test_snell_writer(server_download);
-        let stream = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
+        let mut stream = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
         stream.reject(9, "blocked").await.unwrap();
     };
 
