@@ -79,7 +79,10 @@ fn try_enable_tcp_fast_open(_socket: &TcpSocket) {
     tracing::warn!("snell tcp_fast_open is unsupported on this platform");
 }
 
-pub(crate) async fn drain_connection_tasks(mut tasks: JoinSet<()>, drain_timeout: Duration) {
+pub(crate) async fn drain_connection_tasks<T: 'static>(
+    mut tasks: JoinSet<T>,
+    drain_timeout: Duration,
+) {
     let drain = async {
         while let Some(result) = tasks.join_next().await {
             log_connection_task_result(Some(result));
@@ -99,15 +102,15 @@ pub(crate) async fn drain_connection_tasks(mut tasks: JoinSet<()>, drain_timeout
     tasks.abort_all();
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(err) if err.is_cancelled() => {}
             Err(err) => tracing::debug!(%err, "snell connection task ended unexpectedly"),
         }
     }
 }
 
-pub(crate) fn log_connection_task_result(
-    result: Option<std::result::Result<(), tokio::task::JoinError>>,
+pub(crate) fn log_connection_task_result<T>(
+    result: Option<std::result::Result<T, tokio::task::JoinError>>,
 ) {
     if let Some(Err(err)) = result {
         tracing::debug!(%err, "snell connection task ended unexpectedly");

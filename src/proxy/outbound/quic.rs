@@ -20,8 +20,16 @@ use super::{RelayOptions, UpstreamRelay, address_ref_from_host};
 pub(crate) struct QuicProxyRelay {
     outbound: Arc<UdpSocket>,
     target: QuicProxyRelayTarget,
-    request: BytesMut,
+    buffers: Box<QuicProxyRelayBuffers>,
     _control: Option<tokio::net::TcpStream>,
+}
+
+struct QuicProxyRelayBuffers {
+    request: BytesMut,
+}
+
+struct QuicProxyResponseBuffers {
+    responses: UdpRecvBatch,
 }
 
 #[derive(Clone)]
@@ -32,6 +40,22 @@ enum QuicProxyRelayTarget {
         host: String,
         port: u16,
     },
+}
+
+impl QuicProxyRelayBuffers {
+    fn new() -> Self {
+        Self {
+            request: BytesMut::with_capacity(MAX_PACKET_SIZE + 512),
+        }
+    }
+}
+
+impl QuicProxyResponseBuffers {
+    fn new() -> Self {
+        Self {
+            responses: UdpRecvBatch::new(MAX_PACKET_SIZE + 512),
+        }
+    }
 }
 
 pub(crate) async fn open_quic_udp(
@@ -53,7 +77,7 @@ pub(crate) async fn open_quic_udp(
             Ok(QuicProxyRelay {
                 outbound: Arc::new(outbound),
                 target: QuicProxyRelayTarget::Direct(target),
-                request: BytesMut::with_capacity(MAX_PACKET_SIZE + 512),
+                buffers: Box::new(QuicProxyRelayBuffers::new()),
                 _control: None,
             })
         }
@@ -79,7 +103,7 @@ pub(crate) async fn open_quic_udp(
                     host,
                     port,
                 },
-                request: BytesMut::with_capacity(MAX_PACKET_SIZE + 512),
+                buffers: Box::new(QuicProxyRelayBuffers::new()),
                 _control: Some(association.control),
             })
         }
@@ -103,16 +127,16 @@ impl QuicProxyRelay {
                 host,
                 port,
             } => {
-                self.request.clear();
+                self.buffers.request.clear();
                 write_socks_udp_packet(
-                    &mut self.request,
+                    &mut self.buffers.request,
                     address_ref_from_host(host),
                     *port,
                     payload,
                 )?;
                 send_udp_batch(
                     &self.outbound,
-                    &[UdpSendPacket::single(&self.request, *relay_addr)],
+                    &[UdpSendPacket::single(&self.buffers.request, *relay_addr)],
                     MAX_PACKET_SIZE + 512,
                 )
                 .await?;
@@ -139,12 +163,12 @@ pub(crate) async fn run_quic_proxy_response_session(
     client_addr: SocketAddr,
     relay: QuicProxyResponseRelay,
 ) -> Result<()> {
-    let mut responses = UdpRecvBatch::new(MAX_PACKET_SIZE + 512);
+    let mut buffers = Box::new(QuicProxyResponseBuffers::new());
 
     loop {
-        let count = responses.recv_from(&relay.outbound).await?;
+        let count = buffers.responses.recv_from(&relay.outbound).await?;
         for index in 0..count {
-            let Some(response) = responses.get(index) else {
+            let Some(response) = buffers.responses.get(index) else {
                 continue;
             };
             let peer = response.peer();

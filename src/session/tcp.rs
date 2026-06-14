@@ -1,3 +1,4 @@
+use std::future::poll_fn;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -73,6 +74,10 @@ where
         writer.write_tcp_request(host, port, reuse).await?;
         let reader = SnellStreamReader::new(reader_io, secret, version);
         Ok(Self::from_parts(reader, writer))
+    }
+
+    pub(crate) async fn accept_tunnel_reply(&mut self) -> Result<()> {
+        poll_fn(|cx| self.reader.poll_read_tunnel_reply(cx)).await
     }
 
     fn from_parts(reader: SnellStreamReader<R>, writer: SnellStreamWriter<W>) -> Self {

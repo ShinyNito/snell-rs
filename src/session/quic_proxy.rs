@@ -27,6 +27,20 @@ const SESSION_QUEUE_CAPACITY: usize = 256;
 const RECV_BUFFER_CAPACITY: usize = MAX_PACKET_SIZE + 512;
 const PAYLOAD_SCRATCH_CAPACITY: usize = 64 * 1024;
 
+struct QuicProxySocketBuffers {
+    recv_batch: UdpRecvBatch,
+    scratch: BytesMut,
+}
+
+impl QuicProxySocketBuffers {
+    fn new() -> Self {
+        Self {
+            recv_batch: UdpRecvBatch::new(RECV_BUFFER_CAPACITY),
+            scratch: BytesMut::with_capacity(PAYLOAD_SCRATCH_CAPACITY),
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn serve_quic_proxy_socket(
     socket: UdpSocket,
@@ -38,18 +52,17 @@ pub(crate) async fn serve_quic_proxy_socket(
     let psk = Zeroizing::new(psk);
     let socket = Arc::new(socket);
     let mut sessions = HashMap::<SocketAddr, QuicProxySession>::new();
-    let mut recv_batch = UdpRecvBatch::new(RECV_BUFFER_CAPACITY);
-    let mut scratch = BytesMut::with_capacity(PAYLOAD_SCRATCH_CAPACITY);
+    let mut buffers = Box::new(QuicProxySocketBuffers::new());
     let cleanup = sleep(idle_timeout);
     tokio::pin!(cleanup);
 
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
-            recv_result = recv_batch.recv_from(&socket) => {
+            recv_result = buffers.recv_batch.recv_from(&socket) => {
                 let count = recv_result?;
                 for index in 0..count {
-                    let Some(entry) = recv_batch.get(index) else {
+                    let Some(entry) = buffers.recv_batch.get(index) else {
                         continue;
                     };
                     if entry.is_oversized() || entry.payload_len() == 0 {
@@ -65,9 +78,9 @@ pub(crate) async fn serve_quic_proxy_socket(
                     }
                     if sessions.contains_key(&client_addr) {
                         let payload = if is_quic_looking(first_byte) {
-                            copy_payload(&mut scratch, entry.payload())
+                            copy_payload(&mut buffers.scratch, entry.payload())
                         } else {
-                            let mut entry = recv_batch
+                            let mut entry = buffers.recv_batch
                                 .get_mut(index)
                                 .expect("checked UDP batch index must exist");
                             let init = match decode_init_datagram(&psk, entry.payload_mut()) {
@@ -78,7 +91,10 @@ pub(crate) async fn serve_quic_proxy_socket(
                                 }
                             };
                             let span = init.payload_span;
-                            copy_payload(&mut scratch, &entry.payload_mut()[span.start..span.end])
+                            copy_payload(
+                                &mut buffers.scratch,
+                                &entry.payload_mut()[span.start..span.end],
+                            )
                         };
                         let Some(session) = sessions.get_mut(&client_addr) else {
                             continue;
@@ -102,7 +118,7 @@ pub(crate) async fn serve_quic_proxy_socket(
                     }
 
                     let (host, port, first_payload) = {
-                        let mut entry = recv_batch
+                        let mut entry = buffers.recv_batch
                             .get_mut(index)
                             .expect("checked UDP batch index must exist");
                         let init = match decode_init_datagram(&psk, entry.payload_mut()) {
@@ -116,7 +132,10 @@ pub(crate) async fn serve_quic_proxy_socket(
                         (
                             init.host.to_owned(),
                             init.port,
-                            copy_payload(&mut scratch, &entry.payload_mut()[span.start..span.end]),
+                            copy_payload(
+                                &mut buffers.scratch,
+                                &entry.payload_mut()[span.start..span.end],
+                            ),
                         )
                     };
                     let (queue, payloads) = mpsc::channel(SESSION_QUEUE_CAPACITY);

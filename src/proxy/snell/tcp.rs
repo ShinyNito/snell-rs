@@ -31,10 +31,10 @@ async fn relay_opened_tcp_connect(
 ) -> Result<RelayStats> {
     match connect {
         SnellTcpConnect::Fresh(mut server) => {
-            relay_bidirectional(local, &mut server, activity).await
+            relay_bidirectional(local, &mut *server, activity).await
         }
         SnellTcpConnect::Reused { mut conn, pool } => {
-            let stats = relay_bidirectional(local, &mut conn, activity).await?;
+            let stats = relay_bidirectional(local, &mut *conn, activity).await?;
             pool.put(conn);
             Ok(stats)
         }

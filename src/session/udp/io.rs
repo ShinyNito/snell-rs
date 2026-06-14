@@ -172,6 +172,10 @@ impl UdpRecvBatch {
             .await
     }
 
+    pub(crate) fn try_recv_from(&mut self, socket: &UdpSocket) -> Result<usize> {
+        self.try_recv_from_with_headroom(socket, 0, self.max_datagram_len)
+    }
+
     pub(crate) async fn recv_from_with_headroom(
         &mut self,
         socket: &UdpSocket,
@@ -180,6 +184,18 @@ impl UdpRecvBatch {
     ) -> Result<usize> {
         self.prepare_slots(headroom, payload_limit)?;
         let count = recv_udp_batch_platform(socket, self).await?;
+        self.count = count;
+        Ok(count)
+    }
+
+    pub(crate) fn try_recv_from_with_headroom(
+        &mut self,
+        socket: &UdpSocket,
+        headroom: usize,
+        payload_limit: usize,
+    ) -> Result<usize> {
+        self.prepare_slots(headroom, payload_limit)?;
+        let count = try_recv_udp_batch_platform(socket, self)?;
         self.count = count;
         Ok(count)
     }
@@ -450,6 +466,19 @@ async fn recv_udp_batch_platform(socket: &UdpSocket, batch: &mut UdpRecvBatch) -
 async fn recv_udp_batch_platform(socket: &UdpSocket, batch: &mut UdpRecvBatch) -> Result<usize> {
     let slot = &mut batch.slots[0];
     let (payload_len, peer) = socket.recv_buf_from(&mut slot.datagram).await?;
+    slot.set_received(payload_len, peer, batch.payload_limit);
+    Ok(1)
+}
+
+#[cfg(target_os = "linux")]
+fn try_recv_udp_batch_platform(socket: &UdpSocket, batch: &mut UdpRecvBatch) -> Result<usize> {
+    Ok(socket.try_io(Interest::READABLE, || try_recvmmsg(socket, batch))?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_recv_udp_batch_platform(socket: &UdpSocket, batch: &mut UdpRecvBatch) -> Result<usize> {
+    let slot = &mut batch.slots[0];
+    let (payload_len, peer) = socket.try_recv_buf_from(&mut slot.datagram)?;
     slot.set_received(payload_len, peer, batch.payload_limit);
     Ok(1)
 }

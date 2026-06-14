@@ -75,6 +75,10 @@ pub struct SocksUdpPacketRef<'a> {
 pub enum SocksReply {
     Succeeded = 0,
     GeneralFailure = 1,
+    NetworkUnreachable = 3,
+    HostUnreachable = 4,
+    ConnectionRefused = 5,
+    TtlExpired = 6,
     CommandNotSupported = 7,
     AddressTypeNotSupported = 8,
 }

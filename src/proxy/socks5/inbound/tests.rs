@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -21,7 +21,8 @@ use crate::protocol::version::DEFAULT_CLIENT_VERSION;
 use crate::proxy::outbound::RelayOptions;
 use crate::proxy::outbound::snell::SnellClientOutbound;
 use crate::proxy::snell::server::{
-    SERVER_TCP_ACTIVITY_TIMEOUTS, open_tcp_target, serve_server_connection,
+    SERVER_TCP_ACTIVITY_TIMEOUTS, V6_ERROR_CONNECTION_REFUSED, open_tcp_target,
+    serve_server_connection,
 };
 use crate::proxy::socks5::udp::is_allowed_socks_udp_peer;
 use crate::test_support::{
@@ -66,6 +67,26 @@ async fn relay_socks5_connection_with_options(
         version,
     )?);
     super::relay_socks5_connection(local, outbound, quic_proxy).await
+}
+
+async fn read_request_error_reply(request: &'static [u8]) -> ([u8; 10], Error) {
+    let (mut client, mut server) = duplex(128);
+
+    let server_task = async { super::read_client_request(&mut server).await.unwrap_err() };
+    let client_task = async {
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+
+        client.write_all(request).await.unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        reply
+    };
+
+    let (err, reply) = tokio::join!(server_task, client_task);
+    (reply, err)
 }
 
 #[tokio::test]
@@ -136,7 +157,7 @@ async fn socks5_connection_relays_tcp_over_snell() {
 }
 
 #[tokio::test]
-async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
+async fn socks5_connect_waits_for_snell_tunnel_reply_before_success() {
     let psk = TEST_PSK;
     let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
@@ -144,6 +165,8 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
     let socks_addr = socks_listener.local_addr().unwrap();
     let request_payload = b"GET / HTTP/1.1\r\n\r\n";
     let response_payload = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let (request_seen_tx, request_seen_rx) = oneshot::channel();
+    let (allow_reply_tx, allow_reply_rx) = oneshot::channel();
 
     let snell_server = async {
         let (stream, _) = snell_listener.accept().await.unwrap();
@@ -161,12 +184,18 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
                 rest: b"",
             }
         );
+        request_seen_tx.send(()).unwrap();
+        allow_reply_rx.await.unwrap();
+
+        let mut server_writer = test_snell_writer(server_write);
+        write_snell_tunnel_reply_message(&mut server_writer, b"")
+            .await
+            .unwrap();
 
         let payload = read_snell_frame_payload(&mut reader).await.unwrap();
         assert_eq!(&payload[..], request_payload);
 
-        let mut server_writer = test_snell_writer(server_write);
-        write_snell_tunnel_reply_message(&mut server_writer, response_payload)
+        write_snell_payload_message(&mut server_writer, response_payload)
             .await
             .unwrap();
         server_writer.write_zero_chunk().await.unwrap();
@@ -190,7 +219,14 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
         stream.read_exact(&mut method).await.unwrap();
         assert_eq!(method, [5, 0]);
 
+        request_seen_rx.await.unwrap();
         let mut reply = [0; 10];
+        assert!(
+            timeout(Duration::from_millis(100), stream.read_exact(&mut reply))
+                .await
+                .is_err()
+        );
+        allow_reply_tx.send(()).unwrap();
         timeout(Duration::from_millis(200), stream.read_exact(&mut reply))
             .await
             .unwrap()
@@ -208,6 +244,68 @@ async fn socks5_connect_sends_success_before_snell_tunnel_reply() {
     let ((), stats, ()) = tokio::join!(snell_server, socks_server, client);
     assert_eq!(stats.uploaded, request_payload.len() as u64);
     assert_eq!(stats.downloaded, response_payload.len() as u64);
+}
+
+#[tokio::test]
+async fn socks5_connect_error_reply_reflects_snell_tunnel_error() {
+    let psk = TEST_PSK;
+    let snell_listener = test_tcp_listener().await;
+    let snell_addr = snell_listener.local_addr().unwrap();
+    let socks_listener = test_tcp_listener().await;
+    let socks_addr = socks_listener.local_addr().unwrap();
+
+    let snell_server = async {
+        let (stream, _) = snell_listener.accept().await.unwrap();
+        let (server_read, server_write) = stream.into_split();
+        let mut reader = test_snell_reader(server_read);
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+        let request = parse_client_request(&payload).unwrap();
+        assert_eq!(
+            request,
+            ClientRequest::Connect {
+                reuse: false,
+                host: "1.1.1.1",
+                port: 80,
+                rest_span: Range { start: 13, end: 13 },
+                rest: b"",
+            }
+        );
+
+        let mut writer = test_snell_writer(server_write);
+        writer
+            .write_error_reply(V6_ERROR_CONNECTION_REFUSED, "refused")
+            .await
+            .unwrap();
+    };
+
+    let socks_server = async {
+        let (stream, _) = socks_listener.accept().await.unwrap();
+        std::assert_matches!(
+            relay_socks5_connection(stream, snell_addr, psk, false).await,
+            Err(Error::Server {
+                code: V6_ERROR_CONNECTION_REFUSED,
+                ..
+            })
+        );
+    };
+
+    let client = async {
+        let mut stream = TcpStream::connect(socks_addr).await.unwrap();
+        stream
+            .write_all(&[5, 1, 0, 5, 1, 0, 1, 1, 1, 1, 1, 0, 80])
+            .await
+            .unwrap();
+
+        let mut method = [0; 2];
+        stream.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+
+        let mut reply = [0; 10];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [5, 5, 0, 1, 0, 0, 0, 0, 0, 0]);
+    };
+
+    let ((), (), ()) = tokio::join!(snell_server, socks_server, client);
 }
 
 #[tokio::test]
@@ -244,7 +342,7 @@ async fn socks5_failure_reply_closes_tcp_connection() {
 
         let mut reply = [0; 10];
         stream.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply, [5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(reply, [5, 5, 0, 1, 0, 0, 0, 0, 0, 0]);
 
         let mut tail = Vec::new();
         timeout(Duration::from_secs(1), stream.read_to_end(&mut tail))
@@ -255,6 +353,21 @@ async fn socks5_failure_reply_closes_tcp_connection() {
     };
 
     let ((), ()) = tokio::join!(socks_server, client);
+}
+
+#[tokio::test]
+async fn socks5_request_errors_use_specific_reply_codes() {
+    let (reply, err) = read_request_error_reply(&[5, 2, 0, 1, 127, 0, 0, 1, 0, 80]).await;
+    assert_eq!(reply, [5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+    std::assert_matches!(err, Error::InvalidSocksRequest);
+
+    let (reply, err) = read_request_error_reply(&[5, 1, 0, 9]).await;
+    assert_eq!(reply, [5, 8, 0, 1, 0, 0, 0, 0, 0, 0]);
+    std::assert_matches!(err, Error::InvalidSocksRequest);
+
+    let (reply, err) = read_request_error_reply(&[5, 1, 0, 3, 0, 0, 80]).await;
+    assert_eq!(reply, [5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+    std::assert_matches!(err, Error::EmptyHost);
 }
 
 #[tokio::test]

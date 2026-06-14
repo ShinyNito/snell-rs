@@ -8,6 +8,7 @@ use crate::ProtocolVersion;
 use crate::config::ClientConfig;
 use crate::error::Result;
 use crate::protocol::psk::SnellPsk;
+use crate::proxy::outbound::RelayStats;
 use crate::proxy::outbound::snell::SnellClientOutbound;
 use crate::proxy::socks5::inbound::relay_socks5_connection;
 use crate::server::shutdown::{SHUTDOWN_DRAIN_TIMEOUT, bind_tcp_listener, drain_connection_tasks};
@@ -57,21 +58,12 @@ async fn serve_socks5_listener(
         tokio::select! {
             () = shutdown.cancelled() => break,
             result = listener.accept() => {
-                let (local, peer_addr) = result?;
+                let (local, _peer_addr) = result?;
                 let outbound = outbound.clone();
-                tasks.spawn(async move {
-                    let result = relay_socks5_connection(
-                        local, outbound, quic_proxy,
-                    ).await;
-                    if let Err(err) = result {
-                        tracing::debug!(%err, %peer_addr, "snell socks5 client connection failed");
-                    }
-                });
+                tasks.spawn(relay_socks5_connection(local, outbound, quic_proxy));
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some(Err(err)) = result {
-                    tracing::debug!(%err, "snell socks5 client task ended unexpectedly");
-                }
+                log_socks5_client_task_result(result);
             }
         }
     }
@@ -80,4 +72,18 @@ async fn serve_socks5_listener(
     drain_connection_tasks(tasks, SHUTDOWN_DRAIN_TIMEOUT).await;
     outbound.close_idle_connections();
     Ok(())
+}
+
+fn log_socks5_client_task_result(
+    result: Option<std::result::Result<Result<RelayStats>, tokio::task::JoinError>>,
+) {
+    match result {
+        Some(Ok(Ok(_))) | None => {}
+        Some(Ok(Err(err))) => {
+            tracing::debug!(%err, "snell socks5 client connection failed");
+        }
+        Some(Err(err)) => {
+            tracing::debug!(%err, "snell socks5 client task ended unexpectedly");
+        }
+    }
 }

@@ -206,7 +206,10 @@ async fn udp_server_relays_datagram_via_upstream_socks5() {
     };
 
     let socks = async {
-        let (mut control, _) = socks_listener.accept().await.unwrap();
+        let (mut control, _) = timeout(Duration::from_millis(500), socks_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
         let request = read_socks_client_request(&mut control).await.unwrap();
         assert_eq!(
             request,
@@ -292,7 +295,7 @@ async fn udp_server_relays_datagram_via_upstream_socks5() {
 }
 
 #[tokio::test]
-async fn udp_upstream_socks5_failure_returns_server_error_before_tunnel_success() {
+async fn udp_upstream_socks5_failure_after_tunnel_open_closes_server() {
     let psk = TEST_PSK;
     let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
@@ -321,16 +324,31 @@ async fn udp_upstream_socks5_failure_returns_server_error_before_tunnel_success(
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let secret = shared_secret(psk);
-        assert!(matches!(
-            UdpClientStream::open_io(
-                reader,
-                writer,
-                &secret,
-                crate::ProtocolVersion::V4,
-            )
-            .await,
-            Err(Error::Server { code: 1, message }) if message == "connect failed"
-        ));
+        let (mut reader, mut writer) =
+            UdpClientStream::open_io(reader, writer, &secret, crate::ProtocolVersion::V4)
+                .await
+                .unwrap()
+                .into_parts();
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            53,
+            b"query",
+        )
+        .await
+        .unwrap();
+
+        let result = timeout(
+            Duration::from_millis(500),
+            reader.read_udp_response_message(),
+        )
+        .await
+        .unwrap();
+        match result {
+            Ok(None) => {}
+            Err(err) if err.is_closed_io() => {}
+            other => panic!("unexpected udp response read result: {other:?}"),
+        }
     };
 
     let ((), server_result, ()) = tokio::join!(socks, server, client);
@@ -338,7 +356,7 @@ async fn udp_upstream_socks5_failure_returns_server_error_before_tunnel_success(
 }
 
 #[tokio::test]
-async fn udp_upstream_socks5_control_close_ends_association() {
+async fn udp_upstream_socks5_control_close_reopens_without_ending_association() {
     let psk = TEST_PSK;
     let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
@@ -346,17 +364,64 @@ async fn udp_upstream_socks5_control_close_ends_association() {
     let snell_addr = snell_listener.local_addr().unwrap();
 
     let socks = async {
-        let (mut control, _) = socks_listener.accept().await.unwrap();
+        let (mut control, _) = timeout(Duration::from_millis(500), socks_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
         let request = read_socks_client_request(&mut control).await.unwrap();
         assert!(matches!(request, SocksRequest::UdpAssociate(_)));
         let relay = test_udp_socket().await;
-        write_reply_with_bind(
-            &mut control,
-            SocksReply::Succeeded,
-            relay.local_addr().unwrap(),
+        let relay_addr = relay.local_addr().unwrap();
+        write_reply_with_bind(&mut control, SocksReply::Succeeded, relay_addr)
+            .await
+            .unwrap();
+
+        let mut packet_buf = bytes::BytesMut::with_capacity(crate::MAX_PACKET_SIZE + 512);
+        let (n, _) = timeout(
+            Duration::from_millis(500),
+            relay.recv_buf_from(&mut packet_buf),
         )
         .await
+        .unwrap()
         .unwrap();
+        let packet = parse_socks_udp_packet(&packet_buf[..n]).unwrap();
+        assert_eq!(packet.payload, b"first");
+        drop(control);
+
+        let (mut control, _) = timeout(Duration::from_millis(500), socks_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = read_socks_client_request(&mut control).await.unwrap();
+        assert!(matches!(request, SocksRequest::UdpAssociate(_)));
+        let relay = test_udp_socket().await;
+        let relay_addr = relay.local_addr().unwrap();
+        write_reply_with_bind(&mut control, SocksReply::Succeeded, relay_addr)
+            .await
+            .unwrap();
+
+        packet_buf.clear();
+        let (n, snell_peer) = timeout(
+            Duration::from_millis(500),
+            relay.recv_buf_from(&mut packet_buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let packet = parse_socks_udp_packet(&packet_buf[..n]).unwrap();
+        assert_eq!(packet.payload, b"second");
+        let mut response = bytes::BytesMut::new();
+        write_socks_udp_packet(
+            &mut response,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            5353,
+            b"answer",
+        )
+        .unwrap();
+        relay.send_to(&response, snell_peer).await.unwrap();
+
+        let mut control_buf = [0; 1];
+        let _ = timeout(Duration::from_millis(500), control.read(&mut control_buf)).await;
     };
 
     let server = async {
@@ -377,21 +442,173 @@ async fn udp_upstream_socks5_control_close_ends_association() {
         let stream = TcpStream::connect(snell_addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let secret = shared_secret(psk);
-        let (mut reader, _) =
+        let (mut reader, mut writer) =
             UdpClientStream::open_io(reader, writer, &secret, crate::ProtocolVersion::V4)
                 .await
                 .unwrap()
                 .into_parts();
-        assert!(
-            timeout(
-                Duration::from_millis(200),
-                reader.read_udp_response_message()
-            )
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            53,
+            b"first",
+        )
+        .await
+        .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            53,
+            b"second",
+        )
+        .await
+        .unwrap();
+
+        let message = timeout(
+            Duration::from_millis(500),
+            reader.read_udp_response_message(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let response = TestUdpPacket::from_ref(parse_udp_response(&message).unwrap());
+        assert_eq!(response.payload, b"answer");
+        assert_eq!(response.port, 5353);
+        writer.write_zero_chunk().await.unwrap();
+    };
+
+    let ((), (), ()) = tokio::join!(socks, server, client);
+}
+
+#[tokio::test]
+async fn udp_upstream_socks5_idle_reopens_without_ending_association() {
+    let psk = TEST_PSK;
+    let socks_listener = test_tcp_listener().await;
+    let socks_addr = socks_listener.local_addr().unwrap();
+    let snell_listener = test_tcp_listener().await;
+    let snell_addr = snell_listener.local_addr().unwrap();
+
+    let socks = async {
+        let (mut control, _) = timeout(Duration::from_millis(500), socks_listener.accept())
             .await
             .unwrap()
+            .unwrap();
+        let request = read_socks_client_request(&mut control).await.unwrap();
+        assert!(matches!(request, SocksRequest::UdpAssociate(_)));
+        let relay = test_udp_socket().await;
+        let relay_addr = relay.local_addr().unwrap();
+        write_reply_with_bind(&mut control, SocksReply::Succeeded, relay_addr)
+            .await
+            .unwrap();
+
+        let mut packet_buf = bytes::BytesMut::with_capacity(crate::MAX_PACKET_SIZE + 512);
+        let (n, _) = timeout(
+            Duration::from_millis(500),
+            relay.recv_buf_from(&mut packet_buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let packet = parse_socks_udp_packet(&packet_buf[..n]).unwrap();
+        assert_eq!(packet.payload, b"first");
+
+        let mut control_buf = [0; 1];
+        let n = timeout(Duration::from_millis(500), control.read(&mut control_buf))
+            .await
             .unwrap()
-            .is_none()
-        );
+            .unwrap();
+        assert_eq!(n, 0);
+
+        let (mut control, _) = timeout(Duration::from_millis(500), socks_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = read_socks_client_request(&mut control).await.unwrap();
+        assert!(matches!(request, SocksRequest::UdpAssociate(_)));
+        let relay = test_udp_socket().await;
+        let relay_addr = relay.local_addr().unwrap();
+        write_reply_with_bind(&mut control, SocksReply::Succeeded, relay_addr)
+            .await
+            .unwrap();
+
+        packet_buf.clear();
+        let (n, snell_peer) = timeout(
+            Duration::from_millis(500),
+            relay.recv_buf_from(&mut packet_buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let packet = parse_socks_udp_packet(&packet_buf[..n]).unwrap();
+        assert_eq!(packet.payload, b"second");
+        let mut response = bytes::BytesMut::new();
+        write_socks_udp_packet(
+            &mut response,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            5353,
+            b"answer",
+        )
+        .unwrap();
+        relay.send_to(&response, snell_peer).await.unwrap();
+
+        let _ = timeout(Duration::from_millis(500), control.read(&mut control_buf)).await;
+    };
+
+    let server = async {
+        let (client, _) = snell_listener.accept().await.unwrap();
+        serve_server_connection(
+            client,
+            shared_secret(psk),
+            socks5_options(false, socks_addr),
+            V6SaltReplayCache::default(),
+            open_tcp_target,
+            SERVER_TCP_ACTIVITY_TIMEOUTS,
+        )
+        .await
+        .unwrap()
+    };
+
+    let client = async {
+        let stream = TcpStream::connect(snell_addr).await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let secret = shared_secret(psk);
+        let (mut reader, mut writer) =
+            UdpClientStream::open_io(reader, writer, &secret, crate::ProtocolVersion::V4)
+                .await
+                .unwrap()
+                .into_parts();
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            53,
+            b"first",
+        )
+        .await
+        .unwrap();
+        sleep(Duration::from_millis(150)).await;
+        write_snell_udp_packet(
+            &mut writer,
+            AddressRef::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            53,
+            b"second",
+        )
+        .await
+        .unwrap();
+
+        let message = timeout(
+            Duration::from_millis(500),
+            reader.read_udp_response_message(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let response = TestUdpPacket::from_ref(parse_udp_response(&message).unwrap());
+        assert_eq!(response.payload, b"answer");
+        assert_eq!(response.port, 5353);
+        writer.write_zero_chunk().await.unwrap();
     };
 
     let ((), (), ()) = tokio::join!(socks, server, client);

@@ -13,7 +13,12 @@ use crate::protocol::socks5::{
 };
 use crate::protocol::udp::AddressRef;
 use crate::proxy::outbound::RelayStats;
-use crate::proxy::outbound::snell::SnellClientOutbound;
+use crate::proxy::outbound::snell::{SnellClientOutbound, SnellTcpConnect};
+use crate::proxy::snell::server::{
+    V6_ERROR_ADDRESS_FAMILY_NOT_SUPPORTED, V6_ERROR_CONNECTION_REFUSED, V6_ERROR_DNS_FAILED,
+    V6_ERROR_HOST_UNREACHABLE, V6_ERROR_NETWORK_DOWN, V6_ERROR_NETWORK_UNREACHABLE,
+    V6_ERROR_TIMED_OUT,
+};
 use crate::proxy::snell::tcp::relay_tcp_connect;
 use crate::proxy::socks5::udp::relay_socks5_udp_association;
 
@@ -43,15 +48,78 @@ async fn relay_socks5_tcp_connect(
     outbound: Arc<SnellClientOutbound>,
     target: SocksTarget,
 ) -> Result<RelayStats> {
-    let connect = match outbound.open_tcp(&target.host, target.port).await {
+    let mut connect = match outbound.open_tcp(&target.host, target.port).await {
         Ok(connect) => connect,
         Err(err) => {
-            write_reply_and_shutdown(&mut local, SocksReply::GeneralFailure).await;
+            write_reply_and_shutdown(&mut local, socks_reply_for_connect_error(&err)).await;
             return Err(err);
         }
     };
+    if let Err(err) = accept_socks5_connect(&mut connect).await {
+        write_reply_and_shutdown(&mut local, socks_reply_for_connect_error(&err)).await;
+        return Err(err);
+    }
     write_reply(&mut local, SocksReply::Succeeded).await?;
     relay_tcp_connect(local, connect).await
+}
+
+async fn accept_socks5_connect(connect: &mut SnellTcpConnect) -> Result<()> {
+    connect.accept_tunnel_reply().await
+}
+
+fn socks_reply_for_connect_error(err: &Error) -> SocksReply {
+    match err {
+        Error::Server { code, .. } => socks_reply_for_snell_server_error(*code),
+        Error::Dns(_) | Error::DnsTimeout | Error::DnsUnavailable => SocksReply::HostUnreachable,
+        Error::Ipv6Disabled | Error::InvalidAddressType => SocksReply::AddressTypeNotSupported,
+        Error::Io(err) => socks_reply_for_io_error(err),
+        _ => SocksReply::GeneralFailure,
+    }
+}
+
+const fn socks_reply_for_snell_server_error(code: u8) -> SocksReply {
+    match code {
+        V6_ERROR_ADDRESS_FAMILY_NOT_SUPPORTED => SocksReply::AddressTypeNotSupported,
+        V6_ERROR_NETWORK_DOWN | V6_ERROR_NETWORK_UNREACHABLE => SocksReply::NetworkUnreachable,
+        V6_ERROR_HOST_UNREACHABLE | V6_ERROR_DNS_FAILED => SocksReply::HostUnreachable,
+        V6_ERROR_CONNECTION_REFUSED => SocksReply::ConnectionRefused,
+        V6_ERROR_TIMED_OUT => SocksReply::TtlExpired,
+        _ => SocksReply::GeneralFailure,
+    }
+}
+
+fn socks_reply_for_io_error(err: &std::io::Error) -> SocksReply {
+    match err.kind() {
+        std::io::ErrorKind::ConnectionRefused => SocksReply::ConnectionRefused,
+        std::io::ErrorKind::TimedOut => SocksReply::TtlExpired,
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::InvalidInput => {
+            SocksReply::AddressTypeNotSupported
+        }
+        std::io::ErrorKind::NotFound => SocksReply::HostUnreachable,
+        _ => SocksReply::GeneralFailure,
+    }
+}
+
+fn socks_reply_for_request_error(err: &Error) -> SocksReply {
+    match err {
+        Error::InvalidAddressType | Error::Ipv6Disabled => SocksReply::AddressTypeNotSupported,
+        _ => SocksReply::GeneralFailure,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SocksRequestCommand {
+    Connect,
+    UdpAssociate,
+}
+
+impl SocksRequestCommand {
+    const fn into_request(self, target: SocksTarget) -> SocksRequest {
+        match self {
+            Self::Connect => SocksRequest::Connect(target),
+            Self::UdpAssociate => SocksRequest::UdpAssociate(target),
+        }
+    }
 }
 
 async fn relay_socks5_udp_associate(
@@ -159,9 +227,23 @@ where
         write_reply(stream, SocksReply::GeneralFailure).await?;
         return Err(Error::InvalidSocksRequest);
     }
+    let command = match header[1] {
+        COMMAND_CONNECT => SocksRequestCommand::Connect,
+        COMMAND_UDP_ASSOCIATE => SocksRequestCommand::UdpAssociate,
+        _ => {
+            write_reply(stream, SocksReply::CommandNotSupported).await?;
+            return Err(Error::InvalidSocksRequest);
+        }
+    };
     let (address, port) = match header[3] {
         ATYP_IPV4 | ATYP_DOMAIN | ATYP_IPV6 => {
-            read_address_port(stream, header[3], SocksAddressContext::Request).await?
+            match read_address_port(stream, header[3], SocksAddressContext::Request).await {
+                Ok(address) => address,
+                Err(err) => {
+                    write_reply(stream, socks_reply_for_request_error(&err)).await?;
+                    return Err(err);
+                }
+            }
         }
         _ => {
             write_reply(stream, SocksReply::AddressTypeNotSupported).await?;
@@ -173,14 +255,7 @@ where
         SocksAddress::Domain(host) => host,
     };
     let target = SocksTarget { host, port };
-    match header[1] {
-        COMMAND_CONNECT => Ok(SocksRequest::Connect(target)),
-        COMMAND_UDP_ASSOCIATE => Ok(SocksRequest::UdpAssociate(target)),
-        _ => {
-            write_reply(stream, SocksReply::CommandNotSupported).await?;
-            Err(Error::InvalidSocksRequest)
-        }
-    }
+    Ok(command.into_request(target))
 }
 
 #[cfg(test)]

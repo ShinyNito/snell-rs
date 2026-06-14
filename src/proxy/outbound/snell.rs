@@ -17,14 +17,23 @@ const REUSE_POOL_MAX_SIZE: usize = 10;
 const REUSE_POOL_MAX_IDLE_AGE: Duration = Duration::from_secs(15);
 
 type FreshSnellTcp = TcpClientStream<OwnedReadHalf, OwnedWriteHalf>;
-pub(crate) type ReusedSnellTcp = ReuseClientConn<OwnedReadHalf, OwnedWriteHalf>;
+pub(crate) type ReusedSnellTcp = Box<ReuseClientConn<OwnedReadHalf, OwnedWriteHalf>>;
 
 pub(crate) enum SnellTcpConnect {
-    Fresh(FreshSnellTcp),
+    Fresh(Box<FreshSnellTcp>),
     Reused {
         conn: ReusedSnellTcp,
         pool: Arc<ReusePool>,
     },
+}
+
+impl SnellTcpConnect {
+    pub(crate) async fn accept_tunnel_reply(&mut self) -> Result<()> {
+        match self {
+            Self::Fresh(stream) => stream.accept_tunnel_reply().await,
+            Self::Reused { conn, .. } => conn.accept_tunnel_reply().await,
+        }
+    }
 }
 
 pub(crate) struct SnellClientOutbound {
@@ -169,7 +178,7 @@ impl ReusePool {
         let (reader_io, writer_io) = stream.into_split();
         let reader = SnellStreamReader::new(reader_io, &self.secret, self.version);
         let writer = SnellStreamWriter::new(writer_io, &self.secret, self.version)?;
-        Ok(ReuseClientConn::from_parts(reader, writer))
+        Ok(Box::new(ReuseClientConn::from_parts(reader, writer)))
     }
 
     pub(crate) fn put(&self, mut conn: ReusedSnellTcp) {
@@ -199,7 +208,7 @@ impl ReusePool {
     fn push_idle_pruning_expired(
         &self,
         conn: ReusedSnellTcp,
-    ) -> (Option<ReusedSnellTcp>, Vec<ReusedSnellTcp>) {
+    ) -> (Option<ReusedSnellTcp>, Vec<IdleReuseConn>) {
         let mut idle = self.idle.lock().expect("reuse pool mutex poisoned");
         let expired = self.drain_expired_front_locked(&mut idle);
         if idle.len() < self.max_size {
@@ -212,7 +221,7 @@ impl ReusePool {
         }
     }
 
-    fn take_idle(&self) -> (Option<ReusedSnellTcp>, Vec<ReusedSnellTcp>) {
+    fn take_idle(&self) -> (Option<ReusedSnellTcp>, Vec<IdleReuseConn>) {
         let mut idle = self.idle.lock().expect("reuse pool mutex poisoned");
         let expired = self.drain_expired_front_locked(&mut idle);
         let reusable = idle.pop_front().map(|idle_conn| idle_conn.conn);
@@ -220,20 +229,17 @@ impl ReusePool {
         (reusable, expired)
     }
 
-    fn drain_idle(&self) -> Vec<ReusedSnellTcp> {
+    fn drain_idle(&self) -> Vec<IdleReuseConn> {
         let mut idle = self.idle.lock().expect("reuse pool mutex poisoned");
-        idle.drain(..).map(|idle_conn| idle_conn.conn).collect()
+        idle.drain(..).collect()
     }
 
-    fn drain_expired_front_locked(
-        &self,
-        idle: &mut VecDeque<IdleReuseConn>,
-    ) -> Vec<ReusedSnellTcp> {
+    fn drain_expired_front_locked(&self, idle: &mut VecDeque<IdleReuseConn>) -> Vec<IdleReuseConn> {
         let mut expired = Vec::new();
         while let Some(idle_conn) =
             idle.pop_front_if(|idle_conn| idle_conn.is_expired(self.max_idle_age))
         {
-            expired.push(idle_conn.conn);
+            expired.push(idle_conn);
         }
         expired
     }
@@ -248,7 +254,7 @@ async fn open_tcp_connect(
 ) -> Result<SnellTcpConnect> {
     open_tcp_client_stream(server_addr, secret, host, port, version)
         .await
-        .map(SnellTcpConnect::Fresh)
+        .map(|stream| SnellTcpConnect::Fresh(Box::new(stream)))
 }
 
 async fn open_tcp_client_stream(

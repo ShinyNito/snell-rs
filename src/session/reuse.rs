@@ -1,3 +1,4 @@
+use std::future::poll_fn;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -27,6 +28,10 @@ where
     pub(crate) async fn start_request(&mut self, host: &str, port: u16) -> Result<()> {
         self.reset_request_state();
         self.writer.write_reuse_request(host, port).await
+    }
+
+    pub(crate) async fn accept_tunnel_reply(&mut self) -> Result<()> {
+        poll_fn(|cx| self.reader.poll_read_tunnel_reply(cx)).await
     }
 
     pub(crate) const fn can_reuse(&self) -> bool {
@@ -108,6 +113,23 @@ where
     fn compact_buffers_for_reuse(&mut self) {
         self.payload.compact_buffers_for_reuse();
     }
+
+    fn poll_read_tunnel_reply(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.reply_read {
+            return Poll::Ready(Ok(()));
+        }
+
+        match ready!(self.payload.poll_read_tunnel_reply(cx)) {
+            Ok(()) => {
+                self.reply_read = true;
+                Poll::Ready(Ok(()))
+            }
+            Err(err) => {
+                self.broken = true;
+                Poll::Ready(Err(err))
+            }
+        }
+    }
 }
 
 impl<R> AsyncRead for ReuseClientReader<R>
@@ -124,14 +146,10 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        if !this.reply_read {
-            match ready!(this.payload.poll_read_tunnel_reply(cx)) {
-                Ok(()) => this.reply_read = true,
-                Err(err) => {
-                    this.broken = true;
-                    return Poll::Ready(Err(error_into_io(err)));
-                }
-            }
+        if !this.reply_read
+            && let Err(err) = ready!(this.poll_read_tunnel_reply(cx))
+        {
+            return Poll::Ready(Err(error_into_io(err)));
         }
 
         match this.payload.poll_read_payload(cx, out, false) {
