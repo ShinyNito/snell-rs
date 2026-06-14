@@ -2,7 +2,7 @@
 pub struct Nonce12([u8; 12]);
 
 impl Nonce12 {
-    #[allow(clippy::must_use_candidate)]
+    #[must_use]
     pub const fn new() -> Self {
         Self([0; 12])
     }

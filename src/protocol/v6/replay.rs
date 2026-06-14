@@ -15,7 +15,7 @@ struct V6SaltReplayCacheInner {
 }
 
 impl V6SaltReplayCache {
-    #[allow(clippy::must_use_candidate)]
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(V6SaltReplayCacheInner {

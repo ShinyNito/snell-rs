@@ -25,7 +25,7 @@ impl Aes128GcmCrypto {
     ///
     /// Panics only if ring rejects a fixed-size AES-128 key, which would
     /// indicate a programming error or unsupported crypto backend.
-    #[allow(clippy::must_use_candidate)]
+    #[must_use]
     pub fn new(key: [u8; AES_128_KEY_SIZE]) -> Self {
         let key = UnboundKey::new(&AES_128_GCM, &key)
             .expect("Aes128GcmCrypto::new received a fixed-size AES-128 key");

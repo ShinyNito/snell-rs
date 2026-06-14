@@ -7,7 +7,7 @@ pub struct V6ChunkSizer {
 }
 
 impl V6ChunkSizer {
-    #[allow(clippy::must_use_candidate)]
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             current_chunk_size: 0,
