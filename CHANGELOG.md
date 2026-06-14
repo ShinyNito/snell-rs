@@ -2,6 +2,13 @@
 
 All notable changes to this project are maintained manually.
 
+## [0.4.6] - 2026-06-14
+
+## Release Notes
+
+  * UDP 关联移除服务端空闲超时轮询，改由传输层 EOF 关闭；framed reader 在干净帧边界（decoder 已初始化、无 pending header、body 空）收到 `UnexpectedEof` 时返回 `Ok(None)`，不再误报错误
+  * protocol 构造函数用语义明确的 `#[must_use]` 替代 `#[allow(clippy::must_use_candidate)]` 压制
+
 ## [0.4.5] - 2026-06-14
 
 ## Release Notes
