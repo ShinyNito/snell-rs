@@ -14,7 +14,7 @@ use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::protocol::udp::{
     AddressRef, UdpPacketRef, write_udp_request_prefix, write_udp_response_prefix,
 };
-use crate::session::udp::stream::UdpServerStream;
+use crate::transport::udp::stream::UdpServerStream;
 
 pub(crate) const TEST_PSK: &[u8] = b"test psk";
 pub(crate) const TEST_VERSION: ProtocolVersion = ProtocolVersion::V4;
@@ -101,7 +101,7 @@ where
 {
     let mut plain = BytesMut::from(payload);
     Ok(writer
-        .write_payload_message_from_buffer(&mut plain)
+        .write_payload_from_buffer(&mut plain)
         .await?
         .unwrap_or(0))
 }
@@ -120,7 +120,7 @@ where
 
     let mut plain = BytesMut::from(payload);
     Ok(
-        poll_fn(|cx| writer.poll_write_tunnel_reply_message_from_buffer(&mut plain, cx))
+        poll_fn(|cx| writer.poll_write_tunnel_reply_from_buffer(&mut plain, cx))
             .await?
             .unwrap_or(0),
     )
@@ -143,7 +143,7 @@ where
         return Err(Error::PayloadTooLarge);
     }
     assert_eq!(
-        writer.write_payload_message_from_buffer(&mut plain).await?,
+        writer.write_payload_from_buffer(&mut plain).await?,
         Some(message_len)
     );
     Ok(payload.len())
@@ -166,7 +166,7 @@ where
         return Err(Error::PayloadTooLarge);
     }
     assert_eq!(
-        writer.write_payload_message_from_buffer(&mut plain).await?,
+        writer.write_payload_from_buffer(&mut plain).await?,
         Some(message_len)
     );
     Ok(payload.len())

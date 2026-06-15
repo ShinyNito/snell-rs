@@ -2,26 +2,34 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
-use crate::protocol::v6::{SharedV6Profile, V6Profile};
+use crate::protocol::v6::V6Profile;
 
 #[derive(Clone)]
 pub(crate) struct SnellPsk {
-    bytes: Arc<Zeroizing<Vec<u8>>>,
-    v6_profile: SharedV6Profile,
+    inner: Arc<SnellPskInner>,
+}
+
+struct SnellPskInner {
+    bytes: Zeroizing<Vec<u8>>,
+    v6_profile: V6Profile,
 }
 
 impl SnellPsk {
     pub(crate) fn new(psk: Zeroizing<Vec<u8>>) -> Self {
-        let bytes = Arc::new(psk);
-        let v6_profile = Arc::new(V6Profile::derive(bytes.as_slice()));
-        Self { bytes, v6_profile }
+        let v6_profile = V6Profile::derive(psk.as_slice());
+        Self {
+            inner: Arc::new(SnellPskInner {
+                bytes: psk,
+                v6_profile,
+            }),
+        }
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
-        self.bytes.as_slice()
+        self.inner.bytes.as_slice()
     }
 
-    pub(crate) fn clone_v6_profile(&self) -> SharedV6Profile {
-        self.v6_profile.clone()
+    pub(crate) fn v6_profile(&self) -> &V6Profile {
+        &self.inner.v6_profile
     }
 }

@@ -1,6 +1,4 @@
-use super::{
-    Arc, Error, HashSet, Mutex, Result, SALT_SIZE, V6_SALT_REPLAY_CACHE_CAPACITY, VecDeque,
-};
+use super::{Arc, Error, HashSet, Mutex, Result, SALT_SIZE, V6_SALT_REPLAY_CACHE_CAPACITY};
 
 #[derive(Clone, Debug)]
 pub struct V6SaltReplayCache {
@@ -9,19 +7,20 @@ pub struct V6SaltReplayCache {
 
 #[derive(Debug)]
 struct V6SaltReplayCacheInner {
-    capacity: usize,
     salts: HashSet<[u8; SALT_SIZE]>,
-    order: VecDeque<[u8; SALT_SIZE]>,
+    ring: Vec<[u8; SALT_SIZE]>,
+    next: usize,
 }
 
 impl V6SaltReplayCache {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             inner: Arc::new(Mutex::new(V6SaltReplayCacheInner {
-                capacity: capacity.max(1),
-                salts: HashSet::new(),
-                order: VecDeque::new(),
+                salts: HashSet::with_capacity(capacity),
+                ring: vec![[0; SALT_SIZE]; capacity],
+                next: 0,
             })),
         }
     }
@@ -41,13 +40,14 @@ impl V6SaltReplayCache {
                 return Err(Error::SaltReplay);
             }
 
-            if inner.salts.len() == inner.capacity
-                && let Some(oldest) = inner.order.pop_front()
-            {
+            if inner.salts.len() == inner.ring.len() {
+                let oldest = inner.ring[inner.next];
                 inner.salts.remove(&oldest);
             }
             inner.salts.insert(salt);
-            inner.order.push_back(salt);
+            let next = inner.next;
+            inner.ring[next] = salt;
+            inner.next = (next + 1) % inner.ring.len();
         }
         Ok(())
     }

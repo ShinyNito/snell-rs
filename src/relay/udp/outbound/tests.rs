@@ -1,3 +1,4 @@
+use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::error::Error;
@@ -25,7 +26,10 @@ async fn udp_response_accepts_largest_payloads_that_fit_application_message() {
             &v4_payload,
         );
         let read = async {
-            let message = reader.read_udp_response_message().await.unwrap().unwrap();
+            let message = poll_fn(|cx| reader.poll_read_udp_response_message(cx))
+                .await
+                .unwrap()
+                .unwrap();
             let response = parse_udp_response(&message).unwrap();
             assert_eq!(response.payload.len(), UDP_MAX_IPV4_RESPONSE_PAYLOAD);
             message.len()
@@ -47,7 +51,10 @@ async fn udp_response_accepts_largest_payloads_that_fit_application_message() {
             &v6_payload,
         );
         let read = async {
-            let message = reader.read_udp_response_message().await.unwrap().unwrap();
+            let message = poll_fn(|cx| reader.poll_read_udp_response_message(cx))
+                .await
+                .unwrap()
+                .unwrap();
             let response = parse_udp_response(&message).unwrap();
             assert_eq!(response.payload.len(), UDP_MAX_IPV6_RESPONSE_PAYLOAD);
             message.len()

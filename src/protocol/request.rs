@@ -1,5 +1,4 @@
 use bytes::BufMut;
-use core::range::Range;
 
 use crate::error::{Error, Result};
 use crate::parse::{read_be_u16, read_u8, take_bytes};
@@ -15,11 +14,11 @@ pub enum ClientRequest<'a> {
         reuse: bool,
         host: &'a str,
         port: u16,
-        rest_span: Range<usize>,
+        rest_start: usize,
         rest: &'a [u8],
     },
     Udp {
-        rest_span: Range<usize>,
+        rest_start: usize,
         rest: &'a [u8],
     },
 }
@@ -27,7 +26,7 @@ pub enum ClientRequest<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerReply<'a> {
     Tunnel {
-        payload_span: Range<usize>,
+        payload_start: usize,
         payload: &'a [u8],
     },
     Pong,
@@ -39,7 +38,7 @@ pub enum ServerReply<'a> {
 
 /// Parses a client request as a borrowed view into `input`.
 ///
-/// `host`, `rest`, and spans refer to the original frame payload. Convert the
+/// `host`, `rest`, and offsets refer to the original frame payload. Convert the
 /// fields that must survive another read or await boundary to owned values at
 /// the runtime edge.
 ///
@@ -77,20 +76,14 @@ pub fn parse_client_request(input: &[u8]) -> Result<ClientRequest<'_>> {
                 reuse: command == COMMAND_CONNECT_V2,
                 host,
                 port,
-                rest_span: Range {
-                    start: rest_start,
-                    end: original_len,
-                },
+                rest_start,
                 rest: input,
             })
         }
         COMMAND_UDP => {
             let rest_start = original_len - input.len();
             Ok(ClientRequest::Udp {
-                rest_span: Range {
-                    start: rest_start,
-                    end: original_len,
-                },
+                rest_start,
                 rest: input,
             })
         }
@@ -100,22 +93,18 @@ pub fn parse_client_request(input: &[u8]) -> Result<ClientRequest<'_>> {
 
 /// Parses a server reply as a borrowed view into `input`.
 ///
-/// `payload` and `message` borrow from the original frame payload.
+/// `payload_start`, `payload`, and `message` refer to the original frame payload.
 ///
 /// # Errors
 ///
 /// Returns an error if the reply is truncated, has an invalid command, or
 /// contains invalid UTF-8 in an error message.
 pub fn parse_server_reply(input: &[u8]) -> Result<ServerReply<'_>> {
-    let original_len = input.len();
     let mut input = input;
 
     match read_u8(&mut input, Error::TruncatedServerReply)? {
         COMMAND_TUNNEL => Ok(ServerReply::Tunnel {
-            payload_span: Range {
-                start: 1,
-                end: original_len,
-            },
+            payload_start: 1,
             payload: input,
         }),
         COMMAND_PONG => Ok(ServerReply::Pong),
@@ -152,8 +141,6 @@ pub fn write_error_reply(out: &mut impl BufMut, code: u8, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use core::range::Range;
-
     use bytes::BytesMut;
 
     use super::{
@@ -180,7 +167,7 @@ mod tests {
                 reuse: true,
                 host: "example.com",
                 port: 443,
-                rest_span: Range { start: 17, end: 27 },
+                rest_start: 17,
                 rest: b"early-data",
             }
         );
@@ -195,7 +182,7 @@ mod tests {
         assert_eq!(
             parse_client_request(&input).unwrap(),
             ClientRequest::Udp {
-                rest_span: Range { start: 3, end: 9 },
+                rest_start: 3,
                 rest: b"packet"
             }
         );
@@ -208,7 +195,7 @@ mod tests {
         assert_eq!(
             parse_server_reply(&input).unwrap(),
             ServerReply::Tunnel {
-                payload_span: Range { start: 1, end: 6 },
+                payload_start: 1,
                 payload: b"hello"
             }
         );

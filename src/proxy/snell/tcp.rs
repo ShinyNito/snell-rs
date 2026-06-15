@@ -8,33 +8,53 @@ use tokio::time::Instant;
 use crate::error::{Error, Result};
 use crate::proxy::outbound::RelayStats;
 use crate::proxy::outbound::snell::SnellTcpConnect;
-use crate::session::activity::{RelayActivity, RelayActivityTimeouts, wait_relay_idle};
-use crate::session::tcp::relay::relay_bidirectional;
+use crate::relay::activity::{RelayActivity, RelayActivityTimeouts, wait_relay_idle};
+use crate::relay::tcp::{TcpClosePolicy, TcpRelayDriver};
 
 const CLIENT_TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 const CLIENT_TCP_ACTIVITY_TIMEOUTS: RelayActivityTimeouts =
     RelayActivityTimeouts::new(CLIENT_TCP_RELAY_IDLE_TIMEOUT, CLIENT_TCP_RELAY_IDLE_TIMEOUT);
 
 pub(crate) async fn relay_tcp_connect(
-    mut local: TcpStream,
+    local: TcpStream,
     connect: SnellTcpConnect,
 ) -> Result<RelayStats> {
     let (activity, last_activity) = RelayActivity::new();
-    let relay = relay_opened_tcp_connect(&mut local, connect, &activity);
+    let relay = relay_opened_tcp_connect(local, connect, &activity);
     relay_client_tcp_with_idle_timeout(relay, last_activity).await
 }
 
 async fn relay_opened_tcp_connect(
-    local: &mut TcpStream,
+    local: TcpStream,
     connect: SnellTcpConnect,
     activity: &RelayActivity,
 ) -> Result<RelayStats> {
     match connect {
-        SnellTcpConnect::Fresh(mut server) => {
-            relay_bidirectional(local, &mut *server, activity).await
+        SnellTcpConnect::Fresh(server) => {
+            let relay = TcpRelayDriver::new(
+                local,
+                server,
+                TcpClosePolicy::BothDirectionsClosed,
+                activity.clone(),
+            );
+            tokio::pin!(relay);
+            relay.as_mut().await
         }
-        SnellTcpConnect::Reused { mut conn, pool } => {
-            let stats = relay_bidirectional(local, &mut *conn, activity).await?;
+        SnellTcpConnect::Reused { conn, pool } => {
+            let local = local;
+            tokio::pin!(local);
+            let mut conn = Box::into_pin(conn);
+            let stats = {
+                let relay = TcpRelayDriver::new(
+                    local.as_mut(),
+                    conn.as_mut(),
+                    TcpClosePolicy::BothDirectionsClosed,
+                    activity.clone(),
+                );
+                tokio::pin!(relay);
+                relay.as_mut().await?
+            };
+            let conn = std::pin::Pin::into_inner(conn);
             pool.put(conn);
             Ok(stats)
         }

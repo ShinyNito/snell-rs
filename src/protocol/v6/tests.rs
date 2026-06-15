@@ -311,3 +311,17 @@ fn salt_replay_cache_rejects_recent_reuse_and_evicts_oldest() {
     cache.remember(third).unwrap();
     cache.remember(first).unwrap();
 }
+
+#[test]
+fn salt_replay_cache_capacity_one_replaces_previous_salt() {
+    let cache = V6SaltReplayCache::new(1);
+    let first = [1u8; 16];
+    let second = [2u8; 16];
+
+    cache.remember(first).unwrap();
+    assert!(matches!(cache.remember(first), Err(Error::SaltReplay)));
+
+    cache.remember(second).unwrap();
+    cache.remember(first).unwrap();
+    assert!(matches!(cache.remember(first), Err(Error::SaltReplay)));
+}

@@ -4,15 +4,15 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
 use bytes::{Buf, Bytes, BytesMut};
+use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::ProtocolVersion;
 use crate::error::{Error, Result};
-use crate::framed::{SnellStreamReader, SnellStreamWriter};
+use crate::framed::{PayloadSource, PayloadWriteStatus, SnellStreamReader, SnellStreamWriter};
 use crate::protocol::psk::SnellPsk;
 use crate::protocol::request::{ServerReply, parse_server_reply};
-
-pub(crate) mod relay;
+use crate::relay::tcp::SnellPayloadSink;
 
 const SERVER_PLAIN_BATCH_INITIAL_CAPACITY: usize = 64 * 1024;
 pub(crate) const SERVER_PLAIN_READ_AHEAD_CAPACITY: usize = 256 * 1024;
@@ -40,9 +40,13 @@ pub(crate) struct TcpTarget {
     pub(crate) reuse: bool,
 }
 
-pub(crate) struct TcpClientStream<R, W> {
-    reader: TcpReader<R>,
-    writer: TcpClientWriter<W>,
+pin_project! {
+    pub(crate) struct TcpClientStream<R, W> {
+        #[pin]
+        reader: TcpReader<R>,
+        #[pin]
+        writer: TcpClientWriter<W>,
+    }
 }
 
 pub(crate) struct TcpClientOpenOptions<'a> {
@@ -114,7 +118,7 @@ where
         let payload_start = {
             let payload = ready!(self.reader.poll_read_frame_payload(cx))?;
             match parse_server_reply(payload)? {
-                ServerReply::Tunnel { payload_span, .. } => Ok(payload_span.start),
+                ServerReply::Tunnel { payload_start, .. } => Ok(payload_start),
                 ServerReply::Pong => Err(Error::InvalidServerReply),
                 ServerReply::Error { code, message } => Err(Error::Server {
                     code,
@@ -192,9 +196,11 @@ enum TcpReaderPhase {
     Payload,
 }
 
-struct TcpReader<R> {
-    payload: TcpPayloadReader<R>,
-    phase: TcpReaderPhase,
+pin_project! {
+    struct TcpReader<R> {
+        payload: TcpPayloadReader<R>,
+        phase: TcpReaderPhase,
+    }
 }
 
 impl<R> TcpReader<R>
@@ -216,13 +222,7 @@ where
     }
 
     fn poll_read_tunnel_reply(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.phase == TcpReaderPhase::Payload {
-            return Poll::Ready(Ok(()));
-        }
-
-        ready!(self.payload.poll_read_tunnel_reply(cx))?;
-        self.phase = TcpReaderPhase::Payload;
-        Poll::Ready(Ok(()))
+        poll_tcp_reader_tunnel_reply(&mut self.payload, &mut self.phase, cx)
     }
 
     fn into_frame_reader(self) -> SnellStreamReader<R> {
@@ -239,9 +239,9 @@ where
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if this.phase == TcpReaderPhase::ServerReply
-            && let Err(err) = ready!(this.poll_read_tunnel_reply(cx))
+        let this = self.project();
+        if *this.phase == TcpReaderPhase::ServerReply
+            && let Err(err) = ready!(poll_tcp_reader_tunnel_reply(this.payload, this.phase, cx))
         {
             return Poll::Ready(Err(error_into_io(err)));
         }
@@ -259,7 +259,28 @@ where
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().reader).poll_read(cx, out)
+        self.project().reader.poll_read(cx, out)
+    }
+}
+
+impl<R, W> SnellPayloadSink for TcpClientStream<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write_payload_from_source<T>(
+        self: Pin<&mut Self>,
+        source: Pin<&mut T>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<PayloadWriteStatus>>
+    where
+        T: PayloadSource + ?Sized,
+    {
+        poll_result_into_io(
+            self.project()
+                .writer
+                .poll_write_payload_from_source(source, cx),
+        )
     }
 }
 
@@ -359,10 +380,12 @@ impl PlainWriteBuffer {
     }
 }
 
-struct TcpClientWriter<W> {
-    frame_writer: SnellStreamWriter<W>,
-    plain: PlainWriteBuffer,
-    write_closed: bool,
+pin_project! {
+    struct TcpClientWriter<W> {
+        frame_writer: SnellStreamWriter<W>,
+        plain: PlainWriteBuffer,
+        write_closed: bool,
+    }
 }
 
 impl<W> TcpClientWriter<W>
@@ -377,18 +400,35 @@ where
         }
     }
 
-    fn poll_close_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if !self.write_closed {
-            ready!(self.plain.poll_flush_payload(&mut self.frame_writer, cx))?;
-            ready!(self.frame_writer.poll_write_zero_chunk(cx))?;
-            self.write_closed = true;
+    fn poll_close_write(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let this = self.project();
+        if !*this.write_closed {
+            ready!(this.plain.poll_flush_payload(this.frame_writer, cx))?;
+            ready!(this.frame_writer.poll_write_zero_chunk(cx))?;
+            *this.write_closed = true;
         }
         Poll::Ready(Ok(()))
     }
 
-    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        ready!(self.plain.poll_flush_payload(&mut self.frame_writer, cx))?;
-        self.frame_writer.poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let this = self.project();
+        ready!(this.plain.poll_flush_payload(this.frame_writer, cx))?;
+        this.frame_writer.poll_flush(cx)
+    }
+
+    fn poll_write_payload_from_source<R>(
+        self: Pin<&mut Self>,
+        source: Pin<&mut R>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<PayloadWriteStatus>>
+    where
+        R: PayloadSource + ?Sized,
+    {
+        let this = self.project();
+        if *this.write_closed {
+            return Poll::Ready(Err(Error::WriteClosed));
+        }
+        this.frame_writer.poll_write_payload_from_source(source, cx)
     }
 }
 
@@ -401,22 +441,19 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if this.write_closed {
+        let this = self.project();
+        if *this.write_closed {
             return Poll::Ready(Err(error_into_io(Error::WriteClosed)));
         }
-        poll_result_into_io(
-            this.plain
-                .poll_write_payload(&mut this.frame_writer, buf, cx),
-        )
+        poll_result_into_io(this.plain.poll_write_payload(this.frame_writer, buf, cx))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        poll_result_into_io(self.get_mut().poll_flush(cx))
+        poll_result_into_io(TcpClientWriter::poll_flush(self, cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        poll_result_into_io(self.get_mut().poll_close_write(cx))
+        poll_result_into_io(TcpClientWriter::poll_close_write(self, cx))
     }
 }
 
@@ -430,21 +467,25 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().writer).poll_write(cx, buf)
+        self.project().writer.poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+        poll_result_into_io(TcpClientWriter::poll_flush(self.project().writer, cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
+        self.project().writer.poll_shutdown(cx)
     }
 }
 
-pub(crate) struct TcpServerStream<R, W> {
-    reader: TcpReader<R>,
-    writer: TcpServerWriter<W>,
+pin_project! {
+    pub(crate) struct TcpServerStream<R, W> {
+        #[pin]
+        reader: TcpReader<R>,
+        #[pin]
+        writer: TcpServerWriter<W>,
+    }
 }
 
 impl<R, W> TcpServerStream<R, W>
@@ -489,15 +530,38 @@ where
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().reader).poll_read(cx, out)
+        self.project().reader.poll_read(cx, out)
     }
 }
 
-struct TcpServerWriter<W> {
-    frame_writer: SnellStreamWriter<W>,
-    plain: PlainWriteBuffer,
-    tunnel_open: bool,
-    write_closed: bool,
+impl<R, W> SnellPayloadSink for TcpServerStream<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write_payload_from_source<T>(
+        self: Pin<&mut Self>,
+        source: Pin<&mut T>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<PayloadWriteStatus>>
+    where
+        T: PayloadSource + ?Sized,
+    {
+        poll_result_into_io(
+            self.project()
+                .writer
+                .poll_write_payload_from_source(source, cx),
+        )
+    }
+}
+
+pin_project! {
+    struct TcpServerWriter<W> {
+        frame_writer: SnellStreamWriter<W>,
+        plain: PlainWriteBuffer,
+        tunnel_open: bool,
+        write_closed: bool,
+    }
 }
 
 impl<W> TcpServerWriter<W>
@@ -529,28 +593,22 @@ where
         Ok(())
     }
 
-    fn poll_close_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if !self.write_closed {
-            if !self.tunnel_open && self.plain.pending_write_len.is_some() {
-                ready!(
-                    self.plain
-                        .poll_flush_tunnel_payload(&mut self.frame_writer, cx)
-                )?;
-                self.tunnel_open = true;
+    fn poll_close_write(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let this = self.project();
+        if !*this.write_closed {
+            if !*this.tunnel_open && this.plain.pending_write_len.is_some() {
+                ready!(this.plain.poll_flush_tunnel_payload(this.frame_writer, cx))?;
+                *this.tunnel_open = true;
             } else {
-                ready!(self.plain.poll_flush_payload(&mut self.frame_writer, cx))?;
-                ready!(self.poll_open_tunnel(cx))?;
+                ready!(this.plain.poll_flush_payload(this.frame_writer, cx))?;
+                ready!(poll_server_open_tunnel(
+                    this.frame_writer,
+                    this.tunnel_open,
+                    cx
+                ))?;
             }
-            ready!(self.frame_writer.poll_write_zero_chunk(cx))?;
-            self.write_closed = true;
-        }
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_open_tunnel(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if !self.tunnel_open {
-            ready!(self.frame_writer.poll_write_empty_tunnel_reply(cx))?;
-            self.tunnel_open = true;
+            ready!(this.frame_writer.poll_write_zero_chunk(cx))?;
+            *this.write_closed = true;
         }
         Poll::Ready(Ok(()))
     }
@@ -559,17 +617,45 @@ where
         self.frame_writer
     }
 
-    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if !self.tunnel_open && self.plain.pending_write_len.is_some() {
-            ready!(
-                self.plain
-                    .poll_flush_tunnel_payload(&mut self.frame_writer, cx)
-            )?;
-            self.tunnel_open = true;
-        } else if self.tunnel_open {
-            ready!(self.plain.poll_flush_payload(&mut self.frame_writer, cx))?;
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let this = self.project();
+        if !*this.tunnel_open && this.plain.pending_write_len.is_some() {
+            ready!(this.plain.poll_flush_tunnel_payload(this.frame_writer, cx))?;
+            *this.tunnel_open = true;
+        } else if *this.tunnel_open {
+            ready!(this.plain.poll_flush_payload(this.frame_writer, cx))?;
         }
-        self.frame_writer.poll_flush(cx)
+        this.frame_writer.poll_flush(cx)
+    }
+
+    fn poll_write_payload_from_source<R>(
+        self: Pin<&mut Self>,
+        source: Pin<&mut R>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<PayloadWriteStatus>>
+    where
+        R: PayloadSource + ?Sized,
+    {
+        let this = self.project();
+        if *this.write_closed {
+            return Poll::Ready(Err(Error::WriteClosed));
+        }
+
+        let result = if *this.tunnel_open {
+            this.frame_writer.poll_write_payload_from_source(source, cx)
+        } else {
+            this.frame_writer
+                .poll_write_tunnel_reply_from_source(source, cx)
+        };
+        match result {
+            Poll::Ready(Ok(PayloadWriteStatus::Written(n))) => {
+                if n != 0 {
+                    *this.tunnel_open = true;
+                }
+                Poll::Ready(Ok(PayloadWriteStatus::Written(n)))
+            }
+            other => other,
+        }
     }
 }
 
@@ -582,23 +668,22 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if this.write_closed {
+        let this = self.project();
+        if *this.write_closed {
             return Poll::Ready(Err(error_into_io(Error::WriteClosed)));
         }
 
-        let result = if this.tunnel_open {
-            this.plain
-                .poll_write_payload(&mut this.frame_writer, buf, cx)
+        let result = if *this.tunnel_open {
+            this.plain.poll_write_payload(this.frame_writer, buf, cx)
         } else {
             this.plain
-                .poll_write_tunnel_payload(&mut this.frame_writer, buf, cx)
+                .poll_write_tunnel_payload(this.frame_writer, buf, cx)
         };
 
         match result {
             Poll::Ready(Ok(n)) => {
                 if n != 0 {
-                    this.tunnel_open = true;
+                    *this.tunnel_open = true;
                 }
                 Poll::Ready(Ok(n))
             }
@@ -608,12 +693,44 @@ where
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        poll_result_into_io(self.get_mut().poll_flush(cx))
+        poll_result_into_io(TcpServerWriter::poll_flush(self, cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        poll_result_into_io(self.get_mut().poll_close_write(cx))
+        poll_result_into_io(TcpServerWriter::poll_close_write(self, cx))
     }
+}
+
+fn poll_tcp_reader_tunnel_reply<R>(
+    payload: &mut TcpPayloadReader<R>,
+    phase: &mut TcpReaderPhase,
+    cx: &mut Context<'_>,
+) -> Poll<Result<()>>
+where
+    R: AsyncRead + Unpin,
+{
+    if *phase == TcpReaderPhase::Payload {
+        return Poll::Ready(Ok(()));
+    }
+
+    ready!(payload.poll_read_tunnel_reply(cx))?;
+    *phase = TcpReaderPhase::Payload;
+    Poll::Ready(Ok(()))
+}
+
+fn poll_server_open_tunnel<W>(
+    frame_writer: &mut SnellStreamWriter<W>,
+    tunnel_open: &mut bool,
+    cx: &mut Context<'_>,
+) -> Poll<Result<()>>
+where
+    W: AsyncWrite + Unpin,
+{
+    if !*tunnel_open {
+        ready!(frame_writer.poll_write_empty_tunnel_reply(cx))?;
+        *tunnel_open = true;
+    }
+    Poll::Ready(Ok(()))
 }
 
 impl<R, W> AsyncWrite for TcpServerStream<R, W>
@@ -626,15 +743,15 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().writer).poll_write(cx, buf)
+        self.project().writer.poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+        poll_result_into_io(TcpServerWriter::poll_flush(self.project().writer, cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
+        self.project().writer.poll_shutdown(cx)
     }
 }
 
@@ -665,7 +782,7 @@ impl PlainReadBatch {
         W: AsyncWrite + Unpin,
     {
         self.poll_flush_message_with(frame_writer, cx, |frame_writer, buffer, cx| {
-            frame_writer.poll_write_payload_message_from_buffer(buffer, cx)
+            frame_writer.poll_write_payload_from_buffer(buffer, cx)
         })
     }
 
@@ -678,7 +795,7 @@ impl PlainReadBatch {
         W: AsyncWrite + Unpin,
     {
         self.poll_flush_message_with(frame_writer, cx, |frame_writer, buffer, cx| {
-            frame_writer.poll_write_tunnel_reply_message_from_buffer(buffer, cx)
+            frame_writer.poll_write_tunnel_reply_from_buffer(buffer, cx)
         })
     }
 

@@ -1,4 +1,4 @@
-use core::range::Range;
+use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr};
 
 use bytes::Bytes;
@@ -8,9 +8,9 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep, timeout};
 
 use super::{
-    SERVER_FAST_OPEN_BUFFER_LIMIT, V6_ERROR_DNS_FAILED, V6_ERROR_DNS_FAILED_MESSAGE,
-    V6_ERROR_FALLBACK, buffer_fast_open_payload_until_connected, relay_tcp_server_stream_reusable,
-    serve_server_connection, v6_server_error_reply,
+    SERVER_EARLY_UPLOAD_BUFFER_LIMIT, V6_ERROR_DNS_FAILED, V6_ERROR_DNS_FAILED_MESSAGE,
+    V6_ERROR_FALLBACK, buffer_upload_until_connected, serve_server_connection,
+    v6_server_error_reply,
 };
 use crate::MAX_PACKET_SIZE;
 use crate::ProtocolVersion;
@@ -22,14 +22,14 @@ use crate::protocol::request::{
 use crate::protocol::udp::AddressRef;
 use crate::protocol::v6::V6SaltReplayCache;
 use crate::proxy::outbound::RelayOptions;
-use crate::session::activity::{RelayActivity, RelayActivityTimeouts};
-use crate::session::tcp::TcpServerStream;
-use crate::session::tcp::relay::PlainUploadBatch;
-use crate::session::udp::stream::UdpClientStream;
+use crate::relay::activity::{RelayActivity, RelayActivityTimeouts};
+use crate::relay::tcp::{PrefixedReadStream, ReadPrefixBuffer, TcpClosePolicy, TcpRelayDriver};
 use crate::test_support::{
     read_snell_frame_payload, test_duplex_pair, test_secret, test_snell_reader, test_snell_writer,
     test_tcp_listener, test_udp_socket, write_snell_payload_message, write_snell_udp_packet,
 };
+use crate::transport::tcp::TcpServerStream;
+use crate::transport::udp::stream::UdpClientStream;
 
 #[test]
 fn v6_server_error_reply_maps_dns_errors_structurally() {
@@ -52,7 +52,7 @@ fn v6_server_error_reply_does_not_parse_io_error_text() {
 }
 
 #[tokio::test]
-async fn fast_open_buffer_stops_before_next_frame_could_exceed_limit() {
+async fn early_upload_buffer_stops_before_next_frame_could_exceed_limit() {
     let (client_upload, server_upload) = test_duplex_pair();
 
     let mut writer = test_snell_writer(client_upload);
@@ -63,9 +63,9 @@ async fn fast_open_buffer_stops_before_next_frame_could_exceed_limit() {
     let reader = test_snell_reader(server_upload);
     let writer = test_snell_writer(tokio::io::sink());
     let mut snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
-    let mut early_payload = PlainUploadBatch::new();
-    let initial_len = SERVER_FAST_OPEN_BUFFER_LIMIT - MAX_PACKET_SIZE + 1;
-    early_payload.push(Bytes::from(vec![0; initial_len]));
+    let mut read_prefix = ReadPrefixBuffer::new();
+    let initial_len = SERVER_EARLY_UPLOAD_BUFFER_LIMIT - MAX_PACKET_SIZE + 1;
+    read_prefix.push(Bytes::from(vec![0; initial_len]));
 
     let (connect_tx, connect_rx) = oneshot::channel();
     let connect = async {
@@ -74,23 +74,19 @@ async fn fast_open_buffer_stops_before_next_frame_could_exceed_limit() {
     };
     let (activity, _last_activity) = RelayActivity::new();
     {
-        let fast_open = buffer_fast_open_payload_until_connected(
-            &mut snell,
-            connect,
-            &mut early_payload,
-            &activity,
-        );
-        tokio::pin!(fast_open);
+        let early_upload =
+            buffer_upload_until_connected(&mut snell, connect, &mut read_prefix, &activity);
+        tokio::pin!(early_upload);
 
         assert!(
-            timeout(Duration::from_millis(50), &mut fast_open)
+            timeout(Duration::from_millis(50), &mut early_upload)
                 .await
                 .is_err()
         );
         connect_tx.send(()).unwrap();
-        fast_open.await.unwrap();
+        early_upload.await.unwrap();
     }
-    assert_eq!(early_payload.len(), initial_len);
+    assert_eq!(read_prefix.len(), initial_len);
 }
 
 #[tokio::test]
@@ -124,7 +120,7 @@ async fn reusable_relay_releases_upstream_when_upstream_closes_first() {
         assert!(matches!(
             parse_server_reply(&payload),
             Ok(ServerReply::Tunnel {
-                payload_span: Range { start: 1, end: 1 },
+                payload_start: 1,
                 payload: []
             })
         ));
@@ -137,7 +133,9 @@ async fn reusable_relay_releases_upstream_when_upstream_closes_first() {
             .await
             .unwrap()
             .unwrap();
-        writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
         writer
             .write_tcp_request("next.example", 443, true)
             .await
@@ -150,15 +148,26 @@ async fn reusable_relay_releases_upstream_when_upstream_closes_first() {
         let snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
         let (activity, _last_activity) = RelayActivity::new();
 
-        let (stats, mut reader, _) = relay_tcp_server_stream_reusable(
-            snell,
-            upstream,
-            true,
-            PlainUploadBatch::new(),
-            activity,
-        )
-        .await
-        .unwrap();
+        let upstream = upstream;
+        let mut snell = snell;
+        let stats = {
+            tokio::pin!(upstream);
+            let prefixed_snell =
+                PrefixedReadStream::new(std::pin::Pin::new(&mut snell), ReadPrefixBuffer::new());
+            tokio::pin!(prefixed_snell);
+            let relay = TcpRelayDriver::new(
+                upstream.as_mut(),
+                prefixed_snell.as_mut(),
+                TcpClosePolicy::EndWhenPlainToSnellClosed,
+                activity.clone(),
+            );
+            tokio::pin!(relay);
+            relay.as_mut().await.unwrap()
+        };
+        super::drain_tcp_stream(&mut snell, &activity)
+            .await
+            .unwrap();
+        let (mut reader, _) = snell.into_frame_parts();
 
         assert_eq!(stats.uploaded, 0);
         assert_eq!(stats.downloaded, 0);
@@ -169,10 +178,84 @@ async fn reusable_relay_releases_upstream_when_upstream_closes_first() {
                 reuse: true,
                 host: "next.example",
                 port: 443,
-                rest_span: Range { start: 18, end: 18 },
+                rest_start: 18,
                 rest: b"",
             }
         );
+    };
+
+    let ((), (), ()) = tokio::join!(client, target, server);
+}
+
+#[tokio::test]
+async fn server_tcp_relay_reports_uploaded_and_downloaded_for_reusable_policy() {
+    let upload = b"client-upload";
+    let download = b"target-download";
+    let (client_upload, server_upload) = test_duplex_pair();
+    let (server_download, client_download) = test_duplex_pair();
+    let upstream_listener = test_tcp_listener().await;
+    let upstream = TcpStream::connect(upstream_listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut target, _) = upstream_listener.accept().await.unwrap();
+
+    let target = async {
+        let mut received = vec![0; upload.len()];
+        target.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, upload);
+        target.write_all(download).await.unwrap();
+        target.shutdown().await.unwrap();
+    };
+
+    let client = async {
+        let mut reader = test_snell_reader(client_download);
+        let mut writer = test_snell_writer(client_upload);
+        write_snell_payload_message(&mut writer, upload)
+            .await
+            .unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
+
+        let payload = read_snell_frame_payload(&mut reader).await.unwrap();
+        assert!(matches!(
+            parse_server_reply(&payload),
+            Ok(ServerReply::Tunnel {
+                payload_start: 1,
+                payload
+            }) if payload == download
+        ));
+        assert!(matches!(
+            read_snell_frame_payload(&mut reader).await,
+            Err(Error::ZeroChunk)
+        ));
+    };
+
+    let server = async {
+        let reader = test_snell_reader(server_upload);
+        let writer = test_snell_writer(server_download);
+        let snell = TcpServerStream::from_parts_with_pending(reader, writer, Bytes::new());
+        let (activity, _last_activity) = RelayActivity::new();
+
+        let upstream = upstream;
+        let mut snell = snell;
+        let stats = {
+            tokio::pin!(upstream);
+            let prefixed_snell =
+                PrefixedReadStream::new(std::pin::Pin::new(&mut snell), ReadPrefixBuffer::new());
+            tokio::pin!(prefixed_snell);
+            let relay = TcpRelayDriver::new(
+                upstream.as_mut(),
+                prefixed_snell.as_mut(),
+                TcpClosePolicy::EndWhenPlainToSnellClosed,
+                activity,
+            );
+            tokio::pin!(relay);
+            relay.as_mut().await.unwrap()
+        };
+
+        assert_eq!(stats.uploaded, upload.len() as u64);
+        assert_eq!(stats.downloaded, download.len() as u64);
     };
 
     let ((), (), ()) = tokio::join!(client, target, server);
@@ -302,7 +385,7 @@ async fn serve_server_connection_times_out_idle_tcp_tunnel() {
         assert_eq!(
             parse_server_reply(&payload).unwrap(),
             ServerReply::Tunnel {
-                payload_span: Range { start: 1, end: 1 },
+                payload_start: 1,
                 payload: b"",
             }
         );
@@ -383,12 +466,14 @@ async fn serve_server_connection_udp_activity_resets_tcp_idle_timeout() {
         assert!(
             timeout(
                 Duration::from_millis(40),
-                reader.read_udp_response_message()
+                poll_fn(|cx| reader.poll_read_udp_response_message(cx))
             )
             .await
             .is_err()
         );
-        writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     };
 
     let ((), server_result, ()) = tokio::join!(target, server, client);

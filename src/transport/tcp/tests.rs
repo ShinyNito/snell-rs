@@ -1,4 +1,3 @@
-use core::range::Range;
 use std::io;
 use std::io::ErrorKind;
 
@@ -69,7 +68,7 @@ where
             reuse,
             host,
             port,
-            rest_span,
+            rest_start,
             ..
         } => (
             TcpTarget {
@@ -77,7 +76,7 @@ where
                 port,
                 reuse,
             },
-            rest_span.start,
+            rest_start,
         ),
         ClientRequest::Ping | ClientRequest::Udp { .. } => {
             return Err(Error::InvalidClientRequest);
@@ -142,7 +141,7 @@ async fn client_open_writes_connect_request() {
                 reuse: false,
                 host: "example.com",
                 port: 443,
-                rest_span: Range { start: 17, end: 17 },
+                rest_start: 17,
                 rest: b"",
             }
         );
@@ -208,7 +207,7 @@ async fn server_stream_preserves_early_data_and_coalesces_first_reply() {
         assert_eq!(
             reply,
             ServerReply::Tunnel {
-                payload_span: Range { start: 1, end: 6 },
+                payload_start: 1,
                 payload: b"first"
             }
         );
@@ -262,7 +261,7 @@ async fn server_writer_coalesces_tunnel_with_first_reader_payload() {
         assert_eq!(
             reply,
             ServerReply::Tunnel {
-                payload_span: Range { start: 1, end: 6 },
+                payload_start: 1,
                 payload: b"first"
             }
         );

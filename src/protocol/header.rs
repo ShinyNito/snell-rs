@@ -28,23 +28,24 @@ pub fn write_tcp_request_header(
     snell_version: ProtocolVersion,
     reuse: bool,
 ) -> Result<()> {
-    if host.is_empty() {
+    let host_len = host.len();
+
+    if host_len == 0 {
         return Err(Error::EmptyHost);
     }
-    if host.len() > u8::MAX as usize {
-        return Err(Error::HostTooLong);
-    }
 
-    out.put_u8(PROTOCOL_VERSION);
-    if snell_version == ProtocolVersion::V2 || reuse {
-        out.put_u8(COMMAND_CONNECT_V2);
+    let host_len = u8::try_from(host_len).map_err(|_| Error::HostTooLong)?;
+
+    let command = if snell_version == ProtocolVersion::V2 || reuse {
+        COMMAND_CONNECT_V2
     } else {
-        out.put_u8(COMMAND_CONNECT);
-    }
-    out.put_u8(0);
-    out.put_u8(u8::try_from(host.len()).map_err(|_| Error::HostTooLong)?);
+        COMMAND_CONNECT
+    };
+
+    out.put_slice(&[PROTOCOL_VERSION, command, 0, host_len]);
     out.put_slice(host.as_bytes());
     out.put_u16(port);
+
     Ok(())
 }
 

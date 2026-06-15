@@ -1,10 +1,11 @@
 use std::future::poll_fn;
+use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
-use bytes::{Buf, BytesMut};
-use tokio::io::AsyncWrite;
+use bytes::{BufMut, BytesMut};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::{Error, Result};
 #[cfg(test)]
@@ -13,13 +14,10 @@ use crate::protocol::header::{COMMAND_TUNNEL, write_tcp_request_header, write_ud
 use crate::protocol::psk::SnellPsk;
 use crate::protocol::request::{write_error_reply, write_pong_reply, write_tunnel_reply};
 use crate::protocol::v4::frame::V4FrameEncoder;
-use crate::protocol::v6::{SharedV6Profile, V6ChunkSizer, V6FrameEncoder};
+use crate::protocol::v6::{V6ChunkSizer, V6FrameEncoder};
 use crate::{MAX_PACKET_SIZE, MAX_V6_RECORD_PAYLOAD_LEN, ProtocolVersion};
 
-use super::buffer::{
-    compact_stream_buffer_for_reuse, poll_write_all_contiguous, poll_write_all_vectored,
-    write_all_vectored,
-};
+use super::buffer::{compact_stream_buffer_for_reuse, poll_write_all_vectored, write_all_vectored};
 use super::{
     FRAME_HEAD_INITIAL_CAPACITY, STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY,
     TCP_FIRST_RECORD_OVERHEAD, TCP_RECORD_IDLE_TIMEOUT, TCP_RECORD_MSS, TCP_STEADY_RECORD_OVERHEAD,
@@ -31,6 +29,13 @@ mod v6;
 pub(super) use v4::V4StreamWriter;
 pub(super) use v6::V6StreamWriter;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PayloadWriteStatus {
+    Written(usize),
+    SourceEof,
+}
+
+#[derive(Clone)]
 pub(super) struct RecordSizer {
     pub(super) initial_padding_len: usize,
     pub(super) last_limit: usize,
@@ -78,54 +83,298 @@ const fn steady_record_limit() -> usize {
     TCP_RECORD_MSS - TCP_STEADY_RECORD_OVERHEAD
 }
 
-pub(super) trait MessageRecordEncoder {
-    fn clear_wire(&mut self);
+const PAYLOAD_WRITE_BATCH_TARGET_BYTES: usize = 64 * 1024;
+pub(super) const PAYLOAD_WRITE_BATCH_MAX_RECORDS: usize = 64;
+const PAYLOAD_WRITE_BATCH_MAX_IO_SLICES: usize = PAYLOAD_WRITE_BATCH_MAX_RECORDS * 2;
 
-    fn peek_record_limit(&mut self, now: Instant) -> usize;
-
-    fn commit_record_limit(&mut self, now: Instant, limit: usize);
-
-    fn encode_record_into(&mut self, prefix: &[u8], payload: &[u8]) -> Result<usize>;
+pub(crate) trait PayloadSource {
+    fn poll_read_payload_into_slots(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        slots: &mut [libc::iovec],
+    ) -> Poll<io::Result<usize>>;
 }
 
-pub(super) fn encode_payload_message_from_buffer<E>(
-    encoder: &mut E,
-    plain: &mut BytesMut,
-    first_record_prefix: &[u8],
-) -> Result<Option<usize>>
+pub(crate) fn poll_read_payload_into_slots_fallback<R>(
+    mut reader: Pin<&mut R>,
+    cx: &mut Context<'_>,
+    slots: &mut [libc::iovec],
+) -> Poll<io::Result<usize>>
 where
-    E: MessageRecordEncoder,
+    R: AsyncRead + ?Sized,
 {
-    if plain.is_empty() {
-        return Ok(None);
+    let Some(slot) = slots.iter_mut().find(|slot| slot.iov_len != 0) else {
+        return Poll::Ready(Ok(0));
+    };
+    // The iovec points at spare capacity owned by a BytesMut. ReadBuf accepts
+    // MaybeUninit here and will only mark initialized bytes as filled.
+    let spare = unsafe {
+        std::slice::from_raw_parts_mut(
+            slot.iov_base.cast::<std::mem::MaybeUninit<u8>>(),
+            slot.iov_len,
+        )
+    };
+    let mut read_buf = ReadBuf::uninit(spare);
+    match reader.as_mut().poll_read(cx, &mut read_buf) {
+        Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+        Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+pub(super) struct PendingPayloadBatch {
+    records: Vec<PendingPayloadRecord>,
+    active_len: usize,
+    write_index: usize,
+    plain_len: usize,
+    wire_len: usize,
+}
+
+impl PendingPayloadBatch {
+    pub(super) fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            active_len: 0,
+            write_index: 0,
+            plain_len: 0,
+            wire_len: 0,
+        }
     }
 
-    encoder.clear_wire();
-    let mut written = 0;
-    let mut first_record = true;
-    while !plain.is_empty() {
-        let now = Instant::now();
-        let prefix = if first_record {
-            first_record_prefix
-        } else {
-            &[]
-        };
-        let limit = encoder.peek_record_limit(now);
-        let Some(read_limit) = limit.checked_sub(prefix.len()).filter(|limit| *limit != 0) else {
-            encoder.clear_wire();
-            return Err(Error::PayloadTooLarge);
-        };
-
-        let read_len = plain.len().min(read_limit);
-        let chunk = &plain[..read_len];
-        encoder.encode_record_into(prefix, chunk)?;
-        plain.advance(read_len);
-        encoder.commit_record_limit(now, limit);
-        written += read_len;
-        first_record = false;
+    pub(super) const fn is_empty(&self) -> bool {
+        self.active_len == 0
     }
 
-    Ok(Some(written))
+    pub(super) const fn is_full(&self) -> bool {
+        self.active_len >= PAYLOAD_WRITE_BATCH_MAX_RECORDS
+            || self.wire_len >= PAYLOAD_WRITE_BATCH_TARGET_BYTES
+    }
+
+    pub(super) fn begin_record(&mut self) -> &mut PendingPayloadRecord {
+        debug_assert_eq!(self.write_index, 0);
+        debug_assert!(self.active_len < PAYLOAD_WRITE_BATCH_MAX_RECORDS);
+        if self.active_len == self.records.len() {
+            self.records.push(PendingPayloadRecord::new());
+        }
+        let record = &mut self.records[self.active_len];
+        record.clear_for_fill();
+        record
+    }
+
+    pub(super) fn commit_record(&mut self, plain_len: usize) {
+        let record = &mut self.records[self.active_len];
+        debug_assert!(!record.head.is_empty() || !record.payload.is_empty());
+        record.head_pos = 0;
+        record.payload_pos = 0;
+        record.plain_len = plain_len;
+        self.active_len += 1;
+        self.plain_len += plain_len;
+        self.wire_len += record.head.len() + record.payload.len();
+    }
+
+    pub(super) fn begin_source_record(&mut self) -> &mut PendingPayloadRecord {
+        debug_assert_eq!(self.write_index, 0);
+        debug_assert!(self.active_len < PAYLOAD_WRITE_BATCH_MAX_RECORDS);
+        if self.active_len == self.records.len() {
+            self.records.push(PendingPayloadRecord::new());
+        }
+        let record = &mut self.records[self.active_len];
+        record.clear_for_fill();
+        self.active_len += 1;
+        record
+    }
+
+    pub(super) fn source_record(&mut self, index: usize) -> &mut PendingPayloadRecord {
+        debug_assert!(index < self.active_len);
+        &mut self.records[index]
+    }
+
+    pub(super) const fn active_len(&self) -> usize {
+        self.active_len
+    }
+
+    pub(super) const fn target_bytes() -> usize {
+        PAYLOAD_WRITE_BATCH_TARGET_BYTES
+    }
+
+    pub(super) fn finish_source_record(&mut self, index: usize, plain_len: usize) {
+        let record = &mut self.records[index];
+        debug_assert!(!record.head.is_empty() || !record.payload.is_empty());
+        record.head_pos = 0;
+        record.payload_pos = 0;
+        record.plain_len = plain_len;
+        self.plain_len += plain_len;
+        self.wire_len += record.head.len() + record.payload.len();
+    }
+
+    pub(super) fn truncate_active(&mut self, active_len: usize) {
+        debug_assert!(active_len <= self.active_len);
+        for record in &mut self.records[active_len..self.active_len] {
+            record.clear_for_fill();
+        }
+        self.active_len = active_len;
+    }
+
+    pub(super) fn discard(&mut self) {
+        self.reset_active();
+    }
+
+    pub(super) fn compact_for_reuse(&mut self) {
+        self.records.clear();
+        self.records.shrink_to(0);
+        self.active_len = 0;
+        self.write_index = 0;
+        self.plain_len = 0;
+        self.wire_len = 0;
+    }
+
+    pub(super) fn finish_written(&mut self) -> usize {
+        debug_assert_eq!(self.write_index, self.active_len);
+        let plain_len = self.plain_len;
+        self.reset_active();
+        plain_len
+    }
+
+    pub(super) fn poll_write_all<W>(
+        &mut self,
+        writer: &mut W,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        while self.write_index < self.active_len {
+            let mut bufs: [IoSlice<'_>; PAYLOAD_WRITE_BATCH_MAX_IO_SLICES] =
+                std::array::from_fn(|_| IoSlice::new(&[]));
+            let mut len = 0;
+            for record in &self.records[self.write_index..self.active_len] {
+                let head = record.remaining_head();
+                if !head.is_empty() {
+                    bufs[len] = IoSlice::new(head);
+                    len += 1;
+                }
+
+                let payload = record.remaining_payload();
+                if !payload.is_empty() {
+                    bufs[len] = IoSlice::new(payload);
+                    len += 1;
+                }
+            }
+            debug_assert!(len != 0);
+
+            let n = ready!(Pin::new(&mut *writer).poll_write_vectored(cx, &bufs[..len]))?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write snell payload batch",
+                )
+                .into()));
+            }
+            self.advance(n);
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn advance(&mut self, mut written: usize) {
+        while written != 0 && self.write_index < self.active_len {
+            let record = &mut self.records[self.write_index];
+            written = record.advance(written);
+            if record.is_written() {
+                self.write_index += 1;
+            }
+        }
+    }
+
+    fn reset_active(&mut self) {
+        for record in &mut self.records[..self.active_len] {
+            record.clear_for_fill();
+        }
+        self.active_len = 0;
+        self.write_index = 0;
+        self.plain_len = 0;
+        self.wire_len = 0;
+    }
+}
+
+pub(super) struct PendingPayloadRecord {
+    pub(super) head: BytesMut,
+    pub(super) payload: BytesMut,
+    head_pos: usize,
+    payload_pos: usize,
+    plain_len: usize,
+    prefix_len: usize,
+    read_limit: usize,
+}
+
+impl PendingPayloadRecord {
+    fn new() -> Self {
+        Self {
+            head: BytesMut::with_capacity(FRAME_HEAD_INITIAL_CAPACITY),
+            payload: BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY),
+            head_pos: 0,
+            payload_pos: 0,
+            plain_len: 0,
+            prefix_len: 0,
+            read_limit: 0,
+        }
+    }
+
+    fn clear_for_fill(&mut self) {
+        self.head.clear();
+        self.payload.clear();
+        self.head_pos = 0;
+        self.payload_pos = 0;
+        self.plain_len = 0;
+        self.prefix_len = 0;
+        self.read_limit = 0;
+    }
+
+    pub(super) fn prepare_spare(&mut self, prefix: &[u8], read_limit: usize) -> libc::iovec {
+        self.payload.extend_from_slice(prefix);
+        self.payload.reserve(read_limit);
+        self.prefix_len = prefix.len();
+        self.read_limit = read_limit;
+        let spare = self.payload.chunk_mut();
+        debug_assert!(spare.len() >= read_limit);
+        libc::iovec {
+            iov_base: spare.as_mut_ptr().cast(),
+            iov_len: read_limit,
+        }
+    }
+
+    pub(super) fn finish_read(&mut self, read_len: usize) -> usize {
+        debug_assert!(read_len <= self.read_limit);
+        // The reader reported these bytes as initialized in the spare capacity.
+        unsafe {
+            self.payload.advance_mut(read_len);
+        }
+        self.prefix_len + read_len
+    }
+
+    fn remaining_head(&self) -> &[u8] {
+        &self.head[self.head_pos..]
+    }
+
+    fn remaining_payload(&self) -> &[u8] {
+        &self.payload[self.payload_pos..]
+    }
+
+    fn is_written(&self) -> bool {
+        self.head_pos == self.head.len() && self.payload_pos == self.payload.len()
+    }
+
+    fn advance(&mut self, mut written: usize) -> usize {
+        let head_remaining = self.head.len() - self.head_pos;
+        let head_advance = head_remaining.min(written);
+        self.head_pos += head_advance;
+        written -= head_advance;
+
+        let payload_remaining = self.payload.len() - self.payload_pos;
+        let payload_advance = payload_remaining.min(written);
+        self.payload_pos += payload_advance;
+        written - payload_advance
+    }
 }
 
 pub(crate) enum SnellStreamWriter<W> {
@@ -162,34 +411,60 @@ where
         )?))
     }
 
-    pub(crate) async fn write_payload_message_from_buffer(
+    pub(crate) async fn write_payload_from_buffer(
         &mut self,
         plain: &mut BytesMut,
     ) -> Result<Option<usize>> {
-        poll_fn(|cx| self.poll_write_payload_message_from_buffer(plain, cx)).await
+        poll_fn(|cx| self.poll_write_payload_from_buffer(plain, cx)).await
     }
 
-    pub(crate) fn poll_write_payload_message_from_buffer(
+    pub(crate) fn poll_write_payload_from_buffer(
         &mut self,
         plain: &mut BytesMut,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<usize>>> {
         match self {
-            Self::V4 { writer, .. } => writer.poll_write_payload_message_from_buffer(plain, cx),
-            Self::V6(writer) => writer.poll_write_payload_message_from_buffer(plain, cx),
+            Self::V4 { writer, .. } => writer.poll_write_payload_from_buffer(plain, cx),
+            Self::V6(writer) => writer.poll_write_payload_from_buffer(plain, cx),
         }
     }
 
-    pub(crate) fn poll_write_tunnel_reply_message_from_buffer(
+    pub(crate) fn poll_write_payload_from_source<R>(
+        &mut self,
+        reader: Pin<&mut R>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<PayloadWriteStatus>>
+    where
+        R: PayloadSource + ?Sized,
+    {
+        match self {
+            Self::V4 { writer, .. } => writer.poll_write_payload_from_source(reader, cx),
+            Self::V6(writer) => writer.poll_write_payload_from_source(reader, cx),
+        }
+    }
+
+    pub(crate) fn poll_write_tunnel_reply_from_source<R>(
+        &mut self,
+        reader: Pin<&mut R>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<PayloadWriteStatus>>
+    where
+        R: PayloadSource + ?Sized,
+    {
+        match self {
+            Self::V4 { writer, .. } => writer.poll_write_tunnel_reply_from_source(reader, cx),
+            Self::V6(writer) => writer.poll_write_tunnel_reply_from_source(reader, cx),
+        }
+    }
+
+    pub(crate) fn poll_write_tunnel_reply_from_buffer(
         &mut self,
         plain: &mut BytesMut,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<usize>>> {
         match self {
-            Self::V4 { writer, .. } => {
-                writer.poll_write_tunnel_reply_message_from_buffer(plain, cx)
-            }
-            Self::V6(writer) => writer.poll_write_tunnel_reply_message_from_buffer(plain, cx),
+            Self::V4 { writer, .. } => writer.poll_write_tunnel_reply_from_buffer(plain, cx),
+            Self::V6(writer) => writer.poll_write_tunnel_reply_from_buffer(plain, cx),
         }
     }
 
@@ -267,10 +542,6 @@ where
             Self::V4 { writer, .. } => writer.write_error_reply(code, message).await,
             Self::V6(writer) => writer.write_error_reply(code, message).await,
         }
-    }
-
-    pub(crate) async fn write_zero_chunk(&mut self) -> Result<()> {
-        poll_fn(|cx| self.poll_write_zero_chunk(cx)).await
     }
 
     pub(crate) fn poll_write_zero_chunk(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {

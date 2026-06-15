@@ -5,7 +5,9 @@ mod tests;
 mod writer;
 
 pub(crate) use reader::SnellStreamReader;
-pub(crate) use writer::SnellStreamWriter;
+pub(crate) use writer::{
+    PayloadSource, PayloadWriteStatus, SnellStreamWriter, poll_read_payload_into_slots_fallback,
+};
 
 use crate::MAX_PACKET_SIZE;
 

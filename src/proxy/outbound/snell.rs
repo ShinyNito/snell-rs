@@ -10,8 +10,8 @@ use crate::error::{Error, Result};
 use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::net::connect::connect_tcp;
 use crate::protocol::psk::SnellPsk;
-use crate::session::reuse::ReuseClientConn;
-use crate::session::tcp::{TcpClientOpenOptions, TcpClientStream};
+use crate::transport::reuse::ReuseClientConn;
+use crate::transport::tcp::{TcpClientOpenOptions, TcpClientStream};
 
 const REUSE_POOL_MAX_SIZE: usize = 10;
 const REUSE_POOL_MAX_IDLE_AGE: Duration = Duration::from_secs(15);

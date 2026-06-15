@@ -13,9 +13,11 @@ bytes = "1"
 clap = { version = "4.6", features = ["derive"] }
 hickory-resolver = "0.26.1"
 libc = "0.2"
+pin-project-lite = "0.2"
 rand = "0.10.1"
 ring = "0.17.14"
 rust-ini = "0.21.1"
+rustix = { version = "1", features = ["net"] }
 thiserror = "2"
 tokio = { version = "1", features = [
   "io-util",

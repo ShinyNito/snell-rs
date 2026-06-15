@@ -1,5 +1,3 @@
-use core::range::Range;
-
 use super::{UdpClientStream, UdpServerStream};
 use crate::ProtocolVersion;
 use crate::error::Error;
@@ -31,7 +29,7 @@ async fn udp_client_open_writes_udp_request_and_accepts_empty_tunnel() {
         assert_eq!(
             request,
             ClientRequest::Udp {
-                rest_span: Range { start: 3, end: 3 },
+                rest_start: 3,
                 rest: b"",
             }
         );
@@ -64,7 +62,7 @@ async fn udp_client_open_supports_v6_stream() {
         assert_eq!(
             request,
             ClientRequest::Udp {
-                rest_span: Range { start: 3, end: 3 },
+                rest_start: 3,
                 rest: b"",
             }
         );
@@ -122,7 +120,7 @@ async fn udp_server_accept_sends_empty_tunnel_reply() {
         assert_eq!(
             parse_server_reply(&payload).unwrap(),
             ServerReply::Tunnel {
-                payload_span: Range { start: 1, end: 1 },
+                payload_start: 1,
                 payload: b"",
             }
         );

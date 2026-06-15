@@ -10,8 +10,8 @@ use crate::net::tcp_brutal::validate_tcp_brutal_available;
 use crate::protocol::psk::SnellPsk;
 use crate::protocol::v6::V6SaltReplayCache;
 use crate::proxy::outbound::{RelayOptions, UpstreamRelay};
+use crate::relay::quic_proxy::{QUIC_PROXY_FLOW_IDLE_TIMEOUT, serve_quic_proxy_socket};
 use crate::server::shutdown::{SHUTDOWN_DRAIN_TIMEOUT, bind_tcp_listener};
-use crate::session::quic_proxy::{QUIC_PROXY_SESSION_IDLE_TIMEOUT, serve_quic_proxy_socket};
 
 mod listener;
 pub(crate) mod shutdown;
@@ -71,7 +71,7 @@ pub async fn bind_configured_tcp_server_with_shutdown(
         udp_socket,
         quic_psk,
         tcp_runtime.options.clone(),
-        QUIC_PROXY_SESSION_IDLE_TIMEOUT,
+        QUIC_PROXY_FLOW_IDLE_TIMEOUT,
         shutdown.clone(),
     );
     let tcp = serve_tcp_listener_with_shutdown_and_timeout(listener, tcp_runtime);

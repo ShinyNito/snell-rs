@@ -12,7 +12,7 @@ use crate::protocol::psk::SnellPsk;
 use crate::protocol::udp::{parse_udp_request, parse_udp_response};
 use crate::protocol::v4::frame::{DecodedHeader, V4_HEADER_CIPHER_SIZE, V4FrameDecoder};
 use crate::protocol::v6::{
-    SharedV6Profile, V6_HEADER_CIPHER_SIZE, V6ChunkSizer, V6DecodedHeader, V6FrameDecoder,
+    V6_HEADER_CIPHER_SIZE, V6ChunkSizer, V6DecodedHeader, V6FrameDecoder, V6Profile,
     V6SaltReplayCache,
 };
 
@@ -41,7 +41,7 @@ impl SnellFrameFamily {
 
 pub struct V4StreamReader<R> {
     inner: R,
-    pub(super) secret: Option<SnellPsk>,
+    secret: SnellPsk,
     decoder: Option<V4FrameDecoder>,
     /// Raw ciphertext accumulation buffer. Reads pull as much as the spare
     /// capacity allows, so several frames can be parsed per syscall.
@@ -64,8 +64,7 @@ pub struct V4StreamReader<R> {
 
 pub struct V6StreamReader<R> {
     inner: R,
-    secret: Option<SnellPsk>,
-    profile: SharedV6Profile,
+    secret: SnellPsk,
     chunk_sizer: V6ChunkSizer,
     salt_replay_cache: Option<V6SaltReplayCache>,
     decoder: Option<V6FrameDecoder>,
@@ -127,8 +126,7 @@ where
     ) -> Self {
         Self {
             inner,
-            secret: Some(secret.clone()),
-            profile: secret.clone_v6_profile(),
+            secret: secret.clone(),
             chunk_sizer: V6ChunkSizer::new(),
             salt_replay_cache,
             decoder: None,
@@ -150,26 +148,24 @@ where
     fn poll_read_frame_payload_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.discard_consumed();
         if self.decoder.is_none() {
-            let salt_block_len = self.profile.salt_block_len();
+            let salt_block_len = self.secret.v6_profile().salt_block_len();
             ready!(self.poll_fill_to(cx, salt_block_len))?;
-            let salt = self.profile.extract_salt(&self.body[..salt_block_len])?;
+            let salt = self
+                .secret
+                .v6_profile()
+                .extract_salt(&self.body[..salt_block_len])?;
             if let Some(cache) = &self.salt_replay_cache {
                 cache.remember(salt)?;
             }
             self.body.advance(salt_block_len);
-            let secret = self
-                .secret
-                .as_ref()
-                .expect("v6 reader secret is kept until decoder initialization");
-            self.decoder = Some(V6FrameDecoder::new(secret.as_bytes(), salt)?);
-            self.secret = None;
+            self.decoder = Some(V6FrameDecoder::new(self.secret.as_bytes(), salt)?);
         }
 
         let prefix_len = self
             .decoder
             .as_ref()
             .expect("decoder initialized before prefix length")
-            .next_prefix_len(&self.profile);
+            .next_prefix_len(self.secret.v6_profile());
         let header = if let Some(header) = self.pending_header {
             header
         } else {
@@ -208,19 +204,26 @@ where
             .as_ref()
             .expect("decoder initialized before v6 payload limit")
             .seq();
-        let chunk_limit = self.chunk_sizer.peek_limit(&self.profile, seq, now);
+        let chunk_limit = self
+            .chunk_sizer
+            .peek_limit(self.secret.v6_profile(), seq, now);
         if let Err(err) = self
             .decoder
             .as_mut()
             .expect("decoder initialized before v6 payload decode")
-            .decode_payload_in_place(&self.profile, header, &mut self.body[body_start..frame_len])
+            .decode_payload_in_place(
+                self.secret.v6_profile(),
+                header,
+                &mut self.body[body_start..frame_len],
+            )
         {
             log_frame_decode_error(&err, "v6", "payload", Some(payload_len), Some(body_len));
             return Poll::Ready(Err(err));
         }
         self.last_chunk_limit = Some(chunk_limit);
         if payload_len != 0 {
-            self.chunk_sizer.commit_record(&self.profile, now);
+            self.chunk_sizer
+                .commit_record(self.secret.v6_profile(), now);
         }
         self.payload_start = body_start + header.padding_len;
         self.payload_end = self.payload_start + payload_len;
@@ -397,19 +400,11 @@ where
         self.poll_read_udp_payload_message(cx, UdpPayloadKind::Request)
     }
 
-    pub(crate) async fn read_udp_request_message(&mut self) -> Result<Option<Bytes>> {
-        poll_fn(|cx| self.poll_read_udp_request_message(cx)).await
-    }
-
     pub(crate) fn poll_read_udp_response_message(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Bytes>>> {
         self.poll_read_udp_payload_message(cx, UdpPayloadKind::Response)
-    }
-
-    pub(crate) async fn read_udp_response_message(&mut self) -> Result<Option<Bytes>> {
-        poll_fn(|cx| self.poll_read_udp_response_message(cx)).await
     }
 
     fn poll_read_udp_payload_message(
@@ -754,7 +749,7 @@ impl<T> DetectionAttempt<T> {
 struct ServerFrameFamilyDetector<'a, R> {
     inner: R,
     psk: &'a [u8],
-    profile: SharedV6Profile,
+    profile: &'a V6Profile,
     body: BytesMut,
 }
 
@@ -766,7 +761,7 @@ where
         Self {
             inner,
             psk: secret.as_bytes(),
-            profile: secret.clone_v6_profile(),
+            profile: secret.v6_profile(),
             body: BytesMut::with_capacity(STREAM_BUFFER_INITIAL_CAPACITY),
         }
     }
@@ -785,7 +780,7 @@ where
             Ok(decoder) => decoder,
             Err(error) => return DetectionAttempt::Failed(error),
         };
-        let prefix_len = decoder.next_prefix_len(&self.profile);
+        let prefix_len = decoder.next_prefix_len(self.profile);
         let needed = salt_block_len + prefix_len + V6_HEADER_CIPHER_SIZE;
         if self.body.len() < needed {
             return DetectionAttempt::Need(needed);
@@ -886,7 +881,7 @@ where
     fn with_prefilled_body(inner: R, secret: &SnellPsk, body: BytesMut) -> Self {
         Self {
             inner,
-            secret: Some(secret.clone()),
+            secret: secret.clone(),
             decoder: None,
             body,
             consumed: 0,
@@ -911,12 +906,7 @@ where
             let mut salt = [0; SALT_SIZE];
             salt.copy_from_slice(&self.body[..SALT_SIZE]);
             self.body.advance(SALT_SIZE);
-            let secret = self
-                .secret
-                .as_ref()
-                .expect("v4 reader secret is kept until decoder initialization");
-            self.decoder = Some(V4FrameDecoder::new(secret.as_bytes(), salt)?);
-            self.secret = None;
+            self.decoder = Some(V4FrameDecoder::new(self.secret.as_bytes(), salt)?);
         }
 
         let header = if let Some(header) = self.pending_header {

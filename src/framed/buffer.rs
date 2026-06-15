@@ -105,31 +105,6 @@ where
     Poll::Ready(Ok(()))
 }
 
-pub(super) fn poll_write_all_contiguous<W>(
-    writer: &mut W,
-    cx: &mut Context<'_>,
-    buffer: &mut BytesMut,
-) -> Poll<Result<()>>
-where
-    W: AsyncWrite + Unpin,
-{
-    while !buffer.is_empty() {
-        let n = ready!(Pin::new(&mut *writer).poll_write(cx, buffer))?;
-
-        if n == 0 {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "failed to write snell frame batch",
-            )
-            .into()));
-        }
-
-        buffer.advance(n);
-    }
-
-    Poll::Ready(Ok(()))
-}
-
 /// Like `poll_read_into_spare`, but offers the reader the whole spare capacity
 /// up to the stream read-ahead budget instead of an exact byte count, so one
 /// syscall can pull in bytes of several frames.
@@ -173,7 +148,7 @@ where
     poll_read_into_spare(reader, cx, buffer, read_len)
 }
 
-fn poll_read_into_spare<R>(
+pub(super) fn poll_read_into_spare<R>(
     reader: &mut R,
     cx: &mut Context<'_>,
     buffer: &mut BytesMut,

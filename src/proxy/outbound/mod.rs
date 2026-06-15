@@ -11,9 +11,9 @@ pub(crate) mod socks5;
 pub(crate) mod tcp;
 pub(crate) mod udp;
 
-pub(crate) use quic::{open_quic_udp, run_quic_proxy_response_session};
+pub(crate) use quic::{QuicProxyRelay, open_quic_udp, relay_quic_proxy_responses};
 pub(crate) use tcp::open_tcp;
-pub(crate) use udp::{PreparedUdpProxy, PreparedUdpRelay, open_udp, validate_proxy_udp_target};
+pub(crate) use udp::{PreparedUdpRelay, open_udp, validate_proxy_udp_target};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RelayStats {

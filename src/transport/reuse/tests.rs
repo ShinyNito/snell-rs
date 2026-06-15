@@ -1,4 +1,4 @@
-use core::range::Range;
+use std::future::poll_fn;
 use std::io::{self, ErrorKind};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -74,7 +74,7 @@ async fn reuse_conn_requires_both_sides_done_before_reuse() {
                 reuse: true,
                 host: "example.com",
                 port: 443,
-                rest_span: Range { start: 17, end: 17 },
+                rest_start: 17,
                 rest: b"",
             }
         );
@@ -83,7 +83,9 @@ async fn reuse_conn_requires_both_sides_done_before_reuse() {
         write_snell_tunnel_reply_message(&mut server_writer, b"pong")
             .await
             .unwrap();
-        server_writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| server_writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
 
         assert!(matches!(
             read_snell_frame_payload(&mut reader).await,
@@ -115,7 +117,9 @@ async fn reuse_conn_with_pending_payload_is_not_reusable() {
         write_snell_tunnel_reply_message(&mut server_writer, b"pong")
             .await
             .unwrap();
-        server_writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| server_writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     };
 
     let ((), ()) = tokio::join!(client, server);

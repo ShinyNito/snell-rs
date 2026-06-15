@@ -1,4 +1,4 @@
-use core::range::Range;
+use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +24,7 @@ use crate::proxy::snell::server::{
     SERVER_TCP_ACTIVITY_TIMEOUTS, V6_ERROR_CONNECTION_REFUSED, open_tcp_target,
     serve_server_connection,
 };
-use crate::proxy::socks5::udp::is_allowed_socks_udp_peer;
+use crate::relay::udp::association::is_allowed_socks_udp_peer;
 use crate::test_support::{
     TEST_PSK, TestUdpPacket, accept_udp_server_stream, read_snell_frame_payload, shared_secret,
     test_snell_reader, test_snell_writer, test_tcp_listener, test_udp_socket,
@@ -180,7 +180,7 @@ async fn socks5_connect_waits_for_snell_tunnel_reply_before_success() {
                 reuse: false,
                 host: "1.1.1.1",
                 port: 80,
-                rest_span: Range { start: 13, end: 13 },
+                rest_start: 13,
                 rest: b"",
             }
         );
@@ -198,7 +198,9 @@ async fn socks5_connect_waits_for_snell_tunnel_reply_before_success() {
         write_snell_payload_message(&mut server_writer, response_payload)
             .await
             .unwrap();
-        server_writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| server_writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     };
 
     let socks_server = async {
@@ -266,7 +268,7 @@ async fn socks5_connect_error_reply_reflects_snell_tunnel_error() {
                 reuse: false,
                 host: "1.1.1.1",
                 port: 80,
-                rest_span: Range { start: 13, end: 13 },
+                rest_start: 13,
                 rest: b"",
             }
         );
@@ -472,12 +474,18 @@ async fn socks5_udp_associate_routes_pending_responses_by_udp_target() {
                 .unwrap()
                 .into_parts();
 
-        let first = reader.read_udp_request_message().await.unwrap().unwrap();
+        let first = poll_fn(|cx| reader.poll_read_udp_request_message(cx))
+            .await
+            .unwrap()
+            .unwrap();
         let first = TestUdpPacket::from_ref(parse_udp_request(&first).unwrap());
         assert_eq!(first.payload, b"one");
         assert_eq!(first.port, 5301);
 
-        let second = reader.read_udp_request_message().await.unwrap().unwrap();
+        let second = poll_fn(|cx| reader.poll_read_udp_request_message(cx))
+            .await
+            .unwrap()
+            .unwrap();
         let second = TestUdpPacket::from_ref(parse_udp_request(&second).unwrap());
         assert_eq!(second.payload, b"two");
         assert_eq!(second.port, 5302);
@@ -754,7 +762,10 @@ async fn socks5_v5_non_quic_udp_falls_back_to_udp_over_tcp() {
                 .await
                 .unwrap()
                 .into_parts();
-        let message = reader.read_udp_request_message().await.unwrap().unwrap();
+        let message = poll_fn(|cx| reader.poll_read_udp_request_message(cx))
+            .await
+            .unwrap()
+            .unwrap();
         let request = TestUdpPacket::from_ref(parse_udp_request(&message).unwrap());
         assert_eq!(request.payload, b"query");
         assert_eq!(request.port, 53);
@@ -843,7 +854,10 @@ async fn socks5_v4_udp_ignores_quic_proxy_flag() {
                 .await
                 .unwrap()
                 .into_parts();
-        let message = reader.read_udp_request_message().await.unwrap().unwrap();
+        let message = poll_fn(|cx| reader.poll_read_udp_request_message(cx))
+            .await
+            .unwrap()
+            .unwrap();
         let request = TestUdpPacket::from_ref(parse_udp_request(&message).unwrap());
         assert_eq!(request.payload, b"\xc0still-over-tcp");
         assert_eq!(request.port, 443);
@@ -1142,7 +1156,10 @@ async fn socks5_udp_associate_drops_invalid_snell_responses_without_closing() {
                 .await
                 .unwrap()
                 .into_parts();
-        let message = reader.read_udp_request_message().await.unwrap().unwrap();
+        let message = poll_fn(|cx| reader.poll_read_udp_request_message(cx))
+            .await
+            .unwrap()
+            .unwrap();
         let request = TestUdpPacket::from_ref(parse_udp_request(&message).unwrap());
         assert_eq!(request.payload, b"query");
         assert_eq!(request.port, 53);

@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -113,7 +113,6 @@ pub use chunk::V6ChunkSizer;
 pub use frame::{V6DecodedHeader, V6FrameDecoder, V6FrameEncoder};
 pub use profile::V6Profile;
 pub use replay::V6SaltReplayCache;
-pub(crate) type SharedV6Profile = Arc<V6Profile>;
 pub(in crate::protocol::v6) use salt::salt_positions;
 #[cfg(test)]
 pub(crate) use salt::split_salt_block;
@@ -343,8 +342,4 @@ const fn pick_usize(raw: u32, lo: usize, hi: usize) -> usize {
     } else {
         lo + raw as usize % (hi - lo + 1)
     }
-}
-
-fn clamp_usize(x: usize, lo: usize, hi: usize) -> usize {
-    x.max(lo).min(hi)
 }

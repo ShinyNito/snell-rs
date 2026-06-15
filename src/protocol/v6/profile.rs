@@ -13,9 +13,8 @@ use super::{
     MAX_EXTRA_TARGET_PADDING, MIX_HANDSHAKE_DOMAIN, NS_SEED_CHUNK, NS_SEED_MIX, NS_SEED_MOTIF,
     NS_SEED_PREFIX, NS_SEED_PROFILE, NS_SEED_SALT, NS_SEED_WRITE, PROFILE_SEED, Range, Result,
     SALT_SIZE, V6_CHUNK_MAX_RAW_BOUND, V6_HEADER_CIPHER_SIZE, V6_TARGET_DIRECT_LIMIT,
-    V6_TARGET_U16_LIMIT, V6_TRAFFIC_SHAPING_MTU_CAP, blake2b_256_from_slices, clamp_usize,
-    derive_namespace, expand_stream, expand_stream_array, pick_u32, pick_usize, prf32_mix,
-    salt_positions,
+    V6_TARGET_U16_LIMIT, V6_TRAFFIC_SHAPING_MTU_CAP, blake2b_256_from_slices, derive_namespace,
+    expand_stream, expand_stream_array, pick_u32, pick_usize, prf32_mix, salt_positions,
 };
 
 #[cfg(test)]
@@ -184,15 +183,12 @@ impl V6Profile {
         let mix_block = pick_usize(namespaces.prf_static(LABEL_MIX_BLOCK, 0), 8, 0x40);
 
         let chunk_policy = namespaces.prf_static(LABEL_CHUNK_POLICY, 0) % 3;
-        let chunk_initial = clamp_usize(
-            pick_usize(
-                namespaces.prf_static(LABEL_CHUNK_INITIAL, 0),
-                0x200,
-                V6_TRAFFIC_SHAPING_MTU_CAP,
-            ),
-            0x60,
+        let chunk_initial = pick_usize(
+            namespaces.prf_static(LABEL_CHUNK_INITIAL, 0),
+            0x200,
             V6_TRAFFIC_SHAPING_MTU_CAP,
-        );
+        )
+        .clamp(0x60, V6_TRAFFIC_SHAPING_MTU_CAP);
         let chunk_max = pick_usize(
             namespaces.prf_static(LABEL_CHUNK_MAX, 0),
             0x2000,
@@ -226,24 +222,18 @@ impl V6Profile {
             } else {
                 chunk_bucket
             };
-            write_buckets[i] = clamp_usize(
-                pick_usize(
-                    namespaces.prf_static(LABEL_WRITE_BUCKET, u32_from_usize(i)),
-                    0x140,
-                    V6_TRAFFIC_SHAPING_MTU_CAP,
-                ),
-                0x100,
+            write_buckets[i] = pick_usize(
+                namespaces.prf_static(LABEL_WRITE_BUCKET, u32_from_usize(i)),
+                0x140,
                 V6_TRAFFIC_SHAPING_MTU_CAP,
-            );
-            write_seq[i] = clamp_usize(
-                pick_usize(
-                    namespaces.prf_static(LABEL_WRITE_SEQ, u32_from_usize(i)),
-                    0x168,
-                    V6_TRAFFIC_SHAPING_MTU_CAP,
-                ),
-                0x100,
+            )
+            .clamp(0x100, V6_TRAFFIC_SHAPING_MTU_CAP);
+            write_seq[i] = pick_usize(
+                namespaces.prf_static(LABEL_WRITE_SEQ, u32_from_usize(i)),
+                0x168,
                 V6_TRAFFIC_SHAPING_MTU_CAP,
-            );
+            )
+            .clamp(0x100, V6_TRAFFIC_SHAPING_MTU_CAP);
         }
 
         let write_jitter = pick_usize(namespaces.prf_static(LABEL_WRITE_JITTER, 0), 0x08, 0x60);

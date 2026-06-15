@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use super::{run_quic_proxy_session, serve_quic_proxy_socket};
+use super::{run_quic_proxy_flow, serve_quic_proxy_socket};
 use crate::net::dns::DnsResolver;
 use crate::protocol::quic_proxy::encode_init_datagram;
 use crate::protocol::socks5::{
@@ -29,7 +29,7 @@ fn socks5_options(proxy_addr: std::net::SocketAddr) -> RelayOptions {
 }
 
 #[tokio::test]
-async fn quic_proxy_init_session_forwards_raw_and_response() {
+async fn quic_proxy_init_flow_forwards_raw_and_response() {
     let psk = TEST_PSK;
     let target = test_udp_socket().await;
     let target_addr = target.local_addr().unwrap();
@@ -87,7 +87,7 @@ async fn quic_proxy_init_session_forwards_raw_and_response() {
 }
 
 #[tokio::test]
-async fn quic_proxy_drops_raw_packet_without_session() {
+async fn quic_proxy_drops_raw_packet_without_flow() {
     let server = test_udp_socket().await;
     let server_addr = server.local_addr().unwrap();
     let client = test_udp_socket().await;
@@ -211,13 +211,13 @@ async fn quic_proxy_open_failure_keeps_socket_loop_alive() {
 }
 
 #[tokio::test]
-async fn quic_proxy_response_failure_closes_session_task() {
+async fn quic_proxy_response_failure_closes_flow_task() {
     let target = test_udp_socket().await;
     let target_addr = target.local_addr().unwrap();
     let server = test_udp_socket().await;
     let client_addr = "[::1]:12345".parse().unwrap();
     let (queue, payloads) = mpsc::channel(1);
-    let task = tokio::spawn(run_quic_proxy_session(
+    let task = tokio::spawn(run_quic_proxy_flow(
         std::sync::Arc::new(server),
         client_addr,
         "127.0.0.1".to_owned(),
@@ -237,13 +237,13 @@ async fn quic_proxy_response_failure_closes_session_task() {
 
     timeout(Duration::from_secs(1), task)
         .await
-        .expect("response failure should end the session")
+        .expect("response failure should end the flow")
         .unwrap();
     assert!(queue.is_closed());
 }
 
 #[tokio::test]
-async fn quic_proxy_session_idle_timeout_drops_session() {
+async fn quic_proxy_flow_idle_timeout_drops_flow() {
     let psk = TEST_PSK;
     let target = test_udp_socket().await;
     let target_addr = target.local_addr().unwrap();

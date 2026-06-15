@@ -25,16 +25,22 @@ pub mod protocol {
 
 pub(crate) mod framed;
 
-pub(crate) mod session {
+pub(crate) mod relay {
     pub(crate) mod activity;
     pub(crate) mod quic_proxy;
-    pub(crate) mod reuse;
     pub(crate) mod tcp;
     pub(crate) mod udp {
         pub(crate) mod association;
         pub(crate) mod io;
         pub(crate) mod outbound;
         pub(crate) mod socket;
+    }
+}
+
+pub(crate) mod transport {
+    pub(crate) mod reuse;
+    pub(crate) mod tcp;
+    pub(crate) mod udp {
         pub(crate) mod stream;
     }
 }

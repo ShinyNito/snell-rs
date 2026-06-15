@@ -1,11 +1,12 @@
+use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 use super as udp_io;
 use super::{
-    SnellUdpPacketKind, UdpRecvBatch, UdpSendPacket, parse_socks_udp_header,
-    reframe_socks_udp_packet, send_udp_batch,
+    SnellUdpPacketKind, UdpRecvBatch, UdpSendBatch, parse_socks_udp_header,
+    reframe_socks_udp_packet,
 };
 use crate::error::Error;
 use crate::protocol::socks5::write_udp_packet as write_socks_udp_packet;
@@ -185,7 +186,9 @@ async fn recv_socks_udp_datagram_reports_peer_and_preserves_bytes() {
         .unwrap();
 
     let mut received = UdpRecvBatch::new(v4_socks_udp_datagram_limit());
-    let n = received.recv_from(&receiver).await.unwrap();
+    let n = poll_fn(|cx| received.poll_recv_from(&receiver, cx))
+        .await
+        .unwrap();
     let entry = received.get(0).unwrap();
 
     assert_eq!(n, 1);
@@ -216,21 +219,17 @@ fn socks_udp_datagram_limit_allows_socks_rsv_overhead() {
 }
 
 #[tokio::test]
-async fn send_udp_batch_combines_prefix_and_payload() {
+async fn udp_send_batch_poll_combines_prefix_and_payload() {
     let sender = test_udp_socket().await;
     let receiver = test_udp_socket().await;
 
-    send_udp_batch(
-        &sender,
-        &[UdpSendPacket::parts(
-            b"header",
-            b"payload",
-            receiver.local_addr().unwrap(),
-        )],
+    let mut batch = UdpSendBatch::parts(
+        Bytes::from_static(b"header"),
+        Bytes::from_static(b"payload"),
+        receiver.local_addr().unwrap(),
         v4_socks_udp_datagram_limit(),
-    )
-    .await
-    .unwrap();
+    );
+    poll_fn(|cx| batch.poll_send(&sender, cx)).await.unwrap();
 
     let mut received = [0; 64];
     let (n, peer) = receiver.recv_from(&mut received).await.unwrap();
@@ -240,21 +239,18 @@ async fn send_udp_batch_combines_prefix_and_payload() {
 }
 
 #[tokio::test]
-async fn send_udp_batch_rejects_packets_above_call_site_limit() {
+async fn udp_send_batch_poll_rejects_packets_above_call_site_limit() {
     let sender = test_udp_socket().await;
     let receiver = test_udp_socket().await;
 
+    let mut batch = UdpSendBatch::parts(
+        Bytes::from_static(b"header"),
+        Bytes::from_static(b"payload"),
+        receiver.local_addr().unwrap(),
+        b"header".len() + b"payload".len() - 1,
+    );
     assert!(matches!(
-        send_udp_batch(
-            &sender,
-            &[UdpSendPacket::parts(
-                b"header",
-                b"payload",
-                receiver.local_addr().unwrap(),
-            )],
-            b"header".len() + b"payload".len() - 1,
-        )
-        .await,
+        poll_fn(|cx| batch.poll_send(&sender, cx)).await,
         Err(Error::PayloadTooLarge)
     ));
 }

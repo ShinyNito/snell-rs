@@ -1,15 +1,17 @@
-use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-use bytes::{Buf, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use bytes::{Buf, Bytes, BytesMut};
+use pin_project_lite::pin_project;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, Sleep, sleep};
 
 use crate::error::{Error, Result};
-use crate::framed::{SnellStreamReader, SnellStreamWriter};
 use crate::net::connect::connect_tcp;
 use crate::protocol::psk::SnellPsk;
 use crate::protocol::quic_proxy::{
@@ -17,21 +19,21 @@ use crate::protocol::quic_proxy::{
     is_quic_short_header,
 };
 use crate::protocol::socks5::{SocksReply, parse_udp_packet, write_udp_packet};
-use crate::protocol::udp::{AddressRef, parse_udp_response, write_udp_request_prefix};
+use crate::protocol::udp::{AddressRef, write_udp_request_prefix};
 use crate::proxy::outbound::RelayStats;
 use crate::proxy::socks5::inbound::{write_reply_and_shutdown, write_reply_with_bind};
-use crate::session::udp::io::{
-    MAX_SOCKS_UDP_HEADER, SnellUdpPacketKind, UdpRecvBatch, UdpSendPacket,
-    max_socks_udp_datagram_len, parse_socks_udp_header, reframe_socks_udp_packet, send_udp_batch,
+use crate::relay::activity::RelayActivity;
+use crate::relay::udp::association::{
+    ClientPeerByUdpTarget, OwnedUdpTarget, Socks5ClientUdpSeed, UdpRelayDriver, UdpRelayStats,
+    is_allowed_socks_udp_peer, quic_init_host,
 };
-use crate::session::udp::outbound::write_zero_chunk;
-use crate::session::udp::stream::UdpClientStream;
+use crate::relay::udp::io::{MAX_SOCKS_UDP_HEADER, UdpRecvBatch, UdpSendBatch};
+use crate::transport::udp::stream::UdpClientStream;
 use crate::{MAX_PACKET_SIZE, ProtocolVersion};
 
-pub(super) const SOCKS5_UDP_ASSOCIATION_TIMEOUT: Duration = Duration::from_mins(1);
+const SOCKS5_UDP_ASSOCIATION_TIMEOUT: Duration = Duration::from_mins(1);
 const SOCKS5_UDP_BUFFER_SIZE: usize = MAX_PACKET_SIZE + 512;
 const MAX_QUIC_SOCKS_UDP_DATAGRAM: usize = MAX_SOCKS_UDP_HEADER + SOCKS5_UDP_BUFFER_SIZE;
-type ClientPeerByUdpTarget = HashMap<OwnedUdpTarget, SocketAddr>;
 
 struct FirstSocksUdpBuffers {
     socks_in: UdpRecvBatch,
@@ -67,11 +69,6 @@ struct LazyQuicUdpBuffers {
     quic_host_scratch: String,
 }
 
-struct SocksUdpOverSnellBuffers {
-    socks_header: BytesMut,
-    socks_in_batch: UdpRecvBatch,
-}
-
 impl FirstSocksUdpBuffers {
     fn new() -> Self {
         Self {
@@ -103,15 +100,6 @@ impl LazyQuicUdpBuffers {
     }
 }
 
-impl SocksUdpOverSnellBuffers {
-    fn new(socks_udp_limit: usize) -> Self {
-        Self {
-            socks_header: BytesMut::with_capacity(MAX_SOCKS_UDP_HEADER),
-            socks_in_batch: UdpRecvBatch::new(socks_udp_limit),
-        }
-    }
-}
-
 pub(crate) async fn relay_socks5_udp_association(
     mut control: TcpStream,
     server_addr: SocketAddr,
@@ -124,7 +112,7 @@ pub(crate) async fn relay_socks5_udp_association(
     }
 
     let control_peer_ip = control.peer_addr()?.ip();
-    let udp_socket = bind_socks5_udp_socket(control.local_addr()?).await?;
+    let udp_socket = Arc::new(bind_socks5_udp_socket(control.local_addr()?).await?);
     let udp_bind_addr = udp_socket.local_addr()?;
     let snell_tcp = match connect_tcp(server_addr).await {
         Ok(stream) => {
@@ -148,17 +136,20 @@ pub(crate) async fn relay_socks5_udp_association(
 
     write_reply_with_bind(&mut control, SocksReply::Succeeded, udp_bind_addr).await?;
 
-    let (mut control_reader, _control_writer) = control.into_split();
-    let (mut snell_reader, mut snell_writer) = snell.into_parts();
-    relay_socks5_udp_over_snell(
-        &mut control_reader,
-        &udp_socket,
+    let (control_reader, _control_writer) = control.into_split();
+    let (snell_reader, snell_writer) = snell.into_parts();
+    let (activity, _last_activity) = RelayActivity::new();
+    let driver = UdpRelayDriver::from_socks5_client_parts(
+        snell_reader,
+        snell_writer,
+        control_reader,
+        udp_socket,
         control_peer_ip,
-        &mut snell_reader,
-        &mut snell_writer,
-        SocksUdpOverSnellState::default(),
-    )
-    .await
+        Socks5ClientUdpSeed::default(),
+        &activity,
+    );
+    tokio::pin!(driver);
+    driver.await.map(UdpRelayStats::into_relay_stats)
 }
 
 /// SOCKS5 UDP associate that only opens the snell/quic-proxy path after the
@@ -172,15 +163,17 @@ async fn relay_socks5_udp_association_lazy_quic(
     secret: SnellPsk,
 ) -> Result<RelayStats> {
     let control_peer_ip = control.peer_addr()?.ip();
-    let udp_socket = bind_socks5_udp_socket(control.local_addr()?).await?;
+    let udp_socket = Arc::new(bind_socks5_udp_socket(control.local_addr()?).await?);
     let udp_bind_addr = udp_socket.local_addr()?;
     write_reply_with_bind(&mut control, SocksReply::Succeeded, udp_bind_addr).await?;
 
-    let (mut control_reader, _control_writer) = control.into_split();
+    let (control_reader, _control_writer) = control.into_split();
+    tokio::pin!(control_reader);
 
-    let Some(first) =
-        recv_first_lazy_quic_datagram(&mut control_reader, &udp_socket, control_peer_ip).await?
-    else {
+    let first_datagram =
+        recv_first_lazy_quic_datagram(control_reader.as_mut(), &udp_socket, control_peer_ip);
+    tokio::pin!(first_datagram);
+    let Some(first) = first_datagram.await? else {
         return Ok(RelayStats::default());
     };
 
@@ -190,20 +183,21 @@ async fn relay_socks5_udp_association_lazy_quic(
         .is_some_and(|byte| is_quic_initial(*byte))
     {
         let quic_socket = UdpSocket::bind(quic_bind_addr(server_addr)).await?;
-        relay_lazy_quic_proxy_packets(
-            &mut control_reader,
+        let relay = relay_lazy_quic_proxy_packets(
+            control_reader.as_mut(),
             &udp_socket,
             &quic_socket,
             server_addr,
             control_peer_ip,
             &secret,
             first,
-        )
-        .await
+        )?;
+        tokio::pin!(relay);
+        relay.await
     } else {
         relay_lazy_quic_first_over_snell(
-            &mut control_reader,
-            &udp_socket,
+            control_reader.as_mut(),
+            udp_socket,
             control_peer_ip,
             server_addr,
             &secret,
@@ -215,44 +209,89 @@ async fn relay_socks5_udp_association_lazy_quic(
 
 /// Waits for the first client datagram. Returns `None` when the control
 /// connection closes or the association idles out before any data arrives.
-async fn recv_first_lazy_quic_datagram<R>(
-    control_reader: &mut R,
-    udp_socket: &UdpSocket,
+fn recv_first_lazy_quic_datagram<'a, R>(
+    control_reader: Pin<&'a mut R>,
+    udp_socket: &'a UdpSocket,
     control_peer_ip: IpAddr,
-) -> Result<Option<FirstSocksDatagram>>
+) -> FirstLazyQuicDatagramFuture<'a, R>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead,
 {
-    let mut buffers = Box::new(FirstSocksUdpBuffers::new());
-    let idle = sleep(SOCKS5_UDP_ASSOCIATION_TIMEOUT);
-    tokio::pin!(idle);
+    FirstLazyQuicDatagramFuture::new(control_reader, udp_socket, control_peer_ip)
+}
 
-    loop {
-        tokio::select! {
-            result = wait_control_closed(control_reader) => {
-                result?;
-                return Ok(None);
+pin_project! {
+    struct FirstLazyQuicDatagramFuture<'a, R> {
+        control_reader: Pin<&'a mut R>,
+        udp_socket: &'a UdpSocket,
+        control_peer_ip: IpAddr,
+        control_buf: [u8; 128],
+        buffers: Box<FirstSocksUdpBuffers>,
+        #[pin]
+        idle: Sleep,
+    }
+}
+
+impl<'a, R> FirstLazyQuicDatagramFuture<'a, R> {
+    fn new(
+        control_reader: Pin<&'a mut R>,
+        udp_socket: &'a UdpSocket,
+        control_peer_ip: IpAddr,
+    ) -> Self {
+        Self {
+            control_reader,
+            udp_socket,
+            control_peer_ip,
+            control_buf: [0; 128],
+            buffers: Box::new(FirstSocksUdpBuffers::new()),
+            idle: sleep(SOCKS5_UDP_ASSOCIATION_TIMEOUT),
+        }
+    }
+}
+
+impl<R> Future for FirstLazyQuicDatagramFuture<'_, R>
+where
+    R: AsyncRead,
+{
+    type Output = Result<Option<FirstSocksDatagram>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        loop {
+            let mut out = ReadBuf::new(this.control_buf);
+            match this.control_reader.as_mut().poll_read(cx, &mut out) {
+                Poll::Ready(Ok(())) if out.filled().is_empty() => return Poll::Ready(Ok(None)),
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err.into())),
+                Poll::Pending => break,
             }
-            recv_result = buffers.socks_in.recv_from(udp_socket) => {
-                recv_result?;
-                let Some(entry) = buffers.socks_in.get(0) else {
-                    continue;
+        }
+
+        match this.buffers.socks_in.poll_recv_from(this.udp_socket, cx) {
+            Poll::Ready(Ok(_)) => {
+                let Some(entry) = this.buffers.socks_in.get(0) else {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 };
                 if entry.is_oversized() {
                     tracing::debug!("ignored oversized socks5 udp datagram");
-                    continue;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
                 let peer = entry.peer();
-                if !is_allowed_socks_udp_peer(control_peer_ip, peer) {
-                    tracing::debug!(%peer, %control_peer_ip, "ignored socks5 udp datagram from unexpected source ip");
-                    continue;
+                if !is_allowed_socks_udp_peer(*this.control_peer_ip, peer) {
+                    tracing::debug!(%peer, control_peer_ip = %this.control_peer_ip, "ignored socks5 udp datagram from unexpected source ip");
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
                 let (target, payload_start, payload_len) = {
                     let packet = match parse_udp_packet(entry.payload()) {
                         Ok(packet) => packet,
                         Err(err) => {
                             tracing::debug!(%err, "ignored invalid socks5 udp datagram");
-                            continue;
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
                         }
                     };
                     (
@@ -262,34 +301,39 @@ where
                     )
                 };
                 let datagram = BytesMut::from(entry.payload());
-                return Ok(Some(FirstSocksDatagram {
+                return Poll::Ready(Ok(Some(FirstSocksDatagram {
                     peer,
                     target,
                     payload_start,
                     payload_len,
                     datagram,
-                }));
+                })));
             }
-            () = &mut idle => {
-                tracing::debug!("snell socks5 udp association idle timed out");
-                return Ok(None);
-            }
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => {}
         }
+
+        if this.idle.poll(cx).is_ready() {
+            tracing::debug!("snell socks5 udp association idle timed out");
+            return Poll::Ready(Ok(None));
+        }
+
+        Poll::Pending
     }
 }
 
 /// Non-QUIC first datagram: open a snell UDP tunnel and forward the first
 /// packet before entering the shared snell-over-udp relay loop.
 async fn relay_lazy_quic_first_over_snell<R>(
-    control_reader: &mut R,
-    udp_socket: &UdpSocket,
+    control_reader: Pin<&mut R>,
+    udp_socket: Arc<UdpSocket>,
     control_peer_ip: IpAddr,
     server_addr: SocketAddr,
     secret: &SnellPsk,
     first: FirstSocksDatagram,
 ) -> Result<RelayStats>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead,
 {
     let FirstSocksDatagram {
         peer: first_peer,
@@ -310,7 +354,7 @@ where
         ProtocolVersion::V5,
     )
     .await?;
-    let (mut snell_reader, mut snell_writer) = snell.into_parts();
+    let (snell_reader, mut snell_writer) = snell.into_parts();
     let mut client_peer_by_target = ClientPeerByUdpTarget::new();
     client_peer_by_target.insert(target.clone(), first_peer);
 
@@ -319,189 +363,400 @@ where
         payload_start,
         payload_len,
         target.address_ref(),
-        target.port,
+        target.port(),
         &mut buffers.socks_header,
     )?;
     if buffers.datagram.len() > snell_writer.max_udp_application_payload_len() {
         return Err(Error::PayloadTooLarge);
     }
     snell_writer
-        .write_payload_message_from_buffer(&mut buffers.datagram)
+        .write_payload_from_buffer(&mut buffers.datagram)
         .await?;
 
-    relay_socks5_udp_over_snell(
+    let (activity, _last_activity) = RelayActivity::new();
+    let driver = UdpRelayDriver::from_socks5_client_parts(
+        snell_reader,
+        snell_writer,
         control_reader,
         udp_socket,
         control_peer_ip,
-        &mut snell_reader,
-        &mut snell_writer,
-        SocksUdpOverSnellState {
+        Socks5ClientUdpSeed {
             client_addr: Some(first_peer),
             client_peer_by_target,
             uploaded: payload_len as u64,
         },
-    )
-    .await
+        &activity,
+    );
+    tokio::pin!(driver);
+    driver.await.map(UdpRelayStats::into_relay_stats)
 }
 
 /// QUIC Initial first datagram: run the lazy QUIC-proxy relay, encoding
 /// snell-over-quic datagrams toward `server_addr` and bridging responses
 /// back to the socks5 client.
-#[allow(clippy::too_many_lines)]
-async fn relay_lazy_quic_proxy_packets<R>(
-    control_reader: &mut R,
-    udp_socket: &UdpSocket,
-    quic_socket: &UdpSocket,
+fn relay_lazy_quic_proxy_packets<'a, R>(
+    control_reader: Pin<&'a mut R>,
+    udp_socket: &'a UdpSocket,
+    quic_socket: &'a UdpSocket,
     server_addr: SocketAddr,
     control_peer_ip: IpAddr,
-    secret: &SnellPsk,
+    secret: &'a SnellPsk,
     first: FirstSocksDatagram,
-) -> Result<RelayStats>
+) -> Result<LazyQuicProxyRelayFuture<'a, R>>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead,
 {
-    let FirstSocksDatagram {
-        peer: first_peer,
-        mut target,
-        payload_start,
-        payload_len,
-        datagram,
-    } = first;
-
-    let mut buffers = Box::new(LazyQuicUdpBuffers::new(datagram));
-    let first_payload = &buffers.first_datagram[payload_start..payload_start + payload_len];
-    let mut client_addr = Some(first_peer);
-    let mut uploaded = first_payload.len() as u64;
-    let mut downloaded = 0;
-    let mut quic_handshake_done = first_payload
-        .first()
-        .is_some_and(|first| is_quic_short_header(*first));
-    encode_init_datagram(
-        secret.as_bytes(),
-        target.quic_init_host(&mut buffers.quic_host_scratch),
-        target.port,
-        first_payload,
-        &mut buffers.plaintext,
-        &mut buffers.wire,
-    )?;
-    send_udp_batch(
+    LazyQuicProxyRelayFuture::new(
+        control_reader,
+        udp_socket,
         quic_socket,
-        &[UdpSendPacket::single(&buffers.wire, server_addr)],
-        MAX_PACKET_SIZE + 512,
+        server_addr,
+        control_peer_ip,
+        secret,
+        first,
     )
-    .await?;
+}
 
-    let idle = sleep(SOCKS5_UDP_ASSOCIATION_TIMEOUT);
-    tokio::pin!(idle);
-    idle.as_mut()
-        .reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
+#[derive(Clone, Copy)]
+enum LazyQuicSendSocket {
+    SocksClient,
+    QuicServer,
+}
 
-    loop {
-        tokio::select! {
-            result = wait_control_closed(control_reader) => {
-                result?;
-                break;
-            }
-            recv_result = buffers.socks_in.recv_from(udp_socket) => {
-                recv_result?;
-                let Some(entry) = buffers.socks_in.get(0) else {
-                    continue;
-                };
-                if entry.is_oversized() {
-                    tracing::debug!("ignored oversized socks5 udp datagram");
-                    continue;
-                }
-                let peer = entry.peer();
-                if !is_allowed_socks_udp_peer(control_peer_ip, peer) {
-                    tracing::debug!(%peer, %control_peer_ip, "ignored socks5 udp datagram from unexpected source ip");
-                    continue;
-                }
-                let packet = match parse_udp_packet(entry.payload()) {
-                    Ok(packet) => packet,
-                    Err(err) => {
-                        tracing::debug!(%err, "ignored invalid socks5 udp datagram");
-                        continue;
-                    }
-                };
-                client_addr = Some(peer);
-                let raw_quic_payload = packet.payload.first().copied().is_some_and(|first| {
-                    if !is_quic_looking(first) {
-                        return false;
-                    }
-                    if is_quic_short_header(first) {
-                        quic_handshake_done = true;
-                        return true;
-                    }
-                    !(is_quic_initial_packet(first) && quic_handshake_done)
-                });
-                if raw_quic_payload {
-                    target.update(packet.address, packet.port);
-                    send_udp_batch(
-                        quic_socket,
-                        &[UdpSendPacket::single(packet.payload, server_addr)],
-                        MAX_PACKET_SIZE + 512,
-                    )
-                    .await?;
-                } else if !packet.payload.is_empty() {
-                    encode_init_datagram(
-                        secret.as_bytes(),
-                        quic_init_host(packet.address, &mut buffers.quic_host_scratch),
-                        packet.port,
-                        packet.payload,
-                        &mut buffers.plaintext,
-                        &mut buffers.wire,
-                    )?;
-                    target.update(packet.address, packet.port);
-                    send_udp_batch(
-                        quic_socket,
-                        &[UdpSendPacket::single(&buffers.wire, server_addr)],
-                        MAX_PACKET_SIZE + 512,
-                    )
-                    .await?;
-                } else {
-                    target.update(packet.address, packet.port);
-                }
-                uploaded += packet.payload.len() as u64;
-                idle.as_mut().reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
-            }
-            recv_result = buffers.quic_in.recv_from(quic_socket) => {
-                recv_result?;
-                let Some(entry) = buffers.quic_in.get(0) else {
-                    continue;
-                };
-                if entry.is_oversized() {
-                    tracing::debug!("ignored oversized quic proxy response");
-                    continue;
-                }
-                let peer = entry.peer();
-                if peer != server_addr {
-                    tracing::debug!(%peer, server = %server_addr, "ignored quic proxy response from unexpected peer");
-                    continue;
-                }
-                if let Some(peer) = client_addr {
-                    buffers.socks_header.clear();
-                    write_udp_packet(&mut buffers.socks_header, target.address_ref(), target.port, &[])?;
-                    send_udp_batch(
-                        udp_socket,
-                        &[UdpSendPacket::parts(&buffers.socks_header, entry.payload(), peer)],
-                        MAX_QUIC_SOCKS_UDP_DATAGRAM,
-                    )
-                    .await?;
-                    downloaded += entry.payload_len() as u64;
-                    idle.as_mut().reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
-                }
-            }
-            () = &mut idle => {
-                tracing::debug!("snell socks5 udp association idle timed out");
-                break;
-            }
+struct LazyQuicPendingSend {
+    socket: LazyQuicSendSocket,
+    batch: UdpSendBatch,
+    uploaded: u64,
+    downloaded: u64,
+}
+
+enum LazyQuicDatagramAction {
+    Activity { uploaded: u64 },
+    Send(LazyQuicPendingSend),
+}
+
+pin_project! {
+    struct LazyQuicProxyRelayFuture<'a, R> {
+        control_reader: Pin<&'a mut R>,
+        udp_socket: &'a UdpSocket,
+        quic_socket: &'a UdpSocket,
+        server_addr: SocketAddr,
+        control_peer_ip: IpAddr,
+        secret: &'a SnellPsk,
+        target: OwnedUdpTarget,
+        client_addr: Option<SocketAddr>,
+        uploaded: u64,
+        downloaded: u64,
+        quic_handshake_done: bool,
+        control_buf: [u8; 128],
+        buffers: Box<LazyQuicUdpBuffers>,
+        pending_send: Option<LazyQuicPendingSend>,
+        #[pin]
+        idle: Sleep,
+    }
+}
+
+impl LazyQuicPendingSend {
+    fn to_quic_server(batch: UdpSendBatch, uploaded: u64) -> Self {
+        Self {
+            socket: LazyQuicSendSocket::QuicServer,
+            batch,
+            uploaded,
+            downloaded: 0,
         }
     }
 
-    Ok(RelayStats {
-        uploaded,
-        downloaded,
-    })
+    fn to_socks_client(batch: UdpSendBatch, downloaded: u64) -> Self {
+        Self {
+            socket: LazyQuicSendSocket::SocksClient,
+            batch,
+            uploaded: 0,
+            downloaded,
+        }
+    }
+}
+
+impl<'a, R> LazyQuicProxyRelayFuture<'a, R> {
+    fn new(
+        control_reader: Pin<&'a mut R>,
+        udp_socket: &'a UdpSocket,
+        quic_socket: &'a UdpSocket,
+        server_addr: SocketAddr,
+        control_peer_ip: IpAddr,
+        secret: &'a SnellPsk,
+        first: FirstSocksDatagram,
+    ) -> Result<Self> {
+        let FirstSocksDatagram {
+            peer: first_peer,
+            target,
+            payload_start,
+            payload_len,
+            datagram,
+        } = first;
+
+        let mut buffers = Box::new(LazyQuicUdpBuffers::new(datagram));
+        let first_payload = &buffers.first_datagram[payload_start..payload_start + payload_len];
+        let quic_handshake_done = first_payload
+            .first()
+            .is_some_and(|first| is_quic_short_header(*first));
+        encode_init_datagram(
+            secret.as_bytes(),
+            target.quic_init_host(&mut buffers.quic_host_scratch),
+            target.port(),
+            first_payload,
+            &mut buffers.plaintext,
+            &mut buffers.wire,
+        )?;
+        let batch = UdpSendBatch::single(
+            take_bytes(&mut buffers.wire),
+            server_addr,
+            MAX_PACKET_SIZE + 512,
+        );
+
+        Ok(Self {
+            control_reader,
+            udp_socket,
+            quic_socket,
+            server_addr,
+            control_peer_ip,
+            secret,
+            target,
+            client_addr: Some(first_peer),
+            uploaded: 0,
+            downloaded: 0,
+            quic_handshake_done,
+            control_buf: [0; 128],
+            buffers,
+            pending_send: Some(LazyQuicPendingSend::to_quic_server(
+                batch,
+                payload_len as u64,
+            )),
+            idle: sleep(SOCKS5_UDP_ASSOCIATION_TIMEOUT),
+        })
+    }
+}
+
+impl<R> Future for LazyQuicProxyRelayFuture<'_, R>
+where
+    R: AsyncRead,
+{
+    type Output = Result<RelayStats>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+
+        loop {
+            if this.pending_send.is_some() {
+                let (uploaded, downloaded) = {
+                    let pending = this.pending_send.as_mut().expect("checked above");
+                    let socket = match pending.socket {
+                        LazyQuicSendSocket::SocksClient => *this.udp_socket,
+                        LazyQuicSendSocket::QuicServer => *this.quic_socket,
+                    };
+                    ready!(pending.batch.poll_send(socket, cx))?;
+                    (pending.uploaded, pending.downloaded)
+                };
+                *this.pending_send = None;
+                *this.uploaded += uploaded;
+                *this.downloaded += downloaded;
+                this.idle
+                    .as_mut()
+                    .reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
+                continue;
+            }
+
+            loop {
+                let mut out = ReadBuf::new(this.control_buf);
+                match this.control_reader.as_mut().poll_read(cx, &mut out) {
+                    Poll::Ready(Ok(())) if out.filled().is_empty() => {
+                        return Poll::Ready(Ok(RelayStats {
+                            uploaded: *this.uploaded,
+                            downloaded: *this.downloaded,
+                        }));
+                    }
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err.into())),
+                    Poll::Pending => break,
+                }
+            }
+
+            match this.buffers.socks_in.poll_recv_from(this.udp_socket, cx) {
+                Poll::Ready(Ok(_)) => {
+                    match handle_lazy_quic_socks_datagram(
+                        this.buffers,
+                        this.target,
+                        this.client_addr,
+                        this.quic_handshake_done,
+                        *this.control_peer_ip,
+                        *this.server_addr,
+                        this.secret,
+                    )? {
+                        Some(LazyQuicDatagramAction::Activity { uploaded }) => {
+                            *this.uploaded += uploaded;
+                            this.idle
+                                .as_mut()
+                                .reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
+                        }
+                        Some(LazyQuicDatagramAction::Send(pending)) => {
+                            *this.pending_send = Some(pending);
+                        }
+                        None => {}
+                    }
+                    continue;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => {}
+            }
+
+            match this.buffers.quic_in.poll_recv_from(this.quic_socket, cx) {
+                Poll::Ready(Ok(_)) => {
+                    if let Some(pending) = handle_lazy_quic_response_datagram(
+                        this.buffers,
+                        this.target,
+                        *this.client_addr,
+                        *this.server_addr,
+                    )? {
+                        *this.pending_send = Some(pending);
+                    }
+                    continue;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => {}
+            }
+
+            if this.idle.as_mut().poll(cx).is_ready() {
+                tracing::debug!("snell socks5 udp association idle timed out");
+                return Poll::Ready(Ok(RelayStats {
+                    uploaded: *this.uploaded,
+                    downloaded: *this.downloaded,
+                }));
+            }
+
+            return Poll::Pending;
+        }
+    }
+}
+
+fn handle_lazy_quic_socks_datagram(
+    buffers: &mut LazyQuicUdpBuffers,
+    target: &mut OwnedUdpTarget,
+    client_addr: &mut Option<SocketAddr>,
+    quic_handshake_done: &mut bool,
+    control_peer_ip: IpAddr,
+    server_addr: SocketAddr,
+    secret: &SnellPsk,
+) -> Result<Option<LazyQuicDatagramAction>> {
+    let Some(entry) = buffers.socks_in.get(0) else {
+        return Ok(None);
+    };
+    if entry.is_oversized() {
+        tracing::debug!("ignored oversized socks5 udp datagram");
+        return Ok(None);
+    }
+    let peer = entry.peer();
+    if !is_allowed_socks_udp_peer(control_peer_ip, peer) {
+        tracing::debug!(%peer, %control_peer_ip, "ignored socks5 udp datagram from unexpected source ip");
+        return Ok(None);
+    }
+    let packet = match parse_udp_packet(entry.payload()) {
+        Ok(packet) => packet,
+        Err(err) => {
+            tracing::debug!(%err, "ignored invalid socks5 udp datagram");
+            return Ok(None);
+        }
+    };
+    *client_addr = Some(peer);
+    let uploaded = packet.payload.len() as u64;
+    let raw_quic_payload = packet.payload.first().copied().is_some_and(|first| {
+        if !is_quic_looking(first) {
+            return false;
+        }
+        if is_quic_short_header(first) {
+            *quic_handshake_done = true;
+            return true;
+        }
+        !(is_quic_initial_packet(first) && *quic_handshake_done)
+    });
+
+    if raw_quic_payload {
+        target.update(packet.address, packet.port);
+        let batch = UdpSendBatch::single(
+            Bytes::copy_from_slice(packet.payload),
+            server_addr,
+            MAX_PACKET_SIZE + 512,
+        );
+        return Ok(Some(LazyQuicDatagramAction::Send(
+            LazyQuicPendingSend::to_quic_server(batch, uploaded),
+        )));
+    }
+
+    if !packet.payload.is_empty() {
+        encode_init_datagram(
+            secret.as_bytes(),
+            quic_init_host(packet.address, &mut buffers.quic_host_scratch),
+            packet.port,
+            packet.payload,
+            &mut buffers.plaintext,
+            &mut buffers.wire,
+        )?;
+        target.update(packet.address, packet.port);
+        let batch = UdpSendBatch::single(
+            take_bytes(&mut buffers.wire),
+            server_addr,
+            MAX_PACKET_SIZE + 512,
+        );
+        return Ok(Some(LazyQuicDatagramAction::Send(
+            LazyQuicPendingSend::to_quic_server(batch, uploaded),
+        )));
+    }
+
+    target.update(packet.address, packet.port);
+    Ok(Some(LazyQuicDatagramAction::Activity { uploaded }))
+}
+
+fn handle_lazy_quic_response_datagram(
+    buffers: &mut LazyQuicUdpBuffers,
+    target: &OwnedUdpTarget,
+    client_addr: Option<SocketAddr>,
+    server_addr: SocketAddr,
+) -> Result<Option<LazyQuicPendingSend>> {
+    let Some(entry) = buffers.quic_in.get(0) else {
+        return Ok(None);
+    };
+    if entry.is_oversized() {
+        tracing::debug!("ignored oversized quic proxy response");
+        return Ok(None);
+    }
+    let peer = entry.peer();
+    if peer != server_addr {
+        tracing::debug!(%peer, server = %server_addr, "ignored quic proxy response from unexpected peer");
+        return Ok(None);
+    }
+    let Some(peer) = client_addr else {
+        return Ok(None);
+    };
+
+    buffers.socks_header.clear();
+    write_udp_packet(
+        &mut buffers.socks_header,
+        target.address_ref(),
+        target.port(),
+        &[],
+    )?;
+    let batch = UdpSendBatch::parts(
+        take_bytes(&mut buffers.socks_header),
+        Bytes::copy_from_slice(entry.payload()),
+        peer,
+        MAX_QUIC_SOCKS_UDP_DATAGRAM,
+    );
+    Ok(Some(LazyQuicPendingSend::to_socks_client(
+        batch,
+        entry.payload_len() as u64,
+    )))
+}
+
+fn take_bytes(buffer: &mut BytesMut) -> Bytes {
+    buffer.split_to(buffer.len()).freeze()
 }
 
 fn quic_bind_addr(server_addr: SocketAddr) -> SocketAddr {
@@ -511,273 +766,6 @@ fn quic_bind_addr(server_addr: SocketAddr) -> SocketAddr {
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     };
     SocketAddr::new(bind_ip, 0)
-}
-
-#[derive(Default)]
-struct SocksUdpOverSnellState {
-    client_addr: Option<SocketAddr>,
-    client_peer_by_target: ClientPeerByUdpTarget,
-    uploaded: u64,
-}
-
-async fn relay_socks5_udp_over_snell<C, R, W>(
-    control_reader: &mut C,
-    udp_socket: &UdpSocket,
-    control_peer_ip: IpAddr,
-    snell_reader: &mut SnellStreamReader<R>,
-    snell_writer: &mut SnellStreamWriter<W>,
-    mut state: SocksUdpOverSnellState,
-) -> Result<RelayStats>
-where
-    C: AsyncRead + Unpin,
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let socks_udp_limit =
-        max_socks_udp_datagram_len(snell_writer.max_udp_application_payload_len());
-    let idle = sleep(SOCKS5_UDP_ASSOCIATION_TIMEOUT);
-    tokio::pin!(idle);
-
-    let mut downloaded = 0;
-    let mut buffers = Box::new(SocksUdpOverSnellBuffers::new(socks_udp_limit));
-
-    loop {
-        tokio::select! {
-            result = wait_control_closed(control_reader) => {
-                result?;
-                break;
-            }
-            result = forward_socks_udp_socket_packets(
-                snell_writer,
-                udp_socket,
-                control_peer_ip,
-                &mut buffers.socks_in_batch,
-                &mut state.client_peer_by_target,
-            ) => {
-                if let Some((batch_uploaded, peer)) = result? {
-                    state.client_addr = Some(peer);
-                    state.uploaded += batch_uploaded as u64;
-                    idle.as_mut().reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
-                }
-            }
-            packet = snell_reader.read_udp_response_message() => {
-                match packet {
-                    Ok(Some(message)) => {
-                        let packet = match parse_udp_response(&message) {
-                            Ok(packet) => packet,
-                            Err(err) if err.is_invalid_udp_packet() => {
-                                tracing::debug!(%err, "ignored invalid snell udp response");
-                                continue;
-                            }
-                            Err(err) => return Err(err),
-                        };
-                        if let Some(peer) = client_peer_for_response(
-                            &state.client_peer_by_target,
-                            state.client_addr,
-                            packet.address,
-                            packet.port,
-                        ) {
-                            buffers.socks_header.clear();
-                            write_udp_packet(
-                                &mut buffers.socks_header,
-                                packet.address,
-                                packet.port,
-                                &[],
-                            )?;
-                            send_udp_batch(
-                                udp_socket,
-                                &[UdpSendPacket::parts(
-                                    &buffers.socks_header,
-                                    packet.payload,
-                                    peer,
-                                )],
-                                socks_udp_limit,
-                            )
-                            .await?;
-                            downloaded += packet.payload.len() as u64;
-                            idle.as_mut().reset(Instant::now() + SOCKS5_UDP_ASSOCIATION_TIMEOUT);
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(err) if err.is_invalid_udp_packet() => {
-                        tracing::debug!(%err, "ignored invalid snell udp response");
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-            () = &mut idle => {
-                tracing::debug!("snell socks5 udp association idle timed out");
-                break;
-            }
-        }
-    }
-
-    write_zero_chunk(snell_writer).await?;
-    Ok(RelayStats {
-        uploaded: state.uploaded,
-        downloaded,
-    })
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct OwnedUdpTarget {
-    address: OwnedUdpAddress,
-    port: u16,
-}
-
-impl OwnedUdpTarget {
-    fn from_ref(address: AddressRef<'_>, port: u16) -> Self {
-        Self {
-            address: OwnedUdpAddress::from_ref(address),
-            port,
-        }
-    }
-
-    fn update(&mut self, address: AddressRef<'_>, port: u16) {
-        self.address.update(address);
-        self.port = port;
-    }
-
-    fn address_ref(&self) -> AddressRef<'_> {
-        self.address.as_ref()
-    }
-
-    fn quic_init_host<'a>(&'a self, scratch: &'a mut String) -> &'a str {
-        quic_init_host(self.address_ref(), scratch)
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum OwnedUdpAddress {
-    Domain(String),
-    Ip(IpAddr),
-}
-
-impl OwnedUdpAddress {
-    fn from_ref(address: AddressRef<'_>) -> Self {
-        match address {
-            AddressRef::Domain(host) => Self::Domain(host.to_owned()),
-            AddressRef::Ip(ip) => Self::Ip(ip),
-        }
-    }
-
-    fn update(&mut self, address: AddressRef<'_>) {
-        match (self, address) {
-            (Self::Domain(current), AddressRef::Domain(host)) => {
-                if current != host {
-                    current.clear();
-                    current.push_str(host);
-                }
-            }
-            (Self::Ip(current), AddressRef::Ip(ip)) => *current = ip,
-            (slot, AddressRef::Domain(host)) => *slot = Self::Domain(host.to_owned()),
-            (slot, AddressRef::Ip(ip)) => *slot = Self::Ip(ip),
-        }
-    }
-
-    fn as_ref(&self) -> AddressRef<'_> {
-        match self {
-            Self::Domain(host) => AddressRef::Domain(host),
-            Self::Ip(ip) => AddressRef::Ip(*ip),
-        }
-    }
-}
-
-fn quic_init_host<'a>(address: AddressRef<'a>, scratch: &'a mut String) -> &'a str {
-    match address {
-        AddressRef::Domain(host) => host,
-        AddressRef::Ip(ip) => {
-            scratch.clear();
-            write!(scratch, "{ip}").expect("writing IpAddr to String cannot fail");
-            scratch
-        }
-    }
-}
-
-pub(crate) fn is_allowed_socks_udp_peer(control_peer_ip: IpAddr, udp_peer: SocketAddr) -> bool {
-    udp_peer.ip() == control_peer_ip
-}
-
-async fn forward_socks_udp_socket_packets<W>(
-    snell_writer: &mut SnellStreamWriter<W>,
-    udp_socket: &UdpSocket,
-    control_peer_ip: IpAddr,
-    recv_batch: &mut UdpRecvBatch,
-    client_peer_by_target: &mut ClientPeerByUdpTarget,
-) -> Result<Option<(usize, SocketAddr)>>
-where
-    W: AsyncWrite + Unpin,
-{
-    let max_snell_udp_payload_len = snell_writer.max_udp_application_payload_len();
-    let socks_udp_limit = max_socks_udp_datagram_len(max_snell_udp_payload_len);
-    let count = recv_batch.recv_from(udp_socket).await?;
-    let mut uploaded = 0;
-    let mut last_peer = None;
-
-    for index in 0..count {
-        let Some(entry) = recv_batch.get(index) else {
-            continue;
-        };
-        let peer = entry.peer();
-        if entry.is_oversized() || entry.datagram().len() > socks_udp_limit {
-            tracing::debug!("ignored oversized socks5 udp datagram");
-            continue;
-        }
-        if !is_allowed_socks_udp_peer(control_peer_ip, peer) {
-            tracing::debug!(%peer, %control_peer_ip, "ignored socks5 udp datagram from unexpected source ip");
-            continue;
-        }
-
-        let header = match parse_socks_udp_header(entry.datagram()) {
-            Ok(header) => header,
-            Err(err) => {
-                tracing::debug!(%err, "ignored invalid socks5 udp datagram");
-                continue;
-            }
-        };
-        let payload_len = header.payload_len();
-        let (target_address, target_port) = header.target(entry.datagram())?;
-        let target = OwnedUdpTarget::from_ref(target_address, target_port);
-        {
-            let mut entry = recv_batch
-                .get_mut(index)
-                .expect("checked UDP batch index must exist");
-            let prefix_start = match reframe_socks_udp_packet(
-                entry.datagram_mut(),
-                &header,
-                SnellUdpPacketKind::Request,
-                max_snell_udp_payload_len,
-            ) {
-                Ok(prefix_start) => prefix_start,
-                Err(Error::PayloadTooLarge) => {
-                    tracing::debug!("ignored oversized socks5 udp datagram");
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-            entry.datagram_mut().advance(prefix_start);
-            snell_writer
-                .write_payload_message_from_buffer(entry.datagram_mut())
-                .await?;
-        }
-        uploaded += payload_len;
-        client_peer_by_target.insert(target, peer);
-        last_peer = Some(peer);
-    }
-
-    Ok(last_peer.map(|peer| (uploaded, peer)))
-}
-
-fn client_peer_for_response(
-    client_peer_by_target: &ClientPeerByUdpTarget,
-    last_client_peer: Option<SocketAddr>,
-    address: AddressRef<'_>,
-    port: u16,
-) -> Option<SocketAddr> {
-    client_peer_by_target
-        .get(&OwnedUdpTarget::from_ref(address, port))
-        .copied()
-        .or(last_client_peer)
 }
 
 fn rewrite_socks_datagram_as_snell_request(
@@ -802,90 +790,4 @@ fn rewrite_socks_datagram_as_snell_request(
 
 async fn bind_socks5_udp_socket(control_addr: SocketAddr) -> Result<UdpSocket> {
     Ok(UdpSocket::bind(SocketAddr::new(control_addr.ip(), 0)).await?)
-}
-
-async fn wait_control_closed<R>(control: &mut R) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = [0; 128];
-    loop {
-        let n = control.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(());
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    use super::{OwnedUdpAddress, OwnedUdpTarget, quic_init_host};
-    use crate::protocol::udp::AddressRef;
-
-    #[test]
-    fn owned_udp_target_keeps_ip_without_domain_state() {
-        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        let target = OwnedUdpTarget::from_ref(AddressRef::Ip(ip), 443);
-
-        assert_eq!(target.address, OwnedUdpAddress::Ip(ip));
-        assert_eq!(target.address_ref(), AddressRef::Ip(ip));
-        assert_eq!(target.port, 443);
-
-        let mut scratch = String::with_capacity(39);
-        assert_eq!(target.quic_init_host(&mut scratch), "1.2.3.4");
-        assert_eq!(target.address_ref(), AddressRef::Ip(ip));
-    }
-
-    #[test]
-    fn owned_udp_target_does_not_replace_same_domain() {
-        let mut target = OwnedUdpTarget::from_ref(AddressRef::Domain("example.com"), 443);
-        let before = match &target.address {
-            OwnedUdpAddress::Domain(host) => host.as_ptr(),
-            OwnedUdpAddress::Ip(_) => panic!("expected domain target"),
-        };
-
-        target.update(AddressRef::Domain("example.com"), 443);
-
-        let after = match &target.address {
-            OwnedUdpAddress::Domain(host) => host.as_ptr(),
-            OwnedUdpAddress::Ip(_) => panic!("expected domain target"),
-        };
-        assert_eq!(before, after);
-        assert_eq!(target.address_ref(), AddressRef::Domain("example.com"));
-    }
-
-    #[test]
-    fn owned_udp_target_switches_address_kind_without_parsing() {
-        let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
-        let mut target = OwnedUdpTarget::from_ref(AddressRef::Domain("example.com"), 53);
-
-        target.update(AddressRef::Ip(ip), 443);
-        assert_eq!(target.address_ref(), AddressRef::Ip(ip));
-        assert_eq!(target.port, 443);
-
-        target.update(AddressRef::Domain("api.example.com"), 8443);
-        assert_eq!(target.address_ref(), AddressRef::Domain("api.example.com"));
-        assert_eq!(target.port, 8443);
-    }
-
-    #[test]
-    fn quic_init_host_borrows_domain_and_reuses_ip_scratch() {
-        let mut scratch = String::from("unchanged");
-        assert_eq!(
-            quic_init_host(AddressRef::Domain("example.com"), &mut scratch),
-            "example.com"
-        );
-        assert_eq!(scratch, "unchanged");
-
-        assert_eq!(
-            quic_init_host(
-                AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-                &mut scratch
-            ),
-            "::1"
-        );
-        assert_eq!(scratch, "::1");
-    }
 }

@@ -1,4 +1,4 @@
-use core::range::Range;
+use std::future::poll_fn;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,7 +71,7 @@ async fn pool_conn_after_reply(
                 reuse: true,
                 host: "example.com",
                 port: 443,
-                rest_span: Range { start: 17, end: 17 },
+                rest_start: 17,
                 rest: b"",
             }
         );
@@ -80,7 +80,9 @@ async fn pool_conn_after_reply(
             .await
             .unwrap();
         if send_server_zero {
-            server_writer.write_zero_chunk().await.unwrap();
+            poll_fn(|cx| server_writer.poll_write_zero_chunk(cx))
+                .await
+                .unwrap();
         }
 
         std::assert_matches!(
@@ -164,14 +166,16 @@ async fn reuse_pool_reuses_completed_stream() {
                     reuse: true,
                     host,
                     port: 443,
-                    rest_span: Range { start: 17, end: 17 },
+                    rest_start: 17,
                     rest: b"",
                 }
             );
             write_snell_tunnel_reply_message(&mut server_writer, reply)
                 .await
                 .unwrap();
-            server_writer.write_zero_chunk().await.unwrap();
+            poll_fn(|cx| server_writer.poll_write_zero_chunk(cx))
+                .await
+                .unwrap();
 
             std::assert_matches!(
                 read_snell_frame_payload(&mut reader).await,
@@ -239,14 +243,16 @@ async fn reuse_pool_reuses_completed_v6_stream() {
                     reuse: true,
                     host,
                     port: 443,
-                    rest_span: Range { start: 17, end: 17 },
+                    rest_start: 17,
                     rest: b"",
                 }
             );
             write_snell_tunnel_reply_message(&mut server_writer, reply)
                 .await
                 .unwrap();
-            server_writer.write_zero_chunk().await.unwrap();
+            poll_fn(|cx| server_writer.poll_write_zero_chunk(cx))
+                .await
+                .unwrap();
 
             std::assert_matches!(
                 read_snell_frame_payload(&mut reader).await,
@@ -307,14 +313,16 @@ async fn reuse_pool_prunes_expired_connections_before_put() {
                     reuse: true,
                     host,
                     port: 443,
-                    rest_span: Range { start: 17, end: 17 },
+                    rest_start: 17,
                     rest: b"",
                 }
             );
             write_snell_tunnel_reply_message(&mut server_writer, b"ok")
                 .await
                 .unwrap();
-            server_writer.write_zero_chunk().await.unwrap();
+            poll_fn(|cx| server_writer.poll_write_zero_chunk(cx))
+                .await
+                .unwrap();
             std::assert_matches!(
                 read_snell_frame_payload(&mut reader).await,
                 Err(Error::ZeroChunk)
@@ -402,14 +410,16 @@ async fn reuse_pool_keeps_only_max_size_connections() {
                     reuse: true,
                     host,
                     port: 443,
-                    rest_span: Range { start: 17, end: 17 },
+                    rest_start: 17,
                     rest: b"",
                 }
             );
             write_snell_tunnel_reply_message(&mut server_writer, b"ok")
                 .await
                 .unwrap();
-            server_writer.write_zero_chunk().await.unwrap();
+            poll_fn(|cx| server_writer.poll_write_zero_chunk(cx))
+                .await
+                .unwrap();
             std::assert_matches!(
                 read_snell_frame_payload(&mut reader).await,
                 Err(Error::ZeroChunk)

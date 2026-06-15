@@ -1,4 +1,5 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::future::poll_fn;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -8,7 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
-use super::relay_udp_server_stream;
+use super::run_udp_server_driver;
+use super::{OwnedUdpAddress, OwnedUdpTarget, quic_init_host};
 use crate::error::Error;
 use crate::framed::SnellStreamWriter;
 use crate::net::dns::DnsResolver;
@@ -25,11 +27,11 @@ use crate::proxy::snell::server::{
 use crate::proxy::socks5::inbound::{
     read_client_request as read_socks_client_request, write_reply_with_bind,
 };
-use crate::session::udp::stream::UdpClientStream;
 use crate::test_support::{
     TEST_PSK, TestUdpPacket, accept_udp_server_stream, shared_secret, test_duplex_pair,
     test_tcp_listener, test_udp_socket, write_snell_udp_packet,
 };
+use crate::transport::udp::stream::UdpClientStream;
 
 fn direct_options(ipv6: bool) -> RelayOptions {
     RelayOptions::direct(ipv6, DnsResolver::system())
@@ -63,7 +65,7 @@ async fn udp_server_stream_relays_one_datagram_response() {
         )
         .await
         .unwrap();
-        relay_udp_server_stream(stream, direct_options(false))
+        run_udp_server_driver(stream, direct_options(false))
             .await
             .unwrap()
     };
@@ -88,11 +90,16 @@ async fn udp_server_stream_relays_one_datagram_response() {
         .await
         .unwrap();
 
-        let message = reader.read_udp_response_message().await.unwrap().unwrap();
+        let message = poll_fn(|cx| reader.poll_read_udp_response_message(cx))
+            .await
+            .unwrap()
+            .unwrap();
         let response = TestUdpPacket::from_ref(parse_udp_response(&message).unwrap());
         assert_eq!(response.payload, b"answer");
         assert_eq!(response.port, target_addr.port());
-        writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     };
 
     let (stats, (), ()) = tokio::join!(server, client, target);
@@ -134,7 +141,7 @@ async fn udp_stream_does_not_head_of_line_block_on_missing_response() {
         )
         .await
         .unwrap();
-        relay_udp_server_stream(stream, direct_options(false))
+        run_udp_server_driver(stream, direct_options(false))
             .await
             .unwrap()
     };
@@ -169,7 +176,7 @@ async fn udp_stream_does_not_head_of_line_block_on_missing_response() {
 
         let message = tokio::time::timeout(
             Duration::from_millis(500),
-            reader.read_udp_response_message(),
+            poll_fn(|cx| reader.poll_read_udp_response_message(cx)),
         )
         .await
         .unwrap()
@@ -178,7 +185,9 @@ async fn udp_stream_does_not_head_of_line_block_on_missing_response() {
         let response = TestUdpPacket::from_ref(parse_udp_response(&message).unwrap());
         assert_eq!(response.payload, b"answer");
         assert_eq!(response.port, reply_addr.port());
-        writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     };
 
     let (stats, (), (), ()) = tokio::join!(server, client, no_reply, reply);
@@ -284,11 +293,16 @@ async fn udp_server_relays_datagram_via_upstream_socks5() {
         .await
         .unwrap();
 
-        let message = reader.read_udp_response_message().await.unwrap().unwrap();
+        let message = poll_fn(|cx| reader.poll_read_udp_response_message(cx))
+            .await
+            .unwrap()
+            .unwrap();
         let response = TestUdpPacket::from_ref(parse_udp_response(&message).unwrap());
         assert_eq!(response.payload, b"answer");
         assert_eq!(response.port, target_addr.port());
-        writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     };
 
     let ((), (), (), ()) = tokio::join!(target, socks, server, client);
@@ -340,7 +354,7 @@ async fn udp_upstream_socks5_failure_after_tunnel_open_closes_server() {
 
         let result = timeout(
             Duration::from_millis(500),
-            reader.read_udp_response_message(),
+            poll_fn(|cx| reader.poll_read_udp_response_message(cx)),
         )
         .await
         .unwrap();
@@ -467,7 +481,7 @@ async fn udp_upstream_socks5_control_close_reopens_without_ending_association() 
 
         let message = timeout(
             Duration::from_millis(500),
-            reader.read_udp_response_message(),
+            poll_fn(|cx| reader.poll_read_udp_response_message(cx)),
         )
         .await
         .unwrap()
@@ -476,7 +490,9 @@ async fn udp_upstream_socks5_control_close_reopens_without_ending_association() 
         let response = TestUdpPacket::from_ref(parse_udp_response(&message).unwrap());
         assert_eq!(response.payload, b"answer");
         assert_eq!(response.port, 5353);
-        writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     };
 
     let ((), (), ()) = tokio::join!(socks, server, client);
@@ -599,7 +615,7 @@ async fn udp_upstream_socks5_idle_reopens_without_ending_association() {
 
         let message = timeout(
             Duration::from_millis(500),
-            reader.read_udp_response_message(),
+            poll_fn(|cx| reader.poll_read_udp_response_message(cx)),
         )
         .await
         .unwrap()
@@ -608,7 +624,9 @@ async fn udp_upstream_socks5_idle_reopens_without_ending_association() {
         let response = TestUdpPacket::from_ref(parse_udp_response(&message).unwrap());
         assert_eq!(response.payload, b"answer");
         assert_eq!(response.port, 5353);
-        writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     };
 
     let ((), (), ()) = tokio::join!(socks, server, client);
@@ -631,7 +649,7 @@ async fn udp_association_transport_eof_closes_without_zero_chunk() {
         .await
         .unwrap();
         let bytes_after_accept = recorded_download.len();
-        let stats = relay_udp_server_stream(stream, direct_options(false))
+        let stats = run_udp_server_driver(stream, direct_options(false))
             .await
             .unwrap();
         assert_eq!(recorded_download.len(), bytes_after_accept);
@@ -701,7 +719,7 @@ async fn client_zero_chunk_ends_udp_association_without_waiting_for_idle() {
         .unwrap();
         timeout(
             Duration::from_millis(200),
-            relay_udp_server_stream(stream, direct_options(false)),
+            run_udp_server_driver(stream, direct_options(false)),
         )
         .await
         .unwrap()
@@ -719,7 +737,9 @@ async fn client_zero_chunk_ends_udp_association_without_waiting_for_idle() {
         .await
         .unwrap()
         .into_parts();
-        writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
     };
 
     let (stats, ()) = tokio::join!(server, client);
@@ -753,7 +773,7 @@ async fn udp_to_snell_stops_when_snell_writer_is_closed() {
         .unwrap();
         timeout(
             Duration::from_millis(500),
-            relay_udp_server_stream(stream, direct_options(false)),
+            run_udp_server_driver(stream, direct_options(false)),
         )
         .await
         .unwrap()
@@ -831,4 +851,69 @@ async fn udp_tcp_connection_rejects_ipv6_when_disabled() {
 
     let (server_result, ()) = tokio::join!(server, client);
     assert!(matches!(server_result, Err(Error::Ipv6Disabled)));
+}
+
+#[test]
+fn owned_udp_target_keeps_ip_without_domain_state() {
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    let target = OwnedUdpTarget::from_ref(AddressRef::Ip(ip), 443);
+
+    assert_eq!(target.address, OwnedUdpAddress::Ip(ip));
+    assert_eq!(target.address_ref(), AddressRef::Ip(ip));
+    assert_eq!(target.port(), 443);
+
+    let mut scratch = String::with_capacity(39);
+    assert_eq!(target.quic_init_host(&mut scratch), "1.2.3.4");
+    assert_eq!(target.address_ref(), AddressRef::Ip(ip));
+}
+
+#[test]
+fn owned_udp_target_does_not_replace_same_domain() {
+    let mut target = OwnedUdpTarget::from_ref(AddressRef::Domain("example.com"), 443);
+    let before = match &target.address {
+        OwnedUdpAddress::Domain(host) => host.as_ptr(),
+        OwnedUdpAddress::Ip(_) => panic!("expected domain target"),
+    };
+
+    target.update(AddressRef::Domain("example.com"), 443);
+
+    let after = match &target.address {
+        OwnedUdpAddress::Domain(host) => host.as_ptr(),
+        OwnedUdpAddress::Ip(_) => panic!("expected domain target"),
+    };
+    assert_eq!(before, after);
+    assert_eq!(target.address_ref(), AddressRef::Domain("example.com"));
+}
+
+#[test]
+fn owned_udp_target_switches_address_kind_without_parsing() {
+    let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let mut target = OwnedUdpTarget::from_ref(AddressRef::Domain("example.com"), 53);
+
+    target.update(AddressRef::Ip(ip), 443);
+    assert_eq!(target.address_ref(), AddressRef::Ip(ip));
+    assert_eq!(target.port(), 443);
+
+    target.update(AddressRef::Domain("api.example.com"), 8443);
+    assert_eq!(target.address_ref(), AddressRef::Domain("api.example.com"));
+    assert_eq!(target.port(), 8443);
+}
+
+#[test]
+fn quic_init_host_borrows_domain_and_reuses_ip_scratch() {
+    let mut scratch = String::from("unchanged");
+    assert_eq!(
+        quic_init_host(AddressRef::Domain("example.com"), &mut scratch),
+        "example.com"
+    );
+    assert_eq!(scratch, "unchanged");
+
+    assert_eq!(
+        quic_init_host(
+            AddressRef::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            &mut scratch
+        ),
+        "::1"
+    );
+    assert_eq!(scratch, "::1");
 }

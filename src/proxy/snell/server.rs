@@ -14,14 +14,12 @@ use crate::protocol::psk::SnellPsk;
 use crate::protocol::request::{ClientRequest, parse_client_request};
 use crate::protocol::v6::V6SaltReplayCache;
 use crate::proxy::outbound::{RelayOptions, RelayStats, open_udp};
-use crate::session::activity::{RelayActivity, RelayActivityTimeouts, wait_relay_idle};
-use crate::session::tcp::TcpServerStream;
-use crate::session::tcp::TcpTarget;
-use crate::session::tcp::relay::{
-    PlainUploadBatch, PrefixedRead, relay_bidirectional_until_right_closed,
-};
-use crate::session::udp::association::relay_udp_server_stream_prepared;
-use crate::session::udp::stream::UdpServerStream;
+use crate::relay::activity::{RelayActivity, RelayActivityTimeouts, wait_relay_idle};
+use crate::relay::tcp::{PrefixedReadStream, ReadPrefixBuffer, TcpClosePolicy, TcpRelayDriver};
+use crate::relay::udp::association::UdpRelayDriver;
+use crate::transport::tcp::TcpServerStream;
+use crate::transport::tcp::TcpTarget;
+use crate::transport::udp::stream::UdpServerStream;
 
 pub(crate) const CONNECT_FAILED_CODE: u8 = 1;
 pub(crate) const CONNECT_FAILED_MESSAGE: &str = "connect failed";
@@ -37,7 +35,7 @@ pub(crate) const V6_ERROR_REMOTE_EOF: u8 = 0x65;
 pub(crate) const V6_ERROR_FALLBACK: u8 = 0xff;
 const V6_ERROR_DNS_FAILED_MESSAGE: &str = "DNS Failed";
 const V6_ERROR_REMOTE_EOF_MESSAGE: &str = "remote eof";
-const SERVER_FAST_OPEN_BUFFER_LIMIT: usize = 64 * 1024;
+const SERVER_EARLY_UPLOAD_BUFFER_LIMIT: usize = 64 * 1024;
 const SERVER_TCP_INITIAL_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVER_TCP_ESTABLISHED_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 pub(crate) const SERVER_TCP_ACTIVITY_TIMEOUTS: RelayActivityTimeouts = RelayActivityTimeouts::new(
@@ -141,18 +139,15 @@ where
                 let snell =
                     TcpServerStream::from_parts_with_pending(frame_reader, frame_writer, pending);
                 let connect = open_target(target, options.clone());
-                let result = if frame_family.uses_v6_frames() {
-                    relay_tcp_server_stream_v6_connect_then_accept(
-                        snell,
-                        connect,
-                        keep_alive,
-                        activity.clone(),
-                    )
-                    .await
+                let admission = if frame_family.uses_v6_frames() {
+                    TcpServerAdmission::ConnectThenAcceptWithReject
                 } else {
-                    relay_tcp_server_stream_fast_open(snell, connect, keep_alive, activity.clone())
-                        .await
+                    TcpServerAdmission::AcceptThenConnect
                 };
+                let result =
+                    TcpServerRelay::new(snell, connect, admission, keep_alive, activity.clone())
+                        .run()
+                        .await;
                 let (stats, next_reader, next_writer) = match result {
                     Ok(result) => result,
                     Err(err) => {
@@ -196,9 +191,23 @@ where
                 let udp = UdpServerStream::accept(frame_reader, frame_writer).await?;
                 activity.record();
                 let stats =
-                    match relay_udp_server_stream_prepared(udp, options, prepared, &activity).await
+                    match UdpRelayDriver::from_server_stream(udp, options, prepared, &activity)
+                        .await
                     {
-                        Ok(stats) => stats,
+                        Ok(driver) => {
+                            tokio::pin!(driver);
+                            match driver.await {
+                                Ok(stats) => stats,
+                                Err(err) => {
+                                    tracing::debug!(
+                                        %err,
+                                        duration_ms = started.elapsed().as_millis(),
+                                        "snell udp server relay failed"
+                                    );
+                                    return Err(err);
+                                }
+                            }
+                        }
                         Err(err) => {
                             tracing::debug!(
                                 %err,
@@ -260,7 +269,7 @@ where
                 reuse,
                 host,
                 port,
-                rest_span,
+                rest_start,
                 ..
             } => ParsedInitialRequest::Tcp(
                 TcpTarget {
@@ -268,7 +277,7 @@ where
                     port,
                     reuse,
                 },
-                rest_span.start,
+                rest_start,
             ),
             ClientRequest::Udp { rest: [], .. } => ParsedInitialRequest::Udp,
             ClientRequest::Ping => ParsedInitialRequest::Ping,
@@ -286,71 +295,113 @@ where
     Poll::Ready(Ok(initial))
 }
 
-async fn relay_tcp_server_stream_fast_open<R, W, Fut>(
-    mut snell: TcpServerStream<R, W>,
-    connect: Fut,
-    keep_alive: bool,
-    activity: RelayActivity,
-) -> Result<(RelayStats, SnellStreamReader<R>, SnellStreamWriter<W>)>
-where
-    R: AsyncRead + Send + Unpin,
-    W: AsyncWrite + Send + Unpin,
-    Fut: Future<Output = Result<TcpStream>>,
-{
-    snell.accept().await?;
-    activity.record();
-    let mut snell = snell;
-    let mut early_payload = PlainUploadBatch::new();
-    let upstream = buffer_fast_open_payload_until_connected(
-        &mut snell,
-        connect,
-        &mut early_payload,
-        &activity,
-    )
-    .await?;
-
-    relay_tcp_server_stream_reusable(snell, upstream, keep_alive, early_payload, activity).await
-}
-
-async fn relay_tcp_server_stream_v6_connect_then_accept<R, W, Fut>(
+struct TcpServerRelay<R, W, Fut> {
     snell: TcpServerStream<R, W>,
     connect: Fut,
+    admission: TcpServerAdmission,
     keep_alive: bool,
     activity: RelayActivity,
-) -> Result<(RelayStats, SnellStreamReader<R>, SnellStreamWriter<W>)>
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TcpServerAdmission {
+    AcceptThenConnect,
+    ConnectThenAcceptWithReject,
+}
+
+impl<R, W, Fut> TcpServerRelay<R, W, Fut>
 where
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
     Fut: Future<Output = Result<TcpStream>>,
 {
-    let mut snell = snell;
-    let mut early_payload = PlainUploadBatch::new();
-    let upstream = match buffer_fast_open_payload_until_connected(
-        &mut snell,
-        connect,
-        &mut early_payload,
-        &activity,
-    )
-    .await
-    {
-        Ok(upstream) => upstream,
-        Err(err) => {
-            let (code, message) = v6_server_error_reply(&err);
-            snell.reject(code, &message).await?;
-            activity.record();
-            return Err(err);
+    const fn new(
+        snell: TcpServerStream<R, W>,
+        connect: Fut,
+        admission: TcpServerAdmission,
+        keep_alive: bool,
+        activity: RelayActivity,
+    ) -> Self {
+        Self {
+            snell,
+            connect,
+            admission,
+            keep_alive,
+            activity,
         }
-    };
+    }
 
-    snell.accept().await?;
-    activity.record();
-    relay_tcp_server_stream_reusable(snell, upstream, keep_alive, early_payload, activity).await
+    async fn run(self) -> Result<(RelayStats, SnellStreamReader<R>, SnellStreamWriter<W>)> {
+        let Self {
+            mut snell,
+            connect,
+            admission,
+            keep_alive,
+            activity,
+        } = self;
+        let mut read_prefix = ReadPrefixBuffer::new();
+        let upstream = match admission {
+            TcpServerAdmission::AcceptThenConnect => {
+                snell.accept().await?;
+                activity.record();
+                buffer_upload_until_connected(&mut snell, connect, &mut read_prefix, &activity)
+                    .await?
+            }
+            TcpServerAdmission::ConnectThenAcceptWithReject => {
+                let upstream = match buffer_upload_until_connected(
+                    &mut snell,
+                    connect,
+                    &mut read_prefix,
+                    &activity,
+                )
+                .await
+                {
+                    Ok(upstream) => upstream,
+                    Err(err) => {
+                        let (code, message) = v6_server_error_reply(&err);
+                        snell.reject(code, &message).await?;
+                        activity.record();
+                        return Err(err);
+                    }
+                };
+                snell.accept().await?;
+                activity.record();
+                upstream
+            }
+        };
+
+        let upstream = upstream;
+        let mut snell = snell;
+        let stats = {
+            tokio::pin!(upstream);
+            let prefixed_snell =
+                PrefixedReadStream::new(std::pin::Pin::new(&mut snell), read_prefix);
+            tokio::pin!(prefixed_snell);
+            let relay = TcpRelayDriver::new(
+                upstream.as_mut(),
+                prefixed_snell.as_mut(),
+                TcpClosePolicy::EndWhenPlainToSnellClosed,
+                activity.clone(),
+            );
+            tokio::pin!(relay);
+            relay.as_mut().await?
+        };
+
+        if keep_alive {
+            drain_tcp_stream(&mut snell, &activity).await?;
+        }
+
+        let (mut frame_reader, mut frame_writer) = snell.into_frame_parts();
+        frame_reader.compact_buffers_for_reuse();
+        frame_writer.compact_buffers_for_reuse();
+        Ok((stats, frame_reader, frame_writer))
+    }
 }
 
-async fn buffer_fast_open_payload_until_connected<S, Fut, T>(
+async fn buffer_upload_until_connected<S, Fut, T>(
     snell: &mut S,
     connect: Fut,
-    early_payload: &mut PlainUploadBatch,
+    read_prefix: &mut ReadPrefixBuffer,
     activity: &RelayActivity,
 ) -> Result<T>
 where
@@ -363,7 +414,7 @@ where
 
     loop {
         if upload_done
-            || early_payload.len().saturating_add(MAX_PACKET_SIZE) > SERVER_FAST_OPEN_BUFFER_LIMIT
+            || read_prefix.len().saturating_add(MAX_PACKET_SIZE) > SERVER_EARLY_UPLOAD_BUFFER_LIMIT
         {
             return connect.await;
         }
@@ -377,11 +428,11 @@ where
                     upload_done = true;
                     continue;
                 }
-                if early_payload.len().saturating_add(n) > SERVER_FAST_OPEN_BUFFER_LIMIT {
+                if read_prefix.len().saturating_add(n) > SERVER_EARLY_UPLOAD_BUFFER_LIMIT {
                     return Err(Error::PayloadTooLarge);
                 }
                 activity.record();
-                early_payload.push(buffer.split_to(n).freeze());
+                read_prefix.push(buffer.split_to(n).freeze());
             }
         }
     }
@@ -418,34 +469,6 @@ fn v6_server_error_reply(err: &Error) -> (u8, String) {
         }
         _ => (V6_ERROR_FALLBACK, err.to_string()),
     }
-}
-
-async fn relay_tcp_server_stream_reusable<R, W>(
-    snell: TcpServerStream<R, W>,
-    upstream: TcpStream,
-    keep_alive: bool,
-    early_payload: PlainUploadBatch,
-    activity: RelayActivity,
-) -> Result<(RelayStats, SnellStreamReader<R>, SnellStreamWriter<W>)>
-where
-    R: AsyncRead + Send + Unpin,
-    W: AsyncWrite + Send + Unpin,
-{
-    let mut snell = PrefixedRead::new(snell, early_payload);
-    let mut upstream = upstream;
-    let stats =
-        relay_bidirectional_until_right_closed(&mut snell, &mut upstream, &activity).await?;
-    drop(upstream);
-    let mut snell = snell.into_inner();
-
-    if keep_alive {
-        drain_tcp_stream(&mut snell, &activity).await?;
-    }
-
-    let (mut frame_reader, mut frame_writer) = snell.into_frame_parts();
-    frame_reader.compact_buffers_for_reuse();
-    frame_writer.compact_buffers_for_reuse();
-    Ok((stats, frame_reader, frame_writer))
 }
 
 async fn drain_tcp_stream<S>(snell: &mut S, activity: &RelayActivity) -> Result<()>

@@ -1,6 +1,7 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use std::ops::RangeFrom;
+use std::sync::LazyLock;
 use zeroize::Zeroize;
 
 use crate::error::{Argon2Error, Error, Result};
@@ -13,6 +14,17 @@ pub const ARGON2_OUTPUT_SIZE: usize = 32;
 const SNELL_ARGON2_MEMORY_KIB: u32 = 8;
 const SNELL_ARGON2_ITERATIONS: u32 = 3;
 const SNELL_ARGON2_PARALLELISM: u32 = 1;
+
+static SNELL_ARGON2: LazyLock<Argon2<'static>> = LazyLock::new(|| {
+    let params = Params::new(
+        SNELL_ARGON2_MEMORY_KIB,
+        SNELL_ARGON2_ITERATIONS,
+        SNELL_ARGON2_PARALLELISM,
+        Some(ARGON2_OUTPUT_SIZE),
+    )
+    .expect("Snell Argon2 parameters should be valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+});
 
 pub struct Aes128GcmCrypto {
     key: LessSafeKey,
@@ -118,16 +130,8 @@ impl Aes128GcmCrypto {
 ///
 /// Returns an error if Argon2 key derivation fails.
 pub fn derive_aes128_key(psk: &[u8], salt: &[u8; SALT_SIZE]) -> Result<[u8; AES_128_KEY_SIZE]> {
-    let params = Params::new(
-        SNELL_ARGON2_MEMORY_KIB,
-        SNELL_ARGON2_ITERATIONS,
-        SNELL_ARGON2_PARALLELISM,
-        Some(ARGON2_OUTPUT_SIZE),
-    )
-    .map_err(Argon2Error)?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut output = [0; ARGON2_OUTPUT_SIZE];
-    argon2
+    SNELL_ARGON2
         .hash_password_into(psk, salt, &mut output)
         .map_err(Argon2Error)?;
 

@@ -1,8 +1,13 @@
+use std::collections::VecDeque;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
+use pin_project_lite::pin_project;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
@@ -11,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::protocol::socks5::{
     parse_udp_packet as parse_socks_udp_packet, write_udp_packet as write_socks_udp_packet,
 };
-use crate::session::udp::io::{UdpRecvBatch, UdpSendPacket, send_udp_batch};
+use crate::relay::udp::io::{UdpRecvBatch, UdpSendBatch};
 
 use super::socks5::open_udp_associate_via_socks5;
 use super::udp::resolve_socks5_udp_relay_addr;
@@ -111,17 +116,13 @@ pub(crate) async fn open_quic_udp(
 }
 
 impl QuicProxyRelay {
-    pub(crate) async fn send_payload(&mut self, payload: &[u8]) -> Result<()> {
+    pub(crate) fn prepare_send_payload(&mut self, payload: &[u8]) -> Result<UdpSendBatch> {
         match &self.target {
-            QuicProxyRelayTarget::Direct(target) => {
-                send_udp_batch(
-                    &self.outbound,
-                    &[UdpSendPacket::single(payload, *target)],
-                    MAX_PACKET_SIZE + 512,
-                )
-                .await?;
-                Ok(())
-            }
+            QuicProxyRelayTarget::Direct(target) => Ok(UdpSendBatch::single(
+                Bytes::copy_from_slice(payload),
+                *target,
+                MAX_PACKET_SIZE + 512,
+            )),
             QuicProxyRelayTarget::Proxy {
                 relay_addr,
                 host,
@@ -134,13 +135,11 @@ impl QuicProxyRelay {
                     *port,
                     payload,
                 )?;
-                send_udp_batch(
-                    &self.outbound,
-                    &[UdpSendPacket::single(&self.buffers.request, *relay_addr)],
+                Ok(UdpSendBatch::single(
+                    self.buffers.request.split().freeze(),
+                    *relay_addr,
                     MAX_PACKET_SIZE + 512,
-                )
-                .await?;
-                Ok(())
+                ))
             }
         }
     }
@@ -151,6 +150,10 @@ impl QuicProxyRelay {
             target: self.target.clone(),
         }
     }
+
+    pub(crate) fn outbound_socket(&self) -> &Arc<UdpSocket> {
+        &self.outbound
+    }
 }
 
 pub(crate) struct QuicProxyResponseRelay {
@@ -158,55 +161,97 @@ pub(crate) struct QuicProxyResponseRelay {
     target: QuicProxyRelayTarget,
 }
 
-pub(crate) async fn run_quic_proxy_response_session(
+pub(crate) fn relay_quic_proxy_responses(
     server_socket: Arc<UdpSocket>,
     client_addr: SocketAddr,
     relay: QuicProxyResponseRelay,
-) -> Result<()> {
-    let mut buffers = Box::new(QuicProxyResponseBuffers::new());
+) -> QuicProxyResponseDriver {
+    QuicProxyResponseDriver::new(server_socket, client_addr, relay)
+}
 
-    loop {
-        let count = buffers.responses.recv_from(&relay.outbound).await?;
-        for index in 0..count {
-            let Some(response) = buffers.responses.get(index) else {
-                continue;
-            };
-            let peer = response.peer();
-            if response.is_oversized() {
-                tracing::debug!("ignored oversized quic proxy response");
+pin_project! {
+    pub(crate) struct QuicProxyResponseDriver {
+        server_socket: Arc<UdpSocket>,
+        client_addr: SocketAddr,
+        relay: QuicProxyResponseRelay,
+        buffers: Box<QuicProxyResponseBuffers>,
+        pending: VecDeque<UdpSendBatch>,
+    }
+}
+
+impl QuicProxyResponseDriver {
+    fn new(
+        server_socket: Arc<UdpSocket>,
+        client_addr: SocketAddr,
+        relay: QuicProxyResponseRelay,
+    ) -> Self {
+        Self {
+            server_socket,
+            client_addr,
+            relay,
+            buffers: Box::new(QuicProxyResponseBuffers::new()),
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+impl Future for QuicProxyResponseDriver {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        loop {
+            if let Some(send) = this.pending.front_mut() {
+                ready!(send.poll_send(this.server_socket, cx))?;
+                this.pending.pop_front();
                 continue;
             }
-            match &relay.target {
-                QuicProxyRelayTarget::Direct(target) => {
-                    if peer != *target {
-                        tracing::debug!(%peer, target = %target, "ignored quic proxy response from unexpected peer");
-                        continue;
-                    }
-                    send_udp_batch(
-                        &server_socket,
-                        &[UdpSendPacket::single(response.payload(), client_addr)],
-                        MAX_PACKET_SIZE + 512,
-                    )
-                    .await?;
+
+            let count = ready!(
+                this.buffers
+                    .responses
+                    .poll_recv_from(&this.relay.outbound, cx)
+            )?;
+            for index in 0..count {
+                let Some(response) = this.buffers.responses.get(index) else {
+                    continue;
+                };
+                let peer = response.peer();
+                if response.is_oversized() {
+                    tracing::debug!("ignored oversized quic proxy response");
+                    continue;
                 }
-                QuicProxyRelayTarget::Proxy { relay_addr, .. } => {
-                    if peer != *relay_addr {
-                        tracing::debug!(%peer, relay_addr = %relay_addr, "ignored quic proxy response from unexpected proxy peer");
-                        continue;
-                    }
-                    let packet = match parse_socks_udp_packet(response.payload()) {
-                        Ok(packet) => packet,
-                        Err(err) => {
-                            tracing::debug!(%err, "ignored invalid quic proxy response");
+                match &this.relay.target {
+                    QuicProxyRelayTarget::Direct(target) => {
+                        if peer != *target {
+                            tracing::debug!(%peer, target = %target, "ignored quic proxy response from unexpected peer");
                             continue;
                         }
-                    };
-                    send_udp_batch(
-                        &server_socket,
-                        &[UdpSendPacket::single(packet.payload, client_addr)],
-                        MAX_PACKET_SIZE + 512,
-                    )
-                    .await?;
+                        this.pending.push_back(UdpSendBatch::single(
+                            Bytes::copy_from_slice(response.payload()),
+                            *this.client_addr,
+                            MAX_PACKET_SIZE + 512,
+                        ));
+                    }
+                    QuicProxyRelayTarget::Proxy { relay_addr, .. } => {
+                        if peer != *relay_addr {
+                            tracing::debug!(%peer, relay_addr = %relay_addr, "ignored quic proxy response from unexpected proxy peer");
+                            continue;
+                        }
+                        let packet = match parse_socks_udp_packet(response.payload()) {
+                            Ok(packet) => packet,
+                            Err(err) => {
+                                tracing::debug!(%err, "ignored invalid quic proxy response");
+                                continue;
+                            }
+                        };
+                        this.pending.push_back(UdpSendBatch::single(
+                            Bytes::copy_from_slice(packet.payload),
+                            *this.client_addr,
+                            MAX_PACKET_SIZE + 512,
+                        ));
+                    }
                 }
             }
         }

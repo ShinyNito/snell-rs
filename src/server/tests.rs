@@ -1,4 +1,4 @@
-use core::range::Range;
+use std::future::poll_fn;
 use std::io;
 use std::time::Duration;
 
@@ -29,11 +29,11 @@ use crate::proxy::snell::server::{
 };
 use crate::proxy::socks5::inbound::{read_client_request, write_reply_with_bind};
 use crate::server::shutdown::bind_tcp_listener;
-use crate::session::tcp::{TcpClientOpenOptions, TcpClientStream};
 use crate::test_support::{
     TEST_PSK, read_snell_frame_payload, shared_secret, test_tcp_listener,
     write_snell_payload_message,
 };
+use crate::transport::tcp::{TcpClientOpenOptions, TcpClientStream};
 
 fn direct_options(ipv6: bool) -> RelayOptions {
     RelayOptions::direct(ipv6, DnsResolver::system())
@@ -556,7 +556,7 @@ async fn serve_server_connection_relays_via_upstream_socks5() {
 }
 
 #[tokio::test]
-async fn serve_server_connection_closes_when_upstream_socks5_rejects_after_fast_open() {
+async fn serve_server_connection_closes_when_upstream_socks5_rejects_after_early_upload() {
     let psk = TEST_PSK;
     let socks_listener = test_tcp_listener().await;
     let socks_addr = socks_listener.local_addr().unwrap();
@@ -620,7 +620,7 @@ async fn serve_server_connection_closes_when_upstream_socks5_rejects_after_fast_
 }
 
 #[tokio::test]
-async fn serve_server_connection_fast_open_accepts_before_target_connects() {
+async fn serve_server_connection_early_upload_accepts_before_target_connects() {
     let psk = TEST_PSK;
     let echo_listener = test_tcp_listener().await;
     let echo_addr = echo_listener.local_addr().unwrap();
@@ -683,7 +683,7 @@ async fn serve_server_connection_fast_open_accepts_before_target_connects() {
         assert_eq!(
             parse_server_reply(&payload).unwrap(),
             ServerReply::Tunnel {
-                payload_span: Range { start: 1, end: 1 },
+                payload_start: 1,
                 payload: b"",
             }
         );
@@ -691,7 +691,9 @@ async fn serve_server_connection_fast_open_accepts_before_target_connects() {
         write_snell_payload_message(&mut snell_writer, b"early")
             .await
             .unwrap();
-        snell_writer.write_zero_chunk().await.unwrap();
+        poll_fn(|cx| snell_writer.poll_write_zero_chunk(cx))
+            .await
+            .unwrap();
         connect_tx.send(()).unwrap();
 
         let payload = read_snell_frame_payload(&mut snell_reader).await.unwrap();
@@ -902,7 +904,7 @@ async fn connect_target_rejects_ipv6_literal_when_disabled() {
 }
 
 #[tokio::test]
-async fn serve_server_connection_closes_after_fast_open_connect_failure() {
+async fn serve_server_connection_closes_after_early_upload_connect_failure() {
     let psk = TEST_PSK;
     let snell_listener = test_tcp_listener().await;
     let snell_addr = snell_listener.local_addr().unwrap();
@@ -942,7 +944,7 @@ async fn serve_server_connection_closes_after_fast_open_connect_failure() {
         assert_eq!(
             parse_server_reply(&payload).unwrap(),
             ServerReply::Tunnel {
-                payload_span: Range { start: 1, end: 1 },
+                payload_start: 1,
                 payload: b"",
             }
         );
