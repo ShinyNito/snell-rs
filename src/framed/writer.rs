@@ -118,6 +118,7 @@ impl PayloadReadSlot {
         unsafe { std::slice::from_raw_parts_mut(self.base.cast(), self.len) }
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.base, self.len) }
     }
