@@ -8,11 +8,15 @@ use std::task::{Context, Poll, ready};
 
 use bytes::{Buf, Bytes};
 use pin_project_lite::pin_project;
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, Interest, ReadBuf};
+#[cfg(unix)]
+use tokio::io::Interest;
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::error::Result;
-use crate::framed::{PayloadSource, PayloadWriteStatus, poll_read_payload_into_slots_fallback};
+use crate::framed::{
+    PayloadReadSlot, PayloadSource, PayloadWriteStatus, poll_read_payload_into_slots_fallback,
+};
 use crate::proxy::outbound::RelayStats;
 use crate::relay::activity::RelayActivity;
 
@@ -332,7 +336,7 @@ impl PayloadSource for TcpStream {
     fn poll_read_payload_into_slots(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        slots: &mut [libc::iovec],
+        slots: &mut [PayloadReadSlot],
     ) -> Poll<io::Result<usize>> {
         poll_tcp_stream_read_into_slots(self, cx, slots)
     }
@@ -342,7 +346,7 @@ impl PayloadSource for DuplexStream {
     fn poll_read_payload_into_slots(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        slots: &mut [libc::iovec],
+        slots: &mut [PayloadReadSlot],
     ) -> Poll<io::Result<usize>> {
         poll_read_payload_into_slots_fallback(self, cx, slots)
     }
@@ -355,7 +359,7 @@ where
     fn poll_read_payload_into_slots(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        slots: &mut [libc::iovec],
+        slots: &mut [PayloadReadSlot],
     ) -> Poll<io::Result<usize>> {
         T::poll_read_payload_into_slots(self.as_mut().get_mut().as_mut(), cx, slots)
     }
@@ -365,9 +369,9 @@ where
 fn poll_tcp_stream_read_into_slots(
     mut stream: Pin<&mut TcpStream>,
     cx: &mut Context<'_>,
-    slots: &mut [libc::iovec],
+    slots: &mut [PayloadReadSlot],
 ) -> Poll<io::Result<usize>> {
-    if slots.iter().all(|slot| slot.iov_len == 0) {
+    if slots.iter().all(PayloadReadSlot::is_empty) {
         return Poll::Ready(Ok(0));
     }
 
@@ -382,11 +386,10 @@ fn poll_tcp_stream_read_into_slots(
         let mut read_slots: [IoSliceMut<'_>; TCP_PAYLOAD_READ_IOV_MAX] =
             std::array::from_fn(|_| IoSliceMut::new(&mut []));
         let mut read_slot_count = 0;
-        for slot in slots.iter_mut().filter(|slot| slot.iov_len != 0) {
-            // SAFETY: the frame writer prepared each iovec to point at live
-            // BytesMut spare capacity for exactly `iov_len` bytes.
-            let buf =
-                unsafe { std::slice::from_raw_parts_mut(slot.iov_base.cast::<u8>(), slot.iov_len) };
+        for slot in slots.iter_mut().filter(|slot| !slot.is_empty()) {
+            // SAFETY: the frame writer prepared each slot to point at live
+            // BytesMut spare capacity for exactly `len` bytes.
+            let buf = unsafe { slot.as_mut_slice() };
             read_slots[read_slot_count] = IoSliceMut::new(buf);
             read_slot_count += 1;
         }
@@ -407,7 +410,7 @@ fn poll_tcp_stream_read_into_slots(
 fn poll_tcp_stream_read_into_slots(
     stream: Pin<&mut TcpStream>,
     cx: &mut Context<'_>,
-    slots: &mut [libc::iovec],
+    slots: &mut [PayloadReadSlot],
 ) -> Poll<io::Result<usize>> {
     poll_read_payload_into_slots_fallback(stream, cx, slots)
 }

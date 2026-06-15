@@ -1,10 +1,11 @@
 use super::{
     AsyncWrite, BytesMut, COMMAND_TUNNEL, Context, Error, FRAME_HEAD_INITIAL_CAPACITY, Instant,
-    PAYLOAD_WRITE_BATCH_MAX_RECORDS, PayloadSource, PayloadWriteStatus, PendingPayloadBatch, Pin,
-    Poll, ProtocolVersion, RecordSizer, Result, STREAM_BUFFER_INITIAL_CAPACITY,
-    STREAM_BUFFER_RETAIN_CAPACITY, SnellPsk, V4FrameEncoder, compact_stream_buffer_for_reuse,
-    poll_fn, poll_write_all_vectored, ready, write_all_vectored, write_error_reply,
-    write_pong_reply, write_tcp_request_header, write_tunnel_reply, write_udp_request_header,
+    PAYLOAD_WRITE_BATCH_MAX_RECORDS, PayloadReadSlot, PayloadSource, PayloadWriteStatus,
+    PendingPayloadBatch, Pin, Poll, ProtocolVersion, RecordSizer, Result,
+    STREAM_BUFFER_INITIAL_CAPACITY, STREAM_BUFFER_RETAIN_CAPACITY, SnellPsk, V4FrameEncoder,
+    compact_stream_buffer_for_reuse, poll_fn, poll_write_all_vectored, ready, write_all_vectored,
+    write_error_reply, write_pong_reply, write_tcp_request_header, write_tunnel_reply,
+    write_udp_request_header,
 };
 
 pub struct V4StreamWriter<W> {
@@ -206,11 +207,8 @@ where
     {
         let now = Instant::now();
         let mut record_sizer = self.record_sizer.clone();
-        let mut iovecs: [libc::iovec; PAYLOAD_WRITE_BATCH_MAX_RECORDS] =
-            std::array::from_fn(|_| libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            });
+        let mut slots: [PayloadReadSlot; PAYLOAD_WRITE_BATCH_MAX_RECORDS] =
+            std::array::from_fn(|_| PayloadReadSlot::empty());
         let mut limits = [0; PAYLOAD_WRITE_BATCH_MAX_RECORDS];
         let mut read_limits = [0; PAYLOAD_WRITE_BATCH_MAX_RECORDS];
         let mut record_count = 0;
@@ -231,7 +229,7 @@ where
             };
 
             let record = self.source_batch.begin_source_record();
-            iovecs[record_count] = record.prepare_spare(prefix, read_limit);
+            slots[record_count] = record.prepare_spare(prefix, read_limit);
             limits[record_count] = limit;
             read_limits[record_count] = read_limit;
             record_count += 1;
@@ -241,7 +239,7 @@ where
 
         let read_total = match reader
             .as_mut()
-            .poll_read_payload_into_slots(cx, &mut iovecs[..record_count])
+            .poll_read_payload_into_slots(cx, &mut slots[..record_count])
         {
             Poll::Ready(Ok(read_total)) => read_total,
             Poll::Ready(Err(err)) => {

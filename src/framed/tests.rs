@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf, duplex, sink};
 
 use super::reader::{V4StreamReader, V6StreamReader};
-use super::writer::{PayloadSource, RecordSizer, V4StreamWriter, V6StreamWriter};
+use super::writer::{PayloadReadSlot, PayloadSource, RecordSizer, V4StreamWriter, V6StreamWriter};
 use super::{
     FRAME_HEAD_INITIAL_CAPACITY, PayloadWriteStatus, STREAM_BUFFER_INITIAL_CAPACITY,
     STREAM_BUFFER_RETAIN_CAPACITY, STREAM_READ_AHEAD_CAPACITY, SnellStreamReader,
@@ -427,21 +427,21 @@ impl PayloadSource for RecordingReadWindow {
     fn poll_read_payload_into_slots(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        bufs: &mut [libc::iovec],
+        bufs: &mut [PayloadReadSlot],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let offered = bufs.iter().map(|buf| buf.iov_len).sum();
+        let offered = bufs.iter().map(|buf| buf.len()).sum();
         this.observed.lock().unwrap().push(offered);
         let mut copied = 0;
-        for buf in bufs.iter_mut().filter(|buf| buf.iov_len != 0) {
-            let n = this.payload.len().min(buf.iov_len);
+        for buf in bufs.iter_mut().filter(|buf| !buf.is_empty()) {
+            let n = this.payload.len().min(buf.len());
             if n == 0 {
                 break;
             }
-            // The destination iovec points at BytesMut spare capacity owned by
+            // The destination slot points at BytesMut spare capacity owned by
             // the writer under test; copying n bytes initializes that range.
             unsafe {
-                std::ptr::copy_nonoverlapping(this.payload.as_ptr(), buf.iov_base.cast(), n);
+                buf.as_mut_slice()[..n].copy_from_slice(&this.payload[..n]);
             }
             this.payload.advance(n);
             copied += n;

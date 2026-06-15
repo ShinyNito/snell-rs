@@ -87,33 +87,64 @@ const PAYLOAD_WRITE_BATCH_TARGET_BYTES: usize = 64 * 1024;
 pub(super) const PAYLOAD_WRITE_BATCH_MAX_RECORDS: usize = 64;
 const PAYLOAD_WRITE_BATCH_MAX_IO_SLICES: usize = PAYLOAD_WRITE_BATCH_MAX_RECORDS * 2;
 
+#[derive(Clone, Copy)]
+pub(crate) struct PayloadReadSlot {
+    base: *mut u8,
+    len: usize,
+}
+
+impl PayloadReadSlot {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            base: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
+
+    fn new(base: *mut u8, len: usize) -> Self {
+        Self { base, len }
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) unsafe fn as_uninit_slice(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
+        unsafe { std::slice::from_raw_parts_mut(self.base.cast(), self.len) }
+    }
+
+    pub(crate) unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.base, self.len) }
+    }
+}
+
 pub(crate) trait PayloadSource {
     fn poll_read_payload_into_slots(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        slots: &mut [libc::iovec],
+        slots: &mut [PayloadReadSlot],
     ) -> Poll<io::Result<usize>>;
 }
 
 pub(crate) fn poll_read_payload_into_slots_fallback<R>(
     mut reader: Pin<&mut R>,
     cx: &mut Context<'_>,
-    slots: &mut [libc::iovec],
+    slots: &mut [PayloadReadSlot],
 ) -> Poll<io::Result<usize>>
 where
     R: AsyncRead + ?Sized,
 {
-    let Some(slot) = slots.iter_mut().find(|slot| slot.iov_len != 0) else {
+    let Some(slot) = slots.iter_mut().find(|slot| !slot.is_empty()) else {
         return Poll::Ready(Ok(0));
     };
-    // The iovec points at spare capacity owned by a BytesMut. ReadBuf accepts
+    // The slot points at spare capacity owned by a BytesMut. ReadBuf accepts
     // MaybeUninit here and will only mark initialized bytes as filled.
-    let spare = unsafe {
-        std::slice::from_raw_parts_mut(
-            slot.iov_base.cast::<std::mem::MaybeUninit<u8>>(),
-            slot.iov_len,
-        )
-    };
+    let spare = unsafe { slot.as_uninit_slice() };
     let mut read_buf = ReadBuf::uninit(spare);
     match reader.as_mut().poll_read(cx, &mut read_buf) {
         Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
@@ -330,17 +361,14 @@ impl PendingPayloadRecord {
         self.read_limit = 0;
     }
 
-    pub(super) fn prepare_spare(&mut self, prefix: &[u8], read_limit: usize) -> libc::iovec {
+    pub(super) fn prepare_spare(&mut self, prefix: &[u8], read_limit: usize) -> PayloadReadSlot {
         self.payload.extend_from_slice(prefix);
         self.payload.reserve(read_limit);
         self.prefix_len = prefix.len();
         self.read_limit = read_limit;
         let spare = self.payload.chunk_mut();
         debug_assert!(spare.len() >= read_limit);
-        libc::iovec {
-            iov_base: spare.as_mut_ptr().cast(),
-            iov_len: read_limit,
-        }
+        PayloadReadSlot::new(spare.as_mut_ptr().cast(), read_limit)
     }
 
     pub(super) fn finish_read(&mut self, read_len: usize) -> usize {

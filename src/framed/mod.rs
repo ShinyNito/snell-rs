@@ -6,7 +6,8 @@ mod writer;
 
 pub(crate) use reader::SnellStreamReader;
 pub(crate) use writer::{
-    PayloadSource, PayloadWriteStatus, SnellStreamWriter, poll_read_payload_into_slots_fallback,
+    PayloadReadSlot, PayloadSource, PayloadWriteStatus, SnellStreamWriter,
+    poll_read_payload_into_slots_fallback,
 };
 
 use crate::MAX_PACKET_SIZE;
