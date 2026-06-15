@@ -2,6 +2,14 @@
 
 All notable changes to this project are maintained manually.
 
+## [0.4.8] - 2026-06-15
+
+## Release Notes
+
+  * 将原 `session` 层拆分为 `transport` 与 `relay`：TCP、UDP、QUIC proxy、复用连接等生命周期状态迁移到更明确的模块边界，减少会话层职责耦合
+  * framed writer 改为批量读取 payload 后合并多条 record 的 vectored 写入，TCP relay 对 Unix 保留 readv 快路径，降低热路径 syscall 次数
+  * 修复 Windows 构建失败：payload 读取槽位改为平台无关的内部类型，不再在跨平台 trait 中暴露 `libc::iovec`
+
 ## [0.4.7] - 2026-06-15
 
 ## Release Notes
