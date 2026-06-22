@@ -28,5 +28,8 @@ bytes = "1.0"
 # Error handling
 thiserror = "2.0"
 
+# Logging — used by protocol::crypto::kdf (tracing::trace on key derivation).
+tracing = "0.1"
+
 [dev-dependencies]
 hex = "0.4"
