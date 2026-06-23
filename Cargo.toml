@@ -15,15 +15,16 @@ blake2 = "0.10" # BLAKE2b-256 profile secret (unpacked fn 0x39d90)
 rand = "0.8"
 
 # Runtime
-# tokio: the runtime for the (forthcoming) transport/driver layer. The codec
-#        layer (protocol/socks5, protocol/snell) is pure-synchronous and does
-#        not depend on any runtime. Only `rt`+`time`+`macros` are pulled in for
-#        now (timeout wrapper + its #[tokio::test]) — add features (e.g. `net`,
-#        `rt-multi-thread`) when the driver/inbound/service layers land.
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+# tokio: the runtime for the transport/driver layer. The codec layer
+#        (protocol/socks5, protocol/snell) is pure-synchronous and does not
+#        depend on any runtime. `net`+`io-util`+`rt`+`time`+`macros` cover the
+#        relay driver + its #[tokio::test] round-trips; `rt-multi-thread` lands
+#        with the binary entry point.
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
 
 # Data structures
 bytes = "1.0"
+lru_time_cache = "0.11"
 
 # Error handling
 thiserror = "2.0"
