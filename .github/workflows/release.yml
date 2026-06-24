@@ -1,0 +1,227 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: snell-rs
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Validate tag version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          version="${TAG_NAME#v}"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "snell-rs") | .version')"
+          if [ "${version}" != "${cargo_version}" ]; then
+            echo "tag ${TAG_NAME} does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          fi
+
+      - name: Validate changelog entry
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          version="${TAG_NAME#v}"
+          if ! awk -v version="${version}" '
+            /^##[[:space:]]+\[[0-9][^]]*\]/ {
+              pattern = "^##[[:space:]]+\\[" version "\\]([[:space:]-]|$)"
+              if ($0 ~ pattern) {
+                found = 1
+              }
+            }
+            END { exit found ? 0 : 1 }
+          ' CHANGELOG.md; then
+            echo "CHANGELOG.md does not contain a ${version} release section" >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --lib --bins
+
+  release-notes:
+    name: Generate release notes
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Extract notes from changelog
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          version="${TAG_NAME#v}"
+          awk -v version="${version}" '
+            /^##[[:space:]]+\[[0-9][^]]*\]/ {
+              if (in_section) {
+                exit
+              }
+              pattern = "^##[[:space:]]+\\[" version "\\]([[:space:]-]|$)"
+              if ($0 ~ pattern) {
+                in_section = 1
+                next
+              }
+            }
+            in_section {
+              print
+            }
+          ' CHANGELOG.md > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+            echo "release notes for ${TAG_NAME} are empty" >&2
+            exit 1
+          fi
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${BIN_NAME}"
+          tar -C dist -czf "${BIN_NAME}-${{ matrix.target }}.${{ matrix.archive }}" "${BIN_NAME}"
+
+      - name: Package binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "dist/${env:BIN_NAME}.exe"
+          Compress-Archive -Path "dist/${env:BIN_NAME}.exe" -DestinationPath "${env:BIN_NAME}-${{ matrix.target }}.${{ matrix.archive }}" -Force
+
+      - name: Generate checksum
+        if: runner.os != 'Windows'
+        run: shasum -a 256 "${BIN_NAME}-${{ matrix.target }}.${{ matrix.archive }}" > "${BIN_NAME}-${{ matrix.target }}.${{ matrix.archive }}.sha256"
+
+      - name: Generate checksum
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $asset = "${env:BIN_NAME}-${{ matrix.target }}.${{ matrix.archive }}"
+          $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
+          "$hash  $asset" | Out-File -Encoding ascii "$asset.sha256"
+
+      - name: Attest artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            ${{ env.BIN_NAME }}-${{ matrix.target }}.${{ matrix.archive }}
+            ${{ env.BIN_NAME }}-${{ matrix.target }}.${{ matrix.archive }}.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: |
+            ${{ env.BIN_NAME }}-${{ matrix.target }}.${{ matrix.archive }}
+            ${{ env.BIN_NAME }}-${{ matrix.target }}.${{ matrix.archive }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - release-notes
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          notes_file="artifacts/release-notes/release-notes.md"
+          mapfile -t files < <(find artifacts -type f ! -name 'release-notes.md' | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no release artifacts found" >&2
+            exit 1
+          fi
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release edit "${TAG_NAME}" --notes-file "${notes_file}"
+            gh release upload "${TAG_NAME}" "${files[@]}" --clobber
+          else
+            gh release create "${TAG_NAME}" "${files[@]}" --title "${TAG_NAME}" --notes-file "${notes_file}"
+          fi
