@@ -15,12 +15,19 @@ blake2 = "0.10" # BLAKE2b-256 profile secret (unpacked fn 0x39d90)
 rand = "0.8"
 
 # Runtime
-# tokio: the runtime for the transport/driver layer. The codec layer
-#        (protocol/socks5, protocol/snell) is pure-synchronous and does not
-#        depend on any runtime. `net`+`io-util`+`rt`+`time`+`macros` cover the
-#        relay driver + its #[tokio::test] round-trips; `rt-multi-thread` lands
-#        with the binary entry point.
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
+# tokio: the runtime for the (forthcoming) transport/driver layer. The codec
+#        layer (protocol/socks5, protocol/snell) is pure-synchronous and does
+#        not depend on any runtime. Only `io-util`+`net`+`rt`+`time` are pulled
+#        in for now — add features (e.g. `macros`, `rt-multi-thread`) when the
+#        driver/inbound/service layers land.
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+# CLI/config parsing
+clap = { version = "4", features = ["derive"] }
+rust-ini = "0.21"
+
+# Async helpers — `ready!` macro used by poll-based driver state machines.
+futures = "0.3"
 
 # Data structures
 bytes = "1.0"
@@ -31,6 +38,7 @@ thiserror = "2.0"
 
 # Logging — used by protocol::crypto::kdf (tracing::trace on key derivation).
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 hex = "0.4"
