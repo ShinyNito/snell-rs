@@ -580,6 +580,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_closes_socks5_connect_before_next_reused_substream() {
+        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = target_listener.accept().await.unwrap();
+                let mut buf = [0u8; 4];
+                stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"ping");
+                stream.write_all(b"pong").await.unwrap();
+            }
+        });
+
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = socks_listener.accept().await.unwrap();
+                serve_socks5_proxy_once(stream, target_addr).await.unwrap();
+            }
+        });
+
+        let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_listener.local_addr().unwrap();
+        let server_psk = psk.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = server_listener.accept().await.unwrap();
+            let _ = serve_snell_inbound_auto(
+                stream,
+                server_psk,
+                Outbound::Socks5 { server: socks_addr },
+            )
+            .await;
+        });
+
+        let connector = Arc::new(SnellConnector::<V6ShapedMode>::new(server_addr, psk, true));
+        for _ in 0..2 {
+            run_client_round_trip_with_connector(&connector, &Address::from(target_addr)).await;
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), proxy)
+            .await
+            .unwrap()
+            .unwrap();
+        target.await.unwrap();
+        drop(connector);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn server_relays_udp_direct() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
 
@@ -711,7 +764,19 @@ mod tests {
         <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
     {
         let connector = Arc::new(SnellConnector::<M>::new(server_addr, psk, false));
-        let transport = connector.connect(&destination).await.unwrap();
+        run_client_round_trip_with_connector(&connector, &destination).await;
+    }
+
+    async fn run_client_round_trip_with_connector<M>(
+        connector: &Arc<SnellConnector<M>>,
+        destination: &Address,
+    ) where
+        M: SnellMode + Send + Sync + 'static + Unpin,
+        M::Encoder: Send + Unpin,
+        M::Decoder: Send + Unpin,
+        <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+    {
+        let transport = connector.connect(destination).await.unwrap();
 
         let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = local_listener.local_addr().unwrap();
