@@ -4,6 +4,7 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::{io::AsyncWriteExt, time};
 
 use crate::{
+    keepalive::apply_tcp_keepalive,
     protocol::{
         address::AddressRef,
         snell::{
@@ -95,6 +96,9 @@ where
     let snell_client = Arc::new(SnellConnector::<M>::new(server, psk, resume));
     loop {
         let (stream, peer_addr) = listener.accept().await?;
+        if let Err(error) = apply_tcp_keepalive(&stream) {
+            tracing::warn!(%peer_addr, %error, "SOCKS5 inbound tcp keepalive could not be enabled");
+        }
         let snell_client = snell_client.clone();
         tokio::spawn(async move {
             match serve_socks5_inbound(stream, snell_client).await {

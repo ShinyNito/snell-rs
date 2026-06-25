@@ -7,6 +7,7 @@ use tokio::{
 };
 
 use crate::{
+    keepalive::apply_tcp_keepalive,
     protocol::snell::{
         self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, DecodeSlot, MAX_CONNECT_REQUEST_LEN,
         SnellMode, SnellTcpDecoder, SnellTcpEncoder, V4Mode, V6ShapedMode,
@@ -47,6 +48,9 @@ pub async fn bind_tcp_listener(config: ServerConfig) -> io::Result<()> {
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
+        if let Err(error) = apply_tcp_keepalive(&stream) {
+            tracing::warn!(%peer_addr, %error, "Snell inbound tcp keepalive could not be enabled");
+        }
         let psk = psk.clone();
         let outbound = outbound.clone();
         tokio::spawn(async move {

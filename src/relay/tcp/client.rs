@@ -12,7 +12,10 @@ use crate::protocol::{
     address::Address,
     snell::{self, COMMAND_ERROR, COMMAND_TUNNEL, SnellMode, SnellTcpDecoder, SnellTcpEncoder},
 };
-use crate::timeout::{with_tcp_connect_timeout, with_tcp_timeout};
+use crate::{
+    keepalive::apply_tcp_keepalive,
+    timeout::{with_tcp_connect_timeout, with_tcp_timeout},
+};
 
 use super::{
     driver::{TcpTunnelReader, TcpTunnelWriter},
@@ -119,6 +122,7 @@ where
     async fn dial_transport(&self) -> io::Result<SnellTransport<M>> {
         let stream =
             with_tcp_connect_timeout(TcpStream::connect(self.server), "snell tcp connect").await?;
+        apply_tcp_keepalive(&stream)?;
         stream.set_nodelay(true)?;
         let (read_half, write_half) = stream.into_split();
         Ok(SnellTransport {

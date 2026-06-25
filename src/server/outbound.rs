@@ -13,6 +13,7 @@ use tokio::{
 };
 
 use crate::{
+    keepalive::apply_tcp_keepalive,
     protocol::{
         ParseState,
         address::{Address, AddressRef},
@@ -97,7 +98,7 @@ impl crate::relay::udp::Transport for UdpOutbound {
 }
 
 async fn connect_direct(destination: &Address) -> io::Result<TcpStream> {
-    with_tcp_connect_timeout(
+    let stream = with_tcp_connect_timeout(
         async {
             match destination {
                 Address::Ip(addr) => TcpStream::connect(addr).await,
@@ -106,7 +107,9 @@ async fn connect_direct(destination: &Address) -> io::Result<TcpStream> {
         },
         "direct tcp connect",
     )
-    .await
+    .await?;
+    apply_tcp_keepalive(&stream)?;
+    Ok(stream)
 }
 
 async fn connect_direct_udp() -> io::Result<DirectUdpOutbound> {
@@ -120,6 +123,7 @@ async fn connect_direct_udp() -> io::Result<DirectUdpOutbound> {
 async fn connect_socks5(server: SocketAddr, destination: &Address) -> io::Result<TcpStream> {
     let stream =
         with_tcp_connect_timeout(TcpStream::connect(server), "socks5 outbound tcp connect").await?;
+    apply_tcp_keepalive(&stream)?;
     let destination = destination.clone();
     with_tcp_timeout(
         async move {
@@ -159,6 +163,7 @@ async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound>
     let control =
         with_tcp_connect_timeout(TcpStream::connect(server), "socks5 udp control tcp connect")
             .await?;
+    apply_tcp_keepalive(&control)?;
     let socket = UdpSocket::bind(udp_bind_addr_for(server)).await?;
     let local_addr = socket.local_addr()?;
     let (control, relay) = with_tcp_timeout(
