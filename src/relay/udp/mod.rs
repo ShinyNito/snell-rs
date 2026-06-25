@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    future::Future,
+    future::{Future, poll_fn},
     io,
     net::SocketAddr,
     pin::Pin,
@@ -30,15 +30,13 @@ use crate::{
 pub(crate) const UDP_ASSOCIATION_TTL: Duration = Duration::from_mins(5);
 pub(crate) const MAX_UDP_DATAGRAM_LEN: usize = 65_535;
 
-pub(crate) trait Inbound {}
-
 pub(crate) trait Outbound {
-    type Transport: Transport;
+    type Transport: DatagramTransport;
 
     async fn connect_udp(&self) -> io::Result<Self::Transport>;
 }
 
-pub(crate) trait Transport {
+pub(crate) trait DatagramTransport {
     type SendState: Default;
 
     fn poll_send_to(
@@ -59,12 +57,16 @@ pub(crate) trait Transport {
 pub(crate) fn relay_snell_udp<M, O>(
     transport: SnellTransport<M>,
     outbound: O,
-) -> SnellUdpRelay<M, O>
+) -> impl Future<Output = io::Result<()>>
 where
-    M: SnellMode,
-    O: Transport,
+    M: SnellMode + Unpin,
+    M::Encoder: Send + Unpin,
+    M::Decoder: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    O: DatagramTransport + Unpin,
+    O::SendState: Unpin,
 {
-    SnellUdpRelay {
+    let mut relay = SnellUdpRelay {
         snell: transport,
         outbound,
         snell_in: Vec::with_capacity(MAX_UDP_DATAGRAM_LEN),
@@ -73,13 +75,14 @@ where
         pending_to_snell: None,
         outbound_send_state: O::SendState::default(),
         snell_write_state: WriteFrameState::default(),
-    }
+    };
+    poll_fn(move |cx| relay.poll(cx))
 }
 
-pub(crate) struct SnellUdpRelay<M, O>
+struct SnellUdpRelay<M, O>
 where
     M: SnellMode,
-    O: Transport,
+    O: DatagramTransport,
 {
     snell: SnellTransport<M>,
     outbound: O,
@@ -96,23 +99,20 @@ struct UdpDatagram {
     payload: Vec<u8>,
 }
 
-impl<M, O> Future for SnellUdpRelay<M, O>
+impl<M, O> SnellUdpRelay<M, O>
 where
     M: SnellMode + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
-    O: Transport + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    O: DatagramTransport + Unpin,
     O::SendState: Unpin,
 {
-    type Output = io::Result<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             let mut progressed = false;
 
-            match this.poll_snell_to_outbound(cx) {
+            match self.poll_snell_to_outbound(cx) {
                 Poll::Ready(Ok(true)) => progressed = true,
                 Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(error)) if is_clean_udp_close(&error) => {
@@ -122,7 +122,7 @@ where
                 Poll::Pending => {}
             }
 
-            match this.poll_outbound_to_snell(cx) {
+            match self.poll_outbound_to_snell(cx) {
                 Poll::Ready(Ok(true)) => progressed = true,
                 Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(error)) if is_clean_udp_close(&error) => {
@@ -144,8 +144,8 @@ where
     M: SnellMode + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
-    O: Transport + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    O: DatagramTransport + Unpin,
     O::SendState: Unpin,
 {
     fn poll_snell_to_outbound(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
@@ -204,24 +204,25 @@ pub(crate) fn relay_socks5_udp<M>(
     control: TcpStream,
     socket: UdpSocket,
     connector: Arc<SnellConnector<M>>,
-) -> impl Inbound + Future<Output = io::Result<()>>
+) -> impl Future<Output = io::Result<()>>
 where
     M: SnellMode + Send + Sync + 'static + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
-    Socks5UdpRelay {
+    let mut relay = Socks5UdpRelay {
         control,
         socket,
         connector,
         nat: LruCache::with_expiry_duration(UDP_ASSOCIATION_TTL),
         client_in: vec![0; MAX_UDP_DATAGRAM_LEN],
         control_buf: [0],
-    }
+    };
+    poll_fn(move |cx| relay.poll(cx))
 }
 
-pub(crate) struct Socks5UdpRelay<M>
+struct Socks5UdpRelay<M>
 where
     M: SnellMode,
 {
@@ -233,39 +234,34 @@ where
     control_buf: [u8; 1],
 }
 
-impl<M> Inbound for Socks5UdpRelay<M> where M: SnellMode {}
-
-impl<M> Future for Socks5UdpRelay<M>
+impl<M> Socks5UdpRelay<M>
 where
     M: SnellMode + Send + Sync + 'static + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
-    type Output = io::Result<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             let mut progressed = false;
 
-            match this.poll_control(cx) {
+            match self.poll_control(cx) {
                 Poll::Ready(Ok(true)) => progressed = true,
                 Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => {}
             }
 
-            match this.poll_client_udp(cx) {
+            match self.poll_client_udp(cx) {
                 Poll::Ready(Ok(true)) => progressed = true,
                 Poll::Ready(Ok(false)) | Poll::Pending => {}
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             }
 
-            let keys: Vec<_> = this.nat.peek_iter().map(|(key, _)| *key).collect();
+            let keys: Vec<_> = self.nat.peek_iter().map(|(key, _)| *key).collect();
             for key in keys {
-                let result = if let Some(cell) = this.nat.peek(&key) {
-                    cell.borrow_mut().poll(cx, &this.socket)
+                let result = if let Some(cell) = self.nat.peek(&key) {
+                    cell.borrow_mut().poll(cx, &self.socket)
                 } else {
                     continue;
                 };
@@ -273,15 +269,15 @@ where
                 match result {
                     Poll::Ready(Ok(true)) => progressed = true,
                     Poll::Ready(Ok(false)) => {
-                        this.nat.remove(&key);
+                        self.nat.remove(&key);
                         progressed = true;
                     }
                     Poll::Ready(Err(error)) if is_clean_udp_close(&error) => {
-                        this.nat.remove(&key);
+                        self.nat.remove(&key);
                         progressed = true;
                     }
                     Poll::Ready(Err(error)) => {
-                        this.nat.remove(&key);
+                        self.nat.remove(&key);
                         tracing::debug!(peer = %key, %error, "SOCKS5 UDP association ended");
                         progressed = true;
                     }
@@ -301,7 +297,7 @@ where
     M: SnellMode + Send + Sync + 'static + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
     fn poll_control(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
         let mut buf = ReadBuf::new(&mut self.control_buf);
@@ -321,7 +317,6 @@ where
         }
 
         let destination = packet.destination.into_owned();
-        let payload = packet.payload.to_vec();
         if self.nat.get(&peer).is_none() {
             self.nat.insert(
                 peer,
@@ -331,7 +326,7 @@ where
         if let Some(association) = self.nat.get(&peer) {
             association
                 .borrow_mut()
-                .queue_to_snell(&destination, &payload)?;
+                .queue_to_snell(&destination, &packet.payload)?;
         }
         Poll::Ready(Ok(true))
     }
@@ -365,7 +360,7 @@ where
     M: SnellMode + Send + Sync + 'static + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
     fn new(peer: SocketAddr, connector: Arc<SnellConnector<M>>) -> Self {
         let future = Box::pin(async move { connector.connect_udp().await });

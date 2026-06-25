@@ -14,10 +14,11 @@ use crate::{
     },
     relay::tcp::{
         client::SnellTransport,
-        driver::{TcpTunnelReader, TcpTunnelWriter},
-        transport::{Inbound, InboundRequest, Outbound as _, Transport},
+        driver::{SnellStreamReader, SnellStreamWriter},
+        transport::{Inbound, InboundRequest, Outbound as _, copy_bidirectional},
     },
     relay::udp::{Outbound as UdpOutbound, relay_snell_udp},
+    timeout::{REUSE_IDLE_TIMEOUT, with_deadline},
 };
 
 pub mod outbound;
@@ -84,12 +85,12 @@ where
     M: SnellMode + Send + Sync + 'static + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
     let (read_half, write_half) = stream.into_split();
     let transport: SnellTransport<M> = SnellTransport::new(
-        TcpTunnelReader::new::<M>(read_half, psk.clone()),
-        TcpTunnelWriter::new::<M>(write_half, psk)?,
+        SnellStreamReader::new::<M>(read_half, psk.clone()),
+        SnellStreamWriter::new::<M>(write_half, psk)?,
     );
     let mut inbound = SnellInbound::new(transport);
 
@@ -118,7 +119,16 @@ where
                 ));
             }
             None => {
-                let request = Inbound::receive(&mut inbound).await?;
+                // 官方 v6：reuse 等下一条 S0 的 idle timer（1h，日志
+                // "Connection idle before handshake"）。上一条 sub-stream 的双向
+                // EOF（copy_bidirectional 要求收发两侧均关闭）结束后回到此处，若客户端在 1h
+                // 内不发下一条 `01 05 ...`，服务端主动关闭，避免连接永久挂起。
+                let request = with_deadline(
+                    REUSE_IDLE_TIMEOUT,
+                    Inbound::receive(&mut inbound),
+                    "snell reuse idle",
+                )
+                .await?;
                 snell::ConnectRequest {
                     destination: request.destination,
                     reuse: request.reuse,
@@ -136,7 +146,7 @@ where
         };
         inbound.accept().await?;
 
-        inbound = SnellInbound::new(inbound.into_transport().relay(target).await?);
+        inbound = SnellInbound::new(copy_bidirectional(inbound.into_transport(), target).await?);
         if !request.reuse {
             break;
         }
@@ -151,7 +161,7 @@ enum SnellInboundRequest {
 }
 
 async fn read_snell_request<R, D>(
-    reader: &mut TcpTunnelReader<R, D>,
+    reader: &mut SnellStreamReader<R, D>,
 ) -> io::Result<SnellInboundRequest>
 where
     R: AsyncRead + Unpin,
@@ -198,7 +208,7 @@ where
 }
 
 async fn write_server_error<W, E>(
-    writer: &mut TcpTunnelWriter<W, E>,
+    writer: &mut SnellStreamWriter<W, E>,
     code: u8,
     message: &str,
 ) -> io::Result<()>
@@ -466,7 +476,7 @@ mod tests {
         let local_addr = local_listener.local_addr().unwrap();
         let relay = tokio::spawn(async move {
             let (local, _) = local_listener.accept().await.unwrap();
-            Transport::relay(transport, local).await.unwrap();
+            copy_bidirectional(transport, local).await.unwrap();
         });
 
         let mut local = TcpStream::connect(local_addr).await.unwrap();
@@ -577,6 +587,52 @@ mod tests {
         server.await.unwrap();
         proxy.await.unwrap();
         target.await.unwrap();
+    }
+
+    /// reuse 完成一条 sub-stream 后，客户端若不再发下一条 S0，服务端必须在
+    /// `REUSE_IDLE_TIMEOUT`（1h）后主动关闭。用 `start_paused` 虚拟时钟，避免
+    /// 真实等待 1h。注意：客户端 connector 必须保持 pool 里的连接活着（不要
+    /// drop），否则服务端 read 会先 EOF 而不是 idle 超时。
+    #[tokio::test(start_paused = true)]
+    async fn reuse_idle_times_out_when_no_next_s0_arrives() {
+        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            // 等客户端关 → sub-stream 双向 EOF（copy_bidirectional 要求两侧都关）。
+            let mut tail = [0u8; 1];
+            assert_eq!(stream.read(&mut tail).await.unwrap(), 0);
+        });
+
+        let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_listener.local_addr().unwrap();
+        let server_psk = psk.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = server_listener.accept().await.unwrap();
+            serve_snell_inbound_auto(stream, server_psk, Outbound::Direct).await
+        });
+
+        // reuse connector：跑一条 sub-stream（CONNECT → ping/pong → 双向 EOF）。
+        // relay 结束后 transport 被归还到客户端 pool，socket 保持打开。
+        let connector = Arc::new(SnellConnector::<V4Mode>::new(server_addr, psk, true));
+        run_client_round_trip_with_connector(&connector, &Address::from(target_addr)).await;
+        target.await.unwrap();
+
+        // 服务端此刻挂在 reuse loop 的 `with_deadline(REUSE_IDLE_TIMEOUT, receive)`。
+        // paused 运行时无就绪 IO，自动快进到 1h idle timer，返回 TimedOut。
+        let result = server.await.unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "reuse idle should time out, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -726,7 +782,7 @@ mod tests {
         M: SnellMode + Send + Sync + 'static + Unpin,
         M::Encoder: Send + Unpin,
         M::Decoder: Send + Unpin,
-        <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+        <M::Encoder as SnellTcpEncoder>::Reservation: Send,
     {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
 
@@ -761,7 +817,7 @@ mod tests {
         M: SnellMode + Send + Sync + 'static + Unpin,
         M::Encoder: Send + Unpin,
         M::Decoder: Send + Unpin,
-        <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+        <M::Encoder as SnellTcpEncoder>::Reservation: Send,
     {
         let connector = Arc::new(SnellConnector::<M>::new(server_addr, psk, false));
         run_client_round_trip_with_connector(&connector, &destination).await;
@@ -774,7 +830,7 @@ mod tests {
         M: SnellMode + Send + Sync + 'static + Unpin,
         M::Encoder: Send + Unpin,
         M::Decoder: Send + Unpin,
-        <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+        <M::Encoder as SnellTcpEncoder>::Reservation: Send,
     {
         let transport = connector.connect(destination).await.unwrap();
 
@@ -782,7 +838,7 @@ mod tests {
         let local_addr = local_listener.local_addr().unwrap();
         let relay = tokio::spawn(async move {
             let (local, _) = local_listener.accept().await.unwrap();
-            Transport::relay(transport, local).await.unwrap();
+            copy_bidirectional(transport, local).await.unwrap();
         });
 
         let mut local = TcpStream::connect(local_addr).await.unwrap();
@@ -803,7 +859,7 @@ mod tests {
         M: SnellMode + Send + Sync + 'static + Unpin,
         M::Encoder: Send + Unpin,
         M::Decoder: Send + Unpin,
-        <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+        <M::Encoder as SnellTcpEncoder>::Reservation: Send,
     {
         let connector = Arc::new(SnellConnector::<M>::new(server_addr, psk, false));
         let mut transport = connector.connect_udp().await.unwrap();

@@ -16,7 +16,7 @@ use crate::{
     relay::tcp::{
         client::SnellConnector,
         handshake::accept_socks5_request,
-        transport::{Outbound as OutboundTrait, Transport as TransportTrait},
+        transport::{Outbound as OutboundTrait, copy_bidirectional},
     },
     relay::udp::relay_socks5_udp,
     timeout::{TCP_TIMEOUT, timed_out},
@@ -91,7 +91,7 @@ where
     M: SnellMode + Send + Sync + 'static + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
     let snell_client = Arc::new(SnellConnector::<M>::new(server, psk, resume));
     loop {
@@ -117,7 +117,7 @@ where
     M: SnellMode + Send + Sync + 'static + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
     let mut stream = stream;
     let (command, destination) = time::timeout(TCP_TIMEOUT, accept_socks5_request(&mut stream))
@@ -137,7 +137,7 @@ where
             };
 
             write_socks5_reply(&mut stream, socks5::Reply::Succeeded).await?;
-            TransportTrait::relay(transport, stream).await?;
+            copy_bidirectional(transport, stream).await?;
         }
         Command::UdpAssociate => {
             let udp = UdpSocket::bind(SocketAddr::new(stream.local_addr()?.ip(), 0)).await?;

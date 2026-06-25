@@ -1,5 +1,5 @@
 use std::{
-    future::Future,
+    future::{Future, poll_fn},
     io,
     pin::Pin,
     task::{Context, Poll},
@@ -14,7 +14,7 @@ use crate::protocol::{address::Address, snell::SnellMode};
 
 use super::{
     client::SnellTransport,
-    driver::{TcpTunnelReader, TcpTunnelWriter, WriteFromState},
+    driver::{SnellStreamReader, SnellStreamWriter, WriteFromState},
 };
 
 pub(crate) struct InboundRequest {
@@ -37,11 +37,22 @@ pub(crate) trait Outbound {
     async fn connect(&self, destination: &Address) -> io::Result<Self::Transport>;
 }
 
-pub(crate) trait Transport {
+pub(crate) trait CopyBidirectional {
     type Peer;
     type Output;
 
-    fn relay(self, peer: Self::Peer) -> impl Future<Output = io::Result<Self::Output>>;
+    fn copy_bidirectional(self, peer: Self::Peer)
+    -> impl Future<Output = io::Result<Self::Output>>;
+}
+
+pub(crate) fn copy_bidirectional<T>(
+    transport: T,
+    peer: T::Peer,
+) -> impl Future<Output = io::Result<T::Output>>
+where
+    T: CopyBidirectional,
+{
+    transport.copy_bidirectional(peer)
 }
 
 #[derive(Debug)]
@@ -65,89 +76,62 @@ enum TunnelState {
     Done,
 }
 
-impl<M> Transport for SnellTransport<M>
+impl<M> CopyBidirectional for SnellTransport<M>
 where
     M: SnellMode + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as crate::protocol::snell::SnellTcpEncoder>::Reservation: Send + Unpin,
+    <M::Encoder as crate::protocol::snell::SnellTcpEncoder>::Reservation: Send,
 {
     type Peer = TcpStream;
     type Output = Self;
 
-    fn relay(self, peer: TcpStream) -> impl Future<Output = io::Result<Self>> {
-        let (peer_read, peer_write) = peer.into_split();
-        SnellRelay {
-            transport: Some(self),
-            peer_read,
-            peer_write,
-            plain_state: PlainState::default(),
-            tunnel_state: TunnelState::default(),
-        }
-    }
-}
+    fn copy_bidirectional(self, peer: TcpStream) -> impl Future<Output = io::Result<Self>> {
+        let (mut peer_read, mut peer_write) = peer.into_split();
+        let mut transport = Some(self);
+        let mut plain_state = PlainState::default();
+        let mut tunnel_state = TunnelState::default();
 
-struct SnellRelay<M>
-where
-    M: SnellMode,
-{
-    transport: Option<SnellTransport<M>>,
-    peer_read: tokio::net::tcp::OwnedReadHalf,
-    peer_write: tokio::net::tcp::OwnedWriteHalf,
-    plain_state: PlainState<<M::Encoder as crate::protocol::snell::SnellTcpEncoder>::Reservation>,
-    tunnel_state: TunnelState,
-}
+        poll_fn(move |cx| {
+            let transport_ref = transport
+                .as_mut()
+                .expect("snell transport polled after done");
+            let mut pending = false;
 
-impl<M> Future for SnellRelay<M>
-where
-    M: SnellMode + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as crate::protocol::snell::SnellTcpEncoder>::Reservation: Send + Unpin,
-{
-    type Output = io::Result<SnellTransport<M>>;
+            match poll_plain_to_snell(
+                cx,
+                &mut transport_ref.writer,
+                &mut peer_read,
+                &mut plain_state,
+            ) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => pending = true,
+            }
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let transport = this
-            .transport
-            .as_mut()
-            .expect("snell relay polled after done");
-        let mut pending = false;
+            match poll_snell_to_plain(
+                cx,
+                &mut transport_ref.reader,
+                &mut peer_write,
+                &mut tunnel_state,
+            ) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => pending = true,
+            }
 
-        match poll_plain_to_snell(
-            cx,
-            &mut transport.writer,
-            &mut this.peer_read,
-            &mut this.plain_state,
-        ) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Pending => pending = true,
-        }
-
-        match poll_snell_to_plain(
-            cx,
-            &mut transport.reader,
-            &mut this.peer_write,
-            &mut this.tunnel_state,
-        ) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Pending => pending = true,
-        }
-
-        if pending {
-            Poll::Pending
-        } else {
-            Poll::Ready(Ok(this.transport.take().expect("transport present")))
-        }
+            if pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(transport.take().expect("transport present")))
+            }
+        })
     }
 }
 
 fn poll_plain_to_snell<W, E, R>(
     cx: &mut Context<'_>,
-    writer: &mut TcpTunnelWriter<W, E>,
+    writer: &mut SnellStreamWriter<W, E>,
     plain_read: &mut R,
     state: &mut PlainState<E::Reservation>,
 ) -> Poll<io::Result<()>>
@@ -176,7 +160,7 @@ where
 
 fn poll_snell_to_plain<R, D, W>(
     cx: &mut Context<'_>,
-    reader: &mut TcpTunnelReader<R, D>,
+    reader: &mut SnellStreamReader<R, D>,
     plain_write: &mut W,
     state: &mut TunnelState,
 ) -> Poll<io::Result<()>>

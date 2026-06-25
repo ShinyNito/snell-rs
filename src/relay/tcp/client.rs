@@ -1,4 +1,4 @@
-use std::{io, marker::PhantomData, net::SocketAddr, sync::Arc};
+use std::{future::Future, io, marker::PhantomData, net::SocketAddr, sync::Arc};
 
 use tokio::{
     io::AsyncRead,
@@ -18,9 +18,9 @@ use crate::{
 };
 
 use super::{
-    driver::{TcpTunnelReader, TcpTunnelWriter},
+    driver::{SnellStreamReader, SnellStreamWriter},
     pool::ConnectionPool,
-    transport::{Outbound, Transport},
+    transport::{CopyBidirectional, Outbound, copy_bidirectional},
 };
 
 pub struct SnellConnector<M>
@@ -37,8 +37,8 @@ pub struct SnellTransport<M>
 where
     M: SnellMode,
 {
-    pub(crate) reader: TcpTunnelReader<OwnedReadHalf, M::Decoder>,
-    pub(crate) writer: TcpTunnelWriter<OwnedWriteHalf, M::Encoder>,
+    pub(crate) reader: SnellStreamReader<OwnedReadHalf, M::Decoder>,
+    pub(crate) writer: SnellStreamWriter<OwnedWriteHalf, M::Encoder>,
 }
 
 pub struct PooledSnellTransport<M>
@@ -126,8 +126,8 @@ where
         stream.set_nodelay(true)?;
         let (read_half, write_half) = stream.into_split();
         Ok(SnellTransport {
-            reader: TcpTunnelReader::new::<M>(read_half, self.psk.clone()),
-            writer: TcpTunnelWriter::new::<M>(write_half, self.psk.clone())?,
+            reader: SnellStreamReader::new::<M>(read_half, self.psk.clone()),
+            writer: SnellStreamWriter::new::<M>(write_half, self.psk.clone())?,
         })
     }
 
@@ -190,29 +190,31 @@ where
     M: SnellMode,
 {
     pub(crate) fn new(
-        reader: TcpTunnelReader<OwnedReadHalf, M::Decoder>,
-        writer: TcpTunnelWriter<OwnedWriteHalf, M::Encoder>,
+        reader: SnellStreamReader<OwnedReadHalf, M::Decoder>,
+        writer: SnellStreamWriter<OwnedWriteHalf, M::Encoder>,
     ) -> Self {
         Self { reader, writer }
     }
 }
 
-impl<M> Transport for PooledSnellTransport<M>
+impl<M> CopyBidirectional for PooledSnellTransport<M>
 where
     M: SnellMode + Send + Sync + 'static + Unpin,
     M::Encoder: Send + Unpin,
     M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
     type Peer = TcpStream;
     type Output = ();
 
-    async fn relay(self, local: TcpStream) -> io::Result<()> {
-        let transport = Transport::relay(self.transport, local).await?;
-        if self.pool.reuse_enabled() {
-            self.pool.put(transport);
+    fn copy_bidirectional(self, local: TcpStream) -> impl Future<Output = io::Result<()>> {
+        async move {
+            let transport = copy_bidirectional(self.transport, local).await?;
+            if self.pool.reuse_enabled() {
+                self.pool.put(transport);
+            }
+            Ok(())
         }
-        Ok(())
     }
 }
 
@@ -228,7 +230,7 @@ fn is_retriable_pool_error(error: &io::Error) -> bool {
     )
 }
 
-async fn read_server_reply<R, D>(reader: &mut TcpTunnelReader<R, D>) -> io::Result<()>
+async fn read_server_reply<R, D>(reader: &mut SnellStreamReader<R, D>) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     D: SnellTcpDecoder,
@@ -350,7 +352,7 @@ mod tests {
     ) {
         let transport = Outbound::connect(client, destination).await.unwrap();
         let (local, mut peer) = tcp_pair().await;
-        let relay = tokio::spawn(Transport::relay(transport, local));
+        let relay = tokio::spawn(copy_bidirectional(transport, local));
         peer.shutdown().await.unwrap();
 
         let mut buf = [0u8; 1];
@@ -364,8 +366,8 @@ mod tests {
     {
         let (read_half, write_half) = stream.into_split();
         SnellTransport::new(
-            TcpTunnelReader::new::<M>(read_half, psk.clone()),
-            TcpTunnelWriter::new::<M>(write_half, psk).unwrap(),
+            SnellStreamReader::new::<M>(read_half, psk.clone()),
+            SnellStreamWriter::new::<M>(write_half, psk).unwrap(),
         )
     }
 
@@ -405,11 +407,11 @@ mod tests {
         M: SnellMode + Send + Sync + 'static + Unpin,
         M::Encoder: Send + Unpin,
         M::Decoder: Send + Unpin,
-        <M::Encoder as SnellTcpEncoder>::Reservation: Send + Unpin,
+        <M::Encoder as SnellTcpEncoder>::Reservation: Send,
     {
         let (target, mut peer) = tcp_pair().await;
         peer.shutdown().await.unwrap();
-        Transport::relay(transport, target).await.unwrap()
+        copy_bidirectional(transport, target).await.unwrap()
     }
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {

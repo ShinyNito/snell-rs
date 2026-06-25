@@ -5,6 +5,13 @@ use tokio::time;
 pub(crate) const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const TCP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// reuse 完成一条 sub-stream 后，等下一条 S0 (`01 05 ...`) 的空闲上限。
+///
+/// 官方 v6 服务端在回到 stage S0 复用等待状态时启动一个 1 hour 的 idle
+/// timer，触发时日志为 `Connection idle before handshake`。与首条 S0 的短
+/// 超时（`Connection timeout before handshake`，10s）不同，二者独立。
+pub(crate) const REUSE_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+
 pub(crate) async fn with_tcp_connect_timeout<F, T>(
     future: F,
     operation: &'static str,
@@ -26,7 +33,7 @@ pub(crate) fn timed_out(operation: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, format!("{operation} timed out"))
 }
 
-async fn with_deadline<F, T>(
+pub(crate) async fn with_deadline<F, T>(
     duration: Duration,
     future: F,
     operation: &'static str,
@@ -49,6 +56,12 @@ mod tests {
     fn uses_sing_box_tcp_defaults() {
         assert_eq!(TCP_CONNECT_TIMEOUT, Duration::from_secs(5));
         assert_eq!(TCP_TIMEOUT, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn reuse_idle_matches_official_one_hour() {
+        // 官方 v6：reuse idle 超时为 1 hour。
+        assert_eq!(REUSE_IDLE_TIMEOUT, Duration::from_secs(3600));
     }
 
     #[tokio::test]

@@ -65,7 +65,7 @@ pub(crate) struct UdpOutboundSendState {
     socks5: Socks5UdpSendState,
 }
 
-impl crate::relay::udp::Transport for UdpOutbound {
+impl crate::relay::udp::DatagramTransport for UdpOutbound {
     type SendState = UdpOutboundSendState;
 
     fn poll_send_to(

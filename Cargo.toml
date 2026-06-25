@@ -45,3 +45,6 @@ rustix = { version = "1", features = ["net"] }
 
 [dev-dependencies]
 hex = "0.4"
+# `test-util` 启用 `tokio::time::pause`/`start_paused`，用于虚拟时钟测试
+# （如 reuse idle 1h 超时），仅测试编译期引入，不影响 release 行为。
+tokio = { version = "1", features = ["test-util", "macros", "rt", "time"] }

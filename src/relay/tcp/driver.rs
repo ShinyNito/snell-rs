@@ -13,13 +13,13 @@ use crate::protocol::snell::{
 };
 
 #[derive(Debug)]
-pub struct TcpTunnelReader<R, D> {
+pub struct SnellStreamReader<R, D> {
     inner: R,
     decoder: D,
 }
 
 #[derive(Debug)]
-pub struct TcpTunnelWriter<W, E> {
+pub struct SnellStreamWriter<W, E> {
     inner: W,
     encoder: E,
 }
@@ -44,7 +44,7 @@ impl<R> Default for WriteFromState<R> {
     }
 }
 
-impl<R, D> TcpTunnelReader<R, D>
+impl<R, D> SnellStreamReader<R, D>
 where
     R: AsyncRead + Unpin,
     D: SnellTcpDecoder,
@@ -217,7 +217,7 @@ where
     }
 }
 
-impl<W, E> TcpTunnelWriter<W, E>
+impl<W, E> SnellStreamWriter<W, E>
 where
     W: AsyncWrite + Unpin,
     E: SnellTcpEncoder,
@@ -411,10 +411,10 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let (server_read, _) = tokio::io::split(server);
         let (_, client_write) = tokio::io::split(client);
-        let mut writer: TcpTunnelWriter<_, V4Encoder> =
-            TcpTunnelWriter::new::<V4Mode>(client_write, psk.clone()).unwrap();
-        let mut reader: TcpTunnelReader<_, V4Decoder> =
-            TcpTunnelReader::new::<V4Mode>(server_read, psk);
+        let mut writer: SnellStreamWriter<_, V4Encoder> =
+            SnellStreamWriter::new::<V4Mode>(client_write, psk.clone()).unwrap();
+        let mut reader: SnellStreamReader<_, V4Decoder> =
+            SnellStreamReader::new::<V4Mode>(server_read, psk);
 
         writer.write_frame(b"hello").await.unwrap();
         writer.write_frame(&[]).await.unwrap();
