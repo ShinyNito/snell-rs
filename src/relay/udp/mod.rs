@@ -69,9 +69,7 @@ where
     let mut relay = SnellUdpRelay {
         snell: transport,
         outbound,
-        snell_in: Vec::with_capacity(MAX_UDP_DATAGRAM_LEN),
         outbound_in: vec![0; MAX_UDP_DATAGRAM_LEN],
-        pending_to_outbound: None,
         pending_to_snell: None,
         outbound_send_state: O::SendState::default(),
         snell_write_state: WriteFrameState::default(),
@@ -86,17 +84,10 @@ where
 {
     snell: SnellTransport<M>,
     outbound: O,
-    snell_in: Vec<u8>,
     outbound_in: Vec<u8>,
-    pending_to_outbound: Option<UdpDatagram>,
     pending_to_snell: Option<Vec<u8>>,
     outbound_send_state: O::SendState,
     snell_write_state: WriteFrameState,
-}
-
-struct UdpDatagram {
-    destination: Address,
-    payload: Vec<u8>,
 }
 
 impl<M, O> SnellUdpRelay<M, O>
@@ -149,32 +140,23 @@ where
     O::SendState: Unpin,
 {
     fn poll_snell_to_outbound(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        loop {
-            if let Some(packet) = &self.pending_to_outbound {
-                ready!(self.outbound.poll_send_to(
-                    cx,
-                    &packet.destination,
-                    &packet.payload,
-                    &mut self.outbound_send_state,
-                ))?;
-                self.pending_to_outbound = None;
-                return Poll::Ready(Ok(true));
-            }
-
-            if !ready!(
-                self.snell
-                    .reader
-                    .poll_read_frame_vec(cx, &mut self.snell_in)
-            )? {
-                return Poll::Ready(Ok(false));
-            }
-
-            let packet = snell::decode_udp_request_packet(&self.snell_in)?;
-            self.pending_to_outbound = Some(UdpDatagram {
-                destination: packet.address.into_owned(),
-                payload: packet.payload.to_vec(),
-            });
-        }
+        let outbound = &mut self.outbound;
+        let send_state = &mut self.outbound_send_state;
+        self.snell
+            .reader
+            .poll_drain_frame_plaintext_with(cx, |cx, plaintext| {
+                let packet = snell::decode_udp_request_packet(plaintext)?;
+                let destination = packet.address.into_owned();
+                let sent =
+                    ready!(outbound.poll_send_to(cx, &destination, packet.payload, send_state))?;
+                if sent != packet.payload.len() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "udp outbound sent a partial datagram",
+                    )));
+                }
+                Poll::Ready(Ok(()))
+            })
     }
 
     fn poll_outbound_to_snell(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
@@ -478,6 +460,117 @@ fn poll_udp_send_to(
                 }
                 return Poll::Ready(Ok(()));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::{
+        protocol::snell::V4Mode,
+        relay::tcp::{
+            client::SnellTransport,
+            driver::{SnellStreamReader, SnellStreamWriter},
+        },
+    };
+
+    #[tokio::test]
+    async fn snell_udp_keeps_plaintext_pending_when_outbound_send_pends() {
+        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server, _) = listener.accept().await.unwrap();
+        let client = client.await.unwrap();
+
+        let (server_read, server_write) = server.into_split();
+        let server_transport: SnellTransport<V4Mode> = SnellTransport::new(
+            SnellStreamReader::new::<V4Mode>(server_read, psk.clone()),
+            SnellStreamWriter::new::<V4Mode>(server_write, psk.clone()).unwrap(),
+        );
+        let (_, client_write) = client.into_split();
+        let mut client_writer = SnellStreamWriter::new::<V4Mode>(client_write, psk).unwrap();
+
+        let state = Arc::new(Mutex::new(PendingOnceState::default()));
+        let outbound = PendingOnceOutbound {
+            state: state.clone(),
+        };
+        let relay = tokio::spawn(relay_snell_udp(server_transport, outbound));
+
+        let destination = Address::from(SocketAddr::from(([127, 0, 0, 1], 53)));
+        let destination_view = destination.as_view();
+        let header_len = snell::udp_request_addr_len(destination_view).unwrap();
+        let mut packet = vec![0u8; header_len + 4];
+        snell::encode_udp_request_addr(&mut packet, destination_view).unwrap();
+        packet[header_len..].copy_from_slice(b"ping");
+        client_writer.write_frame(&packet).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.lock().unwrap().payload.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.attempts, 2);
+        assert_eq!(state.destination, Some(destination));
+        assert_eq!(state.payload.as_deref(), Some(&b"ping"[..]));
+
+        relay.abort();
+        let _ = relay.await;
+    }
+
+    #[derive(Default)]
+    struct PendingOnceState {
+        attempts: usize,
+        destination: Option<Address>,
+        payload: Option<Vec<u8>>,
+    }
+
+    struct PendingOnceOutbound {
+        state: Arc<Mutex<PendingOnceState>>,
+    }
+
+    impl DatagramTransport for PendingOnceOutbound {
+        type SendState = ();
+
+        fn poll_send_to(
+            &mut self,
+            cx: &mut Context<'_>,
+            destination: &Address,
+            payload: &[u8],
+            _state: &mut Self::SendState,
+        ) -> Poll<io::Result<usize>> {
+            let mut state = self.state.lock().unwrap();
+            state.attempts += 1;
+            if state.attempts == 1 {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            state.destination = Some(destination.clone());
+            state.payload = Some(payload.to_vec());
+            Poll::Ready(Ok(payload.len()))
+        }
+
+        fn poll_recv_from(
+            &mut self,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<io::Result<(usize, Address)>> {
+            Poll::Pending
         }
     }
 }

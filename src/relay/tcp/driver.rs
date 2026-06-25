@@ -85,6 +85,47 @@ where
         Poll::Ready(Ok(true))
     }
 
+    pub(crate) fn poll_drain_frame_plaintext_with<F>(
+        &mut self,
+        cx: &mut Context<'_>,
+        f: F,
+    ) -> Poll<io::Result<bool>>
+    where
+        F: FnOnce(&mut Context<'_>, &[u8]) -> Poll<io::Result<()>>,
+    {
+        if !self.decoder.has_pending_plaintext() && !ready!(self.poll_read_frame(cx))? {
+            return Poll::Ready(Ok(false));
+        }
+
+        let (plain_len, result) = {
+            let mut bufs = [IoSlice::new(&[]); 4];
+            let nbufs = self.decoder.pending_plaintext(&mut bufs);
+            if nbufs == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snell decoder produced no plaintext",
+                )));
+            }
+            if nbufs != 1 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "snell decoder produced fragmented plaintext",
+                )));
+            }
+            let plain = &bufs[0];
+            (plain.len(), f(cx, plain))
+        };
+
+        match result {
+            Poll::Ready(Ok(())) => {
+                self.decoder.advance_plaintext(plain_len);
+                Poll::Ready(Ok(true))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
     pub(crate) fn poll_write_pending_plaintext_to<W>(
         &mut self,
         cx: &mut Context<'_>,
