@@ -7,6 +7,7 @@ use tokio::{
 };
 
 use crate::{
+    config::TcpBrutalConfig,
     keepalive::apply_tcp_keepalive,
     protocol::snell::{
         self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, DecodeSlot, MAX_CONNECT_REQUEST_LEN,
@@ -18,6 +19,7 @@ use crate::{
         transport::{Inbound, InboundRequest, Outbound as _, copy_bidirectional},
     },
     relay::udp::{Outbound as UdpOutbound, relay_snell_udp},
+    tcp_brutal::{apply_tcp_brutal, validate_tcp_brutal_available},
     timeout::{REUSE_IDLE_TIMEOUT, with_deadline},
 };
 
@@ -32,9 +34,12 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     pub psk: Vec<u8>,
     pub outbound: Outbound,
+    pub tcp_brutal: Option<TcpBrutalConfig>,
 }
 
 pub async fn bind_tcp_listener(config: ServerConfig) -> io::Result<()> {
+    validate_tcp_brutal_available(config.tcp_brutal).await?;
+
     let socket = if config.listen.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
@@ -46,11 +51,15 @@ pub async fn bind_tcp_listener(config: ServerConfig) -> io::Result<()> {
     let listener = socket.listen(4096)?;
     let psk: Arc<[u8]> = Arc::from(config.psk.into_boxed_slice());
     let outbound = config.outbound;
+    let tcp_brutal = config.tcp_brutal;
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         if let Err(error) = apply_tcp_keepalive(&stream) {
             tracing::warn!(%peer_addr, %error, "snell inbound tcp keepalive could not be enabled");
+        }
+        if let Err(error) = apply_tcp_brutal(&stream, tcp_brutal) {
+            tracing::warn!(%peer_addr, %error, "snell inbound tcp_brutal could not be enabled");
         }
         let psk = psk.clone();
         let outbound = outbound.clone();

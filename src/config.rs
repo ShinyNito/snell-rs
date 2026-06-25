@@ -11,7 +11,18 @@ use crate::protocol::snell::{
 const SNELL_CLIENT_SECTION: &str = "snell-client";
 const SNELL_SERVER_SECTION: &str = "snell-server";
 const CLIENT_KNOWN_KEYS: &[&str] = &["listen", "server", "psk", "version", "reuse"];
-const SERVER_KNOWN_KEYS: &[&str] = &["listen", "psk", "version", "mode", "upstream_socks5"];
+const SERVER_KNOWN_KEYS: &[&str] = &[
+    "listen",
+    "psk",
+    "version",
+    "mode",
+    "upstream_socks5",
+    "tcp_brutal",
+    "tcp_brutal_send_mbps",
+    "tcp_brutal_cwnd_gain",
+];
+const TCP_BRUTAL_CWND_GAIN: u32 = 20;
+const TCP_BRUTAL_SEND_MBIT_TO_BYTES: u64 = 125_000;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -68,6 +79,7 @@ impl ClientConfig {
             .section(Some(SNELL_CLIENT_SECTION))
             .ok_or(ConfigError::MissingSection(SNELL_CLIENT_SECTION))?;
         report_unknown_keys(SNELL_CLIENT_SECTION, section, CLIENT_KNOWN_KEYS);
+        reject_client_tcp_brutal(section)?;
 
         Ok(Self {
             listen: required_socket_addr(SNELL_CLIENT_SECTION, section, "listen")?,
@@ -85,6 +97,13 @@ pub struct ServerConfig {
     pub psk: Vec<u8>,
     pub protocol: Option<ProtocolVersion>,
     pub upstream_socks5: Option<SocketAddr>,
+    pub tcp_brutal: Option<TcpBrutalConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TcpBrutalConfig {
+    pub rate_bytes_per_sec: u64,
+    pub cwnd_gain: u32,
 }
 
 impl ServerConfig {
@@ -108,6 +127,7 @@ impl ServerConfig {
                 section,
                 "upstream_socks5",
             )?,
+            tcp_brutal: optional_tcp_brutal(SNELL_SERVER_SECTION, section)?,
         })
     }
 }
@@ -316,6 +336,101 @@ fn optional_bool(
     }
 }
 
+fn optional_u32(
+    section_name: &'static str,
+    section: &ini::Properties,
+    key: &'static str,
+) -> Result<Option<u32>, ConfigError> {
+    let Some(value) = get_trimmed(section, key) else {
+        return Ok(None);
+    };
+    value
+        .parse()
+        .map(Some)
+        .map_err(|error: std::num::ParseIntError| ConfigError::Invalid {
+            section: section_name,
+            key,
+            msg: error.to_string(),
+        })
+}
+
+fn optional_u64(
+    section_name: &'static str,
+    section: &ini::Properties,
+    key: &'static str,
+) -> Result<Option<u64>, ConfigError> {
+    let Some(value) = get_trimmed(section, key) else {
+        return Ok(None);
+    };
+    value
+        .parse()
+        .map(Some)
+        .map_err(|error: std::num::ParseIntError| ConfigError::Invalid {
+            section: section_name,
+            key,
+            msg: error.to_string(),
+        })
+}
+
+fn optional_tcp_brutal(
+    section_name: &'static str,
+    section: &ini::Properties,
+) -> Result<Option<TcpBrutalConfig>, ConfigError> {
+    if !optional_bool(section_name, section, "tcp_brutal")?.unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let send_mbps = optional_u64(section_name, section, "tcp_brutal_send_mbps")?.ok_or(
+        ConfigError::MissingKey {
+            section: section_name,
+            key: "tcp_brutal_send_mbps",
+        },
+    )?;
+    if send_mbps == 0 {
+        return Err(ConfigError::Invalid {
+            section: section_name,
+            key: "tcp_brutal_send_mbps",
+            msg: "must be greater than 0".to_owned(),
+        });
+    }
+    let rate_bytes_per_sec =
+        send_mbps
+            .checked_mul(TCP_BRUTAL_SEND_MBIT_TO_BYTES)
+            .ok_or(ConfigError::Invalid {
+                section: section_name,
+                key: "tcp_brutal_send_mbps",
+                msg: "is too large".to_owned(),
+            })?;
+
+    let cwnd_gain = optional_u32(section_name, section, "tcp_brutal_cwnd_gain")?
+        .unwrap_or(TCP_BRUTAL_CWND_GAIN);
+    if cwnd_gain == 0 {
+        return Err(ConfigError::Invalid {
+            section: section_name,
+            key: "tcp_brutal_cwnd_gain",
+            msg: "must be greater than 0".to_owned(),
+        });
+    }
+
+    Ok(Some(TcpBrutalConfig {
+        rate_bytes_per_sec,
+        cwnd_gain,
+    }))
+}
+
+fn reject_client_tcp_brutal(section: &ini::Properties) -> Result<(), ConfigError> {
+    for key in ["tcp_brutal", "tcp_brutal_send_mbps", "tcp_brutal_cwnd_gain"] {
+        if section.contains_key(key) {
+            return Err(ConfigError::Invalid {
+                section: SNELL_CLIENT_SECTION,
+                key,
+                msg: "is only supported in [snell-server]".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +514,96 @@ psk = testpsk-16-byte!
         )
         .unwrap();
         assert_eq!(cfg.protocol, None);
+    }
+
+    #[test]
+    fn server_tcp_brutal_config() {
+        let cfg = server_from(
+            r#"
+[snell-server]
+listen = 0.0.0.0:8388
+psk = testpsk-16-byte!
+tcp_brutal = true
+tcp_brutal_send_mbps = 100
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.tcp_brutal,
+            Some(TcpBrutalConfig {
+                rate_bytes_per_sec: 12_500_000,
+                cwnd_gain: TCP_BRUTAL_CWND_GAIN,
+            })
+        );
+
+        let cfg = server_from(
+            r#"
+[snell-server]
+listen = 0.0.0.0:8388
+psk = testpsk-16-byte!
+tcp_brutal = true
+tcp_brutal_send_mbps = 100
+tcp_brutal_cwnd_gain = 42
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.tcp_brutal,
+            Some(TcpBrutalConfig {
+                rate_bytes_per_sec: 12_500_000,
+                cwnd_gain: 42,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_tcp_brutal_config() {
+        assert!(matches!(
+            server_from(
+                "[snell-server]\nlisten=0.0.0.0:8388\npsk=testpsk-16-byte!\ntcp_brutal=true\n"
+            ),
+            Err(ConfigError::MissingKey {
+                key: "tcp_brutal_send_mbps",
+                ..
+            })
+        ));
+        assert!(matches!(
+            server_from(
+                "[snell-server]\nlisten=0.0.0.0:8388\npsk=testpsk-16-byte!\ntcp_brutal=true\ntcp_brutal_send_mbps=0\n"
+            ),
+            Err(ConfigError::Invalid {
+                key: "tcp_brutal_send_mbps",
+                ..
+            })
+        ));
+        assert!(matches!(
+            server_from(
+                "[snell-server]\nlisten=0.0.0.0:8388\npsk=testpsk-16-byte!\ntcp_brutal=true\ntcp_brutal_send_mbps=100\ntcp_brutal_cwnd_gain=0\n"
+            ),
+            Err(ConfigError::Invalid {
+                key: "tcp_brutal_cwnd_gain",
+                ..
+            })
+        ));
+        assert!(matches!(
+            server_from(
+                "[snell-server]\nlisten=0.0.0.0:8388\npsk=testpsk-16-byte!\ntcp_brutal=true\ntcp_brutal_send_mbps=100\ntcp_brutal_cwnd_gain=fast\n"
+            ),
+            Err(ConfigError::Invalid {
+                key: "tcp_brutal_cwnd_gain",
+                ..
+            })
+        ));
+        assert!(matches!(
+            client_from(
+                "[snell-client]\nlisten=127.0.0.1:1\nserver=1.1.1.1:1\npsk=testpsk-16-byte!\nversion=v4\ntcp_brutal=true\n"
+            ),
+            Err(ConfigError::Invalid {
+                section: "snell-client",
+                key: "tcp_brutal",
+                ..
+            })
+        ));
     }
 
     #[test]

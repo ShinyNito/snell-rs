@@ -4,40 +4,26 @@ version = "0.1.2"
 edition = "2024"
 publish = false
 
-[dependencies]
-# Cryptography
-# ring: AES-128-GCM (record-layer hot path, ring uses optimized ASM).
-#       ring's digest module only supports SHA-1/SHA-2 — BLAKE2 is deliberately
-#       not supported (briansmith/ring#169), so BLAKE2b lives in the `blake2` crate.
-ring = "0.17"
-argon2 = "0.5" # KDF: Argon2id (unpacked fn 0x39a90; libsodium crypto_pwhash)
-blake2 = "0.10" # BLAKE2b-256 profile secret (unpacked fn 0x39d90)
-rand = "0.8"
+[profile.release]
+lto = "fat"
+codegen-units = 1
+incremental = false
+panic = "abort"
+strip = true
 
-# Runtime
-# tokio: the runtime for the (forthcoming) transport/driver layer. The codec
-#        layer (protocol/socks5, protocol/snell) is pure-synchronous and does
-#        not depend on any runtime. Only `io-util`+`net`+`rt`+`time` are pulled
-#        in for now — add features (e.g. `macros`, `rt-multi-thread`) when the
-#        driver/inbound/service layers land.
+[dependencies]
+ring = "0.17"
+argon2 = "0.5"
+blake2 = "0.10"
+rand = "0.8"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 mimalloc = { version = "0.1", default-features = false }
-
-# CLI/config parsing
 clap = { version = "4", features = ["derive"] }
 rust-ini = "0.21"
-
-# Async helpers — `ready!` macro used by poll-based driver state machines.
 futures = "0.3"
-
-# Data structures
 bytes = "1.0"
 lru_time_cache = "0.11"
-
-# Error handling
 thiserror = "2.0"
-
-# Logging — used by protocol::crypto::kdf (tracing::trace on key derivation).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -46,6 +32,4 @@ rustix = { version = "1", features = ["net"] }
 
 [dev-dependencies]
 hex = "0.4"
-# `test-util` 启用 `tokio::time::pause`/`start_paused`，用于虚拟时钟测试
-# （如 reuse idle 1h 超时），仅测试编译期引入，不影响 release 行为。
 tokio = { version = "1", features = ["test-util", "macros", "rt", "time"] }

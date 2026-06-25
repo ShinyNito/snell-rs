@@ -110,6 +110,9 @@ async fn run() -> io::Result<()> {
             tracing::info!(
                 listen = %config.listen,
                 outbound = ?config.outbound,
+                tcp_brutal = config.tcp_brutal.is_some(),
+                tcp_brutal_rate = config.tcp_brutal.map(|config| config.rate_bytes_per_sec),
+                tcp_brutal_cwnd_gain = config.tcp_brutal.map(|config| config.cwnd_gain),
                 parsed_protocol = ?protocol,
                 "snell-rs server listening",
             );
@@ -151,6 +154,7 @@ fn server_config(args: ServerArgs) -> io::Result<(RuntimeServerConfig, Option<Pr
                 listen: cfg.listen,
                 psk: cfg.psk,
                 outbound,
+                tcp_brutal: cfg.tcp_brutal,
             },
             cfg.protocol,
         ));
@@ -164,6 +168,7 @@ fn server_config(args: ServerArgs) -> io::Result<(RuntimeServerConfig, Option<Pr
             outbound: args
                 .socks5_outbound
                 .map_or(Outbound::Direct, |server| Outbound::Socks5 { server }),
+            tcp_brutal: None,
         },
         protocol,
     ))
