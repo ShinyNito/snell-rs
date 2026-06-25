@@ -78,14 +78,14 @@ where
         {
             match self.open_request(transport, destination).await {
                 Ok(transport) => {
-                    tracing::debug!(%destination, "复用 Snell 上游连接");
+                    tracing::debug!(%destination, "reused snell upstream connection");
                     return Ok(PooledSnellTransport {
                         transport,
                         pool: self.clone(),
                     });
                 }
                 Err(error) if is_retriable_pool_error(&error) => {
-                    tracing::debug!(%error, "丢弃已断开的 Snell 复用连接");
+                    tracing::debug!(%error, "discarding stale snell reuse connection");
                 }
                 Err(error) => {
                     return Err(error);
@@ -93,7 +93,7 @@ where
             }
         }
 
-        tracing::debug!(server = %self.server, %destination, "建立新的 Snell 上游连接");
+        tracing::debug!(server = %self.server, %destination, "opening new snell upstream connection");
         let transport = self
             .open_request(self.dial_transport().await?, destination)
             .await?;
@@ -160,9 +160,9 @@ where
         };
 
         if pool.put(transport) {
-            tracing::debug!("Snell 上游连接已归还连接池");
+            tracing::debug!("snell upstream connection returned to pool");
         } else {
-            tracing::debug!("Snell 上游连接池已满，关闭连接");
+            tracing::debug!("snell pool full, closing connection");
         }
     }
 

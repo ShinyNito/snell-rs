@@ -107,7 +107,11 @@ async fn connect_direct(destination: &Address) -> io::Result<TcpStream> {
         },
         "direct tcp connect",
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        tracing::debug!(%destination, %error, "direct outbound dial failed");
+        error
+    })?;
     apply_tcp_keepalive(&stream)?;
     Ok(stream)
 }
@@ -122,9 +126,17 @@ async fn connect_direct_udp() -> io::Result<DirectUdpOutbound> {
 
 async fn connect_socks5(server: SocketAddr, destination: &Address) -> io::Result<TcpStream> {
     let stream =
-        with_tcp_connect_timeout(TcpStream::connect(server), "socks5 outbound tcp connect").await?;
+        with_tcp_connect_timeout(TcpStream::connect(server), "socks5 outbound tcp connect").await;
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::debug!(server = %server, %destination, %error, "socks5 outbound dial failed");
+            return Err(error);
+        }
+    };
     apply_tcp_keepalive(&stream)?;
     let destination = destination.clone();
+    let log_destination = destination.clone();
     with_tcp_timeout(
         async move {
             let mut stream = stream;
@@ -157,6 +169,10 @@ async fn connect_socks5(server: SocketAddr, destination: &Address) -> io::Result
         "socks5 outbound connect handshake",
     )
     .await
+    .map_err(|error| {
+        tracing::debug!(server = %server, destination = %log_destination, %error, "socks5 outbound handshake failed");
+        error
+    })
 }
 
 async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound> {

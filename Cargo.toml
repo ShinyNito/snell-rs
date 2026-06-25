@@ -21,6 +21,7 @@ rand = "0.8"
 #        in for now — add features (e.g. `macros`, `rt-multi-thread`) when the
 #        driver/inbound/service layers land.
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+mimalloc = { version = "0.1", default-features = false }
 
 # CLI/config parsing
 clap = { version = "4", features = ["derive"] }

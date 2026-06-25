@@ -15,6 +15,9 @@ use snell_rs::{
 };
 use tracing_subscriber::EnvFilter;
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(version, about = "Snell protocol SOCKS5 bridge")]
 struct Cli {

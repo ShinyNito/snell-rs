@@ -300,6 +300,7 @@ where
 
         let destination = packet.destination.into_owned();
         if self.nat.get(&peer).is_none() {
+            tracing::debug!(%peer, "SOCKS5 UDP association created");
             self.nat.insert(
                 peer,
                 RefCell::new(ClientUdpAssociation::new(peer, self.connector.clone())),

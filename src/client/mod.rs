@@ -102,8 +102,8 @@ where
         let snell_client = snell_client.clone();
         tokio::spawn(async move {
             match serve_socks5_inbound(stream, snell_client).await {
-                Ok(()) => tracing::debug!(%peer_addr, "客户端入站结束"),
-                Err(error) => tracing::debug!(%peer_addr, %error, "客户端入站失败"),
+                Ok(()) => tracing::info!(%peer_addr, "client inbound ended"),
+                Err(error) => tracing::info!(%peer_addr, %error, "client inbound failed"),
             }
         });
     }
@@ -126,10 +126,11 @@ where
 
     match command {
         Command::Connect => {
-            tracing::debug!(%destination, "SOCKS5 CONNECT 握手完成");
+            tracing::info!(%destination, "SOCKS5 CONNECT received");
             let transport = match OutboundTrait::connect(&snell_client, &destination).await {
                 Ok(transport) => transport,
                 Err(error) => {
+                    tracing::debug!(%destination, %error, "upstream connect failed");
                     let _ =
                         write_socks5_reply(&mut stream, socks5::Reply::from_io_error(&error)).await;
                     return Err(error.into());
@@ -142,7 +143,7 @@ where
         Command::UdpAssociate => {
             let udp = UdpSocket::bind(SocketAddr::new(stream.local_addr()?.ip(), 0)).await?;
             let bind = udp.local_addr()?;
-            tracing::debug!(%bind, "SOCKS5 UDP_ASSOCIATE 握手完成");
+            tracing::info!(%bind, "SOCKS5 UDP_ASSOCIATE received");
             write_socks5_reply_with_bind(
                 &mut stream,
                 socks5::Reply::Succeeded,

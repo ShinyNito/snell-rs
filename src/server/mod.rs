@@ -50,14 +50,14 @@ pub async fn bind_tcp_listener(config: ServerConfig) -> io::Result<()> {
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         if let Err(error) = apply_tcp_keepalive(&stream) {
-            tracing::warn!(%peer_addr, %error, "Snell inbound tcp keepalive could not be enabled");
+            tracing::warn!(%peer_addr, %error, "snell inbound tcp keepalive could not be enabled");
         }
         let psk = psk.clone();
         let outbound = outbound.clone();
         tokio::spawn(async move {
-            match serve_snell_inbound_auto(stream, psk, outbound).await {
-                Ok(()) => tracing::debug!(%peer_addr, "Snell server inbound ended"),
-                Err(error) => tracing::debug!(%peer_addr, %error, "Snell server inbound failed"),
+            match serve_snell_inbound_auto(stream, psk, outbound, peer_addr).await {
+                Ok(()) => tracing::info!(%peer_addr, "snell inbound ended"),
+                Err(error) => tracing::info!(%peer_addr, %error, "snell inbound failed"),
             }
         });
     }
@@ -67,12 +67,21 @@ async fn serve_snell_inbound_auto(
     stream: TcpStream,
     psk: Arc<[u8]>,
     outbound: Outbound,
+    peer_addr: SocketAddr,
 ) -> io::Result<()> {
-    match probe_snell_mode(&stream, psk.clone()).await? {
+    let mode = probe_snell_mode(&stream, psk.clone())
+        .await
+        .map_err(|error| {
+            tracing::warn!(%peer_addr, %error, "snell probe failed");
+            error
+        })?;
+    match mode {
         DetectedMode::V6Shaped => {
-            serve_snell_inbound_typed::<V6ShapedMode>(stream, psk, outbound).await
+            serve_snell_inbound_typed::<V6ShapedMode>(stream, psk, outbound, peer_addr).await
         }
-        DetectedMode::V4 => serve_snell_inbound_typed::<V4Mode>(stream, psk, outbound).await,
+        DetectedMode::V4 => {
+            serve_snell_inbound_typed::<V4Mode>(stream, psk, outbound, peer_addr).await
+        }
     }
 }
 
@@ -80,6 +89,7 @@ async fn serve_snell_inbound_typed<M>(
     stream: TcpStream,
     psk: Arc<[u8]>,
     outbound: Outbound,
+    peer_addr: SocketAddr,
 ) -> io::Result<()>
 where
     M: SnellMode + Send + Sync + 'static + Unpin,
@@ -96,10 +106,11 @@ where
 
     let first = inbound.receive_snell().await?;
     if let SnellInboundRequest::Udp = first {
-        tracing::debug!("Snell UDP setup received");
+        tracing::info!(%peer_addr, "snell UDP setup received");
         let target = match UdpOutbound::connect_udp(&outbound).await {
             Ok(target) => target,
             Err(error) => {
+                tracing::debug!(%peer_addr, %error, "snell UDP outbound connect failed");
                 inbound.reject(&error).await?;
                 return Err(error);
             }
@@ -135,11 +146,12 @@ where
                 }
             }
         };
-        tracing::debug!(destination = %request.destination, reuse = request.reuse, "Snell CONNECT received");
+        tracing::info!(%peer_addr, destination = %request.destination, reuse = request.reuse, "snell CONNECT received");
 
         let target = match outbound.connect(&request.destination).await {
             Ok(target) => target,
             Err(error) => {
+                tracing::debug!(%peer_addr, destination = %request.destination, %error, "outbound connect failed");
                 inbound.reject(&error).await?;
                 return Err(error);
             }
@@ -461,8 +473,8 @@ mod tests {
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = server_listener.accept().await.unwrap();
-            serve_snell_inbound_auto(stream, server_psk, Outbound::Direct)
+            let (stream, peer_addr) = server_listener.accept().await.unwrap();
+            serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr)
                 .await
                 .unwrap();
         });
@@ -576,10 +588,15 @@ mod tests {
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = server_listener.accept().await.unwrap();
-            serve_snell_inbound_auto(stream, server_psk, Outbound::Socks5 { server: socks_addr })
-                .await
-                .unwrap();
+            let (stream, peer_addr) = server_listener.accept().await.unwrap();
+            serve_snell_inbound_auto(
+                stream,
+                server_psk,
+                Outbound::Socks5 { server: socks_addr },
+                peer_addr,
+            )
+            .await
+            .unwrap();
         });
 
         run_client_round_trip::<V6ShapedMode>(server_addr, psk, Address::from(target_addr)).await;
@@ -614,8 +631,8 @@ mod tests {
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = server_listener.accept().await.unwrap();
-            serve_snell_inbound_auto(stream, server_psk, Outbound::Direct).await
+            let (stream, peer_addr) = server_listener.accept().await.unwrap();
+            serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr).await
         });
 
         // reuse connector：跑一条 sub-stream（CONNECT → ping/pong → 双向 EOF）。
@@ -664,11 +681,12 @@ mod tests {
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = server_listener.accept().await.unwrap();
+            let (stream, peer_addr) = server_listener.accept().await.unwrap();
             let _ = serve_snell_inbound_auto(
                 stream,
                 server_psk,
                 Outbound::Socks5 { server: socks_addr },
+                peer_addr,
             )
             .await;
         });
@@ -705,8 +723,8 @@ mod tests {
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = server_listener.accept().await.unwrap();
-            let _ = serve_snell_inbound_auto(stream, server_psk, Outbound::Direct).await;
+            let (stream, peer_addr) = server_listener.accept().await.unwrap();
+            let _ = serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr).await;
         });
 
         run_udp_client_round_trip::<V6ShapedMode>(server_addr, psk, Address::from(target_addr))
@@ -725,8 +743,8 @@ mod tests {
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = server_listener.accept().await.unwrap();
-            serve_snell_inbound_auto(stream, server_psk, Outbound::Direct).await
+            let (stream, peer_addr) = server_listener.accept().await.unwrap();
+            serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr).await
         });
 
         let connector = Arc::new(SnellConnector::<V6ShapedMode>::new(server_addr, psk, false));
@@ -760,11 +778,12 @@ mod tests {
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = server_listener.accept().await.unwrap();
+            let (stream, peer_addr) = server_listener.accept().await.unwrap();
             let _ = serve_snell_inbound_auto(
                 stream,
                 server_psk,
                 Outbound::Socks5 { server: socks_addr },
+                peer_addr,
             )
             .await;
         });
@@ -800,8 +819,8 @@ mod tests {
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = server_listener.accept().await.unwrap();
-            serve_snell_inbound_auto(stream, server_psk, Outbound::Direct)
+            let (stream, peer_addr) = server_listener.accept().await.unwrap();
+            serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr)
                 .await
                 .unwrap();
         });
