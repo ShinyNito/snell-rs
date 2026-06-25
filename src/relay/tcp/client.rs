@@ -1,4 +1,4 @@
-use std::{future::Future, io, marker::PhantomData, net::SocketAddr, sync::Arc};
+use std::{io, marker::PhantomData, net::SocketAddr, sync::Arc};
 
 use tokio::{
     io::AsyncRead,
@@ -207,14 +207,12 @@ where
     type Peer = TcpStream;
     type Output = ();
 
-    fn copy_bidirectional(self, local: TcpStream) -> impl Future<Output = io::Result<()>> {
-        async move {
-            let transport = copy_bidirectional(self.transport, local).await?;
-            if self.pool.reuse_enabled() {
-                self.pool.put(transport);
-            }
-            Ok(())
+    async fn copy_bidirectional(self, local: TcpStream) -> io::Result<()> {
+        let transport = copy_bidirectional(self.transport, local).await?;
+        if self.pool.reuse_enabled() {
+            self.pool.put(transport);
         }
+        Ok(())
     }
 }
 

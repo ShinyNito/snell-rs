@@ -308,7 +308,7 @@ where
         if let Some(association) = self.nat.get(&peer) {
             association
                 .borrow_mut()
-                .queue_to_snell(&destination, &packet.payload)?;
+                .queue_to_snell(&destination, packet.payload)?;
         }
         Poll::Ready(Ok(true))
     }
@@ -524,10 +524,12 @@ mod tests {
         .await
         .unwrap();
 
-        let state = state.lock().unwrap();
-        assert_eq!(state.attempts, 2);
-        assert_eq!(state.destination, Some(destination));
-        assert_eq!(state.payload.as_deref(), Some(&b"ping"[..]));
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.attempts, 2);
+            assert_eq!(state.destination, Some(destination));
+            assert_eq!(state.payload.as_deref(), Some(&b"ping"[..]));
+        }
 
         relay.abort();
         let _ = relay.await;

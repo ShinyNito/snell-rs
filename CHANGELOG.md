@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2] - 2026-06-25
+
+## Release Notes
+
+  * 为客户端、服务端入站与 TCP outbound 启用 TCP keepalive，降低长连接静默断开的影响。
+  * 修复复用 TCP 子流空闲后未及时清理的问题，复用连接在等待下一条请求超时后会主动结束。
+  * 修复 UDP outbound 发送暂挂时明文帧可能丢失的问题，避免待发送 UDP 数据报被跳过。
+
 ## [0.1.1] - 2026-06-24
 
 ## Release Notes
