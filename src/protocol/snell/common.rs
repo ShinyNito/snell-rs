@@ -17,8 +17,8 @@ use crate::protocol::ParseState;
 use super::crypto::kdf::aead_key;
 
 use super::{
-    DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE, NONCE_LEN, PlainPrefix,
-    SALT_LEN, TAG_LEN, WriteReservation,
+    DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE, NONCE_LEN, SALT_LEN,
+    TAG_LEN,
 };
 
 /// Streaming read state machine shared by V4 and V6-unshaped decoders.
@@ -47,13 +47,6 @@ pub(super) enum ReadStep {
     },
 }
 
-pub(super) fn fill_from_input(src: &mut &[u8], dst: &mut [u8], filled: usize) -> usize {
-    let take = (dst.len() - filled).min(src.len());
-    dst[filled..filled + take].copy_from_slice(&src[..take]);
-    *src = &src[take..];
-    filled + take
-}
-
 /// Push a single plaintext slice as the sole vectored entry.
 ///
 /// Returns the number of slices written (0 or 1).
@@ -65,63 +58,12 @@ pub(super) fn pending_plaintext_slice<'a>(plain: &'a [u8], out: &mut [IoSlice<'a
     1
 }
 
-/// Map a fill level to the shared exact-read [`ParseState`].
-pub(super) fn need_filled(filled: usize, total: usize) -> ParseState<()> {
-    if filled < total {
-        ParseState::Need(total)
-    } else {
-        ParseState::Done(())
-    }
-}
-
 /// Convert a [`ParseState`] into an `io::Result`, failing on `Need`.
 pub(super) fn parse_done<T>(state: ParseState<T>, message: &'static str) -> io::Result<T> {
     match state {
         ParseState::Done(value) => Ok(value),
         ParseState::Need(_) => Err(invalid_data(message)),
     }
-}
-
-/// Copy a plaintext prefix into a reserved payload region.
-///
-/// Validates the prefix fits within the reservation and records its length so
-/// [`plain_slot_with_prefix`] can expose the remaining slot to the caller.
-pub(super) fn apply_plain_prefix(
-    wire: &mut [u8],
-    reservation: &mut WriteReservation,
-    prefix: PlainPrefix<'_>,
-) -> io::Result<()> {
-    if prefix.len() > reservation.max_payload_len {
-        return Err(invalid_input("snell plain prefix exceeds record capacity"));
-    }
-    prefix.copy_to(&mut wire[reservation.payload_start..]);
-    reservation.plain_prefix_len = prefix.len();
-    Ok(())
-}
-
-/// Borrow the caller-writable slot after any prefix has been laid down.
-pub(super) fn plain_slot_with_prefix<'a>(
-    wire: &'a mut [u8],
-    reservation: &WriteReservation,
-) -> &'a mut [u8] {
-    let start = reservation.payload_start + reservation.plain_prefix_len;
-    let end = reservation.payload_start + reservation.max_payload_len;
-    &mut wire[start..end]
-}
-
-/// Resolve the final payload length including any prefix, with bounds checks.
-pub(super) fn finish_len_with_prefix(
-    reservation: &WriteReservation,
-    payload_len: usize,
-) -> io::Result<usize> {
-    let total = reservation
-        .plain_prefix_len
-        .checked_add(payload_len)
-        .ok_or_else(|| invalid_input("snell payload length overflow"))?;
-    if total > reservation.max_payload_len {
-        return Err(invalid_input("snell payload exceeds reservation"));
-    }
-    Ok(total)
 }
 
 /// Write a plaintext V4 frame header.
@@ -325,27 +267,20 @@ pub(super) fn seal_header(
     Ok(())
 }
 
-/// AEAD-seal `payload_len` bytes of `body` in place, appending the tag.
-///
-/// `body` must hold at least `payload_len + TAG_LEN` bytes. `aad` is bound to
-/// the resulting tag (e.g. the padding region for shaped records).
-pub(super) fn seal_payload(
+/// AEAD-seal a payload in place and return the detached tag.
+pub(super) fn seal_payload_detached(
     key: &LessSafeKey,
     nonce: &mut [u8; NONCE_LEN],
     aad: &[u8],
-    body: &mut [u8],
-    payload_len: usize,
+    payload: &mut [u8],
     error: &'static str,
-) -> io::Result<()> {
-    if body.len() < payload_len + TAG_LEN {
-        return Err(invalid_input("snell payload buffer too small"));
-    }
-    let (payload, tag_dst) = body[..payload_len + TAG_LEN].split_at_mut(payload_len);
+) -> io::Result<[u8; TAG_LEN]> {
     let tag = key
         .seal_in_place_separate_tag(next_nonce(nonce), Aad::from(aad), payload)
         .map_err(|_| invalid_data(error))?;
-    tag_dst.copy_from_slice(tag.as_ref());
-    Ok(())
+    let mut out = [0; TAG_LEN];
+    out.copy_from_slice(tag.as_ref());
+    Ok(out)
 }
 
 /// Derive a V4 session key: Argon2id(psk, salt) → AES-128-GCM.
@@ -404,17 +339,34 @@ pub(super) fn swap_padding(padding: &mut [u8], payload_cipher: &mut [u8]) {
     }
 }
 
-/// Generate V4 padding whose bit density counters the payload's.
-///
-/// The goal is to keep the on-wire 0/1 ratio near a target so the stream does
-/// not leak the payload's entropy profile. Falls back to uniform random bytes
-/// when the payload is already balanced or the target is unreachable.
-pub(super) fn make_padding(padding: &mut [u8], payload_cipher: &[u8]) {
-    let ones = payload_cipher[..payload_cipher.len() & !3]
+/// V4 padding swap where the AEAD tag is kept as a separate segment.
+pub(super) fn swap_padding_split(padding: &mut [u8], payload_cipher: &mut [u8], tag: &mut [u8]) {
+    let limit = padding.len().min(payload_cipher.len() + tag.len());
+    for i in (0..limit).step_by(2) {
+        if i < payload_cipher.len() {
+            std::mem::swap(&mut padding[i], &mut payload_cipher[i]);
+        } else {
+            std::mem::swap(&mut padding[i], &mut tag[i - payload_cipher.len()]);
+        }
+    }
+}
+
+/// Generate V4 padding for a payload and detached tag without joining them.
+pub(super) fn make_padding_split(padding: &mut [u8], payload_cipher: &[u8], tag: &[u8]) {
+    make_padding_from_slices(padding, &[payload_cipher, tag]);
+}
+
+fn make_padding_from_slices(padding: &mut [u8], payload_cipher: &[&[u8]]) {
+    let payload_len = payload_cipher
         .iter()
+        .map(|slice| slice.len())
+        .sum::<usize>();
+    let ones = payload_cipher
+        .iter()
+        .flat_map(|slice| slice[..slice.len() & !3].iter())
         .map(|byte| byte.count_ones() as usize)
         .sum::<usize>();
-    let zeros = payload_cipher.len() * u8::BITS as usize - ones;
+    let zeros = payload_len * u8::BITS as usize - ones;
     if zeros == 0 {
         rand::thread_rng().fill_bytes(padding);
         return;

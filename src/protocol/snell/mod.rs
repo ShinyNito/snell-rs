@@ -1,8 +1,8 @@
 //! Runtime-free Snell protocol helpers.
 //!
 //! This module intentionally does not depend on Tokio, async traits, or any
-//! concrete buffer type. Runtime code should exact-read/write around these
-//! helpers via the [`SnellTcpEncoder`] / [`SnellTcpDecoder`] traits.
+//! concrete runtime. Runtime code should exact-read/write around these helpers
+//! via the [`SnellTcpEncoder`] / [`SnellTcpDecoder`] traits.
 //!
 //! Design constraints:
 //! - The connect request must not read-ahead into application payload.
@@ -17,7 +17,8 @@
 //!     obfuscation with salt blocks, per-record prefixes, and active shaping.
 //!   - V6 unsafe-raw ([`V6UnsafeRawEncoder`]/[`V6UnsafeRawDecoder`]):
 //!     unencrypted pass-through for local debugging only.
-//! - Encoding writes into caller-provided buffers via a reservation slot.
+//! - Encoding consumes owned plaintext buffers and emits owned vectored wire
+//!   buffers, so the runtime can hand managed read buffers through the codec.
 //!
 //! # Connect request layout
 //!
@@ -59,19 +60,13 @@
 //! # Encode flow (writer side)
 //!
 //! ```text
-//!   begin_plain_reservation(prefix, hint)
+//!   next_plain_capacity()
 //!        |
 //!        v
-//!   +-----------------------+   prefix copied into payload region,
-//!   | reserve record sized  |   slot = max_chunk(hint) - prefix.len()
-//!   | for prefix + payload  |   (first record: inject salt + init padding)
-//!   +-----------------------+
+//!   runtime reads at most that many plaintext bytes into an owned buffer
 //!        |
 //!        v
-//!   plain_slot(reservation) -----> caller writes payload bytes
-//!        |
-//!        v
-//!   finish_plain_reservation(reservation, payload_len)
+//!   seal_plain(buffer)
 //!        |
 //!        | write header (padding/payload lens) -> seal header (AEAD, nonce++)
 //!        | seal payload (AEAD, nonce++)         -> make/swap padding (V4/shaped)
@@ -83,7 +78,9 @@
 //!
 //! ```text
 //!   loop {
-//!     decode_ciphertext(&mut input)
+//!     len = next_cipher_len()
+//!     input = read_exact_owned(len)
+//!     decode_ciphertext(input)
 //!        |
 //!        +-- NeedMore              read more ciphertext
 //!        +-- PlainData/ZeroChunk   drain plaintext or handle zero chunk
@@ -106,11 +103,20 @@
 //! ```
 
 use std::{
+    fmt,
     io::{self, IoSlice},
     net::{IpAddr, SocketAddr},
+    ops::Range,
     str,
     sync::Arc,
 };
+
+use bytes::{Bytes, BytesMut};
+use compio::{
+    buf::{IoBuf, IoBufMut},
+    driver::BufferRef,
+};
+use ring::aead::Tag;
 
 use crate::protocol::address::{Address, AddressRef};
 
@@ -624,32 +630,6 @@ fn decode_udp_response_addr(src: &[u8]) -> io::Result<(AddressRef<'_>, usize)> {
     }
 }
 
-/// Layout of a record reserved inside an encoder's wire buffer.
-///
-/// Callers receive this from `begin_*_reservation`, write payload bytes into
-/// the slot reported by `plain_slot`, then hand it back to
-/// `finish_*_reservation` for encryption. All offsets are relative to the
-/// encoder's internal `wire` buffer.
-#[derive(Clone, Copy, Debug)]
-pub struct WriteReservation {
-    /// Bytes of the caller-provided plaintext prefix already written.
-    plain_prefix_len: usize,
-    /// Start of the obfuscation prefix for this record.
-    prefix_start: usize,
-    /// Length of the obfuscation prefix.
-    prefix_len: usize,
-    /// Start of the AEAD-protected frame header.
-    header_start: usize,
-    /// Start of the padding region.
-    padding_start: usize,
-    /// Length of the padding region.
-    padding_len: usize,
-    /// Start of the plaintext payload slot exposed to the caller.
-    payload_start: usize,
-    /// Maximum payload bytes the caller may write into the slot.
-    max_payload_len: usize,
-}
-
 /// Decoded plaintext frame header returned by the decoders.
 ///
 /// Derived from `HEADER_PLAIN` (`VER RSV RSV PADDING(2) PAYLOAD(2)`):
@@ -700,106 +680,219 @@ pub enum DecodeEvent<'a> {
     Pong,
 }
 
-/// Borrowed plaintext bytes prepended to a record's payload slot.
-///
-/// Encoders copy this prefix into the reserved payload region before exposing
-/// the remaining slot to the caller, so callers can frame commands without an
-/// extra copy.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PlainPrefix<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> PlainPrefix<'a> {
-    /// No prefix: the payload slot is entirely caller-owned.
-    pub const fn none() -> Self {
-        Self { bytes: &[] }
-    }
-
-    /// Wrap a borrowed prefix to prepend before the caller payload.
-    pub const fn bytes(bytes: &'a [u8]) -> Self {
-        Self { bytes }
-    }
-
-    fn len(self) -> usize {
-        self.bytes.len()
-    }
-
-    fn copy_to(self, dst: &mut [u8]) {
-        dst[..self.bytes.len()].copy_from_slice(self.bytes);
-    }
-}
-
 /// Owned sealed bytes ready for an async vectored write.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct PendingWire {
-    salt: Option<[u8; SALT_LEN]>,
-    frame: Vec<u8>,
+    segments: Vec<PendingWireSegment>,
+}
+
+#[doc(hidden)]
+pub enum PendingWireSegment {
+    Bytes(Bytes),
+    Managed(BufferRef),
+    Inline {
+        data: [u8; HEADER_CIPHER_LEN],
+        len: u8,
+    },
+}
+
+impl PendingWireSegment {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Bytes(buf) => buf.as_ref(),
+            Self::Managed(buf) => buf.as_init(),
+            Self::Inline { data, len } => &data[..usize::from(*len)],
+        }
+    }
+
+    fn inline(src: &[u8]) -> Self {
+        debug_assert!(src.len() <= HEADER_CIPHER_LEN);
+        let mut data = [0; HEADER_CIPHER_LEN];
+        data[..src.len()].copy_from_slice(src);
+        Self::Inline {
+            data,
+            len: src.len() as u8,
+        }
+    }
+}
+
+impl From<BytesMut> for PendingWireSegment {
+    fn from(value: BytesMut) -> Self {
+        Self::Bytes(value.freeze())
+    }
+}
+
+impl From<BufferRef> for PendingWireSegment {
+    fn from(value: BufferRef) -> Self {
+        Self::Managed(value)
+    }
 }
 
 impl PendingWire {
-    pub(crate) fn new(salt: Option<[u8; SALT_LEN]>, frame: Vec<u8>) -> Self {
-        Self { salt, frame }
-    }
-
-    pub(crate) fn from_frame(frame: Vec<u8>) -> Self {
-        Self { salt: None, frame }
-    }
-
-    pub(crate) fn into_parts(self) -> (Option<[u8; SALT_LEN]>, Vec<u8>) {
-        (self.salt, self.frame)
+    pub(crate) fn push<S>(&mut self, segment: S)
+    where
+        S: Into<PendingWireSegment>,
+    {
+        let segment = segment.into();
+        if !segment.as_slice().is_empty() {
+            self.segments.push(segment);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.salt.is_none() && self.frame.is_empty()
+        self.segments.is_empty()
     }
 
     pub fn total_len(&self) -> usize {
-        self.salt.as_ref().map_or(0, |salt| salt.len()) + self.frame.len()
+        self.segments
+            .iter()
+            .map(|segment| segment.as_slice().len())
+            .sum()
     }
 
     pub(crate) fn iter_slices(&self) -> impl Iterator<Item = &[u8]> {
-        self.salt
-            .iter()
-            .map(|salt| salt.as_slice())
-            .chain(std::iter::once(self.frame.as_slice()).filter(|slice| !slice.is_empty()))
+        self.segments.iter().map(|segment| segment.as_slice())
+    }
+}
+
+impl From<[u8; SALT_LEN]> for PendingWireSegment {
+    fn from(value: [u8; SALT_LEN]) -> Self {
+        Self::inline(&value)
+    }
+}
+
+impl From<[u8; HEADER_CIPHER_LEN]> for PendingWireSegment {
+    fn from(value: [u8; HEADER_CIPHER_LEN]) -> Self {
+        Self::inline(&value)
+    }
+}
+
+impl From<[u8; HEADER_PLAIN_LEN]> for PendingWireSegment {
+    fn from(value: [u8; HEADER_PLAIN_LEN]) -> Self {
+        Self::inline(&value)
+    }
+}
+
+impl From<Tag> for PendingWireSegment {
+    fn from(value: Tag) -> Self {
+        Self::inline(value.as_ref())
+    }
+}
+
+impl From<Bytes> for PendingWireSegment {
+    fn from(value: Bytes) -> Self {
+        Self::Bytes(value)
+    }
+}
+
+impl fmt::Debug for PendingWire {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingWire")
+            .field("segments", &self.segments.len())
+            .field("total_len", &self.total_len())
+            .finish()
+    }
+}
+
+/// Owned plaintext decoded from one Snell frame.
+#[derive(Debug, Default)]
+pub struct PlaintextFrame {
+    body: PlaintextSegment,
+    plain: Range<usize>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub enum PlaintextSegment {
+    #[default]
+    Empty,
+    Owned(Vec<u8>),
+    Bytes(BytesMut),
+    Managed(BufferRef),
+}
+
+impl PlaintextFrame {
+    pub(crate) fn from_segment<B>(body: B, plain: Range<usize>) -> Self
+    where
+        B: Into<PlaintextSegment>,
+    {
+        Self {
+            body: body.into(),
+            plain,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.as_init().is_empty()
+    }
+
+    pub(crate) fn body_mut(&mut self) -> &mut [u8] {
+        match &mut self.body {
+            PlaintextSegment::Empty => &mut [],
+            PlaintextSegment::Owned(body) => body.as_mut_slice(),
+            PlaintextSegment::Bytes(body) => body.as_mut(),
+            PlaintextSegment::Managed(body) => body.as_mut_slice(),
+        }
+    }
+
+    pub(crate) fn set_plain(&mut self, plain: Range<usize>) {
+        self.plain = plain;
+    }
+
+    pub(crate) fn advance(&mut self, n: usize) {
+        let take = n.min(self.plain.len());
+        self.plain.start += take;
+        if self.plain.is_empty() {
+            self.body = PlaintextSegment::Empty;
+            self.plain = 0..0;
+        }
+    }
+}
+
+impl From<BytesMut> for PlaintextSegment {
+    fn from(value: BytesMut) -> Self {
+        Self::Bytes(value)
+    }
+}
+
+impl From<Vec<u8>> for PlaintextSegment {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Owned(value)
+    }
+}
+
+impl From<BufferRef> for PlaintextSegment {
+    fn from(value: BufferRef) -> Self {
+        Self::Managed(value)
+    }
+}
+
+impl IoBuf for PlaintextFrame {
+    fn as_init(&self) -> &[u8] {
+        match &self.body {
+            PlaintextSegment::Empty => &[],
+            PlaintextSegment::Owned(body) => &body[self.plain.clone()],
+            PlaintextSegment::Bytes(body) => &body.as_ref()[self.plain.clone()],
+            PlaintextSegment::Managed(body) => &body.as_init()[self.plain.clone()],
+        }
     }
 }
 
 /// Streaming Snell TCP encoder.
 ///
-/// The reservation lifecycle is:
-/// 1. [`SnellTcpEncoder::begin_plain_reservation`] — reserve a record sized for
-///    `prefix + payload_hint` and return a [`WriteReservation`].
-/// 2. [`SnellTcpEncoder::plain_slot`] — borrow the writable payload region.
-/// 3. [`SnellTcpEncoder::finish_plain_reservation`] — seal the record and move
-///    it to the pending-wire queue.
-/// 4. [`SnellTcpEncoder::take_pending_wire`] — move sealed bytes to the runtime
-///    for owned vectored flush.
+/// The runtime first asks for the next plaintext capacity, reads at most that
+/// many bytes into an owned buffer, then transfers that buffer into
+/// [`SnellTcpEncoder::seal_plain`]. The encoder mutates the payload in place
+/// when the mode encrypts it and moves all sealed wire segments into
+/// [`PendingWire`].
 pub trait SnellTcpEncoder {
-    /// Opaque handle describing the reserved record.
-    type Reservation;
+    /// Maximum plaintext bytes accepted by the next record.
+    fn next_plain_capacity(&self) -> usize;
 
-    /// Reserve a record sized for `prefix.len() + payload_hint` and copy the
-    /// prefix into the payload region.
-    fn begin_plain_reservation(
-        &mut self,
-        prefix: PlainPrefix<'_>,
-        payload_hint: usize,
-    ) -> io::Result<Self::Reservation>;
-
-    /// Borrow the caller-writable payload slot for this reservation.
-    fn plain_slot(&mut self, reservation: &Self::Reservation) -> &mut [u8];
-
-    /// Seal the record after the caller wrote `payload_len` bytes.
-    fn finish_plain_reservation(
-        &mut self,
-        reservation: Self::Reservation,
-        payload_len: usize,
-    ) -> io::Result<()>;
-
-    /// Discard a reservation without emitting a record.
-    fn cancel_plain_reservation(&mut self, reservation: Self::Reservation);
+    /// Seal one plaintext record, taking ownership of the payload buffer.
+    fn seal_plain<B>(&mut self, payload: B) -> io::Result<()>
+    where
+        B: IoBufMut + Into<PendingWireSegment>;
 
     /// Move sealed bytes pending flush out of the encoder.
     fn take_pending_wire(&mut self) -> PendingWire;
@@ -814,19 +907,30 @@ pub trait SnellTcpEncoder {
 /// Streaming Snell TCP decoder.
 ///
 /// The decode lifecycle is:
-/// 1. [`SnellTcpDecoder::decode_ciphertext`] — consume bytes from an input slice.
+/// 1. [`SnellTcpDecoder::next_cipher_len`] — ask how many ciphertext bytes the
+///    next state needs.
+/// 2. [`SnellTcpDecoder::decode_ciphertext`] — transfer an owned buffer of that
+///    length into the decoder.
 /// 2. On [`PlainData`](DecodeEvent::PlainData), drain plaintext via
 ///    [`SnellTcpDecoder::pending_plaintext`] /
 ///    [`SnellTcpDecoder::advance_plaintext`].
 pub trait SnellTcpDecoder {
-    /// Consume ciphertext from `src`, advancing it by the number of bytes used.
-    fn decode_ciphertext(&mut self, src: &mut &[u8]) -> io::Result<DecodeEvent<'_>>;
+    /// Exact ciphertext bytes required by the next decoder state.
+    fn next_cipher_len(&self) -> usize;
+
+    /// Consume one exact ciphertext chunk, taking ownership of the buffer.
+    fn decode_ciphertext<B>(&mut self, input: B) -> io::Result<DecodeEvent<'_>>
+    where
+        B: IoBufMut + Into<PlaintextSegment>;
 
     /// Collect decrypted plaintext pending drain into `out` as vectored slices.
     fn pending_plaintext<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize;
 
     /// Mark `n` bytes from the pending plaintext queue as consumed.
     fn advance_plaintext(&mut self, n: usize);
+
+    /// Move the pending plaintext frame out of the decoder.
+    fn take_pending_plaintext(&mut self) -> Option<PlaintextFrame>;
 
     /// Whether any decrypted plaintext is still awaiting drain.
     fn has_pending_plaintext(&self) -> bool {

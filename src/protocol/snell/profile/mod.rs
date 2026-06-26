@@ -16,7 +16,7 @@ mod fill;
 mod mix;
 mod sizing;
 
-pub(crate) use mix::mix_padding_payload;
+pub(crate) use mix::{mix_padding_payload, mix_padding_payload_split};
 
 pub const SALT_LEN: usize = 16;
 const HANDSHAKE_DOMAIN: u32 = 0x7053;
@@ -383,11 +383,6 @@ impl ShapedProfile {
     #[must_use]
     pub(crate) const fn salt_block_len(&self) -> usize {
         self.salt_block_len
-    }
-
-    #[must_use]
-    pub(crate) const fn max_padding_len(&self) -> usize {
-        self.pad_max + MAX_EXTRA_TARGET_PADDING
     }
 
     #[must_use]

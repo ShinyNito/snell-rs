@@ -1,10 +1,14 @@
 use std::{io, marker::PhantomData, net::SocketAddr, rc::Rc, sync::Arc};
 
-use compio::{io::AsyncReadManaged, net::TcpStream};
+use compio::{
+    buf::IoBufMut,
+    io::{AsyncRead, AsyncReadManaged},
+    net::TcpStream,
+};
 
 use crate::protocol::{
     address::Address,
-    snell::{self, COMMAND_ERROR, COMMAND_TUNNEL, SnellMode, SnellTcpDecoder, SnellTcpEncoder},
+    snell::{self, COMMAND_ERROR, COMMAND_TUNNEL, PlaintextSegment, SnellMode, SnellTcpDecoder},
 };
 use crate::{
     keepalive::apply_tcp_keepalive,
@@ -45,10 +49,7 @@ where
 
 impl<M> SnellConnector<M>
 where
-    M: SnellMode + Send + Sync + 'static,
-    M::Encoder: Send,
-    M::Decoder: Send,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static,
 {
     pub fn new(server: SocketAddr, psk: impl Into<Arc<[u8]>>, reuse: bool) -> Self {
         Self {
@@ -167,10 +168,7 @@ where
 
 impl<M> Outbound for Rc<SnellConnector<M>>
 where
-    M: SnellMode + Send + Sync + 'static,
-    M::Encoder: Send,
-    M::Decoder: Send,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static,
 {
     type Transport = PooledSnellTransport<M>;
 
@@ -193,10 +191,9 @@ where
 
 impl<M> CopyBidirectional for PooledSnellTransport<M>
 where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static + Unpin,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
 {
     type Peer = TcpStream;
     type Output = ();
@@ -224,8 +221,8 @@ fn is_retriable_pool_error(error: &io::Error) -> bool {
 
 async fn read_server_reply<R, D>(reader: &mut SnellStreamReader<R, D>) -> io::Result<()>
 where
-    R: AsyncReadManaged + Unpin + 'static,
-    R::Buffer: 'static,
+    R: AsyncRead + AsyncReadManaged + Unpin + 'static,
+    R::Buffer: IoBufMut + Into<PlaintextSegment> + 'static,
     D: SnellTcpDecoder,
 {
     let mut command = [0u8; 1];
@@ -398,10 +395,9 @@ mod tests {
 
     async fn relay_closed_peer_transport<M>(transport: SnellTransport<M>) -> SnellTransport<M>
     where
-        M: SnellMode + Send + Sync + 'static + Unpin,
-        M::Encoder: Send + Unpin,
-        M::Decoder: Send + Unpin,
-        <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+        M: SnellMode + 'static + Unpin,
+        M::Encoder: Unpin,
+        M::Decoder: Unpin,
     {
         let (target, mut peer) = tcp_pair().await;
         peer.shutdown().await.unwrap();
@@ -422,7 +418,8 @@ mod tests {
 
     async fn read_once<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<usize>
     where
-        R: AsyncRead + 'static,
+        R: AsyncRead + AsyncReadManaged + 'static,
+        R::Buffer: IoBufMut + Into<PlaintextSegment> + 'static,
     {
         let (result, buf) = reader
             .read(Vec::with_capacity(dst.len()))

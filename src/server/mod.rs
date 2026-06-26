@@ -4,7 +4,11 @@ use std::net::TcpListener as StdTcpListener;
 use std::rc::Rc;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
+use bytes::BytesMut;
+#[cfg(test)]
+use compio::buf::IoVectoredBuf;
 use compio::{
+    buf::IoBufMut,
     io::{AsyncRead, AsyncReadManaged, AsyncWrite},
     net::{TcpListener, TcpSocket, TcpStream},
     runtime, time,
@@ -14,9 +18,9 @@ use crate::{
     config::TcpBrutalConfig,
     keepalive::apply_tcp_keepalive,
     protocol::snell::{
-        self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, MAX_CONNECT_REQUEST_LEN, SnellMode,
-        SnellTcpDecoder, SnellTcpEncoder, V4Decoder, V4Mode, V6ShapedDecoder, V6ShapedMode,
-        V6UnsafeRawMode, V6UnshapedMode,
+        self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, MAX_CONNECT_REQUEST_LEN,
+        PlaintextSegment, SnellMode, SnellTcpDecoder, SnellTcpEncoder, V4Decoder, V4Mode,
+        V6ShapedDecoder, V6ShapedMode, V6UnsafeRawMode, V6UnshapedMode,
         version::{ProtocolVersion, V6Mode},
     },
     relay::tcp::{
@@ -173,10 +177,9 @@ async fn serve_snell_inbound_typed<M>(
     peer_addr: SocketAddr,
 ) -> io::Result<()>
 where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static + Unpin,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
 {
     let decoder = M::new_decoder(psk.clone());
     serve_snell_inbound_typed_with_decoder::<M>(
@@ -245,10 +248,9 @@ async fn serve_snell_inbound_typed_with_decoder<M>(
     peer_addr: SocketAddr,
 ) -> io::Result<()>
 where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static + Unpin,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
 {
     let (read_half, write_half) = stream.into_split();
     let transport: SnellTransport<M> = SnellTransport::new(
@@ -268,10 +270,9 @@ async fn serve_snell_transport<M>(
     peer_addr: SocketAddr,
 ) -> io::Result<()>
 where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static + Unpin,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
 {
     let mut inbound = SnellInbound::new(transport);
 
@@ -347,8 +348,8 @@ async fn read_snell_request<R, D>(
     reader: &mut SnellStreamReader<R, D>,
 ) -> io::Result<SnellInboundRequest>
 where
-    R: AsyncReadManaged + Unpin + 'static,
-    R::Buffer: 'static,
+    R: AsyncRead + AsyncReadManaged + Unpin + 'static,
+    R::Buffer: IoBufMut + Into<PlaintextSegment> + 'static,
     D: SnellTcpDecoder,
 {
     let mut head = [0u8; 3];
@@ -425,10 +426,7 @@ where
         Self { transport }
     }
 
-    async fn receive_snell(&mut self) -> io::Result<SnellInboundRequest>
-    where
-        M::Decoder: Send,
-    {
+    async fn receive_snell(&mut self) -> io::Result<SnellInboundRequest> {
         read_snell_request(&mut self.transport.reader).await
     }
 }
@@ -436,9 +434,6 @@ where
 impl<M> Inbound for SnellInbound<M>
 where
     M: SnellMode,
-    M::Encoder: Send,
-    M::Decoder: Send,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
     type Transport = SnellTransport<M>;
 
@@ -545,6 +540,13 @@ enum ProbeResult {
     Invalid,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbePlaintext {
+    Match,
+    NeedMore,
+    Invalid,
+}
+
 #[cfg(test)]
 fn probe_mode<M>(psk: Arc<[u8]>, bytes: &[u8]) -> ProbeResult
 where
@@ -558,27 +560,32 @@ fn probe_decoder<D>(decoder: &mut D, bytes: &[u8]) -> ProbeResult
 where
     D: SnellTcpDecoder,
 {
-    let mut src = bytes;
+    let mut offset: usize = 0;
     loop {
-        let before = src.len();
-        match decoder.decode_ciphertext(&mut src) {
+        let need = decoder.next_cipher_len();
+        if need == 0 {
+            return ProbeResult::NeedMore;
+        }
+        let Some(end) = offset.checked_add(need).filter(|end| *end <= bytes.len()) else {
+            return ProbeResult::NeedMore;
+        };
+        let chunk = BytesMut::from(&bytes[offset..end]);
+        offset = end;
+        match decoder.decode_ciphertext(chunk) {
             Ok(DecodeEvent::PlainData) => {
                 return match probe_plaintext(decoder) {
-                    ProbeResult::Match { .. } => ProbeResult::Match {
-                        consumed: bytes.len() - src.len(),
-                    },
-                    other => other,
+                    ProbePlaintext::Match => ProbeResult::Match { consumed: offset },
+                    ProbePlaintext::NeedMore => ProbeResult::NeedMore,
+                    ProbePlaintext::Invalid => ProbeResult::Invalid,
                 };
             }
             Ok(DecodeEvent::ZeroChunk) | Err(_) => return ProbeResult::Invalid,
-            Ok(DecodeEvent::NeedMore) if src.is_empty() => return ProbeResult::NeedMore,
-            Ok(_) if src.len() == before => return ProbeResult::NeedMore,
             Ok(_) => {}
         }
     }
 }
 
-fn probe_plaintext<D>(decoder: &D) -> ProbeResult
+fn probe_plaintext<D>(decoder: &D) -> ProbePlaintext
 where
     D: SnellTcpDecoder,
 {
@@ -599,13 +606,15 @@ where
         .or_else(|| {
             probe_control_prefix(snell::decode_udp_setup_request_prefix(&buf[..len]).map(|_| ()))
         })
-        .unwrap_or(ProbeResult::Invalid)
+        .unwrap_or(ProbePlaintext::Invalid)
 }
 
-fn probe_control_prefix(result: io::Result<()>) -> Option<ProbeResult> {
+fn probe_control_prefix(result: io::Result<()>) -> Option<ProbePlaintext> {
     match result {
-        Ok(()) => Some(ProbeResult::Match { consumed: 0 }),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Some(ProbeResult::NeedMore),
+        Ok(()) => Some(ProbePlaintext::Match),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Some(ProbePlaintext::NeedMore)
+        }
         Err(_) => None,
     }
 }
@@ -633,7 +642,14 @@ mod tests {
     struct PendingPlaintext(Vec<u8>);
 
     impl SnellTcpDecoder for PendingPlaintext {
-        fn decode_ciphertext(&mut self, _src: &mut &[u8]) -> io::Result<DecodeEvent<'_>> {
+        fn next_cipher_len(&self) -> usize {
+            0
+        }
+
+        fn decode_ciphertext<B>(&mut self, _input: B) -> io::Result<DecodeEvent<'_>>
+        where
+            B: compio::buf::IoBufMut + Into<snell::PlaintextSegment>,
+        {
             Ok(DecodeEvent::PlainData)
         }
 
@@ -646,6 +662,48 @@ mod tests {
         }
 
         fn advance_plaintext(&mut self, _n: usize) {}
+
+        fn take_pending_plaintext(&mut self) -> Option<snell::PlaintextFrame> {
+            if self.0.is_empty() {
+                return None;
+            }
+            let body = std::mem::take(&mut self.0);
+            let len = body.len();
+            Some(snell::PlaintextFrame::from_segment(body, 0..len))
+        }
+    }
+
+    fn encode_v6_shaped_connect_and_payload(
+        psk: &[u8],
+        destination: AddressRef<'_>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut encoder = V6ShapedMode::new_encoder(psk).unwrap();
+        let mut wire = Vec::new();
+
+        let request_len = snell::connect_request_len(destination).unwrap();
+        let mut request = BytesMut::with_capacity(request_len);
+        request.resize(request_len, 0);
+        let n = snell::encode_connect_request_into(&mut request, destination, false).unwrap();
+        request.truncate(n);
+        encoder.seal_plain(request).unwrap();
+        append_pending_wire(&mut encoder, &mut wire);
+
+        encoder.seal_plain(BytesMut::from(payload)).unwrap();
+        append_pending_wire(&mut encoder, &mut wire);
+
+        wire
+    }
+
+    fn append_pending_wire<E>(encoder: &mut E, wire: &mut Vec<u8>)
+    where
+        E: SnellTcpEncoder,
+    {
+        let pending = encoder.take_pending_wire();
+        wire.reserve(pending.total_len());
+        for slice in pending.iter_slices() {
+            wire.extend_from_slice(slice);
+        }
     }
 
     #[compio::test]
@@ -721,13 +779,7 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = b"\x01\x05\x03abc\x0bexample.com\x01\xbbhello";
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let reservation = encoder
-            .begin_plain_reservation(snell::PlainPrefix::none(), plaintext.len())
-            .unwrap();
-        encoder.plain_slot(reservation)[..plaintext.len()].copy_from_slice(plaintext);
-        encoder
-            .finish_plain_reservation(reservation, plaintext.len())
-            .unwrap();
+        encoder.seal_plain(BytesMut::from(&plaintext[..])).unwrap();
 
         let pending = encoder.take_pending_wire();
         let mut wire = Vec::with_capacity(pending.total_len());
@@ -735,10 +787,28 @@ mod tests {
             wire.extend_from_slice(slice);
         }
 
-        assert!(matches!(
+        assert_eq!(
             probe_mode::<V6ShapedMode>(psk, &wire),
-            ProbeResult::Match { .. }
-        ));
+            ProbeResult::Match {
+                consumed: wire.len()
+            }
+        );
+    }
+
+    #[test]
+    fn v6_probe_reports_consumed_prefix_for_coalesced_records() {
+        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
+        let destination = Address::domain("example.com", 443).unwrap();
+        let wire =
+            encode_v6_shaped_connect_and_payload(psk.as_ref(), destination.as_view(), b"ping");
+
+        let ProbeResult::Match { consumed } = probe_mode::<V6ShapedMode>(psk, &wire) else {
+            panic!("probe should match v6 shaped connect request");
+        };
+        assert!(
+            consumed < wire.len(),
+            "probe should leave the next record pending"
+        );
     }
 
     #[test]
@@ -746,13 +816,7 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = [snell::PROTOCOL_VERSION, snell::COMMAND_UDP, 0];
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let reservation = encoder
-            .begin_plain_reservation(snell::PlainPrefix::none(), plaintext.len())
-            .unwrap();
-        encoder.plain_slot(reservation).copy_from_slice(&plaintext);
-        encoder
-            .finish_plain_reservation(reservation, plaintext.len())
-            .unwrap();
+        encoder.seal_plain(BytesMut::from(&plaintext[..])).unwrap();
 
         let pending = encoder.take_pending_wire();
         let mut wire = Vec::with_capacity(pending.total_len());
@@ -760,10 +824,12 @@ mod tests {
             wire.extend_from_slice(slice);
         }
 
-        assert!(matches!(
+        assert_eq!(
             probe_mode::<V6ShapedMode>(psk, &wire),
-            ProbeResult::Match { .. }
-        ));
+            ProbeResult::Match {
+                consumed: wire.len()
+            }
+        );
     }
 
     #[test]
@@ -772,10 +838,44 @@ mod tests {
         plaintext.resize(plaintext.len() + MAX_CONNECT_REQUEST_LEN, b'x');
         let decoder = PendingPlaintext(plaintext);
 
-        assert!(matches!(
-            probe_plaintext(&decoder),
-            ProbeResult::Match { .. }
-        ));
+        assert_eq!(probe_plaintext(&decoder), ProbePlaintext::Match);
+    }
+
+    #[compio::test]
+    async fn auto_probe_preserves_coalesced_ciphertext_after_connect() {
+        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target = runtime::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            read_exact_into(&mut stream, &mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+        });
+
+        let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_listener.local_addr().unwrap();
+        let server_psk = psk.clone();
+        let server = runtime::spawn(async move {
+            let (stream, peer_addr) = server_listener.accept().await.unwrap();
+            let _ = serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr).await;
+        });
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        let wire = encode_v6_shaped_connect_and_payload(
+            psk.as_ref(),
+            AddressRef::Ip(target_addr),
+            b"ping",
+        );
+        write_all_bytes(&mut client, &wire).await.unwrap();
+
+        time::timeout(std::time::Duration::from_secs(5), target)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(client);
+        drop(server);
     }
 
     #[compio::test]
@@ -1047,10 +1147,9 @@ mod tests {
 
     async fn auto_server_round_trip<M>()
     where
-        M: SnellMode + Send + Sync + 'static + Unpin,
-        M::Encoder: Send + Unpin,
-        M::Decoder: Send + Unpin,
-        <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+        M: SnellMode + 'static + Unpin,
+        M::Encoder: Unpin,
+        M::Decoder: Unpin,
     {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
 
@@ -1082,10 +1181,9 @@ mod tests {
 
     async fn run_client_round_trip<M>(server_addr: SocketAddr, psk: Arc<[u8]>, destination: Address)
     where
-        M: SnellMode + Send + Sync + 'static + Unpin,
-        M::Encoder: Send + Unpin,
-        M::Decoder: Send + Unpin,
-        <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+        M: SnellMode + 'static + Unpin,
+        M::Encoder: Unpin,
+        M::Decoder: Unpin,
     {
         let connector = Rc::new(SnellConnector::<M>::new(server_addr, psk, false));
         run_client_round_trip_with_connector(&connector, &destination).await;
@@ -1095,10 +1193,9 @@ mod tests {
         connector: &Rc<SnellConnector<M>>,
         destination: &Address,
     ) where
-        M: SnellMode + Send + Sync + 'static + Unpin,
-        M::Encoder: Send + Unpin,
-        M::Decoder: Send + Unpin,
-        <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+        M: SnellMode + 'static + Unpin,
+        M::Encoder: Unpin,
+        M::Decoder: Unpin,
     {
         let transport = connector.connect(destination).await.unwrap();
 
@@ -1123,10 +1220,9 @@ mod tests {
         psk: Arc<[u8]>,
         destination: Address,
     ) where
-        M: SnellMode + Send + Sync + 'static + Unpin,
-        M::Encoder: Send + Unpin,
-        M::Decoder: Send + Unpin,
-        <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+        M: SnellMode + 'static + Unpin,
+        M::Encoder: Unpin,
+        M::Decoder: Unpin,
     {
         let connector = Rc::new(SnellConnector::<M>::new(server_addr, psk, false));
         let mut transport = connector.connect_udp().await.unwrap();
@@ -1138,12 +1234,17 @@ mod tests {
         packet[header_len..].copy_from_slice(b"ping");
         transport.writer.write_frame(&packet).await.unwrap();
 
-        let response = time::timeout(
-            std::time::Duration::from_secs(2),
-            transport.reader.read_frame_vec(),
-        )
+        let response = time::timeout(std::time::Duration::from_secs(2), async {
+            let batch = std::future::poll_fn(|cx| transport.reader.poll_read_frame_batch(cx))
+                .await?
+                .expect("snell udp response frame");
+            let mut response = Vec::new();
+            for slice in batch.iter_slice() {
+                response.extend_from_slice(slice);
+            }
+            io::Result::Ok(response)
+        })
         .await
-        .unwrap()
         .unwrap()
         .unwrap();
         let response = snell::decode_udp_response_packet(&response).unwrap();

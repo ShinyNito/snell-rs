@@ -15,7 +15,7 @@ use crate::{
     protocol::{
         address::AddressRef,
         snell::{
-            SnellMode, SnellTcpEncoder, V4Mode, V6ShapedMode, V6UnsafeRawMode, V6UnshapedMode,
+            SnellMode, V4Mode, V6ShapedMode, V6UnsafeRawMode, V6UnshapedMode,
             version::{ProtocolVersion, V6Mode},
         },
         socks5::{self, Command},
@@ -165,10 +165,9 @@ async fn serve_socks5_listener_typed<M>(
     resume: bool,
 ) -> Result<()>
 where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static + Unpin,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
 {
     let snell_client = Rc::new(SnellConnector::<M>::new(server, psk, resume));
     loop {
@@ -196,10 +195,9 @@ async fn serve_socks5_listener_typed_with_dispatcher<M>(
     dispatcher: Arc<compio::dispatcher::Dispatcher>,
 ) -> Result<()>
 where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static + Unpin,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
 {
     let psk: Arc<[u8]> = Arc::from(psk.into_boxed_slice());
     loop {
@@ -235,10 +233,9 @@ async fn serve_socks5_inbound<M>(
     snell_client: Rc<SnellConnector<M>>,
 ) -> std::result::Result<(), Box<dyn Error + Send + Sync>>
 where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static + Unpin,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
 {
     let mut stream = stream;
     let (command, destination) = time::timeout(TCP_TIMEOUT, accept_socks5_request(&mut stream))

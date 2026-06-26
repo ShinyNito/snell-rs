@@ -40,17 +40,13 @@
 //! # Encode flow
 //!
 //! ```text
-//!   begin_write(hint)
+//!   next_plain_capacity()
 //!      |  budget = chunk_limit(now)  (MSS - overhead, grows each record)
-//!      |  slot   = min(hint, budget)
-//!      |  first? -> prepend SALT, set padding = initial_padding_len
 //!      v
-//!   plain_slot(reservation) ----> caller writes payload
-//!      v
-//!   finish_write(reservation, payload_len)
+//!   seal_plain(owned payload)
 //!      |  write HEADER_PLAIN (padding_len, payload_len)
 //!      |  seal header  (AEAD, nonce++, AAD empty)
-//!      |  seal payload (AEAD, nonce++, AAD empty) -> append TAG
+//!      |  seal payload (AEAD, nonce++, AAD empty) -> detached TAG
 //!      |  if padding > 0: make_padding() then swap_padding()
 //!      v
 //!   take_pending_wire() -> flush SALT? + HEADER_CIPHER + BODY
@@ -80,24 +76,23 @@
 use std::{
     fmt,
     io::{self, IoSlice},
-    ops::Range,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
+use compio::buf::{IoBuf, IoBufMut};
 use rand::RngCore;
 use ring::aead::{Aad, LessSafeKey, Tag};
 
-use crate::protocol::ParseState;
-
 use super::{
     DecodeEvent, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE, NONCE_LEN,
-    PendingWire, PlainPrefix, SALT_LEN, SnellTcpDecoder, SnellTcpEncoder, TAG_LEN,
-    WriteReservation,
+    PendingWire, PendingWireSegment, PlaintextFrame, PlaintextSegment, SALT_LEN, SnellTcpDecoder,
+    SnellTcpEncoder,
     common::{
-        ReadStep, apply_plain_prefix, decode_plain_header, fill_from_input, finish_len_with_prefix,
-        invalid_data, invalid_input, make_padding, need_filled, next_nonce,
-        pending_plaintext_slice, plain_slot_with_prefix, swap_padding, v4_key, write_plain_header,
+        ReadStep, decode_plain_header, invalid_data, invalid_input, make_padding_split, next_nonce,
+        pending_plaintext_slice, seal_payload_detached, swap_padding, swap_padding_split, v4_key,
+        write_plain_header,
     },
 };
 
@@ -126,8 +121,7 @@ pub struct V4Encoder {
     initial_padding_len: usize,
     chunk_limit: usize,
     last_write: Option<Instant>,
-    wire: Vec<u8>,
-    pending_salt: bool,
+    pending: PendingWire,
 }
 
 impl fmt::Debug for V4Encoder {
@@ -135,7 +129,7 @@ impl fmt::Debug for V4Encoder {
         f.debug_struct("V4Encoder")
             .field("salt_sent", &self.salt_sent)
             .field("chunk_limit", &self.chunk_limit)
-            .field("wire_len", &self.wire.len())
+            .field("pending_len", &self.pending.total_len())
             .finish()
     }
 }
@@ -150,9 +144,7 @@ pub struct V4Decoder {
     key: Option<LessSafeKey>,
     nonce: [u8; NONCE_LEN],
     read_step: ReadStep,
-    read_buf: Vec<u8>,
-    body: Vec<u8>,
-    plain: Range<usize>,
+    plain: PlaintextFrame,
 }
 
 impl V4Encoder {
@@ -184,155 +176,96 @@ impl V4Encoder {
             initial_padding_len,
             chunk_limit: 0,
             last_write: None,
-            wire: Vec::new(),
-            pending_salt: false,
+            pending: PendingWire::default(),
         })
     }
 
-    /// Reserve a record sized for up to `hint` payload bytes.
-    ///
-    /// Sizes the payload slot by the congestion window, prepends initial padding
-    /// for the first record, and lays out header/padding/payload regions in
-    /// `wire`. The caller writes plaintext into [`V4Encoder::plain_slot`] then
-    /// calls [`V4Encoder::finish_write`].
-    pub fn begin_write(&mut self, hint: usize) -> io::Result<WriteReservation> {
+    fn seal_owned_payload<B>(&mut self, payload: B) -> io::Result<()>
+    where
+        B: IoBufMut + Into<PendingWireSegment>,
+    {
+        let mut payload = payload;
         if !self.pending_empty() {
             return Err(invalid_input("snell pending wire not fully written"));
         }
 
-        let max_payload_len = hint.min(self.next_chunk_limit(Instant::now()));
+        let now = Instant::now();
+        let max_payload_len = self.budget_for(now).min(MAX_PACKET_SIZE);
+        let payload_len = payload.as_init().len();
+        if payload_len > max_payload_len {
+            return Err(invalid_input("snell payload exceeds record capacity"));
+        }
         let first_record = !self.salt_sent;
-        let padding_len = if first_record && max_payload_len > 0 {
+        let padding_len = if first_record && payload_len > 0 {
             self.initial_padding_len
         } else {
             0
         };
 
-        self.wire.clear();
-        self.pending_salt = first_record;
-
-        let header_start = self.wire.len();
-        self.wire.resize(header_start + HEADER_CIPHER_LEN, 0);
-
-        let padding_start = self.wire.len();
-        self.wire.resize(padding_start + padding_len, 0);
-
-        let payload_start = self.wire.len();
-        self.wire
-            .resize(payload_start + max_payload_len + TAG_LEN, 0);
-
-        Ok(WriteReservation {
-            plain_prefix_len: 0,
-            prefix_start: header_start,
-            prefix_len: 0,
-            header_start,
-            padding_start,
-            padding_len,
-            payload_start,
-            max_payload_len,
-        })
-    }
-
-    /// Borrow the plaintext payload slot for this reservation.
-    ///
-    /// Layout in `wire`: `[ ..header.. | ..padding.. | PAYLOAD SLOT | TAG ]`.
-    pub fn plain_slot(&mut self, reservation: WriteReservation) -> &mut [u8] {
-        &mut self.wire
-            [reservation.payload_start..reservation.payload_start + reservation.max_payload_len]
-    }
-
-    /// Seal the record after the caller wrote `payload_len` bytes.
-    ///
-    /// Layout produced in `wire` (first record shown):
-    /// ```text
-    ///   [SALT?][ HEADER_PLAIN ][ HEADER_TAG ][ PADDING ][ PAYLOAD_CIPHER ][ TAG ]
-    ///           ^-- write_plain_header      ^-- seal header (nonce++)          ^-- seal payload (nonce++)
-    ///                                                   padding<->payload swapped when padding > 0
-    /// ```
-    /// A zero-length `payload_len` drops the body entirely and emits a zero chunk.
-    pub fn finish_write(
-        &mut self,
-        reservation: WriteReservation,
-        payload_len: usize,
-    ) -> io::Result<()> {
-        if payload_len > reservation.max_payload_len {
-            return Err(invalid_input("snell payload exceeds reservation"));
-        }
-
-        let padding_len = if payload_len == 0 {
-            0
-        } else {
-            reservation.padding_len
-        };
-        let body_start = reservation.header_start + HEADER_CIPHER_LEN;
-
-        if payload_len == 0 {
-            self.wire.truncate(body_start);
-        } else {
-            self.wire
-                .truncate(reservation.payload_start + payload_len + TAG_LEN);
-        }
-
-        let header = reservation.header_start..reservation.header_start + HEADER_PLAIN_LEN;
-        write_plain_header(&mut self.wire[header.clone()], padding_len, payload_len)?;
+        let mut header = [0; HEADER_CIPHER_LEN];
+        write_plain_header(&mut header[..HEADER_PLAIN_LEN], padding_len, payload_len)?;
         let header_tag = self
             .key
             .seal_in_place_separate_tag(
                 next_nonce(&mut self.nonce),
                 Aad::empty(),
-                &mut self.wire[header.clone()],
+                &mut header[..HEADER_PLAIN_LEN],
             )
             .map_err(|_| invalid_data("snell v4 header encrypt failed"))?;
-        self.wire[header.end..header.end + TAG_LEN].copy_from_slice(header_tag.as_ref());
+        header[HEADER_PLAIN_LEN..HEADER_CIPHER_LEN].copy_from_slice(header_tag.as_ref());
 
+        let mut padding = Vec::new();
+        let mut tag = None;
         if payload_len > 0 {
-            let payload = reservation.payload_start..reservation.payload_start + payload_len;
-            let tag = self
-                .key
-                .seal_in_place_separate_tag(
-                    next_nonce(&mut self.nonce),
-                    Aad::empty(),
-                    &mut self.wire[payload.clone()],
-                )
-                .map_err(|_| invalid_data("snell v4 payload encrypt failed"))?;
-            let tag_start = payload.end;
-            self.wire[tag_start..tag_start + TAG_LEN].copy_from_slice(tag.as_ref());
+            padding.resize(padding_len, 0);
+            let payload_cipher = payload.as_mut_slice();
+            let mut payload_tag = seal_payload_detached(
+                &self.key,
+                &mut self.nonce,
+                &[],
+                payload_cipher,
+                "snell v4 payload encrypt failed",
+            )?;
 
             if padding_len > 0 {
-                let (_, body) = self.wire.split_at_mut(reservation.padding_start);
-                let (padding, payload_cipher_and_tag) = body.split_at_mut(padding_len);
-                make_padding(padding, payload_cipher_and_tag);
-                swap_padding(padding, payload_cipher_and_tag);
+                make_padding_split(&mut padding, payload_cipher, &payload_tag);
+                swap_padding_split(&mut padding, payload_cipher, &mut payload_tag);
             }
+            tag = Some(payload_tag);
         }
 
+        let mut pending = PendingWire::default();
+        if first_record {
+            pending.push(self.salt);
+        }
+        pending.push(header);
+        if payload_len > 0 {
+            pending.push(Bytes::from(padding));
+            pending.push(payload);
+            pending.push(tag.expect("tag set for non-empty payload"));
+        }
+        self.pending = pending;
         self.salt_sent = true;
+        self.chunk_limit = next_v4_chunk_limit(max_payload_len);
+        self.last_write = Some(now);
         Ok(())
     }
 
     /// Whether all sealed bytes have been flushed.
     pub fn pending_empty(&self) -> bool {
-        !self.pending_salt && self.wire.is_empty()
+        self.pending.is_empty()
     }
 
     pub fn take_pending_wire(&mut self) -> PendingWire {
-        let salt = self.pending_salt.then_some(self.salt);
-        self.pending_salt = false;
-        PendingWire::new(salt, std::mem::take(&mut self.wire))
+        std::mem::take(&mut self.pending)
     }
 
     pub fn restore_pending_wire(&mut self, wire: PendingWire) {
-        let (salt, frame) = wire.into_parts();
-        self.pending_salt = salt.is_some();
-        self.wire = frame;
+        self.pending = wire;
     }
 
-    /// Compute this record's payload budget and roll the congestion window forward.
-    fn next_chunk_limit(&mut self, now: Instant) -> usize {
-        let limit = self.budget_for(now).min(MAX_PACKET_SIZE);
-        self.chunk_limit = next_v4_chunk_limit(limit);
-        self.last_write = Some(now);
-        limit
+    fn plain_capacity(&self) -> usize {
+        self.budget_for(Instant::now()).min(MAX_PACKET_SIZE)
     }
 
     /// Payload budget for the next record, by phase:
@@ -382,9 +315,7 @@ impl V4Decoder {
             key: None,
             nonce: [0; NONCE_LEN],
             read_step: ReadStep::Salt { filled: 0 },
-            read_buf: Vec::new(),
-            body: Vec::new(),
-            plain: 0..0,
+            plain: PlaintextFrame::default(),
         }
     }
 
@@ -417,9 +348,9 @@ impl V4Decoder {
     }
 
     /// Decrypt the header currently buffered in `read_buf` (streaming path).
-    fn decode_header_in_place(&mut self) -> io::Result<DecodedHeader> {
+    fn decode_header_in_place(&mut self, header_cipher: &mut [u8]) -> io::Result<DecodedHeader> {
         let nonce = next_nonce(&mut self.nonce);
-        let (cipher, tag) = self.read_buf[..HEADER_CIPHER_LEN].split_at_mut(HEADER_PLAIN_LEN);
+        let (cipher, tag) = header_cipher.split_at_mut(HEADER_PLAIN_LEN);
         let tag = Tag::try_from(&tag[..]).map_err(|_| invalid_data("snell v4 invalid tag"))?;
         let key = self
             .key
@@ -431,12 +362,6 @@ impl V4Decoder {
         decode_plain_header(header)
     }
 
-    /// Borrow the fill slot for a record's body (padding + ciphertext + tag).
-    pub fn body_slot(&mut self, header: DecodedHeader) -> &mut [u8] {
-        self.body.resize(header.body_len, 0);
-        &mut self.body[..header.body_len]
-    }
-
     /// Decrypt the body, returning `Ok(true)` if plaintext is available, `Ok(false)` for
     /// a zero chunk.
     ///
@@ -446,8 +371,11 @@ impl V4Decoder {
     ///   2. AEAD open(payload_cipher, tag, nonce++)  -- decrypt
     ///   3. self.plain = padding_len .. padding_len + payload_len
     /// ```
-    pub fn finish_body(&mut self, header: DecodedHeader) -> io::Result<bool> {
-        self.plain = 0..0;
+    pub fn finish_body<B>(&mut self, input: B, header: DecodedHeader) -> io::Result<bool>
+    where
+        B: IoBufMut + Into<PlaintextSegment>,
+    {
+        self.plain = PlaintextFrame::default();
         if header.payload_len == 0 {
             if header.padding_len != 0 {
                 return Err(invalid_data("snell v4 zero chunk with padding"));
@@ -459,7 +387,11 @@ impl V4Decoder {
             .key
             .as_ref()
             .ok_or_else(|| invalid_data("snell v4 reader key not initialized"))?;
-        let body = &mut self.body[..header.body_len];
+        let mut frame = PlaintextFrame::from_segment(input, 0..0);
+        let body = frame.body_mut();
+        if body.len() != header.body_len {
+            return Err(invalid_data("snell v4 body length mismatch"));
+        }
         let (padding, payload_cipher_and_tag) = body.split_at_mut(header.padding_len);
         swap_padding(padding, payload_cipher_and_tag);
         let (payload_cipher, tag) = payload_cipher_and_tag.split_at_mut(header.payload_len);
@@ -467,23 +399,26 @@ impl V4Decoder {
         let nonce = next_nonce(&mut self.nonce);
         key.open_in_place_separate_tag(nonce, Aad::empty(), tag, payload_cipher, 0..)
             .map_err(|_| invalid_data("snell v4 payload decrypt failed"))?;
-        self.plain = header.padding_len..header.padding_len + header.payload_len;
+        frame.set_plain(header.padding_len..header.padding_len + header.payload_len);
+        self.plain = frame;
         Ok(true)
     }
 
     /// Borrow the decrypted plaintext region from the current record.
     pub fn pending_plain(&self) -> &[u8] {
-        &self.body[self.plain.clone()]
+        self.plain.as_init()
     }
 
     /// Mark `n` bytes from [`V4Decoder::pending_plain`] as consumed.
     pub fn consume_plain(&mut self, n: usize) {
-        let take = n.min(self.plain.len());
-        self.plain.start += take;
+        self.plain.advance(n);
+    }
+
+    pub fn take_pending_plain(&mut self) -> Option<PlaintextFrame> {
         if self.plain.is_empty() {
-            self.body.clear();
-            self.plain = 0..0;
+            return None;
         }
+        Some(std::mem::take(&mut self.plain))
     }
 
     fn key(&self) -> io::Result<&LessSafeKey> {
@@ -494,35 +429,15 @@ impl V4Decoder {
 }
 
 impl SnellTcpEncoder for V4Encoder {
-    type Reservation = WriteReservation;
-
-    fn begin_plain_reservation(
-        &mut self,
-        prefix: PlainPrefix<'_>,
-        payload_hint: usize,
-    ) -> io::Result<Self::Reservation> {
-        let mut reservation =
-            V4Encoder::begin_write(self, prefix.len().saturating_add(payload_hint))?;
-        apply_plain_prefix(&mut self.wire, &mut reservation, prefix)?;
-        Ok(reservation)
+    fn next_plain_capacity(&self) -> usize {
+        self.plain_capacity()
     }
 
-    fn plain_slot(&mut self, reservation: &Self::Reservation) -> &mut [u8] {
-        plain_slot_with_prefix(&mut self.wire, reservation)
-    }
-
-    fn finish_plain_reservation(
-        &mut self,
-        reservation: Self::Reservation,
-        payload_len: usize,
-    ) -> io::Result<()> {
-        let payload_len = finish_len_with_prefix(&reservation, payload_len)?;
-        V4Encoder::finish_write(self, reservation, payload_len)
-    }
-
-    fn cancel_plain_reservation(&mut self, _reservation: Self::Reservation) {
-        self.wire.clear();
-        self.pending_salt = false;
+    fn seal_plain<B>(&mut self, payload: B) -> io::Result<()>
+    where
+        B: IoBufMut + Into<PendingWireSegment>,
+    {
+        self.seal_owned_payload(payload)
     }
 
     fn take_pending_wire(&mut self) -> PendingWire {
@@ -539,66 +454,61 @@ impl SnellTcpEncoder for V4Encoder {
 }
 
 impl SnellTcpDecoder for V4Decoder {
-    fn decode_ciphertext(&mut self, src: &mut &[u8]) -> io::Result<DecodeEvent<'_>> {
+    fn next_cipher_len(&self) -> usize {
+        if !self.pending_plain().is_empty() {
+            return 0;
+        }
+        match self.read_step {
+            ReadStep::Salt { filled } => SALT_LEN - filled,
+            ReadStep::Header { filled } => HEADER_CIPHER_LEN - filled,
+            ReadStep::Body { header, filled } => header.body_len - filled,
+        }
+    }
+
+    fn decode_ciphertext<B>(&mut self, input: B) -> io::Result<DecodeEvent<'_>>
+    where
+        B: IoBufMut + Into<PlaintextSegment>,
+    {
         if !self.pending_plain().is_empty() {
             return Ok(DecodeEvent::PlainData);
         }
 
-        loop {
-            match self.read_step {
-                ReadStep::Salt { filled } => {
-                    self.read_buf.resize(SALT_LEN, 0);
-                    let filled = fill_from_input(src, &mut self.read_buf, filled);
-                    match need_filled(filled, SALT_LEN) {
-                        ParseState::Need(_) => {
-                            self.read_step = ReadStep::Salt { filled };
-                            return Ok(DecodeEvent::NeedMore);
-                        }
-                        ParseState::Done(()) => {}
-                    }
-                    let salt: [u8; SALT_LEN] = self.read_buf[..SALT_LEN]
-                        .try_into()
-                        .expect("salt buffer filled");
-                    self.init_salt(salt)?;
-                    self.read_step = ReadStep::Header { filled: 0 };
+        match self.read_step {
+            ReadStep::Salt { filled } => {
+                if filled != 0 || input.as_init().len() != SALT_LEN {
+                    return Err(invalid_data("snell v4 salt length mismatch"));
                 }
-                ReadStep::Header { filled } => {
-                    self.read_buf.resize(HEADER_CIPHER_LEN, 0);
-                    let filled = fill_from_input(src, &mut self.read_buf, filled);
-                    match need_filled(filled, HEADER_CIPHER_LEN) {
-                        ParseState::Need(_) => {
-                            self.read_step = ReadStep::Header { filled };
-                            return Ok(DecodeEvent::NeedMore);
-                        }
-                        ParseState::Done(()) => {}
-                    }
-                    let header = self.decode_header_in_place()?;
-                    if header.body_len == 0 {
-                        self.read_step = ReadStep::Header { filled: 0 };
-                        return if self.finish_body(header)? {
-                            Ok(DecodeEvent::PlainData)
-                        } else {
-                            Ok(DecodeEvent::ZeroChunk)
-                        };
-                    }
-                    self.read_step = ReadStep::Body { header, filled: 0 };
+                let salt: [u8; SALT_LEN] = input.as_init().try_into().expect("salt buffer filled");
+                self.init_salt(salt)?;
+                self.read_step = ReadStep::Header { filled: 0 };
+                Ok(DecodeEvent::NeedMore)
+            }
+            ReadStep::Header { filled } => {
+                if filled != 0 || input.as_init().len() != HEADER_CIPHER_LEN {
+                    return Err(invalid_data("snell v4 header length mismatch"));
                 }
-                ReadStep::Body { header, filled } => {
-                    self.body.resize(header.body_len, 0);
-                    let filled = fill_from_input(src, &mut self.body, filled);
-                    match need_filled(filled, header.body_len) {
-                        ParseState::Need(_) => {
-                            self.read_step = ReadStep::Body { header, filled };
-                            return Ok(DecodeEvent::NeedMore);
-                        }
-                        ParseState::Done(()) => {}
-                    }
+                let mut input = input;
+                let header = self.decode_header_in_place(input.as_mut_slice())?;
+                if header.body_len == 0 {
                     self.read_step = ReadStep::Header { filled: 0 };
-                    return if self.finish_body(header)? {
+                    return if self.finish_body(input, header)? {
                         Ok(DecodeEvent::PlainData)
                     } else {
                         Ok(DecodeEvent::ZeroChunk)
                     };
+                }
+                self.read_step = ReadStep::Body { header, filled: 0 };
+                Ok(DecodeEvent::NeedMore)
+            }
+            ReadStep::Body { header, filled } => {
+                if filled != 0 || input.as_init().len() != header.body_len {
+                    return Err(invalid_data("snell v4 body length mismatch"));
+                }
+                self.read_step = ReadStep::Header { filled: 0 };
+                if self.finish_body(input, header)? {
+                    Ok(DecodeEvent::PlainData)
+                } else {
+                    Ok(DecodeEvent::ZeroChunk)
                 }
             }
         }
@@ -610,5 +520,9 @@ impl SnellTcpDecoder for V4Decoder {
 
     fn advance_plaintext(&mut self, n: usize) {
         V4Decoder::consume_plain(self, n);
+    }
+
+    fn take_pending_plaintext(&mut self) -> Option<PlaintextFrame> {
+        V4Decoder::take_pending_plain(self)
     }
 }

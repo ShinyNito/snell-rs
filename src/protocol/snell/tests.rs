@@ -1,6 +1,7 @@
 use super::v4::{V4_FIRST_RECORD_OVERHEAD, V4_MSS_BASE, next_v4_chunk_limit};
 use super::*;
 use crate::protocol::address::Address;
+use bytes::BytesMut;
 use std::{io::IoSlice, net::SocketAddr, sync::Arc};
 
 #[test]
@@ -102,23 +103,21 @@ fn udp_response_packet_round_trips_domain_and_ip() {
 fn v4_codec_round_trips_in_place() {
     let psk = b"0123456789abcdef";
     let mut encoder = V4Encoder::new(psk).unwrap();
-    let reservation = encoder.begin_write(32).unwrap();
-    encoder.plain_slot(reservation)[..5].copy_from_slice(b"hello");
-    encoder.finish_write(reservation, 5).unwrap();
+    encoder.seal_plain(BytesMut::from(&b"hello"[..])).unwrap();
 
     let wire = collect_pending(&mut encoder);
     let mut decoder = V4Decoder::new(&psk[..]);
-    let salt: [u8; SALT_LEN] = wire[..SALT_LEN].try_into().unwrap();
-    decoder.init_salt(salt).unwrap();
-    let mut header: [u8; HEADER_CIPHER_LEN] = wire[SALT_LEN..SALT_LEN + HEADER_CIPHER_LEN]
-        .try_into()
-        .unwrap();
-    let decoded = decoder.decode_header(&mut header).unwrap();
-    decoder
-        .body_slot(decoded)
-        .copy_from_slice(&wire[SALT_LEN + HEADER_CIPHER_LEN..]);
-
-    assert!(decoder.finish_body(decoded).unwrap());
+    let mut src = wire.as_slice();
+    loop {
+        match decode_next(&mut decoder, &mut src) {
+            DecodeEvent::NeedMore => assert!(
+                !src.is_empty(),
+                "decoder needs more bytes than encoder emitted"
+            ),
+            DecodeEvent::PlainData => break,
+            event => panic!("unexpected decode event: {event:?}"),
+        }
+    }
     assert_eq!(decoder.pending_plain(), b"hello");
 }
 
@@ -127,17 +126,21 @@ fn v4_encoder_applies_padding_and_chunk_size() {
     let psk = b"0123456789abcdef";
     let mut encoder = V4Encoder::with_salt_and_initial_padding(psk, [7; SALT_LEN], 8).unwrap();
 
-    let first = encoder.begin_write(MAX_PACKET_SIZE).unwrap();
     let first_limit = V4_MSS_BASE - V4_FIRST_RECORD_OVERHEAD - 8;
-    assert_eq!(first.max_payload_len, first_limit);
-    assert_eq!(first.padding_len, 8);
-    encoder.plain_slot(first).fill(0x42);
-    encoder.finish_write(first, first_limit).unwrap();
-    let _ = collect_pending(&mut encoder);
+    assert_eq!(encoder.next_plain_capacity(), first_limit);
+    let mut payload = BytesMut::with_capacity(first_limit);
+    payload.resize(first_limit, 0x42);
+    encoder.seal_plain(payload).unwrap();
+    let wire = collect_pending(&mut encoder);
+    assert_eq!(
+        wire.len(),
+        SALT_LEN + HEADER_CIPHER_LEN + 8 + first_limit + TAG_LEN
+    );
 
-    let second = encoder.begin_write(MAX_PACKET_SIZE).unwrap();
-    assert_eq!(second.padding_len, 0);
-    assert_eq!(second.max_payload_len, next_v4_chunk_limit(first_limit));
+    assert_eq!(
+        encoder.next_plain_capacity(),
+        next_v4_chunk_limit(first_limit)
+    );
 }
 
 #[test]
@@ -180,24 +183,17 @@ where
     M: SnellMode,
 {
     let mut encoder = M::new_encoder(psk).unwrap();
-    let reservation = encoder
-        .begin_plain_reservation(PlainPrefix::none(), payload.len())
-        .unwrap();
-    encoder.plain_slot(&reservation)[..payload.len()].copy_from_slice(payload);
-    encoder
-        .finish_plain_reservation(reservation, payload.len())
-        .unwrap();
+    encoder.seal_plain(BytesMut::from(payload)).unwrap();
 
     let wire = collect_pending_trait(&mut encoder);
     let mut decoder = M::new_decoder(Arc::from(psk));
     let mut src = wire.as_slice();
     loop {
-        let before = src.len();
-        let event = decoder.decode_ciphertext(&mut src).unwrap();
+        let event = decode_next(&mut decoder, &mut src);
         match event {
             DecodeEvent::NeedMore => {
                 assert!(
-                    src.len() < before,
+                    !src.is_empty(),
                     "decoder needs more bytes than encoder emitted"
                 );
             }
@@ -215,13 +211,7 @@ where
     let mut encoder = M::new_encoder(psk).unwrap();
     let mut wire = Vec::new();
     for payload in payloads {
-        let reservation = encoder
-            .begin_plain_reservation(PlainPrefix::none(), payload.len())
-            .unwrap();
-        encoder.plain_slot(&reservation)[..payload.len()].copy_from_slice(payload);
-        encoder
-            .finish_plain_reservation(reservation, payload.len())
-            .unwrap();
+        encoder.seal_plain(BytesMut::from(*payload)).unwrap();
         let frame = collect_pending_trait(&mut encoder);
         wire.extend_from_slice(&frame);
     }
@@ -230,15 +220,36 @@ where
     let mut src = wire.as_slice();
     let mut frames = Vec::new();
     while !src.is_empty() {
-        let event = decoder.decode_ciphertext(&mut src).unwrap();
+        let event = decode_next(&mut decoder, &mut src);
         match event {
-            DecodeEvent::NeedMore => {}
+            DecodeEvent::NeedMore => {
+                assert!(
+                    !src.is_empty(),
+                    "decoder needs more bytes than encoder emitted"
+                );
+            }
             DecodeEvent::PlainData => frames.push(Some(collect_plaintext(&mut decoder))),
             DecodeEvent::ZeroChunk => frames.push(None),
             _ => {}
         }
     }
     frames
+}
+
+fn decode_next<'a, D>(decoder: &'a mut D, src: &mut &[u8]) -> DecodeEvent<'a>
+where
+    D: SnellTcpDecoder,
+{
+    let need = decoder.next_cipher_len();
+    assert!(need > 0, "decoder has no pending ciphertext need");
+    assert!(
+        need <= src.len(),
+        "decoder needs {need} bytes, but only {} remain",
+        src.len()
+    );
+    let chunk = BytesMut::from(&src[..need]);
+    *src = &src[need..];
+    decoder.decode_ciphertext(chunk).unwrap()
 }
 
 fn collect_pending_trait<E>(encoder: &mut E) -> Vec<u8>

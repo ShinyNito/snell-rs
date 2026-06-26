@@ -11,7 +11,7 @@ use std::{
 };
 
 use compio::{
-    buf::BufResult,
+    buf::{BufResult, IoVectoredBuf},
     driver::op::RecvFromMultiResult,
     io::AsyncRead,
     net::{TcpStream, UdpSocket},
@@ -22,7 +22,7 @@ use lru_time_cache::LruCache;
 use crate::{
     protocol::{
         address::Address,
-        snell::{self, SnellMode, SnellTcpEncoder},
+        snell::{self, SnellMode},
         socks5,
     },
     relay::tcp::{
@@ -123,9 +123,8 @@ pub(crate) fn relay_snell_udp<M, O>(
 ) -> impl Future<Output = io::Result<()>>
 where
     M: SnellMode + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
     O: DatagramTransport + Unpin,
     O::SendState: Unpin,
 {
@@ -154,9 +153,8 @@ where
 impl<M, O> SnellUdpRelay<M, O>
 where
     M: SnellMode + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
     O: DatagramTransport + Unpin,
     O::SendState: Unpin,
 {
@@ -248,10 +246,9 @@ pub(crate) fn relay_socks5_udp<M>(
     connector: Rc<SnellConnector<M>>,
 ) -> impl Future<Output = io::Result<()>>
 where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static + Unpin,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
 {
     let mut relay = Socks5UdpRelay {
         control: TcpControlState::new(control),
@@ -276,10 +273,9 @@ where
 
 impl<M> Socks5UdpRelay<M>
 where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static + Unpin,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
 {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
@@ -425,10 +421,9 @@ where
 
 impl<M> ClientUdpAssociation<M>
 where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+    M: SnellMode + 'static + Unpin,
+    M::Encoder: Unpin,
+    M::Decoder: Unpin,
 {
     fn new(peer: SocketAddr, connector: Rc<SnellConnector<M>>) -> Self {
         let future = Box::pin(async move { connector.connect_udp().await });
@@ -490,8 +485,12 @@ where
                 return Poll::Ready(Ok(true));
             }
 
-            match transport.reader.poll_read_frame_vec(cx, &mut self.snell_in) {
-                Poll::Ready(Ok(true)) => {
+            match transport.reader.poll_read_frame_batch(cx) {
+                Poll::Ready(Ok(Some(batch))) => {
+                    self.snell_in.clear();
+                    for slice in batch.iter_slice() {
+                        self.snell_in.extend_from_slice(slice);
+                    }
                     let packet = snell::decode_udp_response_packet(&self.snell_in)?;
                     let header_len = socks5::udp_header_len(packet.address)?;
                     let mut response = vec![0u8; header_len + packet.payload.len()];
@@ -502,7 +501,7 @@ where
                     }
                     self.pending_to_client.push_back(response);
                 }
-                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(false)),
+                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(false)),
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => return Poll::Pending,
             }
