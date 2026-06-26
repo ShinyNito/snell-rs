@@ -15,21 +15,21 @@ use std::{
 };
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
+use snell_rs::client::ClientConfig as RuntimeClientConfig;
+#[cfg(not(windows))]
+use snell_rs::client::bind_tcp_listener as bind_client_tcp_listener;
 #[cfg(windows)]
 use snell_rs::client::bind_tcp_listener_with_dispatcher as bind_client_tcp_listener_with_dispatcher;
-use snell_rs::client::{
-    ClientConfig as RuntimeClientConfig, bind_tcp_listener as bind_client_tcp_listener,
-};
 use snell_rs::config::{
     ClientConfig as FileClientConfig, ServerConfig as FileServerConfig, psk_from_str,
     server_protocol_from_cli,
 };
 use snell_rs::protocol::snell::version::ProtocolVersion;
+#[cfg(not(windows))]
+use snell_rs::server::bind_tcp_listener as bind_server_tcp_listener;
 #[cfg(windows)]
 use snell_rs::server::bind_tcp_listener_with_dispatcher as bind_server_tcp_listener_with_dispatcher;
-use snell_rs::server::{
-    Outbound, ServerConfig as RuntimeServerConfig, bind_tcp_listener as bind_server_tcp_listener,
-};
+use snell_rs::server::{Outbound, ServerConfig as RuntimeServerConfig};
 use tracing_subscriber::EnvFilter;
 
 #[global_allocator]
@@ -185,6 +185,7 @@ where
     })
 }
 
+#[cfg(not(windows))]
 fn run_per_core<F>(run_worker: F) -> io::Result<()>
 where
     F: Fn(usize) -> io::Result<()> + Send + Sync + 'static,
@@ -196,7 +197,7 @@ where
         not(target_os = "cygwin"),
     )))]
     {
-        return run_worker(0);
+        run_worker(0)
     }
 
     #[cfg(all(
