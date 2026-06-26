@@ -23,7 +23,7 @@
 //! # Encode / Decode flow
 //!
 //! Same as V4 minus padding interleave and congestion window:
-//! - Encoder: `begin_write → plain_slot → finish_write (seal header + payload) → pending_wire`
+//! - Encoder: `begin_write → plain_slot → finish_write (seal header + payload) → take_pending_wire`
 //! - Decoder: `Salt → Header (decrypt) → Body (swap_padding is a no-op) → plaintext`
 
 use std::{
@@ -39,12 +39,13 @@ use ring::aead::{Aad, LessSafeKey, Tag};
 use crate::protocol::ParseState;
 
 use super::super::{
-    DecodeEvent, DecodeSlot, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE,
-    NONCE_LEN, PlainPrefix, SALT_LEN, SnellTcpDecoder, SnellTcpEncoder, TAG_LEN, WriteReservation,
+    DecodeEvent, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE, NONCE_LEN,
+    PendingWire, PlainPrefix, SALT_LEN, SnellTcpDecoder, SnellTcpEncoder, TAG_LEN,
+    WriteReservation,
     common::{
-        ReadStep, apply_plain_prefix, decode_v6_unshaped_header, finish_len_with_prefix,
-        invalid_data, invalid_input, need_filled, next_nonce, pending_plaintext_slice,
-        plain_slot_with_prefix, push_pending, seal_header, seal_payload, v6_key,
+        ReadStep, apply_plain_prefix, decode_v6_unshaped_header, fill_from_input,
+        finish_len_with_prefix, invalid_data, invalid_input, need_filled, next_nonce,
+        pending_plaintext_slice, plain_slot_with_prefix, seal_header, seal_payload, v6_key,
         write_v6_plain_header,
     },
 };
@@ -60,7 +61,6 @@ pub struct V6UnshapedEncoder {
     salt_sent: bool,
     wire: Vec<u8>,
     pending_salt: bool,
-    wire_pos: usize,
 }
 
 impl fmt::Debug for V6UnshapedEncoder {
@@ -68,7 +68,6 @@ impl fmt::Debug for V6UnshapedEncoder {
         f.debug_struct("V6UnshapedEncoder")
             .field("salt_sent", &self.salt_sent)
             .field("wire_len", &self.wire.len())
-            .field("wire_pos", &self.wire_pos)
             .finish()
     }
 }
@@ -104,7 +103,6 @@ impl V6UnshapedEncoder {
             salt_sent: false,
             wire: Vec::new(),
             pending_salt: false,
-            wire_pos: 0,
         })
     }
 
@@ -120,7 +118,6 @@ impl V6UnshapedEncoder {
         let max_payload_len = hint.min(MAX_PACKET_SIZE);
         let first_record = !self.salt_sent;
         self.wire.clear();
-        self.wire_pos = 0;
         self.pending_salt = first_record;
         self.wire.resize(
             HEADER_CIPHER_LEN + max_payload_len + usize::from(max_payload_len > 0) * TAG_LEN,
@@ -128,7 +125,6 @@ impl V6UnshapedEncoder {
         );
         Ok(WriteReservation {
             plain_prefix_len: 0,
-            head_start: 0,
             prefix_start: 0,
             prefix_len: 0,
             header_start: 0,
@@ -189,41 +185,24 @@ impl V6UnshapedEncoder {
         }
 
         self.salt_sent = true;
-        self.wire_pos = 0;
         Ok(())
     }
 
     /// Whether all sealed bytes have been flushed.
     pub fn pending_empty(&self) -> bool {
-        self.wire_pos >= self.pending_len()
+        !self.pending_salt && self.wire.is_empty()
     }
 
-    /// Collect sealed bytes pending flush as vectored slices.
-    ///
-    /// Emission order: `[SALT?][HEADER_CIPHER][PAYLOAD_CIPHER + TAG]`.
-    pub fn pending_wire<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
-        let mut len = 0;
-        let mut skip = self.wire_pos;
-        if self.pending_salt {
-            push_pending(out, &mut len, &mut skip, &self.salt);
-        }
-        push_pending(out, &mut len, &mut skip, &self.wire);
-        len
+    pub fn take_pending_wire(&mut self) -> PendingWire {
+        let salt = self.pending_salt.then_some(self.salt);
+        self.pending_salt = false;
+        PendingWire::new(salt, std::mem::take(&mut self.wire))
     }
 
-    /// Mark `written` sealed bytes as flushed, clearing the record when drained.
-    pub fn advance_wire(&mut self, written: usize) {
-        self.wire_pos = (self.wire_pos + written).min(self.pending_len());
-        if self.pending_empty() {
-            self.wire.clear();
-            self.pending_salt = false;
-            self.wire_pos = 0;
-        }
-    }
-
-    /// Total pending bytes: `SALT? + HEADER_CIPHER + BODY`.
-    fn pending_len(&self) -> usize {
-        usize::from(self.pending_salt) * SALT_LEN + self.wire.len()
+    pub fn restore_pending_wire(&mut self, wire: PendingWire) {
+        let (salt, frame) = wire.into_parts();
+        self.pending_salt = salt.is_some();
+        self.wire = frame;
     }
 }
 
@@ -333,93 +312,82 @@ impl SnellTcpEncoder for V6UnshapedEncoder {
     fn cancel_plain_reservation(&mut self, _reservation: Self::Reservation) {
         self.wire.clear();
         self.pending_salt = false;
-        self.wire_pos = 0;
     }
 
-    fn pending_wire<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
-        V6UnshapedEncoder::pending_wire(self, out)
+    fn take_pending_wire(&mut self) -> PendingWire {
+        V6UnshapedEncoder::take_pending_wire(self)
     }
 
-    fn advance_wire(&mut self, written: usize) {
-        V6UnshapedEncoder::advance_wire(self, written);
+    fn restore_pending_wire(&mut self, wire: PendingWire) {
+        V6UnshapedEncoder::restore_pending_wire(self, wire);
+    }
+
+    fn has_pending_wire(&self) -> bool {
+        !self.pending_empty()
     }
 }
 
 impl SnellTcpDecoder for V6UnshapedDecoder {
-    fn next_ciphertext_slot(&mut self) -> DecodeSlot<'_> {
+    fn decode_ciphertext(&mut self, src: &mut &[u8]) -> io::Result<DecodeEvent<'_>> {
         if !self.pending_plain().is_empty() {
-            return DecodeSlot::BlockedByPlaintext;
+            return Ok(DecodeEvent::PlainData);
         }
 
-        match self.read_step {
-            ReadStep::Salt { filled } => {
-                self.read_buf.resize(SALT_LEN, 0);
-                DecodeSlot::Read(&mut self.read_buf[filled..])
-            }
-            ReadStep::Header { filled } => {
-                self.read_buf.resize(HEADER_CIPHER_LEN, 0);
-                DecodeSlot::Read(&mut self.read_buf[filled..])
-            }
-            ReadStep::Body { header, filled } => {
-                self.body.resize(header.body_len, 0);
-                DecodeSlot::Read(&mut self.body[filled..])
-            }
-        }
-    }
-
-    fn commit_ciphertext(&mut self, n: usize) -> io::Result<DecodeEvent<'_>> {
-        match self.read_step {
-            ReadStep::Salt { filled } => {
-                let filled = filled + n;
-                match need_filled(filled, SALT_LEN) {
-                    ParseState::Need(_) => {
-                        self.read_step = ReadStep::Salt { filled };
-                        return Ok(DecodeEvent::NeedMore);
+        loop {
+            match self.read_step {
+                ReadStep::Salt { filled } => {
+                    self.read_buf.resize(SALT_LEN, 0);
+                    let filled = fill_from_input(src, &mut self.read_buf, filled);
+                    match need_filled(filled, SALT_LEN) {
+                        ParseState::Need(_) => {
+                            self.read_step = ReadStep::Salt { filled };
+                            return Ok(DecodeEvent::NeedMore);
+                        }
+                        ParseState::Done(()) => {}
                     }
-                    ParseState::Done(()) => {}
+                    let salt: [u8; SALT_LEN] = self.read_buf[..SALT_LEN]
+                        .try_into()
+                        .expect("salt buffer filled");
+                    self.init_salt(salt)?;
+                    self.read_step = ReadStep::Header { filled: 0 };
                 }
-                let salt: [u8; SALT_LEN] = self.read_buf[..SALT_LEN]
-                    .try_into()
-                    .expect("salt buffer filled");
-                self.init_salt(salt)?;
-                self.read_step = ReadStep::Header { filled: 0 };
-                Ok(DecodeEvent::NeedMore)
-            }
-            ReadStep::Header { filled } => {
-                let filled = filled + n;
-                match need_filled(filled, HEADER_CIPHER_LEN) {
-                    ParseState::Need(_) => {
-                        self.read_step = ReadStep::Header { filled };
-                        return Ok(DecodeEvent::NeedMore);
+                ReadStep::Header { filled } => {
+                    self.read_buf.resize(HEADER_CIPHER_LEN, 0);
+                    let filled = fill_from_input(src, &mut self.read_buf, filled);
+                    match need_filled(filled, HEADER_CIPHER_LEN) {
+                        ParseState::Need(_) => {
+                            self.read_step = ReadStep::Header { filled };
+                            return Ok(DecodeEvent::NeedMore);
+                        }
+                        ParseState::Done(()) => {}
                     }
-                    ParseState::Done(()) => {}
+                    let header = self.decode_header_in_place()?;
+                    if header.body_len == 0 {
+                        self.read_step = ReadStep::Header { filled: 0 };
+                        return if self.finish_body(header)? {
+                            Ok(DecodeEvent::PlainData)
+                        } else {
+                            Ok(DecodeEvent::ZeroChunk)
+                        };
+                    }
+                    self.read_step = ReadStep::Body { header, filled: 0 };
                 }
-                let header = self.decode_header_in_place()?;
-                if header.body_len == 0 {
+                ReadStep::Body { header, filled } => {
+                    self.body.resize(header.body_len, 0);
+                    let filled = fill_from_input(src, &mut self.body, filled);
+                    match need_filled(filled, header.body_len) {
+                        ParseState::Need(_) => {
+                            self.read_step = ReadStep::Body { header, filled };
+                            return Ok(DecodeEvent::NeedMore);
+                        }
+                        ParseState::Done(()) => {}
+                    }
                     self.read_step = ReadStep::Header { filled: 0 };
                     return if self.finish_body(header)? {
                         Ok(DecodeEvent::PlainData)
                     } else {
                         Ok(DecodeEvent::ZeroChunk)
                     };
-                }
-                self.read_step = ReadStep::Body { header, filled: 0 };
-                Ok(DecodeEvent::NeedMore)
-            }
-            ReadStep::Body { header, filled } => {
-                let filled = filled + n;
-                match need_filled(filled, header.body_len) {
-                    ParseState::Need(_) => {
-                        self.read_step = ReadStep::Body { header, filled };
-                        return Ok(DecodeEvent::NeedMore);
-                    }
-                    ParseState::Done(()) => {}
-                }
-                self.read_step = ReadStep::Header { filled: 0 };
-                if self.finish_body(header)? {
-                    Ok(DecodeEvent::PlainData)
-                } else {
-                    Ok(DecodeEvent::ZeroChunk)
                 }
             }
         }

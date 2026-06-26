@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use compio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadManaged, AsyncWrite},
     net::{TcpListener, TcpSocket, TcpStream},
     runtime, time,
 };
@@ -14,9 +14,8 @@ use crate::{
     config::TcpBrutalConfig,
     keepalive::apply_tcp_keepalive,
     protocol::snell::{
-        self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, DecodeSlot, MAX_CONNECT_REQUEST_LEN,
-        SnellMode, SnellTcpDecoder, SnellTcpEncoder, V4Decoder, V4Mode, V6ShapedDecoder,
-        V6ShapedMode,
+        self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, MAX_CONNECT_REQUEST_LEN, SnellMode,
+        SnellTcpDecoder, SnellTcpEncoder, V4Decoder, V4Mode, V6ShapedDecoder, V6ShapedMode,
     },
     relay::tcp::{
         client::SnellTransport,
@@ -272,7 +271,8 @@ async fn read_snell_request<R, D>(
     reader: &mut SnellStreamReader<R, D>,
 ) -> io::Result<SnellInboundRequest>
 where
-    R: AsyncRead + Unpin + 'static,
+    R: AsyncReadManaged + Unpin + 'static,
+    R::Buffer: 'static,
     D: SnellTcpDecoder,
 {
     let mut head = [0u8; 3];
@@ -478,24 +478,15 @@ fn probe_decoder<D>(decoder: &mut D, bytes: &[u8]) -> ProbeResult
 where
     D: SnellTcpDecoder,
 {
-    let mut offset = 0;
+    let mut src = bytes;
     loop {
-        match decoder.next_ciphertext_slot() {
-            DecodeSlot::Read(slot) => {
-                if offset == bytes.len() {
-                    return ProbeResult::NeedMore;
-                }
-                let n = slot.len().min(bytes.len() - offset);
-                slot[..n].copy_from_slice(&bytes[offset..offset + n]);
-                offset += n;
-
-                match decoder.commit_ciphertext(n) {
-                    Ok(DecodeEvent::PlainData) => return probe_plaintext(decoder),
-                    Ok(DecodeEvent::ZeroChunk) | Err(_) => return ProbeResult::Invalid,
-                    Ok(_) => {}
-                }
-            }
-            DecodeSlot::BlockedByPlaintext => return probe_plaintext(decoder),
+        let before = src.len();
+        match decoder.decode_ciphertext(&mut src) {
+            Ok(DecodeEvent::PlainData) => return probe_plaintext(decoder),
+            Ok(DecodeEvent::ZeroChunk) | Err(_) => return ProbeResult::Invalid,
+            Ok(DecodeEvent::NeedMore) if src.is_empty() => return ProbeResult::NeedMore,
+            Ok(_) if src.len() == before => return ProbeResult::NeedMore,
+            Ok(_) => {}
         }
     }
 }
@@ -555,11 +546,7 @@ mod tests {
     struct PendingPlaintext(Vec<u8>);
 
     impl SnellTcpDecoder for PendingPlaintext {
-        fn next_ciphertext_slot(&mut self) -> DecodeSlot<'_> {
-            DecodeSlot::BlockedByPlaintext
-        }
-
-        fn commit_ciphertext(&mut self, _n: usize) -> io::Result<DecodeEvent<'_>> {
+        fn decode_ciphertext(&mut self, _src: &mut &[u8]) -> io::Result<DecodeEvent<'_>> {
             Ok(DecodeEvent::PlainData)
         }
 
@@ -655,10 +642,9 @@ mod tests {
             .finish_plain_reservation(reservation, plaintext.len())
             .unwrap();
 
-        let mut wire = Vec::new();
-        let mut pending = [std::io::IoSlice::new(&[]); 5];
-        let nbufs = encoder.pending_wire(&mut pending);
-        for slice in &pending[..nbufs] {
+        let pending = encoder.take_pending_wire();
+        let mut wire = Vec::with_capacity(pending.total_len());
+        for slice in pending.iter_slices() {
             wire.extend_from_slice(slice);
         }
 
@@ -678,10 +664,9 @@ mod tests {
             .finish_plain_reservation(reservation, plaintext.len())
             .unwrap();
 
-        let mut wire = Vec::new();
-        let mut pending = [std::io::IoSlice::new(&[]); 5];
-        let nbufs = encoder.pending_wire(&mut pending);
-        for slice in &pending[..nbufs] {
+        let pending = encoder.take_pending_wire();
+        let mut wire = Vec::with_capacity(pending.total_len());
+        for slice in pending.iter_slices() {
             wire.extend_from_slice(slice);
         }
 

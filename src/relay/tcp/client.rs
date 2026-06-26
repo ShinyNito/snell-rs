@@ -1,6 +1,6 @@
 use std::{io, marker::PhantomData, net::SocketAddr, rc::Rc, sync::Arc};
 
-use compio::{io::AsyncRead, net::TcpStream};
+use compio::{io::AsyncReadManaged, net::TcpStream};
 
 use crate::protocol::{
     address::Address,
@@ -224,7 +224,8 @@ fn is_retriable_pool_error(error: &io::Error) -> bool {
 
 async fn read_server_reply<R, D>(reader: &mut SnellStreamReader<R, D>) -> io::Result<()>
 where
-    R: AsyncRead + Unpin + 'static,
+    R: AsyncReadManaged + Unpin + 'static,
+    R::Buffer: 'static,
     D: SnellTcpDecoder,
 {
     let mut command = [0u8; 1];

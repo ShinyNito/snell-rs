@@ -53,7 +53,7 @@
 //!      |  seal payload (AEAD, nonce++, AAD empty) -> append TAG
 //!      |  if padding > 0: make_padding() then swap_padding()
 //!      v
-//!   pending_wire() / advance_wire(n) -> flush SALT? + HEADER_CIPHER + BODY
+//!   take_pending_wire() -> flush SALT? + HEADER_CIPHER + BODY
 //! ```
 //!
 //! # Decode flow (state machine)
@@ -91,12 +91,13 @@ use ring::aead::{Aad, LessSafeKey, Tag};
 use crate::protocol::ParseState;
 
 use super::{
-    DecodeEvent, DecodeSlot, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE,
-    NONCE_LEN, PlainPrefix, SALT_LEN, SnellTcpDecoder, SnellTcpEncoder, TAG_LEN, WriteReservation,
+    DecodeEvent, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE, NONCE_LEN,
+    PendingWire, PlainPrefix, SALT_LEN, SnellTcpDecoder, SnellTcpEncoder, TAG_LEN,
+    WriteReservation,
     common::{
-        ReadStep, apply_plain_prefix, decode_plain_header, finish_len_with_prefix, invalid_data,
-        invalid_input, make_padding, need_filled, next_nonce, pending_plaintext_slice,
-        plain_slot_with_prefix, push_pending, swap_padding, v4_key, write_plain_header,
+        ReadStep, apply_plain_prefix, decode_plain_header, fill_from_input, finish_len_with_prefix,
+        invalid_data, invalid_input, make_padding, need_filled, next_nonce,
+        pending_plaintext_slice, plain_slot_with_prefix, swap_padding, v4_key, write_plain_header,
     },
 };
 
@@ -127,8 +128,6 @@ pub struct V4Encoder {
     last_write: Option<Instant>,
     wire: Vec<u8>,
     pending_salt: bool,
-    header_tag: Option<Tag>,
-    wire_pos: usize,
 }
 
 impl fmt::Debug for V4Encoder {
@@ -137,7 +136,6 @@ impl fmt::Debug for V4Encoder {
             .field("salt_sent", &self.salt_sent)
             .field("chunk_limit", &self.chunk_limit)
             .field("wire_len", &self.wire.len())
-            .field("wire_pos", &self.wire_pos)
             .finish()
     }
 }
@@ -188,8 +186,6 @@ impl V4Encoder {
             last_write: None,
             wire: Vec::new(),
             pending_salt: false,
-            header_tag: None,
-            wire_pos: 0,
         })
     }
 
@@ -213,12 +209,10 @@ impl V4Encoder {
         };
 
         self.wire.clear();
-        self.wire_pos = 0;
         self.pending_salt = first_record;
-        self.header_tag = None;
 
         let header_start = self.wire.len();
-        self.wire.resize(header_start + HEADER_PLAIN_LEN, 0);
+        self.wire.resize(header_start + HEADER_CIPHER_LEN, 0);
 
         let padding_start = self.wire.len();
         self.wire.resize(padding_start + padding_len, 0);
@@ -229,7 +223,6 @@ impl V4Encoder {
 
         Ok(WriteReservation {
             plain_prefix_len: 0,
-            head_start: header_start,
             prefix_start: header_start,
             prefix_len: 0,
             header_start,
@@ -271,7 +264,7 @@ impl V4Encoder {
         } else {
             reservation.padding_len
         };
-        let body_start = reservation.header_start + HEADER_PLAIN_LEN;
+        let body_start = reservation.header_start + HEADER_CIPHER_LEN;
 
         if payload_len == 0 {
             self.wire.truncate(body_start);
@@ -282,15 +275,15 @@ impl V4Encoder {
 
         let header = reservation.header_start..reservation.header_start + HEADER_PLAIN_LEN;
         write_plain_header(&mut self.wire[header.clone()], padding_len, payload_len)?;
-        self.header_tag = Some(
-            self.key
-                .seal_in_place_separate_tag(
-                    next_nonce(&mut self.nonce),
-                    Aad::empty(),
-                    &mut self.wire[header],
-                )
-                .map_err(|_| invalid_data("snell v4 header encrypt failed"))?,
-        );
+        let header_tag = self
+            .key
+            .seal_in_place_separate_tag(
+                next_nonce(&mut self.nonce),
+                Aad::empty(),
+                &mut self.wire[header.clone()],
+            )
+            .map_err(|_| invalid_data("snell v4 header encrypt failed"))?;
+        self.wire[header.end..header.end + TAG_LEN].copy_from_slice(header_tag.as_ref());
 
         if payload_len > 0 {
             let payload = reservation.payload_start..reservation.payload_start + payload_len;
@@ -314,61 +307,24 @@ impl V4Encoder {
         }
 
         self.salt_sent = true;
-        self.wire_pos = 0;
         Ok(())
     }
 
     /// Whether all sealed bytes have been flushed.
     pub fn pending_empty(&self) -> bool {
-        self.wire_pos >= self.pending_len()
+        !self.pending_salt && self.wire.is_empty()
     }
 
-    /// Collect sealed bytes pending flush as vectored slices, honoring a partial
-    /// write offset.
-    ///
-    /// Emission order:
-    /// ```text
-    ///   [SALT?] [HEADER_PLAIN][HEADER_TAG] [BODY: PADDING + PAYLOAD_CIPHER + TAG]
-    /// ```
-    pub fn pending_wire<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
-        let mut len = 0;
-        let mut skip = self.wire_pos;
-
-        if self.pending_salt {
-            push_pending(out, &mut len, &mut skip, &self.salt);
-        }
-        push_pending(
-            out,
-            &mut len,
-            &mut skip,
-            &self.wire[..HEADER_PLAIN_LEN.min(self.wire.len())],
-        );
-        if let Some(tag) = &self.header_tag {
-            push_pending(out, &mut len, &mut skip, tag.as_ref());
-        }
-        if self.wire.len() > HEADER_PLAIN_LEN {
-            push_pending(out, &mut len, &mut skip, &self.wire[HEADER_PLAIN_LEN..]);
-        }
-
-        len
+    pub fn take_pending_wire(&mut self) -> PendingWire {
+        let salt = self.pending_salt.then_some(self.salt);
+        self.pending_salt = false;
+        PendingWire::new(salt, std::mem::take(&mut self.wire))
     }
 
-    /// Mark `written` sealed bytes as flushed, clearing the record when drained.
-    pub fn advance_wire(&mut self, written: usize) {
-        self.wire_pos = (self.wire_pos + written).min(self.pending_len());
-        if self.pending_empty() {
-            self.wire.clear();
-            self.pending_salt = false;
-            self.header_tag = None;
-            self.wire_pos = 0;
-        }
-    }
-
-    /// Total sealed bytes pending flush: `SALT? + wire + HEADER_TAG?`.
-    fn pending_len(&self) -> usize {
-        usize::from(self.pending_salt) * SALT_LEN
-            + self.wire.len()
-            + self.header_tag.as_ref().map_or(0, |_| TAG_LEN)
+    pub fn restore_pending_wire(&mut self, wire: PendingWire) {
+        let (salt, frame) = wire.into_parts();
+        self.pending_salt = salt.is_some();
+        self.wire = frame;
     }
 
     /// Compute this record's payload budget and roll the congestion window forward.
@@ -567,94 +523,82 @@ impl SnellTcpEncoder for V4Encoder {
     fn cancel_plain_reservation(&mut self, _reservation: Self::Reservation) {
         self.wire.clear();
         self.pending_salt = false;
-        self.header_tag = None;
-        self.wire_pos = 0;
     }
 
-    fn pending_wire<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
-        V4Encoder::pending_wire(self, out)
+    fn take_pending_wire(&mut self) -> PendingWire {
+        V4Encoder::take_pending_wire(self)
     }
 
-    fn advance_wire(&mut self, written: usize) {
-        V4Encoder::advance_wire(self, written);
+    fn restore_pending_wire(&mut self, wire: PendingWire) {
+        V4Encoder::restore_pending_wire(self, wire);
+    }
+
+    fn has_pending_wire(&self) -> bool {
+        !self.pending_empty()
     }
 }
 
 impl SnellTcpDecoder for V4Decoder {
-    fn next_ciphertext_slot(&mut self) -> DecodeSlot<'_> {
+    fn decode_ciphertext(&mut self, src: &mut &[u8]) -> io::Result<DecodeEvent<'_>> {
         if !self.pending_plain().is_empty() {
-            return DecodeSlot::BlockedByPlaintext;
+            return Ok(DecodeEvent::PlainData);
         }
 
-        match self.read_step {
-            ReadStep::Salt { filled } => {
-                self.read_buf.resize(SALT_LEN, 0);
-                DecodeSlot::Read(&mut self.read_buf[filled..])
-            }
-            ReadStep::Header { filled } => {
-                self.read_buf.resize(HEADER_CIPHER_LEN, 0);
-                DecodeSlot::Read(&mut self.read_buf[filled..])
-            }
-            ReadStep::Body { header, filled } => {
-                self.body.resize(header.body_len, 0);
-                DecodeSlot::Read(&mut self.body[filled..])
-            }
-        }
-    }
-
-    fn commit_ciphertext(&mut self, n: usize) -> io::Result<DecodeEvent<'_>> {
-        match self.read_step {
-            ReadStep::Salt { filled } => {
-                let filled = filled + n;
-                match need_filled(filled, SALT_LEN) {
-                    ParseState::Need(_) => {
-                        self.read_step = ReadStep::Salt { filled };
-                        return Ok(DecodeEvent::NeedMore);
+        loop {
+            match self.read_step {
+                ReadStep::Salt { filled } => {
+                    self.read_buf.resize(SALT_LEN, 0);
+                    let filled = fill_from_input(src, &mut self.read_buf, filled);
+                    match need_filled(filled, SALT_LEN) {
+                        ParseState::Need(_) => {
+                            self.read_step = ReadStep::Salt { filled };
+                            return Ok(DecodeEvent::NeedMore);
+                        }
+                        ParseState::Done(()) => {}
                     }
-                    ParseState::Done(()) => {}
+                    let salt: [u8; SALT_LEN] = self.read_buf[..SALT_LEN]
+                        .try_into()
+                        .expect("salt buffer filled");
+                    self.init_salt(salt)?;
+                    self.read_step = ReadStep::Header { filled: 0 };
                 }
-                let salt: [u8; SALT_LEN] = self.read_buf[..SALT_LEN]
-                    .try_into()
-                    .expect("salt buffer filled");
-                self.init_salt(salt)?;
-                self.read_step = ReadStep::Header { filled: 0 };
-                Ok(DecodeEvent::NeedMore)
-            }
-            ReadStep::Header { filled } => {
-                let filled = filled + n;
-                match need_filled(filled, HEADER_CIPHER_LEN) {
-                    ParseState::Need(_) => {
-                        self.read_step = ReadStep::Header { filled };
-                        return Ok(DecodeEvent::NeedMore);
+                ReadStep::Header { filled } => {
+                    self.read_buf.resize(HEADER_CIPHER_LEN, 0);
+                    let filled = fill_from_input(src, &mut self.read_buf, filled);
+                    match need_filled(filled, HEADER_CIPHER_LEN) {
+                        ParseState::Need(_) => {
+                            self.read_step = ReadStep::Header { filled };
+                            return Ok(DecodeEvent::NeedMore);
+                        }
+                        ParseState::Done(()) => {}
                     }
-                    ParseState::Done(()) => {}
+                    let header = self.decode_header_in_place()?;
+                    if header.body_len == 0 {
+                        self.read_step = ReadStep::Header { filled: 0 };
+                        return if self.finish_body(header)? {
+                            Ok(DecodeEvent::PlainData)
+                        } else {
+                            Ok(DecodeEvent::ZeroChunk)
+                        };
+                    }
+                    self.read_step = ReadStep::Body { header, filled: 0 };
                 }
-                let header = self.decode_header_in_place()?;
-                if header.body_len == 0 {
+                ReadStep::Body { header, filled } => {
+                    self.body.resize(header.body_len, 0);
+                    let filled = fill_from_input(src, &mut self.body, filled);
+                    match need_filled(filled, header.body_len) {
+                        ParseState::Need(_) => {
+                            self.read_step = ReadStep::Body { header, filled };
+                            return Ok(DecodeEvent::NeedMore);
+                        }
+                        ParseState::Done(()) => {}
+                    }
                     self.read_step = ReadStep::Header { filled: 0 };
                     return if self.finish_body(header)? {
                         Ok(DecodeEvent::PlainData)
                     } else {
                         Ok(DecodeEvent::ZeroChunk)
                     };
-                }
-                self.read_step = ReadStep::Body { header, filled: 0 };
-                Ok(DecodeEvent::NeedMore)
-            }
-            ReadStep::Body { header, filled } => {
-                let filled = filled + n;
-                match need_filled(filled, header.body_len) {
-                    ParseState::Need(_) => {
-                        self.read_step = ReadStep::Body { header, filled };
-                        return Ok(DecodeEvent::NeedMore);
-                    }
-                    ParseState::Done(()) => {}
-                }
-                self.read_step = ReadStep::Header { filled: 0 };
-                if self.finish_body(header)? {
-                    Ok(DecodeEvent::PlainData)
-                } else {
-                    Ok(DecodeEvent::ZeroChunk)
                 }
             }
         }

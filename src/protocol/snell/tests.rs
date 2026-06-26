@@ -106,7 +106,7 @@ fn v4_codec_round_trips_in_place() {
     encoder.plain_slot(reservation)[..5].copy_from_slice(b"hello");
     encoder.finish_write(reservation, 5).unwrap();
 
-    let wire = collect_pending(&encoder);
+    let wire = collect_pending(&mut encoder);
     let mut decoder = V4Decoder::new(&psk[..]);
     let salt: [u8; SALT_LEN] = wire[..SALT_LEN].try_into().unwrap();
     decoder.init_salt(salt).unwrap();
@@ -133,8 +133,7 @@ fn v4_encoder_applies_padding_and_chunk_size() {
     assert_eq!(first.padding_len, 8);
     encoder.plain_slot(first).fill(0x42);
     encoder.finish_write(first, first_limit).unwrap();
-    let pending = collect_pending(&encoder).len();
-    encoder.advance_wire(pending);
+    let _ = collect_pending(&mut encoder);
 
     let second = encoder.begin_write(MAX_PACKET_SIZE).unwrap();
     assert_eq!(second.padding_len, 0);
@@ -189,26 +188,19 @@ where
         .finish_plain_reservation(reservation, payload.len())
         .unwrap();
 
-    let wire = collect_pending_trait(&encoder);
+    let wire = collect_pending_trait(&mut encoder);
     let mut decoder = M::new_decoder(Arc::from(psk));
-    let mut offset = 0;
+    let mut src = wire.as_slice();
     loop {
-        let event = match decoder.next_ciphertext_slot() {
-            DecodeSlot::Read(slot) => {
+        let before = src.len();
+        let event = decoder.decode_ciphertext(&mut src).unwrap();
+        match event {
+            DecodeEvent::NeedMore => {
                 assert!(
-                    offset < wire.len(),
+                    src.len() < before,
                     "decoder needs more bytes than encoder emitted"
                 );
-                let n = slot.len().min(wire.len() - offset);
-                slot[..n].copy_from_slice(&wire[offset..offset + n]);
-                offset += n;
-                decoder.commit_ciphertext(n).unwrap()
             }
-            DecodeSlot::BlockedByPlaintext => DecodeEvent::PlainData,
-        };
-
-        match event {
-            DecodeEvent::NeedMore => continue,
             DecodeEvent::PlainData => return collect_plaintext(&mut decoder),
             DecodeEvent::ZeroChunk => panic!("unexpected zero chunk"),
             _ => continue,
@@ -230,25 +222,15 @@ where
         encoder
             .finish_plain_reservation(reservation, payload.len())
             .unwrap();
-        let frame = collect_pending_trait(&encoder);
-        encoder.advance_wire(frame.len());
+        let frame = collect_pending_trait(&mut encoder);
         wire.extend_from_slice(&frame);
     }
 
     let mut decoder = M::new_decoder(Arc::from(psk));
-    let mut offset = 0;
+    let mut src = wire.as_slice();
     let mut frames = Vec::new();
-    while offset < wire.len() {
-        let event = match decoder.next_ciphertext_slot() {
-            DecodeSlot::Read(slot) => {
-                let n = slot.len().min(wire.len() - offset);
-                slot[..n].copy_from_slice(&wire[offset..offset + n]);
-                offset += n;
-                decoder.commit_ciphertext(n).unwrap()
-            }
-            DecodeSlot::BlockedByPlaintext => DecodeEvent::PlainData,
-        };
-
+    while !src.is_empty() {
+        let event = decoder.decode_ciphertext(&mut src).unwrap();
         match event {
             DecodeEvent::NeedMore => {}
             DecodeEvent::PlainData => frames.push(Some(collect_plaintext(&mut decoder))),
@@ -259,14 +241,13 @@ where
     frames
 }
 
-fn collect_pending_trait<E>(encoder: &E) -> Vec<u8>
+fn collect_pending_trait<E>(encoder: &mut E) -> Vec<u8>
 where
     E: SnellTcpEncoder,
 {
     let mut out = Vec::new();
-    let mut pending = [IoSlice::new(&[]); 5];
-    let n = encoder.pending_wire(&mut pending);
-    for slice in &pending[..n] {
+    let pending = encoder.take_pending_wire();
+    for slice in pending.iter_slices() {
         out.extend_from_slice(slice);
     }
     out
@@ -289,12 +270,11 @@ where
     out
 }
 
-fn collect_pending(encoder: &V4Encoder) -> Vec<u8> {
-    let mut pending = [IoSlice::new(&[]); 5];
-    let n = encoder.pending_wire(&mut pending);
-    pending[..n]
-        .iter()
-        .flat_map(|slice| slice.as_ref().iter().copied())
+fn collect_pending(encoder: &mut V4Encoder) -> Vec<u8> {
+    let pending = encoder.take_pending_wire();
+    pending
+        .iter_slices()
+        .flat_map(|slice| slice.iter().copied())
         .collect()
 }
 

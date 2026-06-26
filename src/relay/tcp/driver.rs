@@ -8,20 +8,22 @@ use std::{
 };
 
 use compio::{
-    buf::BufResult,
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    buf::{BufResult, IoBuf, IoVectoredBuf},
+    io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
 };
 
 use crate::protocol::snell::{
-    DecodeEvent, DecodeSlot, PlainPrefix, SnellMode, SnellTcpDecoder, SnellTcpEncoder,
+    DecodeEvent, PendingWire, PlainPrefix, SnellMode, SnellTcpDecoder, SnellTcpEncoder,
 };
 
-type ReadFuture<R> = Pin<Box<dyn Future<Output = (R, BufResult<usize, Vec<u8>>)>>>;
-type WriteVectoredFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), Vec<Vec<u8>>>)>>>;
+type ReadOne<R> = Option<ReadBuffer<<R as AsyncReadManaged>::Buffer>>;
+type ReadFuture<R> = Pin<Box<dyn Future<Output = (R, io::Result<ReadOne<R>>)>>>;
+type WriteVectoredFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), PendingWire>)>>>;
 type FlushFuture<W> = Pin<Box<dyn Future<Output = (W, io::Result<()>)>>>;
 
-pub struct SnellStreamReader<R, D> {
+pub struct SnellStreamReader<R: AsyncReadManaged, D> {
     inner: ReaderIo<R>,
+    pending_ciphertext: ReadOne<R>,
     decoder: D,
 }
 
@@ -30,24 +32,22 @@ pub struct SnellStreamWriter<W, E> {
     encoder: E,
 }
 
-enum ReaderIo<R> {
+enum ReaderIo<R: AsyncReadManaged> {
     Idle(Option<R>),
     Reading(ReadFuture<R>),
 }
 
 enum WriterIo<W> {
     Idle(Option<W>),
-    Writing {
-        advance: usize,
-        future: WriteVectoredFuture<W>,
-    },
+    Writing(WriteVectoredFuture<W>),
     Flushing(FlushFuture<W>),
 }
 
-pub(crate) enum WriteFromState<R, Reservation> {
+pub(crate) enum WriteFromState<R: AsyncReadManaged, Reservation> {
     Reading {
         reader: Option<R>,
         reservation: Option<Reservation>,
+        pending: ReadOne<R>,
     },
     ReadPending {
         reservation: Reservation,
@@ -56,6 +56,7 @@ pub(crate) enum WriteFromState<R, Reservation> {
     Flushing {
         reader: Option<R>,
         eof: bool,
+        pending: ReadOne<R>,
     },
     Done,
 }
@@ -67,16 +68,23 @@ pub(crate) enum WriteFrameState {
     Flushing,
 }
 
-impl<R, Reservation> WriteFromState<R, Reservation> {
+impl<R, Reservation> WriteFromState<R, Reservation>
+where
+    R: AsyncReadManaged,
+{
     pub(crate) fn new(reader: R) -> Self {
         Self::Reading {
             reader: Some(reader),
             reservation: None,
+            pending: None,
         }
     }
 }
 
-impl<R> ReaderIo<R> {
+impl<R> ReaderIo<R>
+where
+    R: AsyncReadManaged,
+{
     fn new(inner: R) -> Self {
         Self::Idle(Some(inner))
     }
@@ -91,14 +99,12 @@ impl<R> ReaderIo<R> {
 
 impl<R> ReaderIo<R>
 where
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged + 'static,
+    R::Buffer: 'static,
 {
-    fn start_read(&mut self, len: usize) {
-        let mut inner = self.take_idle();
-        let future = Box::pin(async move {
-            let result = inner.read(Vec::with_capacity(len)).await;
-            (inner, result)
-        });
+    fn start_read(&mut self) {
+        let inner = self.take_idle();
+        let future = Box::pin(read_one(inner));
         *self = Self::Reading(future);
     }
 }
@@ -111,7 +117,7 @@ impl<W> WriterIo<W> {
     fn take_idle(&mut self) -> W {
         match self {
             Self::Idle(inner) => inner.take().expect("writer io missing"),
-            Self::Writing { .. } | Self::Flushing(_) => unreachable!("writer io is busy"),
+            Self::Writing(_) | Self::Flushing(_) => unreachable!("writer io is busy"),
         }
     }
 }
@@ -120,13 +126,13 @@ impl<W> WriterIo<W>
 where
     W: AsyncWrite + 'static,
 {
-    fn start_write_vectored_all(&mut self, buf: Vec<Vec<u8>>, advance: usize) {
+    fn start_write_vectored_all(&mut self, wire: PendingWire) {
         let mut inner = self.take_idle();
         let future = Box::pin(async move {
-            let result = inner.write_vectored_all(buf).await;
+            let result = inner.write_vectored_all(wire).await;
             (inner, result)
         });
-        *self = Self::Writing { advance, future };
+        *self = Self::Writing(future);
     }
 
     fn start_flush(&mut self) {
@@ -139,9 +145,16 @@ where
     }
 }
 
+impl IoVectoredBuf for PendingWire {
+    fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
+        self.iter_slices()
+    }
+}
+
 impl<R, D> SnellStreamReader<R, D>
 where
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged + 'static,
+    R::Buffer: 'static,
     D: SnellTcpDecoder,
 {
     pub fn new<M>(inner: R, psk: Arc<[u8]>) -> Self
@@ -150,6 +163,7 @@ where
     {
         Self {
             inner: ReaderIo::new(inner),
+            pending_ciphertext: None,
             decoder: M::new_decoder(psk),
         }
     }
@@ -157,6 +171,7 @@ where
     pub(crate) fn from_decoder(inner: R, decoder: D) -> Self {
         Self {
             inner: ReaderIo::new(inner),
+            pending_ciphertext: None,
             decoder,
         }
     }
@@ -252,43 +267,50 @@ where
 
     fn poll_read_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
         loop {
-            match self.decoder.next_ciphertext_slot() {
-                DecodeSlot::Read(slot) => {
-                    if matches!(self.inner, ReaderIo::Idle(_)) {
-                        self.inner.start_read(slot.len());
-                    }
-                }
-                DecodeSlot::BlockedByPlaintext => return Poll::Ready(Ok(true)),
+            if self.decoder.has_pending_plaintext() {
+                return Poll::Ready(Ok(true));
             }
 
-            let (inner, BufResult(result, buf)) = match &mut self.inner {
+            if self.pending_ciphertext.is_some() {
+                let event = {
+                    let read = self.pending_ciphertext.as_mut().expect("pending checked");
+                    let before = read.remaining().len();
+                    let mut src = read.remaining();
+                    let event = self.decoder.decode_ciphertext(&mut src)?;
+                    read.advance(before - src.len());
+                    event
+                };
+                if self
+                    .pending_ciphertext
+                    .as_ref()
+                    .is_some_and(ReadBuffer::is_empty)
+                {
+                    self.pending_ciphertext = None;
+                }
+
+                match event {
+                    DecodeEvent::PlainData => return Poll::Ready(Ok(true)),
+                    DecodeEvent::ZeroChunk => return Poll::Ready(Ok(false)),
+                    _ => continue,
+                }
+            }
+
+            if matches!(self.inner, ReaderIo::Idle(_)) {
+                self.inner.start_read();
+            }
+
+            let (inner, result) = match &mut self.inner {
                 ReaderIo::Idle(_) => continue,
                 ReaderIo::Reading(future) => ready!(future.as_mut().poll(cx)),
             };
             self.inner = ReaderIo::Idle(Some(inner));
 
-            let n = result?;
-            if n == 0 {
+            self.pending_ciphertext = result?;
+            if self.pending_ciphertext.is_none() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "early eof",
                 )));
-            }
-
-            match self.decoder.next_ciphertext_slot() {
-                DecodeSlot::Read(slot) => slot[..n].copy_from_slice(&buf[..n]),
-                DecodeSlot::BlockedByPlaintext => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "snell decoder blocked after socket read",
-                    )));
-                }
-            }
-
-            match self.decoder.commit_ciphertext(n)? {
-                DecodeEvent::PlainData => return Poll::Ready(Ok(true)),
-                DecodeEvent::ZeroChunk => return Poll::Ready(Ok(false)),
-                _ => continue,
             }
         }
     }
@@ -362,13 +384,15 @@ where
         state: &mut WriteFromState<R, E::Reservation>,
     ) -> Poll<io::Result<bool>>
     where
-        R: AsyncRead + 'static,
+        R: AsyncReadManaged + 'static,
+        R::Buffer: 'static,
     {
         loop {
             match state {
                 WriteFromState::Reading {
                     reader,
                     reservation,
+                    pending,
                 } => {
                     if reservation.is_none() {
                         *reservation = Some(
@@ -379,44 +403,83 @@ where
 
                     let reservation_ref = reservation.as_ref().expect("reservation just created");
                     let slot_len = self.encoder.plain_slot(reservation_ref).len();
-                    let mut plain_read = reader.take().expect("plain reader missing");
+
+                    if let Some(read) = pending.as_mut() {
+                        let n = {
+                            let src = read.remaining();
+                            let n = slot_len.min(src.len());
+                            self.encoder.plain_slot(reservation_ref)[..n]
+                                .copy_from_slice(&src[..n]);
+                            n
+                        };
+                        read.advance(n);
+                        if read.is_empty() {
+                            *pending = None;
+                        }
+                        let reservation = reservation.take().expect("reservation just created");
+                        self.encoder.finish_plain_reservation(reservation, n)?;
+                        *state = WriteFromState::Flushing {
+                            reader: reader.take(),
+                            eof: false,
+                            pending: pending.take(),
+                        };
+                        continue;
+                    }
+
+                    let plain_read = reader.take().expect("plain reader missing");
                     let reservation = reservation.take().expect("reservation just created");
-                    let future = Box::pin(async move {
-                        let result = plain_read.read(Vec::with_capacity(slot_len)).await;
-                        (plain_read, result)
-                    });
+                    let future = Box::pin(read_one(plain_read));
                     *state = WriteFromState::ReadPending {
                         reservation,
                         future,
                     };
                 }
                 WriteFromState::ReadPending { future, .. } => {
-                    let (reader, BufResult(result, buf)) = ready!(future.as_mut().poll(cx));
+                    let (reader, result) = ready!(future.as_mut().poll(cx));
                     let old_state = std::mem::replace(state, WriteFromState::Done);
                     let reservation = match old_state {
                         WriteFromState::ReadPending { reservation, .. } => reservation,
                         _ => unreachable!("write-from state changed while polling"),
                     };
 
-                    let n = match result {
-                        Ok(n) => n,
+                    let mut pending = match result {
+                        Ok(pending) => pending,
                         Err(error) => {
                             self.encoder.cancel_plain_reservation(reservation);
                             *state = WriteFromState::Reading {
                                 reader: Some(reader),
                                 reservation: None,
+                                pending: None,
                             };
                             return Poll::Ready(Err(error));
                         }
                     };
-                    self.encoder.plain_slot(&reservation)[..n].copy_from_slice(&buf[..n]);
+
+                    let n = if let Some(read) = pending.as_mut() {
+                        let slot_len = self.encoder.plain_slot(&reservation).len();
+                        let src = read.remaining();
+                        let n = slot_len.min(src.len());
+                        self.encoder.plain_slot(&reservation)[..n].copy_from_slice(&src[..n]);
+                        read.advance(n);
+                        if read.is_empty() {
+                            pending = None;
+                        }
+                        n
+                    } else {
+                        0
+                    };
                     self.encoder.finish_plain_reservation(reservation, n)?;
                     *state = WriteFromState::Flushing {
                         reader: Some(reader),
                         eof: n == 0,
+                        pending,
                     };
                 }
-                WriteFromState::Flushing { reader, eof } => {
+                WriteFromState::Flushing {
+                    reader,
+                    eof,
+                    pending,
+                } => {
                     ready!(self.poll_drain_pending(cx))?;
                     let reader = reader.take().expect("plain reader missing");
                     if *eof {
@@ -426,6 +489,7 @@ where
                     *state = WriteFromState::Reading {
                         reader: Some(reader),
                         reservation: None,
+                        pending: std::mem::take(pending),
                     };
                     return Poll::Ready(Ok(true));
                 }
@@ -504,26 +568,21 @@ where
             match &mut self.inner {
                 WriterIo::Idle(_) => {
                     if self.encoder.has_pending_wire() {
-                        let mut pending = [IoSlice::new(&[]); 5];
-                        let nbufs = self.encoder.pending_wire(&mut pending);
-                        let mut wire = Vec::with_capacity(nbufs);
-                        for slice in &pending[..nbufs] {
-                            if !slice.is_empty() {
-                                wire.push(slice.to_vec());
-                            }
+                        let wire = self.encoder.take_pending_wire();
+                        if !wire.is_empty() {
+                            self.inner.start_write_vectored_all(wire);
                         }
-                        let len = wire.iter().map(Vec::len).sum();
-                        self.inner.start_write_vectored_all(wire, len);
                         continue;
                     }
                     self.inner.start_flush();
                 }
-                WriterIo::Writing { advance, future } => {
-                    let advance = *advance;
-                    let (inner, BufResult(result, _buf)) = ready!(future.as_mut().poll(cx));
+                WriterIo::Writing(future) => {
+                    let (inner, BufResult(result, wire)) = ready!(future.as_mut().poll(cx));
                     self.inner = WriterIo::Idle(Some(inner));
-                    result?;
-                    self.encoder.advance_wire(advance);
+                    if let Err(error) = result {
+                        self.encoder.restore_pending_wire(wire);
+                        return Poll::Ready(Err(error));
+                    }
                 }
                 WriterIo::Flushing(future) => {
                     let (inner, result) = ready!(future.as_mut().poll(cx));
@@ -533,6 +592,44 @@ where
             }
         }
     }
+}
+
+pub(crate) struct ReadBuffer<B> {
+    buf: B,
+    offset: usize,
+}
+
+impl<B> ReadBuffer<B>
+where
+    B: IoBuf,
+{
+    fn new(buf: B) -> Self {
+        Self { buf, offset: 0 }
+    }
+
+    fn remaining(&self) -> &[u8] {
+        &self.buf.as_init()[self.offset..]
+    }
+
+    fn advance(&mut self, n: usize) {
+        self.offset += n;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.buf.as_init().len()
+    }
+}
+
+async fn read_one<R>(mut reader: R) -> (R, io::Result<ReadOne<R>>)
+where
+    R: AsyncReadManaged + 'static,
+    R::Buffer: 'static,
+{
+    let result = reader
+        .read_managed(0)
+        .await
+        .map(|buf| buf.map(ReadBuffer::new));
+    (reader, result)
 }
 
 #[cfg(test)]

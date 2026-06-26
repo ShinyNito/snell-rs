@@ -24,29 +24,26 @@ use std::{
 use crate::protocol::ParseState;
 
 use super::super::{
-    DecodeEvent, DecodeSlot, DecodedHeader, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, PlainPrefix,
+    DecodeEvent, DecodedHeader, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, PendingWire, PlainPrefix,
     SnellTcpDecoder, SnellTcpEncoder, WriteReservation,
     common::{
-        apply_plain_prefix, finish_len_with_prefix, invalid_input, need_filled,
-        parse_v6_raw_header_need, pending_plaintext_slice, plain_slot_with_prefix, push_pending,
+        apply_plain_prefix, fill_from_input, finish_len_with_prefix, invalid_input, need_filled,
+        parse_v6_raw_header_need, pending_plaintext_slice, plain_slot_with_prefix,
         write_v6_plain_header,
     },
 };
 
 /// V6 unsafe-raw encoder — plaintext frames, no crypto.
 ///
-/// Wire state: `wire` buffers the current record; `wire_pos` tracks the
-/// partial-flush offset.
+/// Wire state: `wire` buffers the current record until the runtime takes it.
 pub struct V6UnsafeRawEncoder {
     wire: Vec<u8>,
-    wire_pos: usize,
 }
 
 impl fmt::Debug for V6UnsafeRawEncoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("V6UnsafeRawEncoder")
             .field("wire_len", &self.wire.len())
-            .field("wire_pos", &self.wire_pos)
             .finish()
     }
 }
@@ -77,10 +74,7 @@ enum RawReadStep {
 impl V6UnsafeRawEncoder {
     /// Create an encoder with no crypto state.
     pub fn new() -> Self {
-        Self {
-            wire: Vec::new(),
-            wire_pos: 0,
-        }
+        Self { wire: Vec::new() }
     }
 
     /// Reserve a record sized for up to `hint` payload bytes.
@@ -94,11 +88,9 @@ impl V6UnsafeRawEncoder {
 
         let max_payload_len = hint.min(MAX_PACKET_SIZE_V6);
         self.wire.clear();
-        self.wire_pos = 0;
         self.wire.resize(HEADER_PLAIN_LEN + max_payload_len, 0);
         Ok(WriteReservation {
             plain_prefix_len: 0,
-            head_start: 0,
             prefix_start: 0,
             prefix_len: 0,
             header_start: 0,
@@ -128,30 +120,21 @@ impl V6UnsafeRawEncoder {
         }
         self.wire.truncate(HEADER_PLAIN_LEN + payload_len);
         write_v6_plain_header(&mut self.wire[..HEADER_PLAIN_LEN], 0, payload_len)?;
-        self.wire_pos = 0;
         Ok(())
     }
 
     /// Whether all pending wire bytes have been flushed.
     pub fn pending_empty(&self) -> bool {
-        self.wire_pos >= self.wire.len()
+        self.wire.is_empty()
     }
 
-    /// Collect pending wire bytes as a single vectored slice.
-    pub fn pending_wire<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
-        let mut len = 0;
-        let mut skip = self.wire_pos;
-        push_pending(out, &mut len, &mut skip, &self.wire);
-        len
+    pub fn take_pending_wire(&mut self) -> PendingWire {
+        PendingWire::from_frame(std::mem::take(&mut self.wire))
     }
 
-    /// Mark `written` sealed bytes as flushed, clearing the record when drained.
-    pub fn advance_wire(&mut self, written: usize) {
-        self.wire_pos = (self.wire_pos + written).min(self.wire.len());
-        if self.pending_empty() {
-            self.wire.clear();
-            self.wire_pos = 0;
-        }
+    pub fn restore_pending_wire(&mut self, wire: PendingWire) {
+        let (_, frame) = wire.into_parts();
+        self.wire = frame;
     }
 }
 
@@ -223,66 +206,59 @@ impl SnellTcpEncoder for V6UnsafeRawEncoder {
 
     fn cancel_plain_reservation(&mut self, _reservation: Self::Reservation) {
         self.wire.clear();
-        self.wire_pos = 0;
     }
 
-    fn pending_wire<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
-        V6UnsafeRawEncoder::pending_wire(self, out)
+    fn take_pending_wire(&mut self) -> PendingWire {
+        V6UnsafeRawEncoder::take_pending_wire(self)
     }
 
-    fn advance_wire(&mut self, written: usize) {
-        V6UnsafeRawEncoder::advance_wire(self, written);
+    fn restore_pending_wire(&mut self, wire: PendingWire) {
+        V6UnsafeRawEncoder::restore_pending_wire(self, wire);
+    }
+
+    fn has_pending_wire(&self) -> bool {
+        !self.pending_empty()
     }
 }
 
 impl SnellTcpDecoder for V6UnsafeRawDecoder {
-    fn next_ciphertext_slot(&mut self) -> DecodeSlot<'_> {
+    fn decode_ciphertext(&mut self, src: &mut &[u8]) -> io::Result<DecodeEvent<'_>> {
         if !self.pending_plain().is_empty() {
-            return DecodeSlot::BlockedByPlaintext;
+            return Ok(DecodeEvent::PlainData);
         }
 
-        match self.read_step {
-            RawReadStep::Header { filled } => {
-                self.read_buf.resize(HEADER_PLAIN_LEN, 0);
-                DecodeSlot::Read(&mut self.read_buf[filled..])
-            }
-            RawReadStep::Body { header, filled } => {
-                self.body.resize(header.body_len, 0);
-                DecodeSlot::Read(&mut self.body[filled..])
-            }
-        }
-    }
-
-    fn commit_ciphertext(&mut self, n: usize) -> io::Result<DecodeEvent<'_>> {
-        match self.read_step {
-            RawReadStep::Header { filled } => {
-                let filled = filled + n;
-                let header = match parse_v6_raw_header_need(&self.read_buf[..filled])? {
-                    ParseState::Need(_) => {
-                        self.read_step = RawReadStep::Header { filled };
-                        return Ok(DecodeEvent::NeedMore);
+        loop {
+            match self.read_step {
+                RawReadStep::Header { filled } => {
+                    self.read_buf.resize(HEADER_PLAIN_LEN, 0);
+                    let filled = fill_from_input(src, &mut self.read_buf, filled);
+                    let header = match parse_v6_raw_header_need(&self.read_buf[..filled])? {
+                        ParseState::Need(_) => {
+                            self.read_step = RawReadStep::Header { filled };
+                            return Ok(DecodeEvent::NeedMore);
+                        }
+                        ParseState::Done(header) => header,
+                    };
+                    if header.body_len == 0 {
+                        self.read_step = RawReadStep::Header { filled: 0 };
+                        return Ok(DecodeEvent::ZeroChunk);
                     }
-                    ParseState::Done(header) => header,
-                };
-                if header.body_len == 0 {
+                    self.read_step = RawReadStep::Body { header, filled: 0 };
+                }
+                RawReadStep::Body { header, filled } => {
+                    self.body.resize(header.body_len, 0);
+                    let filled = fill_from_input(src, &mut self.body, filled);
+                    match need_filled(filled, header.body_len) {
+                        ParseState::Need(_) => {
+                            self.read_step = RawReadStep::Body { header, filled };
+                            return Ok(DecodeEvent::NeedMore);
+                        }
+                        ParseState::Done(()) => {}
+                    }
+                    self.plain = 0..header.payload_len;
                     self.read_step = RawReadStep::Header { filled: 0 };
-                    return Ok(DecodeEvent::ZeroChunk);
+                    return Ok(DecodeEvent::PlainData);
                 }
-                self.read_step = RawReadStep::Body { header, filled: 0 };
-                Ok(DecodeEvent::NeedMore)
-            }
-            RawReadStep::Body { header, filled } => {
-                let filled = filled + n;
-                match need_filled(filled, header.body_len) {
-                    ParseState::Need(_) => {
-                        self.read_step = RawReadStep::Body { header, filled };
-                        return Ok(DecodeEvent::NeedMore);
-                    }
-                    ParseState::Done(()) => {}
-                }
-                self.plain = 0..header.payload_len;
-                self.read_step = RawReadStep::Header { filled: 0 };
-                Ok(DecodeEvent::PlainData)
             }
         }
     }

@@ -7,7 +7,7 @@ use std::{
 
 use compio::{
     buf::BufResult,
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -59,12 +59,15 @@ where
     transport.copy_bidirectional(peer)
 }
 
-enum PlainState<R, Reservation> {
+enum PlainState<R: AsyncReadManaged, Reservation> {
     Copying(WriteFromState<R, Reservation>),
     Done,
 }
 
-impl<R, Reservation> PlainState<R, Reservation> {
+impl<R, Reservation> PlainState<R, Reservation>
+where
+    R: AsyncReadManaged,
+{
     fn new(reader: R) -> Self {
         Self::Copying(WriteFromState::new(reader))
     }
@@ -172,7 +175,8 @@ fn poll_plain_to_snell<W, E, R>(
 where
     W: AsyncWrite + 'static,
     E: crate::protocol::snell::SnellTcpEncoder,
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged + 'static,
+    R::Buffer: 'static,
 {
     loop {
         match state {
@@ -197,7 +201,8 @@ fn poll_snell_to_plain<R, D, W>(
     buf: &mut Vec<u8>,
 ) -> Poll<io::Result<()>>
 where
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged + 'static,
+    R::Buffer: 'static,
     D: crate::protocol::snell::SnellTcpDecoder,
     W: AsyncWrite + 'static,
 {

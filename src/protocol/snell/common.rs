@@ -2,14 +2,11 @@
 //!
 //! Everything here is `pub(super)` and used by [`super::v4`] and the
 //! [`super::v6`] variants. The helpers fall into three groups:
-//! - IO plumbing: vectored slice bookkeeping, exact-read state, error shims.
+//! - IO plumbing: plaintext slice projection, exact-read state, error shims.
 //! - Frame headers: plaintext header encode/decode for V4 and V6.
 //! - AEAD + obfuscation: nonce management, header/payload sealing, padding.
 
-use std::{
-    io::{self, IoSlice},
-    ops::Range,
-};
+use std::io::{self, IoSlice};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::{Rng, RngCore};
@@ -50,37 +47,11 @@ pub(super) enum ReadStep {
     },
 }
 
-/// Push `slice` into the vectored output, honoring a skip offset.
-///
-/// `skip` is advanced past fully-skipped slices and decremented for partial
-/// skips, so callers can resume a pending flush after a partial write.
-pub(super) fn push_pending<'a>(
-    out: &mut [IoSlice<'a>],
-    len: &mut usize,
-    skip: &mut usize,
-    slice: &'a [u8],
-) {
-    if *skip >= slice.len() {
-        *skip -= slice.len();
-        return;
-    }
-
-    if *len < out.len() && *skip < slice.len() {
-        out[*len] = IoSlice::new(&slice[*skip..]);
-        *len += 1;
-    }
-    *skip = 0;
-}
-
-/// Variant of [`push_pending`] operating on a sub-range of `buf`.
-pub(super) fn push_pending_range<'a>(
-    out: &mut [IoSlice<'a>],
-    len: &mut usize,
-    skip: &mut usize,
-    buf: &'a [u8],
-    range: Range<usize>,
-) {
-    push_pending(out, len, skip, &buf[range]);
+pub(super) fn fill_from_input(src: &mut &[u8], dst: &mut [u8], filled: usize) -> usize {
+    let take = (dst.len() - filled).min(src.len());
+    dst[filled..filled + take].copy_from_slice(&src[..take]);
+    *src = &src[take..];
+    filled + take
 }
 
 /// Push a single plaintext slice as the sole vectored entry.

@@ -76,27 +76,19 @@
 //!        | write header (padding/payload lens) -> seal header (AEAD, nonce++)
 //!        | seal payload (AEAD, nonce++)         -> make/swap padding (V4/shaped)
 //!        v
-//!   pending_wire() / advance_wire(n) -----> vectored flush to socket
+//!   take_pending_wire() ------------------> owned vectored flush to socket
 //! ```
 //!
 //! # Decode flow (reader side)
 //!
 //! ```text
 //!   loop {
-//!     next_ciphertext_slot()
+//!     decode_ciphertext(&mut input)
 //!        |
-//!        +-- Read(slice)            caller reads ciphertext into slice
-//!        |        |
-//!        |        v
-//!        |   commit_ciphertext(n)
-//!        |        |
-//!        |        v
-//!        +-- BlockedByPlaintext    previous record's plaintext not drained
-//!                 |
-//!                 v
-//!            pending_plaintext() / advance_plaintext(n)
+//!        +-- NeedMore              read more ciphertext
+//!        +-- PlainData/ZeroChunk   drain plaintext or handle zero chunk
 //!
-//!     commit_ciphertext returns DecodeEvent:
+//!     decode_ciphertext returns DecodeEvent:
 //!        NeedMore       -> need more bytes, loop again
 //!        PlainData      -> plaintext ready, drain via pending_plaintext
 //!        ZeroChunk      -> protocol keepalive / end marker
@@ -642,8 +634,6 @@ fn decode_udp_response_addr(src: &[u8]) -> io::Result<(AddressRef<'_>, usize)> {
 pub struct WriteReservation {
     /// Bytes of the caller-provided plaintext prefix already written.
     plain_prefix_len: usize,
-    /// Start of the record head (salt block / padding prefix origin).
-    head_start: usize,
     /// Start of the obfuscation prefix for this record.
     prefix_start: usize,
     /// Length of the obfuscation prefix.
@@ -683,20 +673,9 @@ pub struct DecodedHeader {
     pub body_len: usize,
 }
 
-/// Slot the runtime should fill with freshly read ciphertext.
-///
-/// `BlockedByPlaintext` tells the caller to drain [`SnellTcpDecoder::pending_plaintext`]
-/// before more ciphertext can be accepted.
-pub enum DecodeSlot<'a> {
-    /// Read ciphertext into this slice.
-    Read(&'a mut [u8]),
-    /// Plaintext from a previous record is still pending; drain it first.
-    BlockedByPlaintext,
-}
-
 /// Outcome of feeding ciphertext into a decoder.
 ///
-/// The lifecycle is: feed bytes via [`DecodeSlot`] until a record completes,
+/// The lifecycle is: feed bytes via [`SnellTcpDecoder::decode_ciphertext`] until a record completes,
 /// then observe [`PlainData`](DecodeEvent::PlainData) or a control frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeEvent<'a> {
@@ -751,6 +730,42 @@ impl<'a> PlainPrefix<'a> {
     }
 }
 
+/// Owned sealed bytes ready for an async vectored write.
+#[derive(Debug, Default)]
+pub struct PendingWire {
+    salt: Option<[u8; SALT_LEN]>,
+    frame: Vec<u8>,
+}
+
+impl PendingWire {
+    pub(crate) fn new(salt: Option<[u8; SALT_LEN]>, frame: Vec<u8>) -> Self {
+        Self { salt, frame }
+    }
+
+    pub(crate) fn from_frame(frame: Vec<u8>) -> Self {
+        Self { salt: None, frame }
+    }
+
+    pub(crate) fn into_parts(self) -> (Option<[u8; SALT_LEN]>, Vec<u8>) {
+        (self.salt, self.frame)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.salt.is_none() && self.frame.is_empty()
+    }
+
+    pub fn total_len(&self) -> usize {
+        self.salt.as_ref().map_or(0, |salt| salt.len()) + self.frame.len()
+    }
+
+    pub(crate) fn iter_slices(&self) -> impl Iterator<Item = &[u8]> {
+        self.salt
+            .iter()
+            .map(|salt| salt.as_slice())
+            .chain(std::iter::once(self.frame.as_slice()).filter(|slice| !slice.is_empty()))
+    }
+}
+
 /// Streaming Snell TCP encoder.
 ///
 /// The reservation lifecycle is:
@@ -759,8 +774,8 @@ impl<'a> PlainPrefix<'a> {
 /// 2. [`SnellTcpEncoder::plain_slot`] — borrow the writable payload region.
 /// 3. [`SnellTcpEncoder::finish_plain_reservation`] — seal the record and move
 ///    it to the pending-wire queue.
-/// 4. [`SnellTcpEncoder::pending_wire`] / [`SnellTcpEncoder::advance_wire`] —
-///    vectored flush of sealed bytes to the socket.
+/// 4. [`SnellTcpEncoder::take_pending_wire`] — move sealed bytes to the runtime
+///    for owned vectored flush.
 pub trait SnellTcpEncoder {
     /// Opaque handle describing the reserved record.
     type Reservation;
@@ -786,33 +801,26 @@ pub trait SnellTcpEncoder {
     /// Discard a reservation without emitting a record.
     fn cancel_plain_reservation(&mut self, reservation: Self::Reservation);
 
-    /// Collect sealed bytes pending flush into `out` as vectored slices.
-    fn pending_wire<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize;
+    /// Move sealed bytes pending flush out of the encoder.
+    fn take_pending_wire(&mut self) -> PendingWire;
 
-    /// Mark `written` bytes from the pending queue as flushed.
-    fn advance_wire(&mut self, written: usize);
+    /// Put sealed bytes back after an async write error.
+    fn restore_pending_wire(&mut self, wire: PendingWire);
 
     /// Whether any sealed bytes are still awaiting flush.
-    fn has_pending_wire(&self) -> bool {
-        let mut tmp = [IoSlice::new(&[])];
-        self.pending_wire(&mut tmp) != 0
-    }
+    fn has_pending_wire(&self) -> bool;
 }
 
 /// Streaming Snell TCP decoder.
 ///
 /// The decode lifecycle is:
-/// 1. [`SnellTcpDecoder::next_ciphertext_slot`] — borrow a slice to fill.
-/// 2. [`SnellTcpDecoder::commit_ciphertext`] — report how many bytes arrived.
-/// 3. On [`PlainData`](DecodeEvent::PlainData), drain plaintext via
+/// 1. [`SnellTcpDecoder::decode_ciphertext`] — consume bytes from an input slice.
+/// 2. On [`PlainData`](DecodeEvent::PlainData), drain plaintext via
 ///    [`SnellTcpDecoder::pending_plaintext`] /
 ///    [`SnellTcpDecoder::advance_plaintext`].
 pub trait SnellTcpDecoder {
-    /// Borrow the next ciphertext fill target, or signal a plaintext backpressure.
-    fn next_ciphertext_slot(&mut self) -> DecodeSlot<'_>;
-
-    /// Report `n` newly filled ciphertext bytes and advance the read state.
-    fn commit_ciphertext(&mut self, n: usize) -> io::Result<DecodeEvent<'_>>;
+    /// Consume ciphertext from `src`, advancing it by the number of bytes used.
+    fn decode_ciphertext(&mut self, src: &mut &[u8]) -> io::Result<DecodeEvent<'_>>;
 
     /// Collect decrypted plaintext pending drain into `out` as vectored slices.
     fn pending_plaintext<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize;
