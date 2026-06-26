@@ -16,6 +16,8 @@ use crate::{
     protocol::snell::{
         self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, MAX_CONNECT_REQUEST_LEN, SnellMode,
         SnellTcpDecoder, SnellTcpEncoder, V4Decoder, V4Mode, V6ShapedDecoder, V6ShapedMode,
+        V6UnsafeRawMode, V6UnshapedMode,
+        version::{ProtocolVersion, V6Mode},
     },
     relay::tcp::{
         client::SnellTransport,
@@ -37,6 +39,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub psk: Vec<u8>,
+    pub protocol: Option<ProtocolVersion>,
     pub outbound: Outbound,
     pub tcp_brutal: Option<TcpBrutalConfig>,
 }
@@ -68,6 +71,7 @@ async fn bind_listener(listen: SocketAddr) -> io::Result<TcpListener> {
 
 async fn serve_snell_listener(listener: TcpListener, config: ServerConfig) -> io::Result<()> {
     let psk: Arc<[u8]> = Arc::from(config.psk.into_boxed_slice());
+    let protocol = config.protocol;
     let outbound = config.outbound;
     let tcp_brutal = config.tcp_brutal;
 
@@ -82,7 +86,7 @@ async fn serve_snell_listener(listener: TcpListener, config: ServerConfig) -> io
         let psk = psk.clone();
         let outbound = outbound.clone();
         runtime::spawn(async move {
-            match serve_snell_inbound_auto(stream, psk, outbound, peer_addr).await {
+            match serve_snell_inbound(stream, psk, outbound, protocol, peer_addr).await {
                 Ok(()) => tracing::info!(%peer_addr, "snell inbound ended"),
                 Err(error) => tracing::info!(%peer_addr, %error, "snell inbound failed"),
             }
@@ -99,6 +103,7 @@ pub async fn bind_tcp_listener_with_dispatcher(
     validate_tcp_brutal_available(config.tcp_brutal).await?;
     let listener = bind_std_listener(config.listen)?;
     let psk: Arc<[u8]> = Arc::from(config.psk.into_boxed_slice());
+    let protocol = config.protocol;
     let outbound = config.outbound;
     let tcp_brutal = config.tcp_brutal;
 
@@ -122,7 +127,7 @@ pub async fn bind_tcp_listener_with_dispatcher(
                 if let Err(error) = apply_tcp_brutal(&stream, tcp_brutal) {
                     tracing::warn!(%peer_addr, %error, "snell inbound tcp_brutal could not be enabled");
                 }
-                match serve_snell_inbound_auto(stream, psk, outbound, peer_addr).await {
+                match serve_snell_inbound(stream, psk, outbound, protocol, peer_addr).await {
                     Ok(()) => tracing::info!(%peer_addr, "snell inbound ended"),
                     Err(error) => tracing::info!(%peer_addr, %error, "snell inbound failed"),
                 }
@@ -135,6 +140,54 @@ pub async fn bind_tcp_listener_with_dispatcher(
 #[cfg(windows)]
 fn bind_std_listener(listen: SocketAddr) -> io::Result<StdTcpListener> {
     StdTcpListener::bind(listen)
+}
+
+async fn serve_snell_inbound(
+    stream: TcpStream,
+    psk: Arc<[u8]>,
+    outbound: Outbound,
+    protocol: Option<ProtocolVersion>,
+    peer_addr: SocketAddr,
+) -> io::Result<()> {
+    match protocol {
+        None => serve_snell_inbound_auto(stream, psk, outbound, peer_addr).await,
+        Some(ProtocolVersion::V4 | ProtocolVersion::V5) => {
+            serve_snell_inbound_typed::<V4Mode>(stream, psk, outbound, peer_addr).await
+        }
+        Some(ProtocolVersion::V6(V6Mode::Default)) => {
+            serve_snell_inbound_typed::<V6ShapedMode>(stream, psk, outbound, peer_addr).await
+        }
+        Some(ProtocolVersion::V6(V6Mode::Unshaped)) => {
+            serve_snell_inbound_typed::<V6UnshapedMode>(stream, psk, outbound, peer_addr).await
+        }
+        Some(ProtocolVersion::V6(V6Mode::UnsafeRaw)) => {
+            serve_snell_inbound_typed::<V6UnsafeRawMode>(stream, psk, outbound, peer_addr).await
+        }
+    }
+}
+
+async fn serve_snell_inbound_typed<M>(
+    stream: TcpStream,
+    psk: Arc<[u8]>,
+    outbound: Outbound,
+    peer_addr: SocketAddr,
+) -> io::Result<()>
+where
+    M: SnellMode + Send + Sync + 'static + Unpin,
+    M::Encoder: Send + Unpin,
+    M::Decoder: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+{
+    let decoder = M::new_decoder(psk.clone());
+    serve_snell_inbound_typed_with_decoder::<M>(
+        stream,
+        decoder,
+        Vec::new(),
+        psk,
+        outbound,
+        peer_addr,
+    )
+    .await
 }
 
 async fn serve_snell_inbound_auto(
@@ -150,15 +203,33 @@ async fn serve_snell_inbound_auto(
             error
         })?;
     match probed {
-        ProbedStream::V6Shaped { stream, decoder } => {
+        ProbedStream::V6Shaped {
+            stream,
+            decoder,
+            pending_ciphertext,
+        } => {
             serve_snell_inbound_typed_with_decoder::<V6ShapedMode>(
-                stream, decoder, psk, outbound, peer_addr,
+                stream,
+                decoder,
+                pending_ciphertext,
+                psk,
+                outbound,
+                peer_addr,
             )
             .await
         }
-        ProbedStream::V4 { stream, decoder } => {
+        ProbedStream::V4 {
+            stream,
+            decoder,
+            pending_ciphertext,
+        } => {
             serve_snell_inbound_typed_with_decoder::<V4Mode>(
-                stream, decoder, psk, outbound, peer_addr,
+                stream,
+                decoder,
+                pending_ciphertext,
+                psk,
+                outbound,
+                peer_addr,
             )
             .await
         }
@@ -168,6 +239,7 @@ async fn serve_snell_inbound_auto(
 async fn serve_snell_inbound_typed_with_decoder<M>(
     stream: TcpStream,
     decoder: M::Decoder,
+    pending_ciphertext: Vec<u8>,
     psk: Arc<[u8]>,
     outbound: Outbound,
     peer_addr: SocketAddr,
@@ -180,7 +252,11 @@ where
 {
     let (read_half, write_half) = stream.into_split();
     let transport: SnellTransport<M> = SnellTransport::new(
-        SnellStreamReader::from_decoder(read_half, decoder),
+        SnellStreamReader::from_decoder_with_pending_ciphertext(
+            read_half,
+            decoder,
+            pending_ciphertext,
+        ),
         SnellStreamWriter::new::<M>(write_half, psk)?,
     );
     serve_snell_transport::<M>(transport, outbound, peer_addr).await
@@ -396,10 +472,12 @@ enum ProbedStream {
     V6Shaped {
         stream: TcpStream,
         decoder: V6ShapedDecoder,
+        pending_ciphertext: Vec<u8>,
     },
     V4 {
         stream: TcpStream,
         decoder: V4Decoder,
+        pending_ciphertext: Vec<u8>,
     },
 }
 
@@ -422,10 +500,11 @@ async fn probe_snell_mode(mut stream: TcpStream, psk: Arc<[u8]>) -> io::Result<P
 
             if let Some(decoder) = &mut v6 {
                 match probe_decoder(decoder, &buf[..n]) {
-                    ProbeResult::Match => {
+                    ProbeResult::Match { consumed } => {
                         return Ok(ProbedStream::V6Shaped {
                             stream,
                             decoder: v6.take().expect("v6 decoder present"),
+                            pending_ciphertext: buf[consumed..n].to_vec(),
                         });
                     }
                     ProbeResult::NeedMore => {}
@@ -435,10 +514,11 @@ async fn probe_snell_mode(mut stream: TcpStream, psk: Arc<[u8]>) -> io::Result<P
 
             if let Some(decoder) = &mut v4 {
                 match probe_decoder(decoder, &buf[..n]) {
-                    ProbeResult::Match => {
+                    ProbeResult::Match { consumed } => {
                         return Ok(ProbedStream::V4 {
                             stream,
                             decoder: v4.take().expect("v4 decoder present"),
+                            pending_ciphertext: buf[consumed..n].to_vec(),
                         });
                     }
                     ProbeResult::NeedMore => {}
@@ -460,7 +540,7 @@ async fn probe_snell_mode(mut stream: TcpStream, psk: Arc<[u8]>) -> io::Result<P
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProbeResult {
-    Match,
+    Match { consumed: usize },
     NeedMore,
     Invalid,
 }
@@ -482,7 +562,14 @@ where
     loop {
         let before = src.len();
         match decoder.decode_ciphertext(&mut src) {
-            Ok(DecodeEvent::PlainData) => return probe_plaintext(decoder),
+            Ok(DecodeEvent::PlainData) => {
+                return match probe_plaintext(decoder) {
+                    ProbeResult::Match { .. } => ProbeResult::Match {
+                        consumed: bytes.len() - src.len(),
+                    },
+                    other => other,
+                };
+            }
             Ok(DecodeEvent::ZeroChunk) | Err(_) => return ProbeResult::Invalid,
             Ok(DecodeEvent::NeedMore) if src.is_empty() => return ProbeResult::NeedMore,
             Ok(_) if src.len() == before => return ProbeResult::NeedMore,
@@ -517,7 +604,7 @@ where
 
 fn probe_control_prefix(result: io::Result<()>) -> Option<ProbeResult> {
     match result {
-        Ok(()) => Some(ProbeResult::Match),
+        Ok(()) => Some(ProbeResult::Match { consumed: 0 }),
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Some(ProbeResult::NeedMore),
         Err(_) => None,
     }
@@ -648,7 +735,10 @@ mod tests {
             wire.extend_from_slice(slice);
         }
 
-        assert_eq!(probe_mode::<V6ShapedMode>(psk, &wire), ProbeResult::Match);
+        assert!(matches!(
+            probe_mode::<V6ShapedMode>(psk, &wire),
+            ProbeResult::Match { .. }
+        ));
     }
 
     #[test]
@@ -670,7 +760,10 @@ mod tests {
             wire.extend_from_slice(slice);
         }
 
-        assert_eq!(probe_mode::<V6ShapedMode>(psk, &wire), ProbeResult::Match);
+        assert!(matches!(
+            probe_mode::<V6ShapedMode>(psk, &wire),
+            ProbeResult::Match { .. }
+        ));
     }
 
     #[test]
@@ -679,7 +772,10 @@ mod tests {
         plaintext.resize(plaintext.len() + MAX_CONNECT_REQUEST_LEN, b'x');
         let decoder = PendingPlaintext(plaintext);
 
-        assert_eq!(probe_plaintext(&decoder), ProbeResult::Match);
+        assert!(matches!(
+            probe_plaintext(&decoder),
+            ProbeResult::Match { .. }
+        ));
     }
 
     #[compio::test]
@@ -723,6 +819,42 @@ mod tests {
         server.await.unwrap();
         proxy.await.unwrap();
         target.await.unwrap();
+    }
+
+    #[compio::test]
+    async fn explicit_v6_unshaped_server_bypasses_probe() {
+        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target = runtime::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            read_exact_into(&mut stream, &mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            write_all_bytes(&mut stream, b"pong").await.unwrap();
+        });
+
+        let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_listener.local_addr().unwrap();
+        let server_psk = psk.clone();
+        let server = runtime::spawn(async move {
+            let (stream, peer_addr) = server_listener.accept().await.unwrap();
+            serve_snell_inbound(
+                stream,
+                server_psk,
+                Outbound::Direct,
+                Some(ProtocolVersion::V6(V6Mode::Unshaped)),
+                peer_addr,
+            )
+            .await
+            .unwrap();
+        });
+
+        run_client_round_trip::<V6UnshapedMode>(server_addr, psk, Address::from(target_addr)).await;
+
+        target.await.unwrap();
+        server.await.unwrap();
     }
 
     /// reuse 完成一条 sub-stream 后，客户端若不再发下一条 S0，服务端必须在

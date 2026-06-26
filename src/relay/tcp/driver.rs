@@ -23,6 +23,7 @@ type FlushFuture<W> = Pin<Box<dyn Future<Output = (W, io::Result<()>)>>>;
 
 pub struct SnellStreamReader<R: AsyncReadManaged, D> {
     inner: ReaderIo<R>,
+    pending_probe_ciphertext: Option<ReadBuffer<Vec<u8>>>,
     pending_ciphertext: ReadOne<R>,
     decoder: D,
 }
@@ -163,14 +164,21 @@ where
     {
         Self {
             inner: ReaderIo::new(inner),
+            pending_probe_ciphertext: None,
             pending_ciphertext: None,
             decoder: M::new_decoder(psk),
         }
     }
 
-    pub(crate) fn from_decoder(inner: R, decoder: D) -> Self {
+    pub(crate) fn from_decoder_with_pending_ciphertext(
+        inner: R,
+        decoder: D,
+        pending_ciphertext: Vec<u8>,
+    ) -> Self {
         Self {
             inner: ReaderIo::new(inner),
+            pending_probe_ciphertext: (!pending_ciphertext.is_empty())
+                .then(|| ReadBuffer::new(pending_ciphertext)),
             pending_ciphertext: None,
             decoder,
         }
@@ -271,15 +279,34 @@ where
                 return Poll::Ready(Ok(true));
             }
 
-            if self.pending_ciphertext.is_some() {
+            if self.pending_probe_ciphertext.is_some() {
                 let event = {
-                    let read = self.pending_ciphertext.as_mut().expect("pending checked");
-                    let before = read.remaining().len();
-                    let mut src = read.remaining();
-                    let event = self.decoder.decode_ciphertext(&mut src)?;
-                    read.advance(before - src.len());
-                    event
+                    let read = self
+                        .pending_probe_ciphertext
+                        .as_mut()
+                        .expect("pending checked");
+                    decode_from_buffer(&mut self.decoder, read)?
                 };
+                if self
+                    .pending_probe_ciphertext
+                    .as_ref()
+                    .is_some_and(ReadBuffer::is_empty)
+                {
+                    self.pending_probe_ciphertext = None;
+                }
+
+                match event {
+                    DecodeEvent::PlainData => return Poll::Ready(Ok(true)),
+                    DecodeEvent::ZeroChunk => return Poll::Ready(Ok(false)),
+                    _ => continue,
+                }
+            }
+
+            if self.pending_ciphertext.is_some() {
+                let event = decode_from_buffer(
+                    &mut self.decoder,
+                    self.pending_ciphertext.as_mut().expect("pending checked"),
+                )?;
                 if self
                     .pending_ciphertext
                     .as_ref()
@@ -341,6 +368,21 @@ where
         self.decoder.advance_plaintext(copied);
         copied
     }
+}
+
+fn decode_from_buffer<'a, D, B>(
+    decoder: &'a mut D,
+    read: &mut ReadBuffer<B>,
+) -> io::Result<DecodeEvent<'a>>
+where
+    D: SnellTcpDecoder,
+    B: IoBuf,
+{
+    let before = read.remaining().len();
+    let mut src = read.remaining();
+    let event = decoder.decode_ciphertext(&mut src)?;
+    read.advance(before - src.len());
+    Ok(event)
 }
 
 impl<W, E> SnellStreamWriter<W, E>

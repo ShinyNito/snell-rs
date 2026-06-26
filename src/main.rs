@@ -122,14 +122,14 @@ fn run() -> io::Result<()> {
             run_client(config)
         }
         Cmd::Server(args) => {
-            let (config, protocol) = server_config(args)?;
+            let config = server_config(args)?;
             tracing::info!(
                 listen = %config.listen,
                 outbound = ?config.outbound,
                 tcp_brutal = config.tcp_brutal.is_some(),
                 tcp_brutal_rate = config.tcp_brutal.map(|config| config.rate_bytes_per_sec),
                 tcp_brutal_cwnd_gain = config.tcp_brutal.map(|config| config.cwnd_gain),
-                parsed_protocol = ?protocol,
+                parsed_protocol = ?config.protocol,
                 "snell-rs server listening",
             );
             run_server(config)
@@ -262,35 +262,31 @@ fn client_config(args: ClientArgs) -> io::Result<RuntimeClientConfig> {
     Ok(config)
 }
 
-fn server_config(args: ServerArgs) -> io::Result<(RuntimeServerConfig, Option<ProtocolVersion>)> {
+fn server_config(args: ServerArgs) -> io::Result<RuntimeServerConfig> {
     if let Some(path) = args.config {
         let cfg = FileServerConfig::load(path)?;
         let outbound = cfg
             .upstream_socks5
             .map_or(Outbound::Direct, |server| Outbound::Socks5 { server });
-        return Ok((
-            RuntimeServerConfig {
-                listen: cfg.listen,
-                psk: cfg.psk,
-                outbound,
-                tcp_brutal: cfg.tcp_brutal,
-            },
-            cfg.protocol,
-        ));
+        return Ok(RuntimeServerConfig {
+            listen: cfg.listen,
+            psk: cfg.psk,
+            protocol: cfg.protocol,
+            outbound,
+            tcp_brutal: cfg.tcp_brutal,
+        });
     }
 
     let protocol = server_protocol_from_cli(args.version.as_deref(), args.mode.as_deref())?;
-    Ok((
-        RuntimeServerConfig {
-            listen: args.snell_listen.expect("required by clap arg group"),
-            psk: psk_from_str(&args.psk.expect("required by clap arg group"))?,
-            outbound: args
-                .socks5_outbound
-                .map_or(Outbound::Direct, |server| Outbound::Socks5 { server }),
-            tcp_brutal: None,
-        },
+    Ok(RuntimeServerConfig {
+        listen: args.snell_listen.expect("required by clap arg group"),
+        psk: psk_from_str(&args.psk.expect("required by clap arg group"))?,
         protocol,
-    ))
+        outbound: args
+            .socks5_outbound
+            .map_or(Outbound::Direct, |server| Outbound::Socks5 { server }),
+        tcp_brutal: None,
+    })
 }
 
 fn init_tracing() {
