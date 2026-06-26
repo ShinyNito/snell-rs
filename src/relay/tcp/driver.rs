@@ -11,25 +11,16 @@ use std::{
 use bytes::BytesMut;
 use compio::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf},
-    io::{AsyncRead, AsyncReadManaged, AsyncReadMulti, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadManaged, AsyncWrite, AsyncWriteExt},
 };
-use futures::{Stream, StreamExt};
 
 use crate::protocol::snell::{
     DecodeEvent, PendingWire, PendingWireSegment, PlaintextFrame, PlaintextSegment, SnellMode,
     SnellTcpDecoder, SnellTcpEncoder,
 };
 
-type ManagedReadBatchFuture<R> = Pin<
-    Box<
-        dyn Future<
-            Output = (
-                R,
-                io::Result<PlainReadBatch<<R as AsyncReadManaged>::Buffer>>,
-            ),
-        >,
-    >,
->;
+type ReadOne<R> = Option<<R as AsyncReadManaged>::Buffer>;
+type ManagedReadFuture<R> = Pin<Box<dyn Future<Output = (R, io::Result<ReadOne<R>>)>>>;
 type ReadAheadFuture<R> =
     Pin<Box<dyn Future<Output = (R, io::Result<Option<<R as AsyncReadManaged>::Buffer>>)>>>;
 type WriteVectoredFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), PendingWire>)>>>;
@@ -37,10 +28,6 @@ type FlushFuture<W> = Pin<Box<dyn Future<Output = (W, io::Result<()>)>>>;
 
 const READ_AHEAD_LEN: usize = 64 * 1024;
 const PLAINTEXT_BATCH_LEN: usize = 64 * 1024;
-const PLAIN_TO_SNELL_BATCH_LEN: usize = 64 * 1024;
-// read_multi uses one len for every completion; keep each plaintext buffer
-// small enough for shaped records whose next capacity can move down.
-const PLAIN_TO_SNELL_READ_LEN: usize = 4 * 1024;
 
 pub struct SnellStreamReader<R: AsyncReadManaged, D> {
     inner: ReaderIo<R>,
@@ -58,12 +45,6 @@ pub struct SnellStreamWriter<W, E> {
 pub(crate) struct PlaintextBatch {
     frames: Vec<PlaintextFrame>,
     len: usize,
-}
-
-pub(crate) struct PlainReadBatch<B> {
-    buffers: Vec<B>,
-    len: usize,
-    eof: bool,
 }
 
 struct CiphertextQueue<B> {
@@ -92,9 +73,9 @@ enum WriterIo<W> {
     Flushing(FlushFuture<W>),
 }
 
-pub(crate) enum WriteFromState<R: AsyncReadMulti> {
+pub(crate) enum WriteFromState<R: AsyncReadManaged> {
     Reading { reader: Option<R> },
-    ReadPending { future: ManagedReadBatchFuture<R> },
+    ReadPending { future: ManagedReadFuture<R> },
     Flushing { reader: Option<R>, eof: bool },
     Done,
 }
@@ -108,7 +89,7 @@ pub(crate) enum WriteFrameState {
 
 impl<R> WriteFromState<R>
 where
-    R: AsyncReadMulti,
+    R: AsyncReadManaged,
 {
     pub(crate) fn new(reader: R) -> Self {
         Self::Reading {
@@ -214,28 +195,6 @@ impl PlaintextBatch {
 
     pub(crate) fn into_frames(self) -> impl Iterator<Item = PlaintextFrame> {
         self.frames.into_iter()
-    }
-}
-
-impl<B> PlainReadBatch<B>
-where
-    B: IoBuf,
-{
-    fn new() -> Self {
-        Self {
-            buffers: Vec::new(),
-            len: 0,
-            eof: false,
-        }
-    }
-
-    fn is_full(&self) -> bool {
-        self.len >= PLAIN_TO_SNELL_BATCH_LEN
-    }
-
-    fn push(&mut self, buffer: B) {
-        self.len += buffer.as_init().len();
-        self.buffers.push(buffer);
     }
 }
 
@@ -709,7 +668,7 @@ where
         state: &mut WriteFromState<R>,
     ) -> Poll<io::Result<bool>>
     where
-        R: AsyncReadMulti + 'static,
+        R: AsyncReadManaged + 'static,
         R::Buffer: IoBufMut + Into<PendingWireSegment> + 'static,
     {
         loop {
@@ -723,13 +682,21 @@ where
                         )));
                     }
                     let plain_read = reader.take().expect("plain reader missing");
-                    let read_len = capacity.min(PLAIN_TO_SNELL_READ_LEN);
-                    let future = Box::pin(read_multi_batch(plain_read, read_len));
+                    let future = Box::pin(read_one_len(plain_read, capacity));
                     *state = WriteFromState::ReadPending { future };
                 }
                 WriteFromState::ReadPending { future } => {
                     let (reader, result) = ready!(future.as_mut().poll(cx));
-                    let eof = self.seal_plain_batch(result?)?;
+                    let eof = match result? {
+                        Some(read) => {
+                            self.encoder.seal_plain(read)?;
+                            false
+                        }
+                        None => {
+                            self.encoder.seal_plain(BytesMut::new())?;
+                            true
+                        }
+                    };
                     *state = WriteFromState::Flushing {
                         reader: Some(reader),
                         eof,
@@ -750,42 +717,6 @@ where
                 WriteFromState::Done => return Poll::Ready(Ok(false)),
             }
         }
-    }
-
-    fn seal_plain_batch<B>(&mut self, batch: PlainReadBatch<B>) -> io::Result<bool>
-    where
-        B: IoBufMut + Into<PendingWireSegment>,
-    {
-        let eof = batch.eof;
-        let mut wire = PendingWire::default();
-
-        for buffer in batch.buffers {
-            let capacity = self.encoder.next_plain_capacity();
-            if capacity == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "snell encoder returned zero plaintext capacity",
-                ));
-            }
-            if buffer.as_init().len() > capacity {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "snell plaintext batch exceeded encoder capacity",
-                ));
-            }
-            self.encoder.seal_plain(buffer)?;
-            let mut pending = self.encoder.take_pending_wire();
-            wire.append(&mut pending);
-        }
-
-        if eof {
-            self.encoder.seal_plain(BytesMut::new())?;
-            let mut pending = self.encoder.take_pending_wire();
-            wire.append(&mut pending);
-        }
-
-        self.encoder.restore_pending_wire(wire);
-        Ok(eof)
     }
 
     pub(crate) fn poll_write_owned_frame<B>(
@@ -903,57 +834,13 @@ fn bytes_from_slice(payload: &[u8]) -> BytesMut {
     buf
 }
 
-async fn read_multi_batch<R>(
-    mut reader: R,
-    len: usize,
-) -> (R, io::Result<PlainReadBatch<R::Buffer>>)
+async fn read_one_len<R>(mut reader: R, len: usize) -> (R, io::Result<ReadOne<R>>)
 where
-    R: AsyncReadMulti + 'static,
-    R::Buffer: IoBuf + 'static,
+    R: AsyncReadManaged + 'static,
+    R::Buffer: 'static,
 {
-    let mut batch = PlainReadBatch::new();
-    let result = {
-        let stream = reader.read_multi(len);
-        futures::pin_mut!(stream);
-
-        match stream.next().await {
-            Some(Ok(buffer)) => {
-                if buffer.as_init().is_empty() {
-                    batch.eof = true;
-                    Ok(())
-                } else {
-                    batch.push(buffer);
-                    poll_fn(|cx| {
-                        while !batch.is_full() {
-                            match stream.as_mut().poll_next(cx) {
-                                Poll::Ready(Some(Ok(buffer))) => {
-                                    if buffer.as_init().is_empty() {
-                                        batch.eof = true;
-                                        return Poll::Ready(Ok(()));
-                                    }
-                                    batch.push(buffer);
-                                }
-                                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
-                                Poll::Ready(None) => {
-                                    batch.eof = true;
-                                    return Poll::Ready(Ok(()));
-                                }
-                                Poll::Pending => return Poll::Ready(Ok(())),
-                            }
-                        }
-                        Poll::Ready(Ok(()))
-                    })
-                    .await
-                }
-            }
-            Some(Err(error)) => Err(error),
-            None => {
-                batch.eof = true;
-                Ok(())
-            }
-        }
-    };
-    (reader, result.map(|()| batch))
+    let result = reader.read_managed(len).await;
+    (reader, result)
 }
 
 #[cfg(test)]
@@ -1006,36 +893,6 @@ mod tests {
             V4Decoder::new(psk),
             Vec::new(),
             BytesMut::from(&wire[..]),
-        );
-
-        let payload = read_batch_vec(&mut reader).await.unwrap().unwrap();
-        assert_eq!(payload, b"helloworld");
-        assert!(read_batch_vec(&mut reader).await.unwrap().is_none());
-    }
-
-    #[compio::test]
-    async fn drains_plaintext_batch_in_one_vectored_write() {
-        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
-        let mut writer: SnellStreamWriter<_, V4Encoder> =
-            SnellStreamWriter::new::<V4Mode>(CountingWriter::default(), psk.clone()).unwrap();
-        let mut batch = PlainReadBatch::new();
-        batch.push(bytes_from_slice(b"hello"));
-        batch.push(bytes_from_slice(b"world"));
-        batch.eof = true;
-
-        writer.seal_plain_batch(batch).unwrap();
-        writer.drain_pending().await.unwrap();
-
-        let output = writer_output(&mut writer);
-        assert_eq!(output.vectored_writes, 1);
-
-        let (_client, server) = tcp_pair().await;
-        let (server_read, _) = server.into_split();
-        let mut reader = SnellStreamReader::from_decoder_with_pending(
-            server_read,
-            V4Decoder::new(psk),
-            Vec::new(),
-            BytesMut::from(&output.bytes[..]),
         );
 
         let payload = read_batch_vec(&mut reader).await.unwrap().unwrap();
@@ -1175,46 +1032,6 @@ mod tests {
         let pending = encoder.take_pending_wire();
         for slice in pending.iter_slices() {
             wire.extend_from_slice(slice);
-        }
-    }
-
-    #[derive(Default)]
-    struct CountingWriter {
-        bytes: Vec<u8>,
-        vectored_writes: usize,
-    }
-
-    impl compio::io::AsyncWrite for CountingWriter {
-        async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-            self.bytes.extend_from_slice(buf.as_init());
-            BufResult(Ok(buf.as_init().len()), buf)
-        }
-
-        async fn write_vectored<T: IoVectoredBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-            let mut written = 0;
-            for slice in buf.iter_slice() {
-                self.bytes.extend_from_slice(slice);
-                written += slice.len();
-            }
-            self.vectored_writes += 1;
-            BufResult(Ok(written), buf)
-        }
-
-        async fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-
-        async fn shutdown(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn writer_output(writer: &mut SnellStreamWriter<CountingWriter, V4Encoder>) -> &CountingWriter {
-        match &writer.inner {
-            WriterIo::Idle(Some(output)) => output,
-            WriterIo::Idle(None) | WriterIo::Writing(_) | WriterIo::Flushing(_) => {
-                panic!("writer is not idle")
-            }
         }
     }
 
