@@ -210,7 +210,8 @@ impl V4Encoder {
             "snell v4 header encrypt failed",
         )?;
 
-        let mut segments = Vec::with_capacity(1 + (padding_len > 0) as usize + (payload_len > 0) as usize + 1);
+        let mut segments =
+            Vec::with_capacity(1 + (padding_len > 0) as usize + (payload_len > 0) as usize + 1);
         segments.push(head.freeze());
 
         if payload_len > 0 {
@@ -227,11 +228,7 @@ impl V4Encoder {
             if padding_len > 0 {
                 let mut padding = vec![0u8; padding_len];
                 make_padding_split(&mut padding, &payload_cipher[..], &payload_tag);
-                swap_padding_split(
-                    &mut padding,
-                    payload_cipher.as_mut(),
-                    &mut payload_tag,
-                );
+                swap_padding_split(&mut padding, payload_cipher.as_mut(), &mut payload_tag);
                 segments.push(Bytes::from(padding));
             }
             segments.push(payload_cipher.freeze());
