@@ -10,7 +10,7 @@ use std::{
 
 use bytes::BytesMut;
 use compio::{
-    buf::{BufResult, IntoInner, IoBuf, IoBufMut, IoVectoredBuf},
+    buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf},
     io::{AsyncRead, AsyncReadManaged, AsyncWrite, AsyncWriteExt},
 };
 
@@ -19,25 +19,20 @@ use crate::protocol::snell::{
     SnellTcpDecoder, SnellTcpEncoder,
 };
 
-type ReadOne<R> = Option<ReadBuffer<<R as AsyncReadManaged>::Buffer>>;
+type ReadOne<R> = Option<<R as AsyncReadManaged>::Buffer>;
 type ManagedReadFuture<R> = Pin<Box<dyn Future<Output = (R, io::Result<ReadOne<R>>)>>>;
-type ExactReadFuture<R> = Pin<
-    Box<
-        dyn Future<
-            Output = (
-                R,
-                io::Result<ExactCiphertext<<R as AsyncReadManaged>::Buffer>>,
-            ),
-        >,
-    >,
->;
+type ReadAheadFuture<R> =
+    Pin<Box<dyn Future<Output = (R, io::Result<Option<<R as AsyncReadManaged>::Buffer>>)>>>;
 type WriteVectoredFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), PendingWire>)>>>;
 type FlushFuture<W> = Pin<Box<dyn Future<Output = (W, io::Result<()>)>>>;
+
+const READ_AHEAD_LEN: usize = 64 * 1024;
+const PLAINTEXT_BATCH_LEN: usize = 64 * 1024;
 
 pub struct SnellStreamReader<R: AsyncReadManaged, D> {
     inner: ReaderIo<R>,
     prefetched_plaintext: VecDeque<PlaintextFrame>,
-    prefetched_ciphertext: Option<ReadBuffer<BytesMut>>,
+    prefetched_ciphertext: BytesMut,
     pending_zero_chunk: bool,
     decoder: D,
 }
@@ -49,16 +44,12 @@ pub struct SnellStreamWriter<W, E> {
 
 pub(crate) struct PlaintextBatch {
     frames: Vec<PlaintextFrame>,
-}
-
-enum ExactCiphertext<B> {
-    Managed(B),
-    Heap(BytesMut),
+    len: usize,
 }
 
 enum ReaderIo<R: AsyncReadManaged> {
     Idle(Option<R>),
-    Reading(ExactReadFuture<R>),
+    Reading(ReadAheadFuture<R>),
 }
 
 enum WriterIo<W> {
@@ -110,12 +101,14 @@ where
 
 impl<R> ReaderIo<R>
 where
-    R: AsyncRead + AsyncReadManaged + 'static,
-    R::Buffer: IoBufMut + 'static,
+    R: AsyncReadManaged + 'static,
 {
-    fn start_read(&mut self, len: usize, prefix: BytesMut) {
-        let inner = self.take_idle();
-        let future = Box::pin(read_exact_managed_chunk(inner, len, prefix));
+    fn start_read_ahead(&mut self) {
+        let mut inner = self.take_idle();
+        let future = Box::pin(async move {
+            let result = inner.read_managed(READ_AHEAD_LEN).await;
+            (inner, result)
+        });
         *self = Self::Reading(future);
     }
 }
@@ -164,15 +157,23 @@ impl IoVectoredBuf for PendingWire {
 
 impl PlaintextBatch {
     fn new() -> Self {
-        Self { frames: Vec::new() }
+        Self {
+            frames: Vec::new(),
+            len: 0,
+        }
     }
 
     fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
 
+    fn is_full(&self) -> bool {
+        self.len >= PLAINTEXT_BATCH_LEN
+    }
+
     fn push(&mut self, frame: PlaintextFrame) {
         if !frame.is_empty() {
+            self.len += frame.as_init().len();
             self.frames.push(frame);
         }
     }
@@ -185,6 +186,10 @@ impl PlaintextBatch {
 impl IoVectoredBuf for PlaintextBatch {
     fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
         self.frames.iter().map(IoBuf::as_init)
+    }
+
+    fn total_len(&self) -> usize {
+        self.len
     }
 }
 
@@ -201,7 +206,7 @@ where
         Self {
             inner: ReaderIo::new(inner),
             prefetched_plaintext: VecDeque::new(),
-            prefetched_ciphertext: None,
+            prefetched_ciphertext: BytesMut::new(),
             pending_zero_chunk: false,
             decoder: M::new_decoder(psk),
         }
@@ -216,8 +221,7 @@ where
         Self {
             inner: ReaderIo::new(inner),
             prefetched_plaintext: pending_plaintext.into(),
-            prefetched_ciphertext: (!pending_ciphertext.is_empty())
-                .then(|| ReadBuffer::new(pending_ciphertext)),
+            prefetched_ciphertext: pending_ciphertext,
             pending_zero_chunk: false,
             decoder,
         }
@@ -234,7 +238,9 @@ where
             return Poll::Ready(Ok(None));
         }
 
-        while let Some(frame) = self.prefetched_plaintext.pop_front() {
+        while !batch.is_full()
+            && let Some(frame) = self.prefetched_plaintext.pop_front()
+        {
             batch.push(frame);
         }
         if !batch.is_empty() {
@@ -242,12 +248,27 @@ where
         }
 
         loop {
-            while let Some(frame) = self.decoder.take_pending_plaintext() {
+            while !batch.is_full()
+                && let Some(frame) = self.decoder.take_pending_plaintext()
+            {
                 batch.push(frame);
             }
 
-            if !batch.is_empty() && !self.has_complete_prefetched_ciphertext() {
-                return Poll::Ready(Ok(Some(batch)));
+            if !batch.is_empty() {
+                if batch.is_full() {
+                    return Poll::Ready(Ok(Some(batch)));
+                }
+
+                // Do not start a new read while `batch` owns plaintext; a
+                // pending read would drop the local batch before it is written.
+                match self.try_decode_prefetched_frame()? {
+                    Some(true) => continue,
+                    Some(false) => {
+                        self.pending_zero_chunk = true;
+                        return Poll::Ready(Ok(Some(batch)));
+                    }
+                    None => return Poll::Ready(Ok(Some(batch))),
+                }
             }
 
             if !ready!(self.poll_read_frame(cx))? {
@@ -256,6 +277,34 @@ where
                 }
                 self.pending_zero_chunk = true;
                 return Poll::Ready(Ok(Some(batch)));
+            }
+        }
+    }
+
+    fn try_decode_prefetched_frame(&mut self) -> io::Result<Option<bool>> {
+        loop {
+            if self.decoder.has_pending_plaintext() {
+                return Ok(Some(true));
+            }
+
+            let len = self.decoder.next_cipher_len();
+            if len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snell decoder requested zero ciphertext bytes",
+                ));
+            }
+
+            if !self.has_prefetched_ciphertext(len) {
+                return Ok(None);
+            }
+
+            let ciphertext = self.prefetched_ciphertext.split_to(len);
+            match self.decoder.decode_ciphertext(ciphertext)? {
+                DecodeEvent::PlainData => return Ok(Some(true)),
+                DecodeEvent::ZeroChunk => return Ok(Some(false)),
+                DecodeEvent::NeedMore => continue,
+                _ => continue,
             }
         }
     }
@@ -373,30 +422,18 @@ where
                 )));
             }
 
-            if matches!(self.inner, ReaderIo::Idle(_)) {
-                let prefix = self.take_prefetched_prefix(len);
-                if prefix.len() == len {
-                    let event = self.decoder.decode_ciphertext(prefix)?;
-                    match event {
-                        DecodeEvent::PlainData => return Poll::Ready(Ok(true)),
-                        DecodeEvent::ZeroChunk => return Poll::Ready(Ok(false)),
-                        DecodeEvent::NeedMore => continue,
-                        _ => continue,
-                    }
+            if !self.has_prefetched_ciphertext(len) {
+                if !ready!(self.poll_read_ahead(cx))? {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "failed to fill snell ciphertext chunk",
+                    )));
                 }
-                self.inner.start_read(len, prefix);
+                continue;
             }
 
-            let (inner, result) = match &mut self.inner {
-                ReaderIo::Idle(_) => continue,
-                ReaderIo::Reading(future) => ready!(future.as_mut().poll(cx)),
-            };
-            self.inner = ReaderIo::Idle(Some(inner));
-
-            let event = match result? {
-                ExactCiphertext::Managed(chunk) => self.decoder.decode_ciphertext(chunk)?,
-                ExactCiphertext::Heap(chunk) => self.decoder.decode_ciphertext(chunk)?,
-            };
+            let ciphertext = self.prefetched_ciphertext.split_to(len);
+            let event = self.decoder.decode_ciphertext(ciphertext)?;
             match event {
                 DecodeEvent::PlainData => return Poll::Ready(Ok(true)),
                 DecodeEvent::ZeroChunk => return Poll::Ready(Ok(false)),
@@ -406,26 +443,29 @@ where
         }
     }
 
-    fn take_prefetched_prefix(&mut self, len: usize) -> BytesMut {
-        let mut out = BytesMut::with_capacity(len);
-        if let Some(prefetched) = &mut self.prefetched_ciphertext {
-            let take = len.min(prefetched.remaining().len());
-            out.extend_from_slice(&prefetched.remaining()[..take]);
-            prefetched.advance(take);
-            if prefetched.is_empty() {
-                self.prefetched_ciphertext = None;
-            }
+    fn poll_read_ahead(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        if matches!(self.inner, ReaderIo::Idle(_)) {
+            self.inner.start_read_ahead();
         }
-        out
+
+        let (inner, result) = match &mut self.inner {
+            ReaderIo::Idle(_) => unreachable!("reader io did not start read-ahead"),
+            ReaderIo::Reading(future) => ready!(future.as_mut().poll(cx)),
+        };
+        self.inner = ReaderIo::Idle(Some(inner));
+
+        match result? {
+            Some(chunk) => {
+                self.prefetched_ciphertext
+                    .extend_from_slice(chunk.as_init());
+                Poll::Ready(Ok(true))
+            }
+            None => Poll::Ready(Ok(false)),
+        }
     }
 
-    fn has_complete_prefetched_ciphertext(&self) -> bool {
-        let len = self.decoder.next_cipher_len();
-        len != 0
-            && self
-                .prefetched_ciphertext
-                .as_ref()
-                .is_some_and(|prefetched| prefetched.remaining().len() >= len)
+    fn has_prefetched_ciphertext(&self, len: usize) -> bool {
+        self.prefetched_ciphertext.len() >= len
     }
 
     fn copy_pending_control_plaintext(&mut self, dst: &mut [u8]) -> usize {
@@ -507,7 +547,7 @@ where
                     let (reader, result) = ready!(future.as_mut().poll(cx));
                     let eof = match result? {
                         Some(read) => {
-                            self.encoder.seal_plain(read.into_inner())?;
+                            self.encoder.seal_plain(read)?;
                             false
                         }
                         None => {
@@ -652,152 +692,19 @@ fn bytes_from_slice(payload: &[u8]) -> BytesMut {
     buf
 }
 
-pub(crate) struct ReadBuffer<B> {
-    buf: B,
-    offset: usize,
-}
-
-impl<B> ReadBuffer<B>
-where
-    B: IoBuf,
-{
-    fn new(buf: B) -> Self {
-        Self { buf, offset: 0 }
-    }
-
-    fn remaining(&self) -> &[u8] {
-        &self.buf.as_init()[self.offset..]
-    }
-
-    fn advance(&mut self, n: usize) {
-        self.offset += n;
-    }
-
-    fn is_empty(&self) -> bool {
-        self.offset == self.buf.as_init().len()
-    }
-
-    fn into_inner(self) -> B {
-        debug_assert_eq!(self.offset, 0);
-        self.buf
-    }
-}
-
-async fn read_exact_managed_chunk<R>(
-    mut reader: R,
-    len: usize,
-    prefix: BytesMut,
-) -> (R, io::Result<ExactCiphertext<R::Buffer>>)
-where
-    R: AsyncRead + AsyncReadManaged + 'static,
-    R::Buffer: IoBufMut + 'static,
-{
-    if !prefix.is_empty() {
-        let (reader, result) = read_exact_heap_chunk(reader, len, prefix).await;
-        return (reader, result.map(ExactCiphertext::Heap));
-    }
-
-    let mut buf = match reader.read_managed(len).await {
-        Ok(Some(buf)) => buf,
-        Ok(None) => {
-            return (
-                reader,
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "failed to fill snell ciphertext chunk",
-                )),
-            );
-        }
-        Err(error) => return (reader, Err(error)),
-    };
-    match buf.as_init().len().cmp(&len) {
-        std::cmp::Ordering::Equal => (reader, Ok(ExactCiphertext::Managed(buf))),
-        std::cmp::Ordering::Greater => (
-            reader,
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed read exceeded requested snell ciphertext chunk",
-            )),
-        ),
-        std::cmp::Ordering::Less if buf.buf_capacity() >= len => {
-            let (reader, result) = read_managed_tail(reader, len, buf).await;
-            (reader, result.map(ExactCiphertext::Managed))
-        }
-        std::cmp::Ordering::Less => {
-            let mut heap = BytesMut::with_capacity(len);
-            heap.extend_from_slice(buf.as_init());
-            let (reader, result) = read_exact_heap_chunk(reader, len, heap).await;
-            (reader, result.map(ExactCiphertext::Heap))
-        }
-    }
-}
-
-async fn read_managed_tail<R>(
-    mut reader: R,
-    len: usize,
-    mut buf: R::Buffer,
-) -> (R, io::Result<R::Buffer>)
-where
-    R: AsyncRead + AsyncReadManaged + 'static,
-    R::Buffer: IoBufMut + 'static,
-{
-    while buf.as_init().len() < len {
-        let start = buf.as_init().len();
-        let BufResult(result, slice) = reader.read(buf.slice(start..len)).await;
-        buf = slice.into_inner();
-        if let Err(error) = read_nonzero_result(result) {
-            return (reader, Err(error));
-        }
-    }
-    (reader, Ok(buf))
-}
-
-async fn read_exact_heap_chunk<R>(
-    mut reader: R,
-    len: usize,
-    mut buf: BytesMut,
-) -> (R, io::Result<BytesMut>)
-where
-    R: AsyncRead + 'static,
-{
-    while buf.len() < len {
-        let start = buf.len();
-        let BufResult(result, slice) = reader.read(buf.slice(start..len)).await;
-        buf = slice.into_inner();
-        if let Err(error) = read_nonzero_result(result) {
-            return (reader, Err(error));
-        }
-    }
-    (reader, Ok(buf))
-}
-
-fn read_nonzero_result(result: io::Result<usize>) -> io::Result<()> {
-    match result {
-        Ok(0) => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "failed to fill snell ciphertext chunk",
-        )),
-        Ok(_) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
 async fn read_one_len<R>(mut reader: R, len: usize) -> (R, io::Result<ReadOne<R>>)
 where
     R: AsyncReadManaged + 'static,
     R::Buffer: 'static,
 {
-    let result = reader
-        .read_managed(len)
-        .await
-        .map(|buf| buf.map(ReadBuffer::new));
+    let result = reader.read_managed(len).await;
     (reader, result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::snell::{V4Decoder, V4Encoder, V4Mode};
+    use crate::protocol::snell::{HEADER_CIPHER_LEN, V4Decoder, V4Encoder, V4Mode};
     use compio::{
         io::AsyncWriteExt,
         net::{TcpListener, TcpStream},
@@ -877,6 +784,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(read.await.unwrap().unwrap(), b"hello");
+    }
+
+    #[compio::test]
+    async fn returns_buffered_batch_before_waiting_for_next_frame_body() {
+        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
+        let mut encoder = V4Encoder::new(&psk).unwrap();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let mut zero = Vec::new();
+
+        encoder.seal_plain(bytes_from_slice(b"hello")).unwrap();
+        append_pending_wire(&mut encoder, &mut first);
+        encoder.seal_plain(bytes_from_slice(b"world")).unwrap();
+        append_pending_wire(&mut encoder, &mut second);
+        encoder.seal_plain(BytesMut::new()).unwrap();
+        append_pending_wire(&mut encoder, &mut zero);
+
+        let (client, server) = tcp_pair().await;
+        let (_, mut client_write) = client.into_split();
+        let (server_read, _) = server.into_split();
+        let mut reader: SnellStreamReader<_, V4Decoder> =
+            SnellStreamReader::new::<V4Mode>(server_read, psk);
+
+        let split = HEADER_CIPHER_LEN.min(second.len());
+        let mut prefix = first;
+        prefix.extend_from_slice(&second[..split]);
+        client_write
+            .write_all(BytesMut::from(&prefix[..]))
+            .await
+            .unwrap();
+
+        let payload = time::timeout(Duration::from_secs(1), read_batch_vec(&mut reader))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload, b"hello");
+
+        let mut suffix = Vec::from(&second[split..]);
+        suffix.extend_from_slice(&zero);
+        client_write
+            .write_all(BytesMut::from(&suffix[..]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_batch_vec(&mut reader).await.unwrap().unwrap(),
+            b"world"
+        );
+        assert!(read_batch_vec(&mut reader).await.unwrap().is_none());
     }
 
     async fn read_batch_vec<R, D>(
