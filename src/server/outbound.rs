@@ -20,7 +20,7 @@ use crate::{
         socks5::{self, Command, METHOD_NO_AUTH, Reply},
     },
     relay::udp::{
-        DatagramTransport, MAX_UDP_DATAGRAM_LEN, UDP_ASSOCIATION_TTL, UdpRecvState, UdpSendState,
+        DatagramTransport, ReceivedDatagram, UDP_ASSOCIATION_TTL, UdpRecvState, UdpSendState,
         poll_udp_recv_from, poll_udp_send_to,
     },
     timeout::{with_tcp_connect_timeout, with_tcp_timeout},
@@ -91,14 +91,10 @@ impl DatagramTransport for UdpOutbound {
         }
     }
 
-    fn poll_recv_from(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<(usize, Address)>> {
+    fn poll_recv_from(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<ReceivedDatagram>> {
         match self {
-            Self::Direct(transport) => transport.poll_recv_from(cx, buf),
-            Self::Socks5(transport) => transport.poll_recv_from(cx, buf),
+            Self::Direct(transport) => transport.poll_recv_from(cx),
+            Self::Socks5(transport) => transport.poll_recv_from(cx),
         }
     }
 }
@@ -233,7 +229,6 @@ async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound>
         _control: control,
         socket,
         relay,
-        recv_buf: vec![0; MAX_UDP_DATAGRAM_LEN],
         recv_state: UdpRecvState::default(),
         control_ttl: ttl_timer(),
     })
@@ -389,20 +384,26 @@ impl DirectUdpOutbound {
         }
     }
 
-    fn poll_recv_from(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<(usize, Address)>> {
-        match poll_udp_recv_from(&self.v4, cx, &mut self.v4_recv_state, buf) {
-            Poll::Ready(Ok((n, source))) => return Poll::Ready(Ok((n, Address::Ip(source)))),
+    fn poll_recv_from(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<ReceivedDatagram>> {
+        match poll_udp_recv_from(&self.v4, cx, &mut self.v4_recv_state) {
+            Poll::Ready(Ok(packet)) => {
+                return Poll::Ready(Ok(ReceivedDatagram::new(
+                    Address::Ip(packet.source()),
+                    packet,
+                )));
+            }
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => {}
         }
 
         if let Some(v6) = &self.v6 {
-            match poll_udp_recv_from(v6, cx, &mut self.v6_recv_state, buf) {
-                Poll::Ready(Ok((n, source))) => return Poll::Ready(Ok((n, Address::Ip(source)))),
+            match poll_udp_recv_from(v6, cx, &mut self.v6_recv_state) {
+                Poll::Ready(Ok(packet)) => {
+                    return Poll::Ready(Ok(ReceivedDatagram::new(
+                        Address::Ip(packet.source()),
+                        packet,
+                    )));
+                }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => {}
             }
@@ -429,7 +430,6 @@ pub(crate) struct Socks5UdpOutbound {
     _control: TcpStream,
     socket: UdpSocket,
     relay: SocketAddr,
-    recv_buf: Vec<u8>,
     recv_state: UdpRecvState,
     control_ttl: TimerFuture,
 }
@@ -503,39 +503,28 @@ impl Socks5UdpOutbound {
         }
     }
 
-    fn poll_recv_from(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<(usize, Address)>> {
+    fn poll_recv_from(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<ReceivedDatagram>> {
         self.check_control_ttl(cx)?;
         loop {
-            let (n, source) = ready!(poll_udp_recv_from(
-                &self.socket,
-                cx,
-                &mut self.recv_state,
-                &mut self.recv_buf,
-            ))?;
-            if source != self.relay {
+            let packet = ready!(poll_udp_recv_from(&self.socket, cx, &mut self.recv_state))?;
+            if packet.source() != self.relay {
                 continue;
             }
-            let Ok(packet) = socks5::parse_udp_packet(&self.recv_buf[..n]) else {
-                continue;
+            let (destination, payload_offset) = {
+                let Ok(parsed) = socks5::parse_udp_packet(packet.payload()) else {
+                    continue;
+                };
+                if parsed.frag != 0 {
+                    continue;
+                }
+                (parsed.destination.into_owned(), parsed.payload_offset)
             };
-            if packet.frag != 0 {
-                continue;
-            }
-            if packet.payload.len() > buf.len() {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "socks5 udp outbound packet too large",
-                )));
-            }
-            let payload_len = packet.payload.len();
-            let destination = packet.destination.into_owned();
-            buf[..payload_len].copy_from_slice(packet.payload);
             self.refresh_control_ttl();
-            return Poll::Ready(Ok((payload_len, destination)));
+            return Poll::Ready(ReceivedDatagram::with_payload_offset(
+                destination,
+                packet,
+                payload_offset,
+            ));
         }
     }
 }

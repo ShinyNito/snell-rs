@@ -37,7 +37,7 @@ pub(crate) const UDP_ASSOCIATION_SEND_QUEUE_LIMIT: usize = 1024;
 
 type TcpReadFuture = Pin<Box<dyn Future<Output = (TcpStream, BufResult<usize, Vec<u8>>)>>>;
 type UdpSendFuture = Pin<Box<dyn Future<Output = BufResult<usize, Vec<u8>>>>>;
-type UdpRecvBatch = VecDeque<(Vec<u8>, SocketAddr)>;
+type UdpRecvBatch = VecDeque<UdpRecvPacket>;
 type UdpRecvBatchFuture = Pin<Box<dyn Future<Output = io::Result<UdpRecvBatch>>>>;
 
 pub(crate) trait Outbound {
@@ -57,11 +57,64 @@ pub(crate) trait DatagramTransport {
         state: &mut Self::SendState,
     ) -> Poll<io::Result<usize>>;
 
-    fn poll_recv_from(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<(usize, Address)>>;
+    fn poll_recv_from(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<ReceivedDatagram>>;
+}
+
+pub(crate) struct ReceivedDatagram {
+    source: Address,
+    packet: UdpRecvPacket,
+    payload_offset: usize,
+}
+
+impl ReceivedDatagram {
+    pub(crate) fn new(source: Address, packet: UdpRecvPacket) -> Self {
+        Self {
+            source,
+            packet,
+            payload_offset: 0,
+        }
+    }
+
+    pub(crate) fn with_payload_offset(
+        source: Address,
+        packet: UdpRecvPacket,
+        payload_offset: usize,
+    ) -> io::Result<Self> {
+        if payload_offset > packet.payload().len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "udp payload offset is outside packet",
+            ));
+        }
+        Ok(Self {
+            source,
+            packet,
+            payload_offset,
+        })
+    }
+
+    pub(crate) fn source(&self) -> &Address {
+        &self.source
+    }
+
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.packet.payload()[self.payload_offset..]
+    }
+}
+
+pub(crate) struct UdpRecvPacket {
+    source: SocketAddr,
+    packet: RecvFromMultiResult,
+}
+
+impl UdpRecvPacket {
+    pub(crate) fn source(&self) -> SocketAddr {
+        self.source
+    }
+
+    pub(crate) fn payload(&self) -> &[u8] {
+        self.packet.data()
+    }
 }
 
 pub(crate) fn relay_snell_udp<M, O>(
@@ -79,7 +132,6 @@ where
     let mut relay = SnellUdpRelay {
         snell: transport,
         outbound,
-        outbound_in: vec![0; MAX_UDP_DATAGRAM_LEN],
         pending_to_snell: VecDeque::new(),
         outbound_send_state: O::SendState::default(),
         snell_write_state: WriteFrameState::default(),
@@ -94,7 +146,6 @@ where
 {
     snell: SnellTransport<M>,
     outbound: O,
-    outbound_in: Vec<u8>,
     pending_to_snell: VecDeque<Vec<u8>>,
     outbound_send_state: O::SendState,
     snell_write_state: WriteFrameState,
@@ -171,12 +222,13 @@ where
                 return Poll::Ready(Ok(true));
             }
 
-            let (n, source) = ready!(self.outbound.poll_recv_from(cx, &mut self.outbound_in))?;
-            let source = source.as_view();
+            let datagram = ready!(self.outbound.poll_recv_from(cx))?;
+            let source = datagram.source().as_view();
+            let payload = datagram.payload();
             let header_len = snell::udp_response_addr_len(source)?;
-            let mut packet = vec![0u8; header_len + n];
+            let mut packet = vec![0u8; header_len + payload.len()];
             snell::encode_udp_response_addr(&mut packet, source)?;
-            packet[header_len..].copy_from_slice(&self.outbound_in[..n]);
+            packet[header_len..].copy_from_slice(payload);
             self.queue_to_snell(packet)?;
         }
     }
@@ -206,7 +258,6 @@ where
         socket,
         connector,
         nat: LruCache::with_expiry_duration(UDP_ASSOCIATION_TTL),
-        client_in: vec![0; MAX_UDP_DATAGRAM_LEN],
         client_recv_state: UdpRecvState::default(),
     };
     poll_fn(move |cx| relay.poll(cx))
@@ -220,7 +271,6 @@ where
     socket: UdpSocket,
     connector: Rc<SnellConnector<M>>,
     nat: LruCache<SocketAddr, RefCell<ClientUdpAssociation<M>>>,
-    client_in: Vec<u8>,
     client_recv_state: UdpRecvState,
 }
 
@@ -282,13 +332,13 @@ where
     }
 
     fn poll_client_udp(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        let (n, peer) = ready!(poll_udp_recv_from(
+        let datagram = ready!(poll_udp_recv_from(
             &self.socket,
             cx,
             &mut self.client_recv_state,
-            &mut self.client_in,
         ))?;
-        let Ok(packet) = socks5::parse_udp_packet(&self.client_in[..n]) else {
+        let peer = datagram.source();
+        let Ok(packet) = socks5::parse_udp_packet(datagram.payload()) else {
             return Poll::Ready(Ok(true));
         };
         if packet.frag != 0 {
@@ -523,18 +573,10 @@ pub(crate) fn poll_udp_recv_from(
     socket: &UdpSocket,
     cx: &mut Context<'_>,
     state: &mut UdpRecvState,
-    buf: &mut [u8],
-) -> Poll<io::Result<(usize, SocketAddr)>> {
+) -> Poll<io::Result<UdpRecvPacket>> {
     loop {
-        if let Some((packet, source)) = state.packets.pop_front() {
-            if packet.len() > buf.len() {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "udp packet is larger than receive buffer",
-                )));
-            }
-            buf[..packet.len()].copy_from_slice(&packet);
-            return Poll::Ready(Ok((packet.len(), source)));
+        if let Some(packet) = state.packets.pop_front() {
+            return Poll::Ready(Ok(packet));
         }
 
         if state.receiving.is_none() {
@@ -590,19 +632,23 @@ fn queue_udp_recv_packet(
     if packets.len() >= UDP_ASSOCIATION_SEND_QUEUE_LIMIT {
         return Err(io::Error::other("udp recv queue full"));
     }
-    let source = packet
-        .addr()
-        .and_then(|addr| addr.as_socket())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "udp packet missing source"))?;
     let payload = packet.data();
+    let source = udp_recv_packet_source(&packet)?;
     if payload.len() > MAX_UDP_DATAGRAM_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "udp packet is larger than maximum datagram size",
         ));
     }
-    packets.push_back((payload.to_vec(), source));
+    packets.push_back(UdpRecvPacket { source, packet });
     Ok(())
+}
+
+fn udp_recv_packet_source(packet: &RecvFromMultiResult) -> io::Result<SocketAddr> {
+    packet
+        .addr()
+        .and_then(|addr| addr.as_socket())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "udp packet missing source"))
 }
 
 #[cfg(test)]
@@ -714,11 +760,7 @@ mod tests {
             Poll::Ready(Ok(payload.len()))
         }
 
-        fn poll_recv_from(
-            &mut self,
-            _cx: &mut Context<'_>,
-            _buf: &mut [u8],
-        ) -> Poll<io::Result<(usize, Address)>> {
+        fn poll_recv_from(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<ReceivedDatagram>> {
             Poll::Pending
         }
     }
@@ -781,18 +823,17 @@ mod tests {
         sender.send_to(b"two", receiver_addr).await.unwrap();
 
         let mut state = UdpRecvState::default();
-        let mut buf = [0u8; 8];
-        let (n, source) = poll_fn(|cx| poll_udp_recv_from(&receiver, cx, &mut state, &mut buf))
+        let packet = poll_fn(|cx| poll_udp_recv_from(&receiver, cx, &mut state))
             .await
             .unwrap();
-        assert_eq!(source, sender_addr);
-        let first = buf[..n].to_vec();
+        assert_eq!(packet.source(), sender_addr);
+        let first = packet.payload().to_vec();
 
-        let (n, source) = poll_fn(|cx| poll_udp_recv_from(&receiver, cx, &mut state, &mut buf))
+        let packet = poll_fn(|cx| poll_udp_recv_from(&receiver, cx, &mut state))
             .await
             .unwrap();
-        assert_eq!(source, sender_addr);
-        let second = buf[..n].to_vec();
+        assert_eq!(packet.source(), sender_addr);
+        let second = packet.payload().to_vec();
 
         let mut payloads = vec![first, second];
         payloads.sort();
