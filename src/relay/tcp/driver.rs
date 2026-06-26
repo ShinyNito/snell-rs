@@ -17,7 +17,7 @@ use crate::protocol::snell::{
 };
 
 type ReadFuture<R> = Pin<Box<dyn Future<Output = (R, BufResult<usize, Vec<u8>>)>>>;
-type WriteAllFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), Vec<u8>>)>>>;
+type WriteVectoredFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), Vec<Vec<u8>>>)>>>;
 type FlushFuture<W> = Pin<Box<dyn Future<Output = (W, io::Result<()>)>>>;
 
 pub struct SnellStreamReader<R, D> {
@@ -39,7 +39,7 @@ enum WriterIo<W> {
     Idle(Option<W>),
     Writing {
         advance: usize,
-        future: WriteAllFuture<W>,
+        future: WriteVectoredFuture<W>,
     },
     Flushing(FlushFuture<W>),
 }
@@ -120,10 +120,10 @@ impl<W> WriterIo<W>
 where
     W: AsyncWrite + 'static,
 {
-    fn start_write_all(&mut self, buf: Vec<u8>, advance: usize) {
+    fn start_write_vectored_all(&mut self, buf: Vec<Vec<u8>>, advance: usize) {
         let mut inner = self.take_idle();
         let future = Box::pin(async move {
-            let result = inner.write_all(buf).await;
+            let result = inner.write_vectored_all(buf).await;
             (inner, result)
         });
         *self = Self::Writing { advance, future };
@@ -506,13 +506,14 @@ where
                     if self.encoder.has_pending_wire() {
                         let mut pending = [IoSlice::new(&[]); 5];
                         let nbufs = self.encoder.pending_wire(&mut pending);
-                        let mut wire = Vec::new();
+                        let mut wire = Vec::with_capacity(nbufs);
                         for slice in &pending[..nbufs] {
-                            wire.extend_from_slice(slice);
+                            if !slice.is_empty() {
+                                wire.push(slice.to_vec());
+                            }
                         }
-                        let len = wire.len();
-                        // ponytail: coalesce vectored chunks; restore vectored writes if this costs throughput.
-                        self.inner.start_write_all(wire, len);
+                        let len = wire.iter().map(Vec::len).sum();
+                        self.inner.start_write_vectored_all(wire, len);
                         continue;
                     }
                     self.inner.start_flush();
