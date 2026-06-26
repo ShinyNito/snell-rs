@@ -1,4 +1,4 @@
-use std::{io, marker::PhantomData, net::SocketAddr, sync::Arc};
+use std::{io, marker::PhantomData, net::SocketAddr, rc::Rc, sync::Arc};
 
 use compio::{io::AsyncRead, net::TcpStream};
 
@@ -40,7 +40,7 @@ where
     M: SnellMode,
 {
     transport: SnellTransport<M>,
-    pool: Arc<SnellConnector<M>>,
+    pool: Rc<SnellConnector<M>>,
 }
 
 impl<M> SnellConnector<M>
@@ -64,7 +64,7 @@ where
     }
 
     pub async fn connect(
-        self: &Arc<Self>,
+        self: &Rc<Self>,
         destination: &Address,
     ) -> io::Result<PooledSnellTransport<M>> {
         if let Some(pool) = &self.pool
@@ -97,7 +97,7 @@ where
         })
     }
 
-    pub(crate) async fn connect_udp(self: &Arc<Self>) -> io::Result<SnellTransport<M>> {
+    pub(crate) async fn connect_udp(self: &Rc<Self>) -> io::Result<SnellTransport<M>> {
         let mut transport = self.dial_transport().await?;
         with_tcp_timeout(
             async move {
@@ -165,7 +165,7 @@ where
     }
 }
 
-impl<M> Outbound for Arc<SnellConnector<M>>
+impl<M> Outbound for Rc<SnellConnector<M>>
 where
     M: SnellMode + Send + Sync + 'static,
     M::Encoder: Send,
@@ -251,9 +251,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use compio::{
@@ -295,7 +298,7 @@ mod tests {
             }
         });
 
-        let client = Arc::new(SnellConnector::<V4Mode>::new(server_addr, psk, true));
+        let client = Rc::new(SnellConnector::<V4Mode>::new(server_addr, psk, true));
         for _ in 0..2 {
             run_closed_peer_transport(&client, &destination).await;
         }
@@ -330,7 +333,7 @@ mod tests {
             }
         });
 
-        let client = Arc::new(SnellConnector::<V4Mode>::new(server_addr, psk, false));
+        let client = Rc::new(SnellConnector::<V4Mode>::new(server_addr, psk, false));
         for _ in 0..2 {
             run_closed_peer_transport(&client, &destination).await;
         }
@@ -339,10 +342,7 @@ mod tests {
         assert_eq!(accepts.load(Ordering::SeqCst), 2);
     }
 
-    async fn run_closed_peer_transport(
-        client: &Arc<SnellConnector<V4Mode>>,
-        destination: &Address,
-    ) {
+    async fn run_closed_peer_transport(client: &Rc<SnellConnector<V4Mode>>, destination: &Address) {
         let transport = Outbound::connect(client, destination).await.unwrap();
         let (local, mut peer) = tcp_pair().await;
         let relay = runtime::spawn(copy_bidirectional(transport, local));

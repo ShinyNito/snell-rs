@@ -4,7 +4,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    rc::Rc,
     task::{Context, Poll, ready},
     time::Duration,
 };
@@ -180,7 +180,7 @@ where
 pub(crate) fn relay_socks5_udp<M>(
     control: TcpStream,
     socket: UdpSocket,
-    connector: Arc<SnellConnector<M>>,
+    connector: Rc<SnellConnector<M>>,
 ) -> impl Future<Output = io::Result<()>>
 where
     M: SnellMode + Send + Sync + 'static + Unpin,
@@ -205,7 +205,7 @@ where
 {
     control: TcpControlState,
     socket: UdpSocket,
-    connector: Arc<SnellConnector<M>>,
+    connector: Rc<SnellConnector<M>>,
     nat: LruCache<SocketAddr, RefCell<ClientUdpAssociation<M>>>,
     client_in: Vec<u8>,
     client_recv_state: UdpRecvState,
@@ -360,7 +360,7 @@ where
     M::Decoder: Send + Unpin,
     <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
-    fn new(peer: SocketAddr, connector: Arc<SnellConnector<M>>) -> Self {
+    fn new(peer: SocketAddr, connector: Rc<SnellConnector<M>>) -> Self {
         let future = Box::pin(async move { connector.connect_udp().await });
         Self {
             peer,

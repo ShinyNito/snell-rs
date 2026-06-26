@@ -1,4 +1,8 @@
-use std::{error::Error, io::Result, net::SocketAddr, sync::Arc};
+#[cfg(windows)]
+use std::net::TcpListener as StdTcpListener;
+#[cfg(windows)]
+use std::sync::Arc;
+use std::{error::Error, io::Result, net::SocketAddr, rc::Rc};
 
 use compio::{
     io::AsyncWriteExt,
@@ -104,7 +108,7 @@ pub async fn bind_tcp_listener_with_dispatcher(
     config: ClientConfig,
     dispatcher: Arc<compio::dispatcher::Dispatcher>,
 ) -> Result<()> {
-    let listener = bind_listener(config.listen).await?;
+    let listener = bind_std_listener(config.listen)?;
     match config.version {
         ProtocolVersion::V4 | ProtocolVersion::V5 => {
             serve_socks5_listener_typed_with_dispatcher::<V4Mode>(
@@ -149,6 +153,11 @@ pub async fn bind_tcp_listener_with_dispatcher(
     }
 }
 
+#[cfg(windows)]
+fn bind_std_listener(listen: SocketAddr) -> Result<StdTcpListener> {
+    StdTcpListener::bind(listen)
+}
+
 async fn serve_socks5_listener_typed<M>(
     listener: TcpListener,
     server: SocketAddr,
@@ -161,7 +170,7 @@ where
     M::Decoder: Send + Unpin,
     <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
-    let snell_client = Arc::new(SnellConnector::<M>::new(server, psk, resume));
+    let snell_client = Rc::new(SnellConnector::<M>::new(server, psk, resume));
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         if let Err(error) = apply_tcp_keepalive(&stream) {
@@ -180,7 +189,7 @@ where
 
 #[cfg(windows)]
 async fn serve_socks5_listener_typed_with_dispatcher<M>(
-    listener: TcpListener,
+    listener: StdTcpListener,
     server: SocketAddr,
     psk: Vec<u8>,
     resume: bool,
@@ -192,15 +201,24 @@ where
     M::Decoder: Send + Unpin,
     <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
-    let snell_client = Arc::new(SnellConnector::<M>::new(server, psk, resume));
+    let psk: Arc<[u8]> = Arc::from(psk.into_boxed_slice());
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        if let Err(error) = apply_tcp_keepalive(&stream) {
-            tracing::warn!(%peer_addr, %error, "SOCKS5 inbound tcp keepalive could not be enabled");
-        }
-        let snell_client = snell_client.clone();
+        let (stream, peer_addr) = listener.accept()?;
+        let psk = psk.clone();
         dispatcher
             .dispatch(move || async move {
+                // ponytail: per-connection on Windows; add worker-local pools if resume throughput matters.
+                let snell_client = Rc::new(SnellConnector::<M>::new(server, psk, resume));
+                let stream = match TcpStream::from_std(stream) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::info!(%peer_addr, %error, "client inbound attach failed");
+                        return;
+                    }
+                };
+                if let Err(error) = apply_tcp_keepalive(&stream) {
+                    tracing::warn!(%peer_addr, %error, "SOCKS5 inbound tcp keepalive could not be enabled");
+                }
                 match serve_socks5_inbound(stream, snell_client).await {
                     Ok(()) => tracing::info!(%peer_addr, "client inbound ended"),
                     Err(error) => tracing::info!(%peer_addr, %error, "client inbound failed"),
@@ -212,7 +230,7 @@ where
 
 async fn serve_socks5_inbound<M>(
     stream: TcpStream,
-    snell_client: Arc<SnellConnector<M>>,
+    snell_client: Rc<SnellConnector<M>>,
 ) -> std::result::Result<(), Box<dyn Error + Send + Sync>>
 where
     M: SnellMode + Send + Sync + 'static + Unpin,

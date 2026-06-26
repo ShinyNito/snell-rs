@@ -1,3 +1,7 @@
+#[cfg(windows)]
+use std::net::TcpListener as StdTcpListener;
+#[cfg(test)]
+use std::rc::Rc;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use compio::{
@@ -94,23 +98,30 @@ pub async fn bind_tcp_listener_with_dispatcher(
     dispatcher: Arc<compio::dispatcher::Dispatcher>,
 ) -> io::Result<()> {
     validate_tcp_brutal_available(config.tcp_brutal).await?;
-    let listener = bind_listener(config.listen).await?;
+    let listener = bind_std_listener(config.listen)?;
     let psk: Arc<[u8]> = Arc::from(config.psk.into_boxed_slice());
     let outbound = config.outbound;
     let tcp_brutal = config.tcp_brutal;
 
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        if let Err(error) = apply_tcp_keepalive(&stream) {
-            tracing::warn!(%peer_addr, %error, "snell inbound tcp keepalive could not be enabled");
-        }
-        if let Err(error) = apply_tcp_brutal(&stream, tcp_brutal) {
-            tracing::warn!(%peer_addr, %error, "snell inbound tcp_brutal could not be enabled");
-        }
+        let (stream, peer_addr) = listener.accept()?;
         let psk = psk.clone();
         let outbound = outbound.clone();
         dispatcher
             .dispatch(move || async move {
+                let stream = match TcpStream::from_std(stream) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::info!(%peer_addr, %error, "snell inbound attach failed");
+                        return;
+                    }
+                };
+                if let Err(error) = apply_tcp_keepalive(&stream) {
+                    tracing::warn!(%peer_addr, %error, "snell inbound tcp keepalive could not be enabled");
+                }
+                if let Err(error) = apply_tcp_brutal(&stream, tcp_brutal) {
+                    tracing::warn!(%peer_addr, %error, "snell inbound tcp_brutal could not be enabled");
+                }
                 match serve_snell_inbound_auto(stream, psk, outbound, peer_addr).await {
                     Ok(()) => tracing::info!(%peer_addr, "snell inbound ended"),
                     Err(error) => tracing::info!(%peer_addr, %error, "snell inbound failed"),
@@ -118,6 +129,11 @@ pub async fn bind_tcp_listener_with_dispatcher(
             })
             .map_err(|_| io::Error::other("dispatcher workers stopped"))?;
     }
+}
+
+#[cfg(windows)]
+fn bind_std_listener(listen: SocketAddr) -> io::Result<StdTcpListener> {
+    StdTcpListener::bind(listen)
 }
 
 async fn serve_snell_inbound_auto(
@@ -595,7 +611,7 @@ mod tests {
                 .unwrap();
         });
 
-        let connector = Arc::new(SnellConnector::<V6ShapedMode>::new(server_addr, psk, false));
+        let connector = Rc::new(SnellConnector::<V6ShapedMode>::new(server_addr, psk, false));
         let transport = connector
             .connect(&Address::from(target_addr))
             .await
@@ -754,7 +770,7 @@ mod tests {
 
         // reuse connector：跑一条 sub-stream（CONNECT → ping/pong → 双向 EOF）。
         // relay 结束后 transport 被归还到客户端 pool，socket 保持打开。
-        let connector = Arc::new(SnellConnector::<V4Mode>::new(server_addr, psk, true));
+        let connector = Rc::new(SnellConnector::<V4Mode>::new(server_addr, psk, true));
         run_client_round_trip_with_connector(&connector, &Address::from(target_addr)).await;
         target.await.unwrap();
 
@@ -808,7 +824,7 @@ mod tests {
             .await;
         });
 
-        let connector = Arc::new(SnellConnector::<V6ShapedMode>::new(server_addr, psk, true));
+        let connector = Rc::new(SnellConnector::<V6ShapedMode>::new(server_addr, psk, true));
         for _ in 0..2 {
             run_client_round_trip_with_connector(&connector, &Address::from(target_addr)).await;
         }
@@ -862,7 +878,7 @@ mod tests {
             serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr).await
         });
 
-        let connector = Arc::new(SnellConnector::<V6ShapedMode>::new(server_addr, psk, false));
+        let connector = Rc::new(SnellConnector::<V6ShapedMode>::new(server_addr, psk, false));
         let transport = connector.connect_udp().await.unwrap();
         drop(transport);
 
@@ -952,12 +968,12 @@ mod tests {
         M::Decoder: Send + Unpin,
         <M::Encoder as SnellTcpEncoder>::Reservation: Send,
     {
-        let connector = Arc::new(SnellConnector::<M>::new(server_addr, psk, false));
+        let connector = Rc::new(SnellConnector::<M>::new(server_addr, psk, false));
         run_client_round_trip_with_connector(&connector, &destination).await;
     }
 
     async fn run_client_round_trip_with_connector<M>(
-        connector: &Arc<SnellConnector<M>>,
+        connector: &Rc<SnellConnector<M>>,
         destination: &Address,
     ) where
         M: SnellMode + Send + Sync + 'static + Unpin,
@@ -993,7 +1009,7 @@ mod tests {
         M::Decoder: Send + Unpin,
         <M::Encoder as SnellTcpEncoder>::Reservation: Send,
     {
-        let connector = Arc::new(SnellConnector::<M>::new(server_addr, psk, false));
+        let connector = Rc::new(SnellConnector::<M>::new(server_addr, psk, false));
         let mut transport = connector.connect_udp().await.unwrap();
 
         let destination_view = destination.as_view();
