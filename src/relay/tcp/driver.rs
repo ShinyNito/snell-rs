@@ -174,6 +174,10 @@ impl PlaintextBatch {
             self.frames.push(frame);
         }
     }
+
+    pub(crate) fn into_frames(self) -> impl Iterator<Item = PlaintextFrame> {
+        self.frames.into_iter()
+    }
 }
 
 impl IoVectoredBuf for PlaintextBatch {
@@ -498,29 +502,43 @@ where
         }
     }
 
-    pub(crate) fn poll_write_frame(
+    pub(crate) fn poll_write_owned_frame<B>(
         &mut self,
         cx: &mut Context<'_>,
-        payload: &[u8],
+        payload: B,
         state: &mut WriteFrameState,
-    ) -> Poll<io::Result<()>> {
-        loop {
-            match state {
-                WriteFrameState::Encoding => {
-                    if payload.len() > self.encoder.next_plain_capacity() {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "snell udp packet is larger than one frame",
-                        )));
-                    }
-                    self.encoder.seal_plain(bytes_from_slice(payload))?;
-                    *state = WriteFrameState::Flushing;
+    ) -> Poll<io::Result<()>>
+    where
+        B: IoBufMut + Into<PendingWireSegment>,
+    {
+        match state {
+            WriteFrameState::Encoding => {
+                if payload.as_init().len() > self.encoder.next_plain_capacity() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "snell udp packet is larger than one frame",
+                    )));
                 }
-                WriteFrameState::Flushing => {
-                    ready!(self.poll_drain_pending(cx))?;
-                    *state = WriteFrameState::Encoding;
-                    return Poll::Ready(Ok(()));
-                }
+                self.encoder.seal_plain(payload)?;
+                *state = WriteFrameState::Flushing;
+            }
+            WriteFrameState::Flushing => {}
+        }
+        ready!(self.poll_flush_frame(cx, state))?;
+        Poll::Ready(Ok(()))
+    }
+
+    pub(crate) fn poll_flush_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+        state: &mut WriteFrameState,
+    ) -> Poll<io::Result<bool>> {
+        match state {
+            WriteFrameState::Encoding => Poll::Ready(Ok(false)),
+            WriteFrameState::Flushing => {
+                ready!(self.poll_drain_pending(cx))?;
+                *state = WriteFrameState::Encoding;
+                Poll::Ready(Ok(true))
             }
         }
     }

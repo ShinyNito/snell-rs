@@ -6,6 +6,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
+use bytes::{Bytes, BytesMut};
 use compio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, ToSocketAddrsAsync, UdpSocket},
@@ -21,7 +22,7 @@ use crate::{
     },
     relay::udp::{
         DatagramTransport, ReceivedDatagram, UDP_ASSOCIATION_TTL, UdpRecvState, UdpSendState,
-        poll_udp_recv_from, poll_udp_send_to,
+        poll_udp_recv_from, poll_udp_send_bytes_to, poll_udp_send_to,
     },
     timeout::{with_tcp_connect_timeout, with_tcp_timeout},
 };
@@ -439,7 +440,7 @@ enum Socks5UdpSendState {
     #[default]
     Ready,
     Sending {
-        packet: Vec<u8>,
+        packet: Option<Bytes>,
         payload_len: usize,
         state: UdpSendState,
     },
@@ -473,11 +474,11 @@ impl Socks5UdpOutbound {
                 Socks5UdpSendState::Ready => {
                     let destination = destination.as_view();
                     let header_len = socks5::udp_header_len(destination)?;
-                    let mut packet = vec![0u8; header_len + payload.len()];
+                    let mut packet = BytesMut::zeroed(header_len + payload.len());
                     socks5::encode_udp_header(&mut packet, 0, destination)?;
                     packet[header_len..].copy_from_slice(payload);
                     *state = Socks5UdpSendState::Sending {
-                        packet,
+                        packet: Some(packet.freeze()),
                         payload_len: payload.len(),
                         state: UdpSendState::default(),
                     };
@@ -488,7 +489,7 @@ impl Socks5UdpOutbound {
                     state: send_state,
                 } => {
                     let payload_len = *payload_len;
-                    ready!(poll_udp_send_to(
+                    ready!(poll_udp_send_bytes_to(
                         &self.socket,
                         cx,
                         self.relay,
