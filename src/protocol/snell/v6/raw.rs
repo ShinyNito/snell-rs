@@ -15,98 +15,21 @@
 //!   No salt, no AEAD tag, no padding.
 //! ```
 
-use std::{
-    fmt,
-    io::{self, IoSlice},
-};
+use std::{fmt, io};
 
-use compio::buf::{IoBuf, IoBufMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 use super::super::{
-    DecodeEvent, DecodedHeader, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, PendingWire,
-    PendingWireSegment, PlaintextFrame, PlaintextSegment, SnellTcpDecoder, SnellTcpEncoder,
-    common::{
-        invalid_data, invalid_input, parse_done, parse_v6_raw_header_need, pending_plaintext_slice,
-        write_v6_plain_header,
-    },
+    DecodeEvent, DecodedHeader, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, SnellTcpDecoder,
+    SnellTcpEncoder,
+    common::{invalid_input, parse_done, parse_v6_raw_header_need, write_v6_plain_header},
 };
 
 /// V6 unsafe-raw encoder — plaintext frames, no crypto.
 ///
-/// Wire state: `pending` owns sealed record segments until the runtime takes it.
-pub struct V6UnsafeRawEncoder {
-    pending: PendingWire,
-}
-
-impl fmt::Debug for V6UnsafeRawEncoder {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("V6UnsafeRawEncoder")
-            .field("pending_len", &self.pending.total_len())
-            .finish()
-    }
-}
-
-/// V6 unsafe-raw decoder — plaintext frames, no crypto.
-///
-/// Read state machine: `Header → Body → Header → ...`
-#[derive(Debug)]
-pub struct V6UnsafeRawDecoder {
-    read_step: RawReadStep,
-    plain: PlaintextFrame,
-}
-
-/// Decoder state machine arms.
-#[derive(Clone, Copy, Debug)]
-enum RawReadStep {
-    /// Reading the 7-byte plaintext frame header.
-    Header,
-    /// Reading the frame body (plaintext payload).
-    Body { header: DecodedHeader },
-}
-
-impl V6UnsafeRawEncoder {
-    /// Create an encoder with no crypto state.
-    pub fn new() -> Self {
-        Self {
-            pending: PendingWire::default(),
-        }
-    }
-
-    fn seal_owned_payload<B>(&mut self, payload: B) -> io::Result<()>
-    where
-        B: IoBufMut + Into<PendingWireSegment>,
-    {
-        if !self.pending_empty() {
-            return Err(invalid_input("snell pending wire not fully written"));
-        }
-        let payload_len = payload.as_init().len();
-        if payload_len > MAX_PACKET_SIZE_V6 {
-            return Err(invalid_input("snell payload exceeds record capacity"));
-        }
-
-        let mut header = [0; HEADER_PLAIN_LEN];
-        write_v6_plain_header(&mut header, 0, payload_len)?;
-
-        let mut pending = PendingWire::default();
-        pending.push(header);
-        pending.push(payload);
-        self.pending = pending;
-        Ok(())
-    }
-
-    /// Whether all pending wire bytes have been flushed.
-    pub fn pending_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
-
-    pub fn take_pending_wire(&mut self) -> PendingWire {
-        std::mem::take(&mut self.pending)
-    }
-
-    pub fn restore_pending_wire(&mut self, wire: PendingWire) {
-        self.pending = wire;
-    }
-}
+/// Stateless beyond record framing: each [`SnellTcpEncoder::seal_plain`] call
+/// produces one owned [`Bytes`] record.
+pub struct V6UnsafeRawEncoder;
 
 impl Default for V6UnsafeRawEncoder {
     fn default() -> Self {
@@ -114,30 +37,104 @@ impl Default for V6UnsafeRawEncoder {
     }
 }
 
+impl fmt::Debug for V6UnsafeRawEncoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("V6UnsafeRawEncoder").finish()
+    }
+}
+
+/// V6 unsafe-raw decoder — plaintext frames, no crypto.
+///
+/// Read state machine: `Header → Body → Header → ...`. Partial records are
+/// accumulated in `buf`; each completed body is decrypted (a no-op here) in
+/// place and exposed via `plain`.
+#[derive(Debug)]
+pub struct V6UnsafeRawDecoder {
+    step: RawReadStep,
+    buf: BytesMut,
+    plain: BytesMut,
+}
+
+/// Decoder state machine arms.
+#[derive(Clone, Copy, Debug)]
+enum RawReadStep {
+    /// Reading the 7-byte plaintext frame header; `filled` bytes already consumed from `buf`.
+    Header { filled: usize },
+    /// Reading the frame body; `filled` bytes of `header.body_len` already consumed from `buf`.
+    Body {
+        header: DecodedHeader,
+        filled: usize,
+    },
+}
+
+impl V6UnsafeRawEncoder {
+    /// Create an encoder with no crypto state.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 impl V6UnsafeRawDecoder {
     /// Create a decoder with no crypto state.
     pub fn new() -> Self {
         Self {
-            read_step: RawReadStep::Header,
-            plain: PlaintextFrame::default(),
+            step: RawReadStep::Header { filled: 0 },
+            buf: BytesMut::new(),
+            plain: BytesMut::new(),
         }
     }
 
-    /// Borrow the decrypted plaintext region from the current record.
+    /// The decrypted plaintext region of the current record (the sole source).
     pub fn pending_plain(&self) -> &[u8] {
-        self.plain.as_init()
+        &self.plain
     }
 
-    /// Mark `n` bytes from [`V6UnsafeRawDecoder::pending_plain`] as consumed.
+    /// Mark `n` bytes from [`pending_plain`](Self::pending_plain) as consumed.
     pub fn consume_plain(&mut self, n: usize) {
+        let n = n.min(self.plain.len());
         self.plain.advance(n);
     }
 
-    pub fn take_pending_plain(&mut self) -> Option<PlaintextFrame> {
-        if self.plain.is_empty() {
-            return None;
+    /// Advance the decode state machine as far as `buf` allows.
+    ///
+    /// Emits a non-`NeedMore` event as soon as one record finishes; the caller
+    /// drains plaintext (or handles a control frame) before feeding again.
+    /// Raw mode never produces a borrowed `ServerError`, so the event borrows
+    /// nothing.
+    fn try_drain(&mut self) -> io::Result<DecodeEvent<'static>> {
+        if !self.pending_plain().is_empty() {
+            return Ok(DecodeEvent::PlainData);
         }
-        Some(std::mem::take(&mut self.plain))
+
+        loop {
+            match self.step {
+                RawReadStep::Header { filled } => {
+                    if filled >= HEADER_PLAIN_LEN {
+                        let header = parse_done(
+                            parse_v6_raw_header_need(&self.buf[..HEADER_PLAIN_LEN])?,
+                            "snell v6 raw short header",
+                        )?;
+                        self.buf.advance(HEADER_PLAIN_LEN);
+                        if header.body_len == 0 {
+                            self.step = RawReadStep::Header { filled: 0 };
+                            return Ok(DecodeEvent::ZeroChunk);
+                        }
+                        self.step = RawReadStep::Body { header, filled: 0 };
+                        continue;
+                    }
+                    return Ok(DecodeEvent::NeedMore);
+                }
+                RawReadStep::Body { header, filled } => {
+                    if filled >= header.body_len {
+                        // Raw mode has no crypto: the plaintext is the body.
+                        self.plain = self.buf.split_to(header.payload_len);
+                        self.step = RawReadStep::Header { filled: 0 };
+                        return Ok(DecodeEvent::PlainData);
+                    }
+                    return Ok(DecodeEvent::NeedMore);
+                }
+            }
+        }
     }
 }
 
@@ -152,81 +149,54 @@ impl SnellTcpEncoder for V6UnsafeRawEncoder {
         MAX_PACKET_SIZE_V6
     }
 
-    fn seal_plain<B>(&mut self, payload: B) -> io::Result<()>
-    where
-        B: IoBufMut + Into<PendingWireSegment>,
-    {
-        self.seal_owned_payload(payload)
-    }
+    fn seal_plain(&mut self, payload: &[u8]) -> io::Result<Bytes> {
+        let payload_len = payload.len();
+        if payload_len > MAX_PACKET_SIZE_V6 {
+            return Err(invalid_input("snell payload exceeds record capacity"));
+        }
 
-    fn take_pending_wire(&mut self) -> PendingWire {
-        V6UnsafeRawEncoder::take_pending_wire(self)
-    }
-
-    fn restore_pending_wire(&mut self, wire: PendingWire) {
-        V6UnsafeRawEncoder::restore_pending_wire(self, wire);
-    }
-
-    fn has_pending_wire(&self) -> bool {
-        !self.pending_empty()
+        let mut wire = BytesMut::with_capacity(HEADER_PLAIN_LEN + payload_len);
+        let mut header = [0u8; HEADER_PLAIN_LEN];
+        write_v6_plain_header(&mut header, 0, payload_len)?;
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(payload);
+        Ok(wire.freeze())
     }
 }
 
 impl SnellTcpDecoder for V6UnsafeRawDecoder {
-    fn next_cipher_len(&self) -> usize {
-        if !self.pending_plain().is_empty() {
-            return 0;
+    fn feed_owned(&mut self, chunk: BytesMut) -> io::Result<DecodeEvent<'_>> {
+        // The `filled` cursor counts bytes consumed from `buf` for the current
+        // step. Feeding a new chunk grows `buf`; recompute how many bytes of
+        // the current step's target are now available and clamp the cursor.
+        let target = match self.step {
+            RawReadStep::Header { .. } => HEADER_PLAIN_LEN,
+            RawReadStep::Body { header, .. } => header.body_len,
+        };
+        let available = self.buf.len() + chunk.len();
+        let filled = target.min(available);
+        if self.buf.is_empty() {
+            self.buf = chunk;
+        } else if !chunk.is_empty() {
+            self.buf.extend_from_slice(&chunk);
         }
-        match self.read_step {
-            RawReadStep::Header => HEADER_PLAIN_LEN,
-            RawReadStep::Body { header } => header.body_len,
-        }
+        self.step = match self.step {
+            RawReadStep::Header { .. } => RawReadStep::Header { filled },
+            RawReadStep::Body { header, .. } => RawReadStep::Body { header, filled },
+        };
+
+        self.try_drain()
     }
 
-    fn decode_ciphertext<B>(&mut self, input: B) -> io::Result<DecodeEvent<'_>>
-    where
-        B: IoBufMut + Into<PlaintextSegment>,
-    {
-        if !self.pending_plain().is_empty() {
-            return Ok(DecodeEvent::PlainData);
-        }
-
-        match self.read_step {
-            RawReadStep::Header => {
-                if input.as_init().len() != HEADER_PLAIN_LEN {
-                    return Err(invalid_data("snell v6 raw header length mismatch"));
-                }
-                let header = parse_done(
-                    parse_v6_raw_header_need(input.as_init())?,
-                    "snell v6 raw short header",
-                )?;
-                if header.body_len == 0 {
-                    self.read_step = RawReadStep::Header;
-                    return Ok(DecodeEvent::ZeroChunk);
-                }
-                self.read_step = RawReadStep::Body { header };
-                Ok(DecodeEvent::NeedMore)
-            }
-            RawReadStep::Body { header } => {
-                if input.as_init().len() != header.body_len {
-                    return Err(invalid_data("snell v6 raw body length mismatch"));
-                }
-                self.plain = PlaintextFrame::from_segment(input, 0..header.payload_len);
-                self.read_step = RawReadStep::Header;
-                Ok(DecodeEvent::PlainData)
-            }
-        }
+    fn pending_plain(&self) -> &[u8] {
+        V6UnsafeRawDecoder::pending_plain(self)
     }
 
-    fn pending_plaintext<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
-        pending_plaintext_slice(self.pending_plain(), out)
-    }
-
-    fn advance_plaintext(&mut self, n: usize) {
+    fn consume_plain(&mut self, n: usize) {
         V6UnsafeRawDecoder::consume_plain(self, n);
     }
 
-    fn take_pending_plaintext(&mut self) -> Option<PlaintextFrame> {
-        V6UnsafeRawDecoder::take_pending_plain(self)
+    fn take_plain(&mut self) -> BytesMut {
+        std::mem::take(&mut self.plain)
     }
 }

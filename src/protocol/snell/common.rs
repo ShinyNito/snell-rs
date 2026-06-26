@@ -2,11 +2,11 @@
 //!
 //! Everything here is `pub(super)` and used by [`super::v4`] and the
 //! [`super::v6`] variants. The helpers fall into three groups:
-//! - IO plumbing: plaintext slice projection, exact-read state, error shims.
+//! - IO plumbing: exact-read state and error shims.
 //! - Frame headers: plaintext header encode/decode for V4 and V6.
 //! - AEAD + obfuscation: nonce management, header/payload sealing, padding.
 
-use std::io::{self, IoSlice};
+use std::io;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::{Rng, RngCore};
@@ -26,6 +26,7 @@ use super::{
 /// Each record is consumed in three phases: salt (V4/unshaped) or salt block
 /// (shaped, see shaped.rs), AEAD header, then body. `filled` tracks how many
 /// bytes of the current phase are already in the read buffer.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ReadStep {
     /// Reading the 16-byte salt that seeds the session key.
@@ -45,17 +46,6 @@ pub(super) enum ReadStep {
         /// Bytes of the body already received.
         filled: usize,
     },
-}
-
-/// Push a single plaintext slice as the sole vectored entry.
-///
-/// Returns the number of slices written (0 or 1).
-pub(super) fn pending_plaintext_slice<'a>(plain: &'a [u8], out: &mut [IoSlice<'a>]) -> usize {
-    if plain.is_empty() || out.is_empty() {
-        return 0;
-    }
-    out[0] = IoSlice::new(plain);
-    1
 }
 
 /// Convert a [`ParseState`] into an `io::Result`, failing on `Need`.

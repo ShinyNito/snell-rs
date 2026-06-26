@@ -1,14 +1,10 @@
 use std::{io, marker::PhantomData, net::SocketAddr, rc::Rc, sync::Arc};
 
-use compio::{
-    buf::IoBufMut,
-    io::{AsyncRead, AsyncReadManaged},
-    net::TcpStream,
-};
+use compio::{io::AsyncRead, net::TcpStream};
 
 use crate::protocol::{
     address::Address,
-    snell::{self, COMMAND_ERROR, COMMAND_TUNNEL, PlaintextSegment, SnellMode, SnellTcpDecoder},
+    snell::{self, COMMAND_ERROR, COMMAND_TUNNEL, SnellMode, SnellTcpDecoder},
 };
 use crate::{
     keepalive::apply_tcp_keepalive,
@@ -221,8 +217,7 @@ fn is_retriable_pool_error(error: &io::Error) -> bool {
 
 async fn read_server_reply<R, D>(reader: &mut SnellStreamReader<R, D>) -> io::Result<()>
 where
-    R: AsyncRead + AsyncReadManaged + Unpin + 'static,
-    R::Buffer: IoBufMut + Into<PlaintextSegment> + 'static,
+    R: AsyncRead + Unpin + 'static,
     D: SnellTcpDecoder,
 {
     let mut command = [0u8; 1];
@@ -266,7 +261,7 @@ mod tests {
     use super::*;
     use crate::protocol::{
         address::Address,
-        snell::{self, COMMAND_TUNNEL, MAX_CONNECT_REQUEST_LEN, V4Mode},
+        snell::{self, COMMAND_TUNNEL, V4Mode},
     };
 
     #[compio::test]
@@ -366,31 +361,9 @@ mod tests {
     where
         M: SnellMode,
     {
-        let mut head = [0u8; 3];
-        transport.reader.read_exact_plain(&mut head).await.unwrap();
-
-        let client_id_len = head[2] as usize;
-        let mut client_id_and_host_len = [0u8; 255 + 1];
-        transport
-            .reader
-            .read_exact_plain(&mut client_id_and_host_len[..client_id_len + 1])
+        snell::read_connect_request(&mut transport.reader)
             .await
-            .unwrap();
-
-        let host_len = client_id_and_host_len[client_id_len] as usize;
-        let mut host_and_port = [0u8; 255 + 2];
-        transport
-            .reader
-            .read_exact_plain(&mut host_and_port[..host_len + 2])
-            .await
-            .unwrap();
-
-        let len = 3 + client_id_len + 1 + host_len + 2;
-        let mut buf = [0u8; MAX_CONNECT_REQUEST_LEN];
-        buf[..3].copy_from_slice(&head);
-        buf[3..3 + client_id_len + 1].copy_from_slice(&client_id_and_host_len[..client_id_len + 1]);
-        buf[3 + client_id_len + 1..len].copy_from_slice(&host_and_port[..host_len + 2]);
-        snell::decode_connect_request(&buf[..len]).unwrap()
+            .unwrap()
     }
 
     async fn relay_closed_peer_transport<M>(transport: SnellTransport<M>) -> SnellTransport<M>
@@ -418,8 +391,7 @@ mod tests {
 
     async fn read_once<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<usize>
     where
-        R: AsyncRead + AsyncReadManaged + 'static,
-        R::Buffer: IoBufMut + Into<PlaintextSegment> + 'static,
+        R: AsyncRead + 'static,
     {
         let (result, buf) = reader
             .read(Vec::with_capacity(dst.len()))

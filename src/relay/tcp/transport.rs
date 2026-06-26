@@ -6,15 +6,12 @@ use std::{
 };
 
 use compio::{
-    buf::{BufResult, IoBufMut},
-    io::{AsyncRead, AsyncReadManaged, AsyncWrite, AsyncWriteExt},
+    buf::BufResult,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
-use crate::protocol::{
-    address::Address,
-    snell::{PendingWireSegment, PlaintextSegment, SnellMode},
-};
+use crate::protocol::{address::Address, snell::SnellMode};
 
 use super::{
     client::SnellTransport,
@@ -62,14 +59,14 @@ where
     transport.copy_bidirectional(peer)
 }
 
-enum PlainState<R: AsyncReadManaged> {
+enum PlainState<R: AsyncRead> {
     Copying(WriteFromState<R>),
     Done,
 }
 
 impl<R> PlainState<R>
 where
-    R: AsyncReadManaged,
+    R: AsyncRead,
 {
     fn new(reader: R) -> Self {
         Self::Copying(WriteFromState::new(reader))
@@ -171,8 +168,7 @@ fn poll_plain_to_snell<W, E, R>(
 where
     W: AsyncWrite + 'static,
     E: crate::protocol::snell::SnellTcpEncoder,
-    R: AsyncReadManaged + 'static,
-    R::Buffer: IoBufMut + Into<PendingWireSegment> + 'static,
+    R: AsyncRead + 'static,
 {
     loop {
         match state {
@@ -196,8 +192,7 @@ fn poll_snell_to_plain<R, D, W>(
     state: &mut TunnelState<W>,
 ) -> Poll<io::Result<()>>
 where
-    R: AsyncRead + AsyncReadManaged + 'static,
-    R::Buffer: IoBufMut + Into<PlaintextSegment> + 'static,
+    R: AsyncRead + 'static,
     D: crate::protocol::snell::SnellTcpDecoder,
     W: AsyncWrite + 'static,
 {
@@ -210,9 +205,12 @@ where
                 Poll::Pending => return Poll::Pending,
             },
             TunnelState::Writing(future) => {
-                let (writer, BufResult(result, _payload)) = ready!(future.as_mut().poll(cx));
+                let (writer, BufResult(result, payload)) = ready!(future.as_mut().poll(cx));
                 *state = TunnelState::Reading(Some(writer));
                 result?;
+                if payload.ends_stream() {
+                    state.start_shutdown();
+                }
             }
             TunnelState::ShuttingDown(future) => {
                 let (_writer, result) = ready!(future.as_mut().poll(cx));

@@ -1,8 +1,8 @@
 use super::v4::{V4_FIRST_RECORD_OVERHEAD, V4_MSS_BASE, next_v4_chunk_limit};
 use super::*;
-use crate::protocol::address::Address;
+use crate::protocol::{ParseState, address::Address};
 use bytes::BytesMut;
-use std::{io::IoSlice, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 #[test]
 fn connect_v2_header_matches_wire_shape() {
@@ -58,6 +58,16 @@ fn connect_request_prefix_allows_coalesced_payload() {
 }
 
 #[test]
+fn connect_request_prefix_reports_needed_total() {
+    let partial = b"\x01\x01\x03abc";
+
+    assert_eq!(
+        parse_connect_request_prefix(partial).unwrap(),
+        ParseState::Need(7)
+    );
+}
+
+#[test]
 fn udp_setup_header_matches_wire_shape() {
     let mut out = [0; 3];
 
@@ -65,6 +75,16 @@ fn udp_setup_header_matches_wire_shape() {
 
     assert_eq!(&out[..n], &[PROTOCOL_VERSION, COMMAND_UDP, 0]);
     assert_eq!(decode_udp_setup_request_prefix(&out[..n]).unwrap(), n);
+}
+
+#[test]
+fn udp_setup_prefix_reports_needed_total() {
+    let partial = b"\x01\x06\x03ab";
+
+    assert_eq!(
+        parse_udp_setup_request_prefix(partial).unwrap(),
+        ParseState::Need(6)
+    );
 }
 
 #[test]
@@ -103,11 +123,10 @@ fn udp_response_packet_round_trips_domain_and_ip() {
 fn v4_codec_round_trips_in_place() {
     let psk = b"0123456789abcdef";
     let mut encoder = V4Encoder::new(psk).unwrap();
-    encoder.seal_plain(BytesMut::from(&b"hello"[..])).unwrap();
+    let wire = encoder.seal_plain(b"hello").unwrap();
 
-    let wire = collect_pending(&mut encoder);
     let mut decoder = V4Decoder::new(&psk[..]);
-    let mut src = wire.as_slice();
+    let mut src = wire.as_ref();
     loop {
         match decode_next(&mut decoder, &mut src) {
             DecodeEvent::NeedMore => assert!(
@@ -128,10 +147,8 @@ fn v4_encoder_applies_padding_and_chunk_size() {
 
     let first_limit = V4_MSS_BASE - V4_FIRST_RECORD_OVERHEAD - 8;
     assert_eq!(encoder.next_plain_capacity(), first_limit);
-    let mut payload = BytesMut::with_capacity(first_limit);
-    payload.resize(first_limit, 0x42);
-    encoder.seal_plain(payload).unwrap();
-    let wire = collect_pending(&mut encoder);
+    let payload = vec![0x42; first_limit];
+    let wire = encoder.seal_plain(&payload).unwrap();
     assert_eq!(
         wire.len(),
         SALT_LEN + HEADER_CIPHER_LEN + 8 + first_limit + TAG_LEN
@@ -183,11 +200,10 @@ where
     M: SnellMode,
 {
     let mut encoder = M::new_encoder(psk).unwrap();
-    encoder.seal_plain(BytesMut::from(payload)).unwrap();
+    let wire = encoder.seal_plain(payload).unwrap();
 
-    let wire = collect_pending_trait(&mut encoder);
     let mut decoder = M::new_decoder(Arc::from(psk));
-    let mut src = wire.as_slice();
+    let mut src = wire.as_ref();
     loop {
         let event = decode_next(&mut decoder, &mut src);
         match event {
@@ -211,8 +227,7 @@ where
     let mut encoder = M::new_encoder(psk).unwrap();
     let mut wire = Vec::new();
     for payload in payloads {
-        encoder.seal_plain(BytesMut::from(*payload)).unwrap();
-        let frame = collect_pending_trait(&mut encoder);
+        let frame = encoder.seal_plain(payload).unwrap();
         wire.extend_from_slice(&frame);
     }
 
@@ -240,28 +255,13 @@ fn decode_next<'a, D>(decoder: &'a mut D, src: &mut &[u8]) -> DecodeEvent<'a>
 where
     D: SnellTcpDecoder,
 {
-    let need = decoder.next_cipher_len();
-    assert!(need > 0, "decoder has no pending ciphertext need");
-    assert!(
-        need <= src.len(),
-        "decoder needs {need} bytes, but only {} remain",
-        src.len()
-    );
-    let chunk = BytesMut::from(&src[..need]);
-    *src = &src[need..];
-    decoder.decode_ciphertext(chunk).unwrap()
-}
-
-fn collect_pending_trait<E>(encoder: &mut E) -> Vec<u8>
-where
-    E: SnellTcpEncoder,
-{
-    let mut out = Vec::new();
-    let pending = encoder.take_pending_wire();
-    for slice in pending.iter_slices() {
-        out.extend_from_slice(slice);
+    if src.is_empty() {
+        return decoder.feed_owned(BytesMut::new()).unwrap();
     }
-    out
+    let n = src.len().min(1);
+    let chunk = BytesMut::from(&src[..n]);
+    *src = &src[n..];
+    decoder.feed_owned(chunk).unwrap()
 }
 
 fn collect_plaintext<D>(decoder: &mut D) -> Vec<u8>
@@ -269,24 +269,13 @@ where
     D: SnellTcpDecoder,
 {
     let mut out = Vec::new();
-    while decoder.has_pending_plaintext() {
-        let mut pending = [IoSlice::new(&[]); 4];
-        let n = decoder.pending_plaintext(&mut pending);
-        let copied = pending[..n].iter().map(|slice| slice.len()).sum();
-        for slice in &pending[..n] {
-            out.extend_from_slice(slice);
-        }
-        decoder.advance_plaintext(copied);
+    while decoder.has_pending_plain() {
+        let plain = decoder.pending_plain();
+        let copied = plain.len();
+        out.extend_from_slice(plain);
+        decoder.consume_plain(copied);
     }
     out
-}
-
-fn collect_pending(encoder: &mut V4Encoder) -> Vec<u8> {
-    let pending = encoder.take_pending_wire();
-    pending
-        .iter_slices()
-        .flat_map(|slice| slice.iter().copied())
-        .collect()
 }
 
 fn assert_udp_request_round_trip(address: &Address, payload: &[u8]) {

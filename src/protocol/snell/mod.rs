@@ -1,8 +1,9 @@
-//! Runtime-free Snell protocol helpers.
+//! Snell protocol codecs.
 //!
-//! This module intentionally does not depend on Tokio, async traits, or any
-//! concrete runtime. Runtime code should exact-read/write around these helpers
-//! via the [`SnellTcpEncoder`] / [`SnellTcpDecoder`] traits.
+//! This module depends only on the `bytes` crate — no Tokio, no async traits,
+//! no concrete runtime. The codec self-buffers ciphertext (`BytesMut`) and
+//! decrypts in place, so the runtime can feed any-size socket reads directly
+//! via [`SnellTcpDecoder::feed_owned`] without an external reassembly queue.
 //!
 //! Design constraints:
 //! - The connect request must not read-ahead into application payload.
@@ -17,8 +18,7 @@
 //!     obfuscation with salt blocks, per-record prefixes, and active shaping.
 //!   - V6 unsafe-raw ([`V6UnsafeRawEncoder`]/[`V6UnsafeRawDecoder`]):
 //!     unencrypted pass-through for local debugging only.
-//! - Encoding consumes owned plaintext buffers and emits owned vectored wire
-//!   buffers, so the runtime can hand managed read buffers through the codec.
+//! - Encoding borrows plaintext and emits one owned wire [`Bytes`] record.
 //!
 //! # Connect request layout
 //!
@@ -63,31 +63,34 @@
 //!   next_plain_capacity()
 //!        |
 //!        v
-//!   runtime reads at most that many plaintext bytes into an owned buffer
+//!   runtime reads at most that many plaintext bytes
 //!        |
 //!        v
-//!   seal_plain(buffer)
+//!   seal_plain(&[u8])
 //!        |
 //!        | write header (padding/payload lens) -> seal header (AEAD, nonce++)
 //!        | seal payload (AEAD, nonce++)         -> make/swap padding (V4/shaped)
 //!        v
-//!   take_pending_wire() ------------------> owned vectored flush to socket
+//!   Bytes (one owned record) -----------------> async write to socket
 //! ```
 //!
 //! # Decode flow (reader side)
 //!
+//! The decoder self-buffers: it accepts any-size owned ciphertext chunks and
+//! accumulates partial records internally, so records that span multiple socket
+//! reads need no runtime-side copy or reassembly.
+//!
 //! ```text
 //!   loop {
-//!     len = next_cipher_len()
-//!     input = read_exact_owned(len)
-//!     decode_ciphertext(input)
+//!     input = stream.read(BytesMut)           // any size
+//!     feed_owned(input)
 //!        |
 //!        +-- NeedMore              read more ciphertext
 //!        +-- PlainData/ZeroChunk   drain plaintext or handle zero chunk
 //!
-//!     decode_ciphertext returns DecodeEvent:
+//!     feed_owned returns DecodeEvent:
 //!        NeedMore       -> need more bytes, loop again
-//!        PlainData      -> plaintext ready, drain via pending_plaintext
+//!        PlainData      -> plaintext ready, drain via pending_plain
 //!        ZeroChunk      -> protocol keepalive / end marker
 //!        ServerTunnel / ServerError / Ping / Pong -> control frames
 //!   }
@@ -103,22 +106,18 @@
 //! ```
 
 use std::{
-    fmt,
-    io::{self, IoSlice},
+    io,
     net::{IpAddr, SocketAddr},
-    ops::Range,
     str,
     sync::Arc,
 };
 
 use bytes::{Bytes, BytesMut};
-use compio::{
-    buf::{IoBuf, IoBufMut},
-    driver::BufferRef,
-};
-use ring::aead::Tag;
 
-use crate::protocol::address::{Address, AddressRef};
+use crate::protocol::{
+    ParseState,
+    address::{Address, AddressRef},
+};
 
 mod common;
 pub(crate) mod crypto;
@@ -268,11 +267,20 @@ pub fn decode_connect_request(src: &[u8]) -> io::Result<ConnectRequest> {
 }
 
 pub(crate) fn decode_connect_request_prefix(src: &[u8]) -> io::Result<(ConnectRequest, usize)> {
-    if src.len() < 3 {
-        return Err(io::Error::new(
+    match parse_connect_request_prefix(src)? {
+        ParseState::Done(value) => Ok(value),
+        ParseState::Need(_) => Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            "snell connect request header too short",
-        ));
+            "snell connect request incomplete",
+        )),
+    }
+}
+
+pub(crate) fn parse_connect_request_prefix(
+    src: &[u8],
+) -> io::Result<ParseState<(ConnectRequest, usize)>> {
+    if src.len() < 3 {
+        return Ok(ParseState::Need(3));
     }
     if src[0] != PROTOCOL_VERSION {
         return Err(io::Error::new(
@@ -294,10 +302,7 @@ pub(crate) fn decode_connect_request_prefix(src: &[u8]) -> io::Result<(ConnectRe
     let client_id_len = src[2] as usize;
     let host_len_offset = 3 + client_id_len;
     if src.len() <= host_len_offset {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "snell connect request client id too short",
-        ));
+        return Ok(ParseState::Need(host_len_offset + 1));
     }
 
     let host_len = src[host_len_offset] as usize;
@@ -310,10 +315,7 @@ pub(crate) fn decode_connect_request_prefix(src: &[u8]) -> io::Result<(ConnectRe
     let host_offset = host_len_offset + 1;
     let needed = host_offset + host_len + 2;
     if src.len() < needed {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "snell connect request body too short",
-        ));
+        return Ok(ParseState::Need(needed));
     }
 
     let host = str::from_utf8(&src[host_offset..host_offset + host_len]).map_err(|_| {
@@ -329,7 +331,10 @@ pub(crate) fn decode_connect_request_prefix(src: &[u8]) -> io::Result<(ConnectRe
         Address::domain(host.to_owned(), port)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("snell {error}")))?
     };
-    Ok((ConnectRequest { destination, reuse }, needed))
+    Ok(ParseState::Done((
+        ConnectRequest { destination, reuse },
+        needed,
+    )))
 }
 
 pub fn encode_udp_setup_request_into(dst: &mut [u8]) -> io::Result<usize> {
@@ -343,11 +348,18 @@ pub fn encode_udp_setup_request_into(dst: &mut [u8]) -> io::Result<usize> {
 }
 
 pub fn decode_udp_setup_request_prefix(src: &[u8]) -> io::Result<usize> {
-    if src.len() < 3 {
-        return Err(io::Error::new(
+    match parse_udp_setup_request_prefix(src)? {
+        ParseState::Done(value) => Ok(value),
+        ParseState::Need(_) => Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            "snell udp setup header too short",
-        ));
+            "snell udp setup incomplete",
+        )),
+    }
+}
+
+pub fn parse_udp_setup_request_prefix(src: &[u8]) -> io::Result<ParseState<usize>> {
+    if src.len() < 3 {
+        return Ok(ParseState::Need(3));
     }
     if src[0] != PROTOCOL_VERSION {
         return Err(io::Error::new(
@@ -364,12 +376,96 @@ pub fn decode_udp_setup_request_prefix(src: &[u8]) -> io::Result<usize> {
     let client_id_len = src[2] as usize;
     let needed = 3 + client_id_len;
     if src.len() < needed {
+        return Ok(ParseState::Need(needed));
+    }
+    Ok(ParseState::Done(needed))
+}
+
+pub(crate) trait SnellPlainReader {
+    async fn read_exact_plain(&mut self, dst: &mut [u8]) -> io::Result<()>;
+}
+
+/// Read a full connect request. Currently only exercised by tests (production
+/// callers use [`read_connect_request_with_head`]); kept as part of the codec
+/// API surface.
+#[allow(dead_code)]
+pub(crate) async fn read_connect_request<R>(reader: &mut R) -> io::Result<ConnectRequest>
+where
+    R: SnellPlainReader,
+{
+    let mut head = [0u8; 3];
+    reader.read_exact_plain(&mut head).await?;
+    read_connect_request_with_head(reader, head).await
+}
+
+pub(crate) async fn read_connect_request_with_head<R>(
+    reader: &mut R,
+    head: [u8; 3],
+) -> io::Result<ConnectRequest>
+where
+    R: SnellPlainReader,
+{
+    let mut buf = [0u8; MAX_CONNECT_REQUEST_LEN];
+    buf[..3].copy_from_slice(&head);
+    let mut filled = 3;
+    loop {
+        match parse_connect_request_prefix(&buf[..filled])? {
+            ParseState::Done((request, _)) => return Ok(request),
+            ParseState::Need(total) => {
+                read_plain_prefix(reader, &mut buf, &mut filled, total).await?;
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) async fn read_udp_setup_request<R>(reader: &mut R) -> io::Result<()>
+where
+    R: SnellPlainReader,
+{
+    let mut head = [0u8; 3];
+    reader.read_exact_plain(&mut head).await?;
+    read_udp_setup_request_with_head(reader, head).await
+}
+
+pub(crate) async fn read_udp_setup_request_with_head<R>(
+    reader: &mut R,
+    head: [u8; 3],
+) -> io::Result<()>
+where
+    R: SnellPlainReader,
+{
+    let mut buf = [0u8; 3 + 255];
+    buf[..3].copy_from_slice(&head);
+    let mut filled = 3;
+    loop {
+        match parse_udp_setup_request_prefix(&buf[..filled])? {
+            ParseState::Done(_) => return Ok(()),
+            ParseState::Need(total) => {
+                read_plain_prefix(reader, &mut buf, &mut filled, total).await?;
+            }
+        }
+    }
+}
+
+async fn read_plain_prefix<R, const N: usize>(
+    reader: &mut R,
+    buf: &mut [u8; N],
+    filled: &mut usize,
+    total: usize,
+) -> io::Result<()>
+where
+    R: SnellPlainReader,
+{
+    if total <= *filled || total > N {
         return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "snell udp setup client id too short",
+            io::ErrorKind::InvalidData,
+            "snell control request length is invalid",
         ));
     }
-    Ok(needed)
+    reader.read_exact_plain(&mut buf[*filled..total]).await?;
+    *filled = total;
+    Ok(())
 }
 
 pub fn udp_request_addr_len(address: AddressRef<'_>) -> io::Result<usize> {
@@ -655,8 +751,9 @@ pub struct DecodedHeader {
 
 /// Outcome of feeding ciphertext into a decoder.
 ///
-/// The lifecycle is: feed bytes via [`SnellTcpDecoder::decode_ciphertext`] until a record completes,
-/// then observe [`PlainData`](DecodeEvent::PlainData) or a control frame.
+/// The runtime hands owned ciphertext buffers to
+/// [`SnellTcpDecoder::feed_owned`] until a record completes, then observes
+/// [`PlainData`](DecodeEvent::PlainData) or a control frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeEvent<'a> {
     /// More ciphertext is required to finish the current record.
@@ -680,262 +777,61 @@ pub enum DecodeEvent<'a> {
     Pong,
 }
 
-/// Owned sealed bytes ready for an async vectored write.
-#[derive(Default)]
-pub struct PendingWire {
-    segments: Vec<PendingWireSegment>,
-}
-
-#[doc(hidden)]
-pub enum PendingWireSegment {
-    Bytes(Bytes),
-    Managed(BufferRef),
-    Inline {
-        data: [u8; HEADER_CIPHER_LEN],
-        len: u8,
-    },
-}
-
-impl PendingWireSegment {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Bytes(buf) => buf.as_ref(),
-            Self::Managed(buf) => buf.as_init(),
-            Self::Inline { data, len } => &data[..usize::from(*len)],
-        }
-    }
-
-    fn inline(src: &[u8]) -> Self {
-        debug_assert!(src.len() <= HEADER_CIPHER_LEN);
-        let mut data = [0; HEADER_CIPHER_LEN];
-        data[..src.len()].copy_from_slice(src);
-        Self::Inline {
-            data,
-            len: src.len() as u8,
-        }
-    }
-}
-
-impl From<BytesMut> for PendingWireSegment {
-    fn from(value: BytesMut) -> Self {
-        Self::Bytes(value.freeze())
-    }
-}
-
-impl From<BufferRef> for PendingWireSegment {
-    fn from(value: BufferRef) -> Self {
-        Self::Managed(value)
-    }
-}
-
-impl PendingWire {
-    pub(crate) fn push<S>(&mut self, segment: S)
-    where
-        S: Into<PendingWireSegment>,
-    {
-        let segment = segment.into();
-        if !segment.as_slice().is_empty() {
-            self.segments.push(segment);
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.segments.is_empty()
-    }
-
-    pub fn total_len(&self) -> usize {
-        self.segments
-            .iter()
-            .map(|segment| segment.as_slice().len())
-            .sum()
-    }
-
-    pub(crate) fn iter_slices(&self) -> impl Iterator<Item = &[u8]> {
-        self.segments.iter().map(|segment| segment.as_slice())
-    }
-}
-
-impl From<[u8; SALT_LEN]> for PendingWireSegment {
-    fn from(value: [u8; SALT_LEN]) -> Self {
-        Self::inline(&value)
-    }
-}
-
-impl From<[u8; HEADER_CIPHER_LEN]> for PendingWireSegment {
-    fn from(value: [u8; HEADER_CIPHER_LEN]) -> Self {
-        Self::inline(&value)
-    }
-}
-
-impl From<[u8; HEADER_PLAIN_LEN]> for PendingWireSegment {
-    fn from(value: [u8; HEADER_PLAIN_LEN]) -> Self {
-        Self::inline(&value)
-    }
-}
-
-impl From<Tag> for PendingWireSegment {
-    fn from(value: Tag) -> Self {
-        Self::inline(value.as_ref())
-    }
-}
-
-impl From<Bytes> for PendingWireSegment {
-    fn from(value: Bytes) -> Self {
-        Self::Bytes(value)
-    }
-}
-
-impl fmt::Debug for PendingWire {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PendingWire")
-            .field("segments", &self.segments.len())
-            .field("total_len", &self.total_len())
-            .finish()
-    }
-}
-
-/// Owned plaintext decoded from one Snell frame.
-#[derive(Debug, Default)]
-pub struct PlaintextFrame {
-    body: PlaintextSegment,
-    plain: Range<usize>,
-}
-
-#[doc(hidden)]
-#[derive(Debug, Default)]
-pub enum PlaintextSegment {
-    #[default]
-    Empty,
-    Owned(Vec<u8>),
-    Bytes(BytesMut),
-    Managed(BufferRef),
-}
-
-impl PlaintextFrame {
-    pub(crate) fn from_segment<B>(body: B, plain: Range<usize>) -> Self
-    where
-        B: Into<PlaintextSegment>,
-    {
-        Self {
-            body: body.into(),
-            plain,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.as_init().is_empty()
-    }
-
-    pub(crate) fn body_mut(&mut self) -> &mut [u8] {
-        match &mut self.body {
-            PlaintextSegment::Empty => &mut [],
-            PlaintextSegment::Owned(body) => body.as_mut_slice(),
-            PlaintextSegment::Bytes(body) => body.as_mut(),
-            PlaintextSegment::Managed(body) => body.as_mut_slice(),
-        }
-    }
-
-    pub(crate) fn set_plain(&mut self, plain: Range<usize>) {
-        self.plain = plain;
-    }
-
-    pub(crate) fn advance(&mut self, n: usize) {
-        let take = n.min(self.plain.len());
-        self.plain.start += take;
-        if self.plain.is_empty() {
-            self.body = PlaintextSegment::Empty;
-            self.plain = 0..0;
-        }
-    }
-}
-
-impl From<BytesMut> for PlaintextSegment {
-    fn from(value: BytesMut) -> Self {
-        Self::Bytes(value)
-    }
-}
-
-impl From<Vec<u8>> for PlaintextSegment {
-    fn from(value: Vec<u8>) -> Self {
-        Self::Owned(value)
-    }
-}
-
-impl From<BufferRef> for PlaintextSegment {
-    fn from(value: BufferRef) -> Self {
-        Self::Managed(value)
-    }
-}
-
-impl IoBuf for PlaintextFrame {
-    fn as_init(&self) -> &[u8] {
-        match &self.body {
-            PlaintextSegment::Empty => &[],
-            PlaintextSegment::Owned(body) => &body[self.plain.clone()],
-            PlaintextSegment::Bytes(body) => &body.as_ref()[self.plain.clone()],
-            PlaintextSegment::Managed(body) => &body.as_init()[self.plain.clone()],
-        }
-    }
-}
-
 /// Streaming Snell TCP encoder.
 ///
-/// The runtime first asks for the next plaintext capacity, reads at most that
-/// many bytes into an owned buffer, then transfers that buffer into
-/// [`SnellTcpEncoder::seal_plain`]. The encoder mutates the payload in place
-/// when the mode encrypts it and moves all sealed wire segments into
-/// [`PendingWire`].
+/// The runtime calls [`SnellTcpEncoder::seal_plain`] with a plaintext slice;
+/// the encoder produces one owned [`Bytes`] record ready for an async write.
+/// The codec owns no buffer pool and no compio types — it depends only on the
+/// `bytes` crate, so the protocol layer stays runtime-free.
 pub trait SnellTcpEncoder {
-    /// Maximum plaintext bytes accepted by the next record.
+    /// Maximum plaintext bytes accepted by the next record (congestion window).
     fn next_plain_capacity(&self) -> usize;
 
-    /// Seal one plaintext record, taking ownership of the payload buffer.
-    fn seal_plain<B>(&mut self, payload: B) -> io::Result<()>
-    where
-        B: IoBufMut + Into<PendingWireSegment>;
-
-    /// Move sealed bytes pending flush out of the encoder.
-    fn take_pending_wire(&mut self) -> PendingWire;
-
-    /// Put sealed bytes back after an async write error.
-    fn restore_pending_wire(&mut self, wire: PendingWire);
-
-    /// Whether any sealed bytes are still awaiting flush.
-    fn has_pending_wire(&self) -> bool;
+    /// Seal one plaintext record, returning the owned wire bytes.
+    ///
+    /// `payload.len()` must not exceed [`next_plain_capacity`](Self::next_plain_capacity).
+    /// A zero-length payload encodes a keepalive / end-of-stream zero chunk.
+    fn seal_plain(&mut self, payload: &[u8]) -> io::Result<Bytes>;
 }
 
 /// Streaming Snell TCP decoder.
 ///
-/// The decode lifecycle is:
-/// 1. [`SnellTcpDecoder::next_cipher_len`] — ask how many ciphertext bytes the
-///    next state needs.
-/// 2. [`SnellTcpDecoder::decode_ciphertext`] — transfer an owned buffer of that
-///    length into the decoder.
-/// 2. On [`PlainData`](DecodeEvent::PlainData), drain plaintext via
-///    [`SnellTcpDecoder::pending_plaintext`] /
-///    [`SnellTcpDecoder::advance_plaintext`].
+/// The decode lifecycle: hand owned ciphertext buffers to
+/// [`SnellTcpDecoder::feed_owned`] until a record completes. The decoder
+/// accumulates partial records internally and decrypts each fed buffer in
+/// place, so records that span multiple socket reads require no runtime-side
+/// copy or reassembly. On [`PlainData`](DecodeEvent::PlainData) or a control
+/// frame, drain plaintext via [`pending_plain`](Self::pending_plain) /
+/// [`consume_plain`](Self::consume_plain). Bulk relay callers use
+/// [`take_plain`](Self::take_plain); the built-in decoders override it to move
+/// their internal `BytesMut` out without copying.
 pub trait SnellTcpDecoder {
-    /// Exact ciphertext bytes required by the next decoder state.
-    fn next_cipher_len(&self) -> usize;
+    /// Append ciphertext and advance the decode state machine.
+    ///
+    /// Returns [`DecodeEvent::NeedMore`] when the fed bytes are not yet enough
+    /// to complete the current record (the caller should read more and feed
+    /// again). Any other variant means a record completed and the decoder is
+    /// ready for the next feed.
+    fn feed_owned(&mut self, chunk: BytesMut) -> io::Result<DecodeEvent<'_>>;
 
-    /// Consume one exact ciphertext chunk, taking ownership of the buffer.
-    fn decode_ciphertext<B>(&mut self, input: B) -> io::Result<DecodeEvent<'_>>
-    where
-        B: IoBufMut + Into<PlaintextSegment>;
+    /// The decrypted plaintext region of the current record (the sole source).
+    fn pending_plain(&self) -> &[u8];
 
-    /// Collect decrypted plaintext pending drain into `out` as vectored slices.
-    fn pending_plaintext<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize;
+    /// Mark `n` bytes from [`pending_plain`](Self::pending_plain) as consumed.
+    fn consume_plain(&mut self, n: usize);
 
-    /// Mark `n` bytes from the pending plaintext queue as consumed.
-    fn advance_plaintext(&mut self, n: usize);
+    /// Move the pending plaintext region out of the decoder.
+    ///
+    /// Implementations MUST hand off their owned `BytesMut` with
+    /// `std::mem::take(&mut self.plain)` — the bulk relay path drains every
+    /// frame through this method, so a copying implementation would add a
+    /// per-record memcpy on the hot path. This is a required method (no
+    /// default) precisely so a new decoder cannot silently regress to a copy.
+    fn take_plain(&mut self) -> BytesMut;
 
-    /// Move the pending plaintext frame out of the decoder.
-    fn take_pending_plaintext(&mut self) -> Option<PlaintextFrame>;
-
-    /// Whether any decrypted plaintext is still awaiting drain.
-    fn has_pending_plaintext(&self) -> bool {
-        let mut tmp = [IoSlice::new(&[])];
-        self.pending_plaintext(&mut tmp) != 0
+    /// Whether decrypted plaintext is awaiting drain.
+    fn has_pending_plain(&self) -> bool {
+        !self.pending_plain().is_empty()
     }
 }
 

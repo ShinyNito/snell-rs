@@ -43,13 +43,13 @@
 //!   next_plain_capacity()
 //!      |  budget = chunk_limit(now)  (MSS - overhead, grows each record)
 //!      v
-//!   seal_plain(owned payload)
+//!   seal_plain(&[u8])
 //!      |  write HEADER_PLAIN (padding_len, payload_len)
 //!      |  seal header  (AEAD, nonce++, AAD empty)
 //!      |  seal payload (AEAD, nonce++, AAD empty) -> detached TAG
 //!      |  if padding > 0: make_padding() then swap_padding()
 //!      v
-//!   take_pending_wire() -> flush SALT? + HEADER_CIPHER + BODY
+//!   Bytes -> flush SALT? + HEADER_CIPHER + BODY
 //! ```
 //!
 //! # Decode flow (state machine)
@@ -74,24 +74,21 @@
 //! chunk limit that grows toward [`MAX_PACKET_SIZE`] and resets after idle.
 
 use std::{
-    fmt,
-    io::{self, IoSlice},
+    fmt, io,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
-use compio::buf::{IoBuf, IoBufMut};
+use bytes::{Buf, Bytes, BytesMut};
 use rand::RngCore;
 use ring::aead::{Aad, LessSafeKey, Tag};
 
 use super::{
     DecodeEvent, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE, NONCE_LEN,
-    PendingWire, PendingWireSegment, PlaintextFrame, PlaintextSegment, SALT_LEN, SnellTcpDecoder,
-    SnellTcpEncoder,
+    SALT_LEN, SnellTcpDecoder, SnellTcpEncoder,
     common::{
         ReadStep, decode_plain_header, invalid_data, invalid_input, make_padding_split, next_nonce,
-        pending_plaintext_slice, seal_payload_detached, swap_padding, swap_padding_split, v4_key,
+        seal_header, seal_payload_detached, swap_padding, swap_padding_split, v4_key,
         write_plain_header,
     },
 };
@@ -112,7 +109,7 @@ const V4_IDLE_RESET: Duration = Duration::from_secs(30);
 /// Streaming V4 encoder.
 ///
 /// Holds the session key derived from the salt, a monotonically increasing
-/// nonce, the congestion window state, and the pending wire bytes awaiting flush.
+/// nonce, and the congestion window state.
 pub struct V4Encoder {
     key: LessSafeKey,
     nonce: [u8; NONCE_LEN],
@@ -121,7 +118,6 @@ pub struct V4Encoder {
     initial_padding_len: usize,
     chunk_limit: usize,
     last_write: Option<Instant>,
-    pending: PendingWire,
 }
 
 impl fmt::Debug for V4Encoder {
@@ -129,7 +125,6 @@ impl fmt::Debug for V4Encoder {
         f.debug_struct("V4Encoder")
             .field("salt_sent", &self.salt_sent)
             .field("chunk_limit", &self.chunk_limit)
-            .field("pending_len", &self.pending.total_len())
             .finish()
     }
 }
@@ -144,7 +139,8 @@ pub struct V4Decoder {
     key: Option<LessSafeKey>,
     nonce: [u8; NONCE_LEN],
     read_step: ReadStep,
-    plain: PlaintextFrame,
+    buf: BytesMut,
+    plain: BytesMut,
 }
 
 impl V4Encoder {
@@ -176,22 +172,13 @@ impl V4Encoder {
             initial_padding_len,
             chunk_limit: 0,
             last_write: None,
-            pending: PendingWire::default(),
         })
     }
 
-    fn seal_owned_payload<B>(&mut self, payload: B) -> io::Result<()>
-    where
-        B: IoBufMut + Into<PendingWireSegment>,
-    {
-        let mut payload = payload;
-        if !self.pending_empty() {
-            return Err(invalid_input("snell pending wire not fully written"));
-        }
-
+    fn seal_payload(&mut self, payload: &[u8]) -> io::Result<Bytes> {
         let now = Instant::now();
         let max_payload_len = self.budget_for(now).min(MAX_PACKET_SIZE);
-        let payload_len = payload.as_init().len();
+        let payload_len = payload.len();
         if payload_len > max_payload_len {
             return Err(invalid_input("snell payload exceeds record capacity"));
         }
@@ -202,23 +189,40 @@ impl V4Encoder {
             0
         };
 
-        let mut header = [0; HEADER_CIPHER_LEN];
-        write_plain_header(&mut header[..HEADER_PLAIN_LEN], padding_len, payload_len)?;
-        let header_tag = self
-            .key
-            .seal_in_place_separate_tag(
-                next_nonce(&mut self.nonce),
-                Aad::empty(),
-                &mut header[..HEADER_PLAIN_LEN],
-            )
-            .map_err(|_| invalid_data("snell v4 header encrypt failed"))?;
-        header[HEADER_PLAIN_LEN..HEADER_CIPHER_LEN].copy_from_slice(header_tag.as_ref());
+        let salt_len = if first_record { SALT_LEN } else { 0 };
+        let body_len = padding_len
+            + if payload_len == 0 {
+                0
+            } else {
+                payload_len + super::TAG_LEN
+            };
+        let mut wire = BytesMut::with_capacity(salt_len + HEADER_CIPHER_LEN + body_len);
+        if first_record {
+            wire.extend_from_slice(&self.salt);
+        }
 
-        let mut padding = Vec::new();
-        let mut tag = None;
+        let header_start = wire.len();
+        wire.resize(header_start + HEADER_CIPHER_LEN, 0);
+        write_plain_header(
+            &mut wire[header_start..header_start + HEADER_PLAIN_LEN],
+            padding_len,
+            payload_len,
+        )?;
+        seal_header(
+            &self.key,
+            &mut self.nonce,
+            &[],
+            &mut wire[header_start..header_start + HEADER_CIPHER_LEN],
+            "snell v4 header encrypt failed",
+        )?;
+
         if payload_len > 0 {
-            padding.resize(padding_len, 0);
-            let payload_cipher = payload.as_mut_slice();
+            let body_start = wire.len();
+            wire.resize(body_start + body_len, 0);
+            let (padding, payload_cipher_and_tag) =
+                wire[body_start..body_start + body_len].split_at_mut(padding_len);
+            let (payload_cipher, tag_dst) = payload_cipher_and_tag.split_at_mut(payload_len);
+            payload_cipher.copy_from_slice(payload);
             let mut payload_tag = seal_payload_detached(
                 &self.key,
                 &mut self.nonce,
@@ -228,40 +232,16 @@ impl V4Encoder {
             )?;
 
             if padding_len > 0 {
-                make_padding_split(&mut padding, payload_cipher, &payload_tag);
-                swap_padding_split(&mut padding, payload_cipher, &mut payload_tag);
+                make_padding_split(padding, payload_cipher, &payload_tag);
+                swap_padding_split(padding, payload_cipher, &mut payload_tag);
             }
-            tag = Some(payload_tag);
+            tag_dst.copy_from_slice(&payload_tag);
         }
 
-        let mut pending = PendingWire::default();
-        if first_record {
-            pending.push(self.salt);
-        }
-        pending.push(header);
-        if payload_len > 0 {
-            pending.push(Bytes::from(padding));
-            pending.push(payload);
-            pending.push(tag.expect("tag set for non-empty payload"));
-        }
-        self.pending = pending;
         self.salt_sent = true;
         self.chunk_limit = next_v4_chunk_limit(max_payload_len);
         self.last_write = Some(now);
-        Ok(())
-    }
-
-    /// Whether all sealed bytes have been flushed.
-    pub fn pending_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
-
-    pub fn take_pending_wire(&mut self) -> PendingWire {
-        std::mem::take(&mut self.pending)
-    }
-
-    pub fn restore_pending_wire(&mut self, wire: PendingWire) {
-        self.pending = wire;
+        Ok(wire.freeze())
     }
 
     fn plain_capacity(&self) -> usize {
@@ -315,7 +295,8 @@ impl V4Decoder {
             key: None,
             nonce: [0; NONCE_LEN],
             read_step: ReadStep::Salt { filled: 0 },
-            plain: PlaintextFrame::default(),
+            buf: BytesMut::new(),
+            plain: BytesMut::new(),
         }
     }
 
@@ -371,11 +352,8 @@ impl V4Decoder {
     ///   2. AEAD open(payload_cipher, tag, nonce++)  -- decrypt
     ///   3. self.plain = padding_len .. padding_len + payload_len
     /// ```
-    pub fn finish_body<B>(&mut self, input: B, header: DecodedHeader) -> io::Result<bool>
-    where
-        B: IoBufMut + Into<PlaintextSegment>,
-    {
-        self.plain = PlaintextFrame::default();
+    pub fn finish_body(&mut self, mut body: BytesMut, header: DecodedHeader) -> io::Result<bool> {
+        self.plain.clear();
         if header.payload_len == 0 {
             if header.padding_len != 0 {
                 return Err(invalid_data("snell v4 zero chunk with padding"));
@@ -387,8 +365,6 @@ impl V4Decoder {
             .key
             .as_ref()
             .ok_or_else(|| invalid_data("snell v4 reader key not initialized"))?;
-        let mut frame = PlaintextFrame::from_segment(input, 0..0);
-        let body = frame.body_mut();
         if body.len() != header.body_len {
             return Err(invalid_data("snell v4 body length mismatch"));
         }
@@ -399,32 +375,86 @@ impl V4Decoder {
         let nonce = next_nonce(&mut self.nonce);
         key.open_in_place_separate_tag(nonce, Aad::empty(), tag, payload_cipher, 0..)
             .map_err(|_| invalid_data("snell v4 payload decrypt failed"))?;
-        frame.set_plain(header.padding_len..header.padding_len + header.payload_len);
-        self.plain = frame;
+        body.advance(header.padding_len);
+        body.truncate(header.payload_len);
+        self.plain = body;
         Ok(true)
     }
 
     /// Borrow the decrypted plaintext region from the current record.
     pub fn pending_plain(&self) -> &[u8] {
-        self.plain.as_init()
+        &self.plain
     }
 
     /// Mark `n` bytes from [`V4Decoder::pending_plain`] as consumed.
     pub fn consume_plain(&mut self, n: usize) {
+        let n = n.min(self.plain.len());
         self.plain.advance(n);
-    }
-
-    pub fn take_pending_plain(&mut self) -> Option<PlaintextFrame> {
-        if self.plain.is_empty() {
-            return None;
-        }
-        Some(std::mem::take(&mut self.plain))
     }
 
     fn key(&self) -> io::Result<&LessSafeKey> {
         self.key
             .as_ref()
             .ok_or_else(|| invalid_data("snell v4 reader key not initialized"))
+    }
+
+    fn try_drain(&mut self) -> io::Result<DecodeEvent<'_>> {
+        if !self.pending_plain().is_empty() {
+            return Ok(DecodeEvent::PlainData);
+        }
+
+        loop {
+            match self.read_step {
+                ReadStep::Salt { .. } => {
+                    if self.buf.len() < SALT_LEN {
+                        self.read_step = ReadStep::Salt {
+                            filled: self.buf.len(),
+                        };
+                        return Ok(DecodeEvent::NeedMore);
+                    }
+                    let salt_bytes = self.buf.split_to(SALT_LEN);
+                    let salt: [u8; SALT_LEN] =
+                        salt_bytes[..].try_into().expect("salt buffer filled");
+                    self.init_salt(salt)?;
+                    self.read_step = ReadStep::Header { filled: 0 };
+                }
+                ReadStep::Header { .. } => {
+                    if self.buf.len() < HEADER_CIPHER_LEN {
+                        self.read_step = ReadStep::Header {
+                            filled: self.buf.len(),
+                        };
+                        return Ok(DecodeEvent::NeedMore);
+                    }
+                    let mut header_cipher = self.buf.split_to(HEADER_CIPHER_LEN);
+                    let header = self.decode_header_in_place(&mut header_cipher)?;
+                    if header.body_len == 0 {
+                        self.read_step = ReadStep::Header { filled: 0 };
+                        return if self.finish_body(BytesMut::new(), header)? {
+                            Ok(DecodeEvent::PlainData)
+                        } else {
+                            Ok(DecodeEvent::ZeroChunk)
+                        };
+                    }
+                    self.read_step = ReadStep::Body { header, filled: 0 };
+                }
+                ReadStep::Body { header, .. } => {
+                    if self.buf.len() < header.body_len {
+                        self.read_step = ReadStep::Body {
+                            header,
+                            filled: self.buf.len(),
+                        };
+                        return Ok(DecodeEvent::NeedMore);
+                    }
+                    let body = self.buf.split_to(header.body_len);
+                    self.read_step = ReadStep::Header { filled: 0 };
+                    return if self.finish_body(body, header)? {
+                        Ok(DecodeEvent::PlainData)
+                    } else {
+                        Ok(DecodeEvent::ZeroChunk)
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -433,96 +463,30 @@ impl SnellTcpEncoder for V4Encoder {
         self.plain_capacity()
     }
 
-    fn seal_plain<B>(&mut self, payload: B) -> io::Result<()>
-    where
-        B: IoBufMut + Into<PendingWireSegment>,
-    {
-        self.seal_owned_payload(payload)
-    }
-
-    fn take_pending_wire(&mut self) -> PendingWire {
-        V4Encoder::take_pending_wire(self)
-    }
-
-    fn restore_pending_wire(&mut self, wire: PendingWire) {
-        V4Encoder::restore_pending_wire(self, wire);
-    }
-
-    fn has_pending_wire(&self) -> bool {
-        !self.pending_empty()
+    fn seal_plain(&mut self, payload: &[u8]) -> io::Result<Bytes> {
+        self.seal_payload(payload)
     }
 }
 
 impl SnellTcpDecoder for V4Decoder {
-    fn next_cipher_len(&self) -> usize {
-        if !self.pending_plain().is_empty() {
-            return 0;
+    fn feed_owned(&mut self, chunk: BytesMut) -> io::Result<DecodeEvent<'_>> {
+        if self.buf.is_empty() {
+            self.buf = chunk;
+        } else if !chunk.is_empty() {
+            self.buf.extend_from_slice(&chunk);
         }
-        match self.read_step {
-            ReadStep::Salt { filled } => SALT_LEN - filled,
-            ReadStep::Header { filled } => HEADER_CIPHER_LEN - filled,
-            ReadStep::Body { header, filled } => header.body_len - filled,
-        }
+        self.try_drain()
     }
 
-    fn decode_ciphertext<B>(&mut self, input: B) -> io::Result<DecodeEvent<'_>>
-    where
-        B: IoBufMut + Into<PlaintextSegment>,
-    {
-        if !self.pending_plain().is_empty() {
-            return Ok(DecodeEvent::PlainData);
-        }
-
-        match self.read_step {
-            ReadStep::Salt { filled } => {
-                if filled != 0 || input.as_init().len() != SALT_LEN {
-                    return Err(invalid_data("snell v4 salt length mismatch"));
-                }
-                let salt: [u8; SALT_LEN] = input.as_init().try_into().expect("salt buffer filled");
-                self.init_salt(salt)?;
-                self.read_step = ReadStep::Header { filled: 0 };
-                Ok(DecodeEvent::NeedMore)
-            }
-            ReadStep::Header { filled } => {
-                if filled != 0 || input.as_init().len() != HEADER_CIPHER_LEN {
-                    return Err(invalid_data("snell v4 header length mismatch"));
-                }
-                let mut input = input;
-                let header = self.decode_header_in_place(input.as_mut_slice())?;
-                if header.body_len == 0 {
-                    self.read_step = ReadStep::Header { filled: 0 };
-                    return if self.finish_body(input, header)? {
-                        Ok(DecodeEvent::PlainData)
-                    } else {
-                        Ok(DecodeEvent::ZeroChunk)
-                    };
-                }
-                self.read_step = ReadStep::Body { header, filled: 0 };
-                Ok(DecodeEvent::NeedMore)
-            }
-            ReadStep::Body { header, filled } => {
-                if filled != 0 || input.as_init().len() != header.body_len {
-                    return Err(invalid_data("snell v4 body length mismatch"));
-                }
-                self.read_step = ReadStep::Header { filled: 0 };
-                if self.finish_body(input, header)? {
-                    Ok(DecodeEvent::PlainData)
-                } else {
-                    Ok(DecodeEvent::ZeroChunk)
-                }
-            }
-        }
+    fn pending_plain(&self) -> &[u8] {
+        V4Decoder::pending_plain(self)
     }
 
-    fn pending_plaintext<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
-        pending_plaintext_slice(self.pending_plain(), out)
-    }
-
-    fn advance_plaintext(&mut self, n: usize) {
+    fn consume_plain(&mut self, n: usize) {
         V4Decoder::consume_plain(self, n);
     }
 
-    fn take_pending_plaintext(&mut self) -> Option<PlaintextFrame> {
-        V4Decoder::take_pending_plain(self)
+    fn take_plain(&mut self) -> BytesMut {
+        std::mem::take(&mut self.plain)
     }
 }

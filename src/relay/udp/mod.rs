@@ -12,7 +12,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use compio::{
-    buf::{BufResult, IoBuf},
+    buf::BufResult,
     driver::op::RecvFromMultiResult,
     io::AsyncRead,
     net::{TcpStream, UdpSocket},
@@ -133,6 +133,8 @@ where
         snell: transport,
         outbound,
         pending_to_snell: VecDeque::new(),
+        pending_to_outbound: VecDeque::new(),
+        snell_to_outbound_closed: false,
         outbound_send_state: O::SendState::default(),
         snell_write_state: WriteFrameState::default(),
     };
@@ -147,6 +149,8 @@ where
     snell: SnellTransport<M>,
     outbound: O,
     pending_to_snell: VecDeque<BytesMut>,
+    pending_to_outbound: VecDeque<Bytes>,
+    snell_to_outbound_closed: bool,
     outbound_send_state: O::SendState,
     snell_write_state: WriteFrameState,
 }
@@ -190,23 +194,44 @@ where
     }
 
     fn poll_snell_to_outbound(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        let outbound = &mut self.outbound;
-        let send_state = &mut self.outbound_send_state;
-        self.snell
-            .reader
-            .poll_drain_frame_plaintext_with(cx, |cx, plaintext| {
-                let packet = snell::decode_udp_request_packet(plaintext)?;
-                let destination = packet.address.into_owned();
-                let sent =
-                    ready!(outbound.poll_send_to(cx, &destination, packet.payload, send_state))?;
-                if sent != packet.payload.len() {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "udp outbound sent a partial datagram",
-                    )));
+        if self.pending_to_outbound.is_empty() {
+            if self.snell_to_outbound_closed {
+                return Poll::Ready(Ok(false));
+            }
+            match ready!(self.snell.reader.poll_read_frame_batch(cx))? {
+                Some(batch) => {
+                    self.snell_to_outbound_closed = batch.ends_stream();
+                    self.pending_to_outbound.extend(batch.into_frames());
+                    if self.pending_to_outbound.is_empty() && self.snell_to_outbound_closed {
+                        return Poll::Ready(Ok(false));
+                    }
                 }
-                Poll::Ready(Ok(()))
-            })
+                None => return Poll::Ready(Ok(false)),
+            }
+        }
+
+        let frame = self
+            .pending_to_outbound
+            .front()
+            .expect("pending outbound frame");
+        let packet = snell::decode_udp_request_packet(frame)?;
+        let destination = packet.address.into_owned();
+        let payload = packet.payload;
+        let payload_len = payload.len();
+        let sent = ready!(self.outbound.poll_send_to(
+            cx,
+            &destination,
+            payload,
+            &mut self.outbound_send_state
+        ))?;
+        if sent != payload_len {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "udp outbound sent a partial datagram",
+            )));
+        }
+        self.pending_to_outbound.pop_front();
+        Poll::Ready(Ok(true))
     }
 
     fn poll_outbound_to_snell(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
@@ -423,6 +448,7 @@ where
     transport: ClientUdpTransport<M>,
     pending_to_snell: VecDeque<BytesMut>,
     pending_to_client: VecDeque<BytesMut>,
+    snell_to_client_closed: bool,
     snell_write_state: WriteFrameState,
     client_send_state: UdpSendState,
 }
@@ -440,6 +466,7 @@ where
             transport: ClientUdpTransport::Connecting(future),
             pending_to_snell: VecDeque::new(),
             pending_to_client: VecDeque::new(),
+            snell_to_client_closed: false,
             snell_write_state: WriteFrameState::default(),
             client_send_state: UdpSendState::default(),
         }
@@ -494,6 +521,10 @@ where
                 return Poll::Ready(Ok(true));
             }
 
+            if self.snell_to_client_closed {
+                return Poll::Ready(Ok(false));
+            }
+
             if matches!(self.snell_write_state, WriteFrameState::Flushing) {
                 ready!(
                     transport
@@ -514,8 +545,9 @@ where
 
             match transport.reader.poll_read_frame_batch(cx) {
                 Poll::Ready(Ok(Some(batch))) => {
+                    self.snell_to_client_closed = batch.ends_stream();
                     for frame in batch.into_frames() {
-                        let packet = snell::decode_udp_response_packet(frame.as_init())?;
+                        let packet = snell::decode_udp_response_packet(&frame)?;
                         let header_len = socks5::udp_header_len(packet.address)?;
                         let mut response = BytesMut::zeroed(header_len + packet.payload.len());
                         socks5::encode_udp_header(&mut response, 0, packet.address)?;
@@ -524,6 +556,9 @@ where
                             return Poll::Ready(Err(io::Error::other("udp relay channel full")));
                         }
                         self.pending_to_client.push_back(response);
+                    }
+                    if self.pending_to_client.is_empty() && self.snell_to_client_closed {
+                        return Poll::Ready(Ok(false));
                     }
                 }
                 Poll::Ready(Ok(None)) => return Poll::Ready(Ok(false)),
@@ -911,6 +946,7 @@ mod tests {
             )),
             pending_to_snell: VecDeque::new(),
             pending_to_client: VecDeque::new(),
+            snell_to_client_closed: false,
             snell_write_state: WriteFrameState::default(),
             client_send_state: UdpSendState::default(),
         };

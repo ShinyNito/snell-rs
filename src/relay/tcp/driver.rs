@@ -1,39 +1,30 @@
 use std::{
-    collections::VecDeque,
     future::{Future, poll_fn},
     io,
-    io::IoSlice,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, ready},
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use compio::{
-    buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf},
-    io::{AsyncRead, AsyncReadManaged, AsyncWrite, AsyncWriteExt},
+    buf::{BufResult, IoVectoredBuf},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
 };
 
 use crate::protocol::snell::{
-    DecodeEvent, PendingWire, PendingWireSegment, PlaintextFrame, PlaintextSegment, SnellMode,
-    SnellTcpDecoder, SnellTcpEncoder,
+    DecodeEvent, SnellMode, SnellPlainReader, SnellTcpDecoder, SnellTcpEncoder,
 };
 
-type ReadOne<R> = Option<<R as AsyncReadManaged>::Buffer>;
-type ManagedReadFuture<R> = Pin<Box<dyn Future<Output = (R, io::Result<ReadOne<R>>)>>>;
-type ReadAheadFuture<R> =
-    Pin<Box<dyn Future<Output = (R, io::Result<Option<<R as AsyncReadManaged>::Buffer>>)>>>;
-type WriteVectoredFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), PendingWire>)>>>;
+type ReadFuture<R> = Pin<Box<dyn Future<Output = (R, BufResult<usize, BytesMut>)>>>;
+type WriteFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), Bytes>)>>>;
 type FlushFuture<W> = Pin<Box<dyn Future<Output = (W, io::Result<()>)>>>;
 
 const READ_AHEAD_LEN: usize = 64 * 1024;
 const PLAINTEXT_BATCH_LEN: usize = 64 * 1024;
 
-pub struct SnellStreamReader<R: AsyncReadManaged, D> {
+pub struct SnellStreamReader<R, D> {
     inner: ReaderIo<R>,
-    prefetched_plaintext: VecDeque<PlaintextFrame>,
-    prefetched_ciphertext: CiphertextQueue<R::Buffer>,
-    pending_zero_chunk: bool,
     decoder: D,
 }
 
@@ -43,40 +34,46 @@ pub struct SnellStreamWriter<W, E> {
 }
 
 pub(crate) struct PlaintextBatch {
-    frames: Vec<PlaintextFrame>,
+    frames: Vec<BytesMut>,
     len: usize,
+    end: bool,
 }
 
-struct CiphertextQueue<B> {
-    segments: VecDeque<CiphertextSegment<B>>,
-    len: usize,
+enum CiphertextRead {
+    Progress,
+    ZeroChunk,
+    Eof,
 }
 
-enum CiphertextSegment<B> {
-    Managed { buffer: B, offset: usize },
-    Bytes { buffer: BytesMut, offset: usize },
-}
-
-enum CiphertextChunk<B> {
-    Managed(B),
-    Bytes(BytesMut),
-}
-
-enum ReaderIo<R: AsyncReadManaged> {
+enum ReaderIo<R> {
     Idle(Option<R>),
-    Reading(ReadAheadFuture<R>),
+    Reading(ReadFuture<R>),
 }
 
 enum WriterIo<W> {
     Idle(Option<W>),
-    Writing(WriteVectoredFuture<W>),
+    Writing(WriteFuture<W>),
     Flushing(FlushFuture<W>),
 }
 
-pub(crate) enum WriteFromState<R: AsyncReadManaged> {
-    Reading { reader: Option<R> },
-    ReadPending { future: ManagedReadFuture<R> },
-    Flushing { reader: Option<R>, eof: bool },
+pub(crate) enum WriteFromState<R> {
+    Reading {
+        reader: Option<R>,
+    },
+    ReadPending {
+        future: ReadFuture<R>,
+    },
+    Encoding {
+        reader: Option<R>,
+        payload: BytesMut,
+        offset: usize,
+    },
+    Flushing {
+        reader: Option<R>,
+        payload: BytesMut,
+        offset: usize,
+        eof: bool,
+    },
     Done,
 }
 
@@ -89,7 +86,7 @@ pub(crate) enum WriteFrameState {
 
 impl<R> WriteFromState<R>
 where
-    R: AsyncReadManaged,
+    R: AsyncRead,
 {
     pub(crate) fn new(reader: R) -> Self {
         Self::Reading {
@@ -98,10 +95,7 @@ where
     }
 }
 
-impl<R> ReaderIo<R>
-where
-    R: AsyncReadManaged,
-{
+impl<R> ReaderIo<R> {
     fn new(inner: R) -> Self {
         Self::Idle(Some(inner))
     }
@@ -116,12 +110,12 @@ where
 
 impl<R> ReaderIo<R>
 where
-    R: AsyncReadManaged + 'static,
+    R: AsyncRead + 'static,
 {
-    fn start_read_ahead(&mut self) {
+    fn start_read(&mut self) {
         let mut inner = self.take_idle();
         let future = Box::pin(async move {
-            let result = inner.read_managed(READ_AHEAD_LEN).await;
+            let result = inner.read(BytesMut::with_capacity(READ_AHEAD_LEN)).await;
             (inner, result)
         });
         *self = Self::Reading(future);
@@ -145,10 +139,10 @@ impl<W> WriterIo<W>
 where
     W: AsyncWrite + 'static,
 {
-    fn start_write_vectored_all(&mut self, wire: PendingWire) {
+    fn start_write_all(&mut self, wire: Bytes) {
         let mut inner = self.take_idle();
         let future = Box::pin(async move {
-            let result = inner.write_vectored_all(wire).await;
+            let result = inner.write_all(wire).await;
             (inner, result)
         });
         *self = Self::Writing(future);
@@ -164,17 +158,12 @@ where
     }
 }
 
-impl IoVectoredBuf for PendingWire {
-    fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
-        self.iter_slices()
-    }
-}
-
 impl PlaintextBatch {
     fn new() -> Self {
         Self {
             frames: Vec::new(),
             len: 0,
+            end: false,
         }
     }
 
@@ -186,144 +175,29 @@ impl PlaintextBatch {
         self.len >= PLAINTEXT_BATCH_LEN
     }
 
-    fn push(&mut self, frame: PlaintextFrame) {
+    fn push(&mut self, frame: BytesMut) {
         if !frame.is_empty() {
-            self.len += frame.as_init().len();
+            self.len += frame.len();
             self.frames.push(frame);
         }
     }
 
-    pub(crate) fn into_frames(self) -> impl Iterator<Item = PlaintextFrame> {
-        self.frames.into_iter()
-    }
-}
-
-impl<B> CiphertextQueue<B>
-where
-    B: IoBuf,
-{
-    fn new() -> Self {
-        Self {
-            segments: VecDeque::new(),
-            len: 0,
-        }
+    fn finish(&mut self) {
+        self.end = true;
     }
 
-    fn from_bytes(buffer: BytesMut) -> Self {
-        let mut queue = Self::new();
-        queue.push_bytes(buffer);
-        queue
+    pub(crate) fn ends_stream(&self) -> bool {
+        self.end
     }
 
-    fn push_managed(&mut self, buffer: B) {
-        if !buffer.as_init().is_empty() {
-            self.len += buffer.as_init().len();
-            self.segments
-                .push_back(CiphertextSegment::Managed { buffer, offset: 0 });
-        }
-    }
-
-    fn push_bytes(&mut self, buffer: BytesMut) {
-        if !buffer.is_empty() {
-            self.len += buffer.len();
-            self.segments
-                .push_back(CiphertextSegment::Bytes { buffer, offset: 0 });
-        }
-    }
-
-    fn has(&self, len: usize) -> bool {
-        self.len >= len
-    }
-
-    fn take_exact(&mut self, len: usize) -> CiphertextChunk<B> {
-        assert!(self.len >= len);
-
-        if let Some(segment) = self.segments.front_mut() {
-            let remaining = segment.remaining();
-            if remaining == len {
-                self.len -= len;
-                return match self.segments.pop_front().expect("ciphertext segment") {
-                    CiphertextSegment::Managed { buffer, offset: 0 } => {
-                        CiphertextChunk::Managed(buffer)
-                    }
-                    CiphertextSegment::Managed { buffer, offset } => {
-                        CiphertextChunk::Bytes(bytes_from_slice(&buffer.as_init()[offset..]))
-                    }
-                    CiphertextSegment::Bytes { buffer, offset: 0 } => {
-                        CiphertextChunk::Bytes(buffer)
-                    }
-                    CiphertextSegment::Bytes { buffer, offset } => {
-                        CiphertextChunk::Bytes(bytes_from_slice(&buffer.as_ref()[offset..]))
-                    }
-                };
-            }
-
-            if let CiphertextSegment::Bytes { buffer, offset: 0 } = segment
-                && remaining > len
-            {
-                self.len -= len;
-                return CiphertextChunk::Bytes(buffer.split_to(len));
-            }
-        }
-
-        // ponytail: keep segmented crypto out of the protocol layer; copy only
-        // exact chunks that span buffers or split a managed buffer.
-        let mut out = BytesMut::with_capacity(len);
-        while out.len() < len {
-            let take = {
-                let segment = self.segments.front_mut().expect("ciphertext segment");
-                let remaining = segment.remaining();
-                let take = (len - out.len()).min(remaining);
-                segment.copy_to(&mut out, take);
-                take
-            };
-            self.len -= take;
-            if self
-                .segments
-                .front()
-                .is_some_and(CiphertextSegment::is_empty)
-            {
-                self.segments.pop_front();
-            }
-        }
-        CiphertextChunk::Bytes(out)
-    }
-}
-
-impl<B> CiphertextSegment<B>
-where
-    B: IoBuf,
-{
-    fn remaining(&self) -> usize {
-        match self {
-            Self::Managed { buffer, offset } => buffer.as_init().len() - offset,
-            Self::Bytes { buffer, offset } => buffer.len() - offset,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.remaining() == 0
-    }
-
-    fn copy_to(&mut self, out: &mut BytesMut, len: usize) {
-        match self {
-            Self::Managed { buffer, offset } => {
-                let start = *offset;
-                *offset += len;
-                out.extend_from_slice(&<B as IoBuf>::as_init(buffer)[start..start + len]);
-            }
-            Self::Bytes { buffer, offset } => {
-                let start = *offset;
-                *offset += len;
-                out.extend_from_slice(&buffer.as_ref()[start..start + len]);
-            }
-        }
+    pub(crate) fn into_frames(self) -> impl Iterator<Item = Bytes> {
+        self.frames.into_iter().map(BytesMut::freeze)
     }
 }
 
 impl IoVectoredBuf for PlaintextBatch {
     fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
-        self.frames.iter().map(IoBuf::as_init)
+        self.frames.iter().map(BytesMut::as_ref)
     }
 
     fn total_len(&self) -> usize {
@@ -333,8 +207,7 @@ impl IoVectoredBuf for PlaintextBatch {
 
 impl<R, D> SnellStreamReader<R, D>
 where
-    R: AsyncRead + AsyncReadManaged + 'static,
-    R::Buffer: IoBufMut + Into<PlaintextSegment> + 'static,
+    R: AsyncRead + 'static,
     D: SnellTcpDecoder,
 {
     pub fn new<M>(inner: R, psk: Arc<[u8]>) -> Self
@@ -343,24 +216,18 @@ where
     {
         Self {
             inner: ReaderIo::new(inner),
-            prefetched_plaintext: VecDeque::new(),
-            prefetched_ciphertext: CiphertextQueue::new(),
-            pending_zero_chunk: false,
             decoder: M::new_decoder(psk),
         }
     }
 
-    pub(crate) fn from_decoder_with_pending(
-        inner: R,
-        decoder: D,
-        pending_plaintext: Vec<PlaintextFrame>,
-        pending_ciphertext: BytesMut,
-    ) -> Self {
+    /// Build a reader around an already-warmed decoder.
+    ///
+    /// After [`probe_snell_mode`] the decoder has already absorbed some
+    /// ciphertext into its internal buffer; the residual lives inside the
+    /// decoder itself, so no external `pending_ciphertext` parameter is needed.
+    pub(crate) fn from_decoder(inner: R, decoder: D) -> Self {
         Self {
             inner: ReaderIo::new(inner),
-            prefetched_plaintext: pending_plaintext.into(),
-            prefetched_ciphertext: CiphertextQueue::from_bytes(pending_ciphertext),
-            pending_zero_chunk: false,
             decoder,
         }
     }
@@ -370,260 +237,142 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<Option<PlaintextBatch>>> {
         let mut batch = PlaintextBatch::new();
-
-        if self.pending_zero_chunk {
-            self.pending_zero_chunk = false;
-            return Poll::Ready(Ok(None));
-        }
-
-        while !batch.is_full()
-            && let Some(frame) = self.prefetched_plaintext.pop_front()
-        {
-            batch.push(frame);
-        }
-        if !batch.is_empty() {
-            return Poll::Ready(Ok(Some(batch)));
-        }
-
         loop {
-            while !batch.is_full()
-                && let Some(frame) = self.decoder.take_pending_plaintext()
-            {
-                batch.push(frame);
-            }
-
-            if !batch.is_empty() {
-                if batch.is_full() {
-                    return Poll::Ready(Ok(Some(batch)));
-                }
-
-                // Do not start a new read while `batch` owns plaintext; a
-                // pending read would drop the local batch before it is written.
-                match self.try_decode_prefetched_frame()? {
-                    Some(true) => continue,
-                    Some(false) => {
-                        self.pending_zero_chunk = true;
+            match self.drain_decoder(&mut batch)? {
+                Some(true) => {
+                    if batch.is_full() {
                         return Poll::Ready(Ok(Some(batch)));
                     }
-                    None => return Poll::Ready(Ok(Some(batch))),
+                    continue;
+                }
+                Some(false) => {
+                    return if batch.is_empty() {
+                        Poll::Ready(Ok(None))
+                    } else {
+                        batch.finish();
+                        Poll::Ready(Ok(Some(batch)))
+                    };
+                }
+                None if !batch.is_empty() => return Poll::Ready(Ok(Some(batch))),
+                None => {}
+            }
+
+            match ready!(self.poll_read_ciphertext(cx))? {
+                CiphertextRead::Progress => {}
+                CiphertextRead::ZeroChunk => {
+                    return if batch.is_empty() {
+                        Poll::Ready(Ok(None))
+                    } else {
+                        batch.finish();
+                        Poll::Ready(Ok(Some(batch)))
+                    };
+                }
+                CiphertextRead::Eof => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "snell ciphertext stream ended early",
+                    )));
                 }
             }
-
-            if !ready!(self.poll_read_frame(cx))? {
-                if batch.is_empty() {
-                    return Poll::Ready(Ok(None));
-                }
-                self.pending_zero_chunk = true;
-                return Poll::Ready(Ok(Some(batch)));
-            }
-        }
-    }
-
-    fn try_decode_prefetched_frame(&mut self) -> io::Result<Option<bool>> {
-        loop {
-            if self.decoder.has_pending_plaintext() {
-                return Ok(Some(true));
-            }
-
-            let len = self.decoder.next_cipher_len();
-            if len == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "snell decoder requested zero ciphertext bytes",
-                ));
-            }
-
-            if !self.has_prefetched_ciphertext(len) {
-                return Ok(None);
-            }
-
-            match self.decode_prefetched_ciphertext(len)? {
-                DecodeEvent::PlainData => return Ok(Some(true)),
-                DecodeEvent::ZeroChunk => return Ok(Some(false)),
-                DecodeEvent::NeedMore => continue,
-                _ => continue,
-            }
-        }
-    }
-
-    pub(crate) fn poll_drain_frame_plaintext_with<F>(
-        &mut self,
-        cx: &mut Context<'_>,
-        f: F,
-    ) -> Poll<io::Result<bool>>
-    where
-        F: FnOnce(&mut Context<'_>, &[u8]) -> Poll<io::Result<()>>,
-    {
-        if let Some(prefetched) = self.prefetched_plaintext.front() {
-            let result = f(cx, IoBuf::as_init(prefetched));
-            match result {
-                Poll::Ready(Ok(())) => {
-                    self.prefetched_plaintext.pop_front();
-                    return Poll::Ready(Ok(true));
-                }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        if !self.decoder.has_pending_plaintext() && !ready!(self.poll_read_frame(cx))? {
-            return Poll::Ready(Ok(false));
-        }
-
-        let (plain_len, result) = {
-            let mut bufs = [IoSlice::new(&[]); 4];
-            let nbufs = self.decoder.pending_plaintext(&mut bufs);
-            if nbufs == 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "snell decoder produced no plaintext",
-                )));
-            }
-            if nbufs != 1 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "snell decoder produced fragmented plaintext",
-                )));
-            }
-            let plain = &bufs[0];
-            (plain.len(), f(cx, plain))
-        };
-
-        match result {
-            Poll::Ready(Ok(())) => {
-                self.decoder.advance_plaintext(plain_len);
-                Poll::Ready(Ok(true))
-            }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => Poll::Pending,
         }
     }
 
     pub async fn read_exact_plain(&mut self, dst: &mut [u8]) -> io::Result<()> {
         let mut filled = 0;
         while filled < dst.len() {
-            let copied = self.copy_prefetched_plaintext(&mut dst[filled..]);
-            if copied != 0 {
-                filled += copied;
-                continue;
-            }
-
-            let copied = self.copy_pending_control_plaintext(&mut dst[filled..]);
-            if copied != 0 {
-                filled += copied;
-                continue;
-            }
-
-            if !poll_fn(|cx| self.poll_read_frame(cx)).await? {
+            if self.decoder.pending_plain().is_empty()
+                && !poll_fn(|cx| self.poll_read_frame(cx)).await?
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "snell zero chunk while reading control data",
                 ));
             }
+
+            let plain = self.decoder.pending_plain();
+            if plain.is_empty() {
+                continue;
+            }
+            let take = (dst.len() - filled).min(plain.len());
+            dst[filled..filled + take].copy_from_slice(&plain[..take]);
+            self.decoder.consume_plain(take);
+            filled += take;
         }
         Ok(())
     }
 
-    fn copy_prefetched_plaintext(&mut self, dst: &mut [u8]) -> usize {
-        let Some((take, drained)) = self.prefetched_plaintext.front_mut().map(|prefetched| {
-            let plain_len = IoBuf::as_init(&*prefetched).len();
-            let take = dst.len().min(plain_len);
-            dst[..take].copy_from_slice(&IoBuf::as_init(&*prefetched)[..take]);
-            prefetched.advance(take);
-            (take, take == plain_len)
-        }) else {
-            return 0;
-        };
-        if drained {
-            self.prefetched_plaintext.pop_front();
-        }
-        take
-    }
-
     fn poll_read_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
         loop {
-            if self.pending_zero_chunk {
-                self.pending_zero_chunk = false;
-                return Poll::Ready(Ok(false));
-            }
-
-            if self.decoder.has_pending_plaintext() {
+            if self.decoder.has_pending_plain() {
                 return Poll::Ready(Ok(true));
             }
 
-            let len = self.decoder.next_cipher_len();
-            if len == 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "snell decoder requested zero ciphertext bytes",
-                )));
-            }
-
-            if !self.has_prefetched_ciphertext(len) {
-                if !ready!(self.poll_read_ahead(cx))? {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "failed to fill snell ciphertext chunk",
-                    )));
-                }
-                continue;
-            }
-
-            let event = self.decode_prefetched_ciphertext(len)?;
-            match event {
+            match self.decoder.feed_owned(BytesMut::new())? {
                 DecodeEvent::PlainData => return Poll::Ready(Ok(true)),
                 DecodeEvent::ZeroChunk => return Poll::Ready(Ok(false)),
-                DecodeEvent::NeedMore => continue,
+                DecodeEvent::NeedMore => {}
+                _ => continue,
+            }
+
+            match ready!(self.poll_read_ciphertext(cx))? {
+                CiphertextRead::Progress => {}
+                CiphertextRead::ZeroChunk => return Poll::Ready(Ok(false)),
+                CiphertextRead::Eof => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "snell ciphertext stream ended early",
+                    )));
+                }
+            }
+        }
+    }
+
+    fn drain_decoder(&mut self, batch: &mut PlaintextBatch) -> io::Result<Option<bool>> {
+        loop {
+            if self.decoder.has_pending_plain() {
+                batch.push(self.decoder.take_plain());
+                return Ok(Some(true));
+            }
+
+            match self.decoder.feed_owned(BytesMut::new())? {
+                DecodeEvent::PlainData => continue,
+                DecodeEvent::ZeroChunk => return Ok(Some(false)),
+                DecodeEvent::NeedMore => return Ok(None),
                 _ => continue,
             }
         }
     }
 
-    fn poll_read_ahead(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+    fn poll_read_ciphertext(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<CiphertextRead>> {
         if matches!(self.inner, ReaderIo::Idle(_)) {
-            self.inner.start_read_ahead();
+            self.inner.start_read();
         }
 
-        let (inner, result) = match &mut self.inner {
-            ReaderIo::Idle(_) => unreachable!("reader io did not start read-ahead"),
+        let (inner, BufResult(result, mut chunk)) = match &mut self.inner {
+            ReaderIo::Idle(_) => unreachable!("reader io did not start read"),
             ReaderIo::Reading(future) => ready!(future.as_mut().poll(cx)),
         };
         self.inner = ReaderIo::Idle(Some(inner));
 
-        match result? {
-            Some(chunk) => {
-                self.prefetched_ciphertext.push_managed(chunk);
-                Poll::Ready(Ok(true))
-            }
-            None => Poll::Ready(Ok(false)),
+        let n = result?;
+        if n == 0 {
+            return Poll::Ready(Ok(CiphertextRead::Eof));
         }
+        chunk.truncate(n);
+        Poll::Ready(Ok(match self.decoder.feed_owned(chunk)? {
+            DecodeEvent::ZeroChunk => CiphertextRead::ZeroChunk,
+            _ => CiphertextRead::Progress,
+        }))
     }
+}
 
-    fn decode_prefetched_ciphertext(&mut self, len: usize) -> io::Result<DecodeEvent<'_>> {
-        match self.prefetched_ciphertext.take_exact(len) {
-            CiphertextChunk::Managed(ciphertext) => self.decoder.decode_ciphertext(ciphertext),
-            CiphertextChunk::Bytes(ciphertext) => self.decoder.decode_ciphertext(ciphertext),
-        }
-    }
-
-    fn has_prefetched_ciphertext(&self, len: usize) -> bool {
-        self.prefetched_ciphertext.has(len)
-    }
-
-    fn copy_pending_control_plaintext(&mut self, dst: &mut [u8]) -> usize {
-        let mut bufs = [IoSlice::new(&[]); 4];
-        let nbufs = self.decoder.pending_plaintext(&mut bufs);
-        let mut copied = 0;
-        for buf in &bufs[..nbufs] {
-            if copied == dst.len() {
-                break;
-            }
-            let take = (dst.len() - copied).min(buf.len());
-            dst[copied..copied + take].copy_from_slice(&buf[..take]);
-            copied += take;
-        }
-        self.decoder.advance_plaintext(copied);
-        copied
+impl<R, D> SnellPlainReader for SnellStreamReader<R, D>
+where
+    R: AsyncRead + 'static,
+    D: SnellTcpDecoder,
+{
+    async fn read_exact_plain(&mut self, dst: &mut [u8]) -> io::Result<()> {
+        SnellStreamReader::read_exact_plain(self, dst).await
     }
 }
 
@@ -668,12 +417,52 @@ where
         state: &mut WriteFromState<R>,
     ) -> Poll<io::Result<bool>>
     where
-        R: AsyncReadManaged + 'static,
-        R::Buffer: IoBufMut + Into<PendingWireSegment> + 'static,
+        R: AsyncRead + 'static,
     {
         loop {
             match state {
                 WriteFromState::Reading { reader } => {
+                    let mut reader = reader.take().expect("plain reader missing");
+                    let future = Box::pin(async move {
+                        let result = reader.read(BytesMut::with_capacity(READ_AHEAD_LEN)).await;
+                        (reader, result)
+                    });
+                    *state = WriteFromState::ReadPending { future };
+                }
+                WriteFromState::ReadPending { future } => {
+                    let (reader, BufResult(result, mut payload)) = ready!(future.as_mut().poll(cx));
+                    let n = result?;
+                    let eof = n == 0;
+                    payload.truncate(n);
+                    if eof {
+                        let wire = self.encoder.seal_plain(&[])?;
+                        self.inner.start_write_all(wire);
+                        *state = WriteFromState::Flushing {
+                            reader: Some(reader),
+                            payload,
+                            offset: 0,
+                            eof: true,
+                        };
+                    } else {
+                        *state = WriteFromState::Encoding {
+                            reader: Some(reader),
+                            payload,
+                            offset: 0,
+                        };
+                    };
+                }
+                WriteFromState::Encoding {
+                    reader,
+                    payload,
+                    offset,
+                } => {
+                    if *offset >= payload.len() {
+                        let reader = reader.take().expect("plain reader missing");
+                        *state = WriteFromState::Reading {
+                            reader: Some(reader),
+                        };
+                        continue;
+                    }
                     let capacity = self.encoder.next_plain_capacity();
                     if capacity == 0 {
                         return Poll::Ready(Err(io::Error::new(
@@ -681,33 +470,39 @@ where
                             "snell encoder returned zero plaintext capacity",
                         )));
                     }
-                    let plain_read = reader.take().expect("plain reader missing");
-                    let future = Box::pin(read_one_len(plain_read, capacity));
-                    *state = WriteFromState::ReadPending { future };
-                }
-                WriteFromState::ReadPending { future } => {
-                    let (reader, result) = ready!(future.as_mut().poll(cx));
-                    let eof = match result? {
-                        Some(read) => {
-                            self.encoder.seal_plain(read)?;
-                            false
-                        }
-                        None => {
-                            self.encoder.seal_plain(BytesMut::new())?;
-                            true
-                        }
-                    };
+                    let n = (payload.len() - *offset).min(capacity);
+                    let next_offset = *offset + n;
+                    let wire = self.encoder.seal_plain(&payload[*offset..next_offset])?;
+                    self.inner.start_write_all(wire);
+                    let reader = reader.take().expect("plain reader missing");
+                    let payload = std::mem::take(payload);
                     *state = WriteFromState::Flushing {
                         reader: Some(reader),
-                        eof,
+                        payload,
+                        offset: next_offset,
+                        eof: false,
                     };
                 }
-                WriteFromState::Flushing { reader, eof } => {
+                WriteFromState::Flushing {
+                    reader,
+                    payload,
+                    offset,
+                    eof,
+                } => {
                     ready!(self.poll_drain_pending(cx))?;
                     let reader = reader.take().expect("plain reader missing");
                     if *eof {
                         *state = WriteFromState::Done;
                         return Poll::Ready(Ok(false));
+                    }
+                    if *offset < payload.len() {
+                        let payload = std::mem::take(payload);
+                        *state = WriteFromState::Encoding {
+                            reader: Some(reader),
+                            payload,
+                            offset: *offset,
+                        };
+                        return Poll::Ready(Ok(true));
                     }
                     *state = WriteFromState::Reading {
                         reader: Some(reader),
@@ -726,17 +521,19 @@ where
         state: &mut WriteFrameState,
     ) -> Poll<io::Result<()>>
     where
-        B: IoBufMut + Into<PendingWireSegment>,
+        B: AsRef<[u8]>,
     {
         match state {
             WriteFrameState::Encoding => {
-                if payload.as_init().len() > self.encoder.next_plain_capacity() {
+                let payload = payload.as_ref();
+                if payload.len() > self.encoder.next_plain_capacity() {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "snell udp packet is larger than one frame",
                     )));
                 }
-                self.encoder.seal_plain(payload)?;
+                let wire = self.encoder.seal_plain(payload)?;
+                self.inner.start_write_all(wire);
                 *state = WriteFrameState::Flushing;
             }
             WriteFrameState::Flushing => {}
@@ -775,7 +572,8 @@ where
             ));
         }
         payload.truncate(n);
-        self.encoder.seal_plain(payload)?;
+        let wire = self.encoder.seal_plain(&payload)?;
+        self.inner.start_write_all(wire);
         self.drain_pending().await
     }
 
@@ -787,8 +585,13 @@ where
                 "snell encoder returned zero plaintext capacity",
             ));
         }
-        let n = payload.len().min(capacity);
-        self.encoder.seal_plain(bytes_from_slice(&payload[..n]))?;
+        let n = if payload.is_empty() {
+            0
+        } else {
+            payload.len().min(capacity)
+        };
+        let wire = self.encoder.seal_plain(&payload[..n])?;
+        self.inner.start_write_all(wire);
         self.drain_pending().await?;
         Ok(n)
     }
@@ -801,22 +604,12 @@ where
         loop {
             match &mut self.inner {
                 WriterIo::Idle(_) => {
-                    if self.encoder.has_pending_wire() {
-                        let wire = self.encoder.take_pending_wire();
-                        if !wire.is_empty() {
-                            self.inner.start_write_vectored_all(wire);
-                        }
-                        continue;
-                    }
                     self.inner.start_flush();
                 }
                 WriterIo::Writing(future) => {
-                    let (inner, BufResult(result, wire)) = ready!(future.as_mut().poll(cx));
+                    let (inner, BufResult(result, _wire)) = ready!(future.as_mut().poll(cx));
                     self.inner = WriterIo::Idle(Some(inner));
-                    if let Err(error) = result {
-                        self.encoder.restore_pending_wire(wire);
-                        return Poll::Ready(Err(error));
-                    }
+                    result?;
                 }
                 WriterIo::Flushing(future) => {
                     let (inner, result) = ready!(future.as_mut().poll(cx));
@@ -828,31 +621,17 @@ where
     }
 }
 
-fn bytes_from_slice(payload: &[u8]) -> BytesMut {
-    let mut buf = BytesMut::with_capacity(payload.len());
-    buf.extend_from_slice(payload);
-    buf
-}
-
-async fn read_one_len<R>(mut reader: R, len: usize) -> (R, io::Result<ReadOne<R>>)
-where
-    R: AsyncReadManaged + 'static,
-    R::Buffer: 'static,
-{
-    let result = reader.read_managed(len).await;
-    (reader, result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::snell::{HEADER_CIPHER_LEN, V4Decoder, V4Encoder, V4Mode};
+    use crate::protocol::snell::{V4Decoder, V4Encoder, V4Mode};
     use compio::{
+        buf::{BufResult, IoBufMut, SetLen},
         io::AsyncWriteExt,
         net::{TcpListener, TcpStream},
         runtime, time,
     };
-    use std::time::Duration;
+    use std::{sync::Mutex, time::Duration};
 
     #[compio::test]
     async fn round_trips_payload_and_zero_chunk() {
@@ -868,67 +647,42 @@ mod tests {
         writer.write_frame(b"hello").await.unwrap();
         writer.write_frame(&[]).await.unwrap();
 
-        let payload = read_batch_vec(&mut reader).await.unwrap().unwrap();
-        assert_eq!(payload, b"hello");
-        assert!(read_batch_vec(&mut reader).await.unwrap().is_none());
+        let (frames, ends_stream) = read_batch_vec(&mut reader).await.unwrap().unwrap();
+        assert_eq!(frames, vec![b"hello".to_vec()]);
+        if !ends_stream {
+            assert!(read_batch_vec(&mut reader).await.unwrap().is_none());
+        }
     }
 
     #[compio::test]
-    async fn batches_buffered_plaintext_frames() {
+    async fn reads_pending_ciphertext_after_probe() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let mut encoder = V4Encoder::new(&psk).unwrap();
-        let mut wire = Vec::new();
-
-        encoder.seal_plain(bytes_from_slice(b"hello")).unwrap();
-        append_pending_wire(&mut encoder, &mut wire);
-        encoder.seal_plain(bytes_from_slice(b"world")).unwrap();
-        append_pending_wire(&mut encoder, &mut wire);
-        encoder.seal_plain(BytesMut::new()).unwrap();
-        append_pending_wire(&mut encoder, &mut wire);
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&encoder.seal_plain(b"hello").unwrap());
+        wire.extend_from_slice(&encoder.seal_plain(b"world").unwrap());
+        wire.extend_from_slice(&encoder.seal_plain(&[]).unwrap());
 
         let (_client, server) = tcp_pair().await;
         let (server_read, _) = server.into_split();
-        let mut reader = SnellStreamReader::from_decoder_with_pending(
-            server_read,
-            V4Decoder::new(psk),
-            Vec::new(),
-            BytesMut::from(&wire[..]),
-        );
 
-        let payload = read_batch_vec(&mut reader).await.unwrap().unwrap();
-        assert_eq!(payload, b"helloworld");
-        assert!(read_batch_vec(&mut reader).await.unwrap().is_none());
-    }
+        // Warm the decoder with the residual ciphertext the way probe_snell_mode
+        // would: the bytes sit in the decoder's internal buffer, and the reader
+        // drains them before touching the socket.
+        let mut decoder = V4Decoder::new(psk);
+        decoder.feed_owned(wire).unwrap();
+        let mut reader = SnellStreamReader::from_decoder(server_read, decoder);
 
-    #[test]
-    fn ciphertext_queue_moves_exact_managed_segment() {
-        let mut queue = CiphertextQueue::new();
-        queue.push_managed(BytesMut::from(&b"hello"[..]));
-
-        match queue.take_exact(5) {
-            CiphertextChunk::Managed(buffer) => assert_eq!(buffer.as_init(), b"hello"),
-            CiphertextChunk::Bytes(_) => panic!("exact managed segment was copied"),
-        }
-        assert!(!queue.has(1));
-    }
-
-    #[test]
-    fn ciphertext_queue_copies_split_managed_segment_and_preserves_tail() {
-        let mut queue = CiphertextQueue::new();
-        queue.push_managed(BytesMut::from(&b"helloworld"[..]));
-
-        assert_eq!(ciphertext_chunk_bytes(queue.take_exact(5)), b"hello");
-        assert_eq!(ciphertext_chunk_bytes(queue.take_exact(5)), b"world");
-        assert!(!queue.has(1));
+        let (frames, ends_stream) = read_batch_vec(&mut reader).await.unwrap().unwrap();
+        assert_eq!(frames, vec![b"hello".to_vec(), b"world".to_vec()]);
+        assert!(ends_stream);
     }
 
     #[compio::test]
     async fn reads_frame_split_across_socket_reads() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let mut encoder = V4Encoder::new(&psk).unwrap();
-        let mut wire = Vec::new();
-        encoder.seal_plain(bytes_from_slice(b"hello")).unwrap();
-        append_pending_wire(&mut encoder, &mut wire);
+        let wire = encoder.seal_plain(b"hello").unwrap();
 
         let (client, server) = tcp_pair().await;
         let (_, mut client_write) = client.into_split();
@@ -936,7 +690,7 @@ mod tests {
         let mut reader: SnellStreamReader<_, V4Decoder> =
             SnellStreamReader::new::<V4Mode>(server_read, psk);
 
-        let read = runtime::spawn(async move { read_batch_vec(&mut reader).await.unwrap() });
+        let read = runtime::spawn(async move { read_frame_vec(&mut reader).await.unwrap() });
         client_write
             .write_all(BytesMut::from(&wire[..8]))
             .await
@@ -951,88 +705,85 @@ mod tests {
     }
 
     #[compio::test]
-    async fn returns_buffered_batch_before_waiting_for_next_frame_body() {
+    async fn write_from_reads_fixed_read_ahead_before_framing() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
-        let mut encoder = V4Encoder::new(&psk).unwrap();
-        let mut first = Vec::new();
-        let mut second = Vec::new();
-        let mut zero = Vec::new();
-
-        encoder.seal_plain(bytes_from_slice(b"hello")).unwrap();
-        append_pending_wire(&mut encoder, &mut first);
-        encoder.seal_plain(bytes_from_slice(b"world")).unwrap();
-        append_pending_wire(&mut encoder, &mut second);
-        encoder.seal_plain(BytesMut::new()).unwrap();
-        append_pending_wire(&mut encoder, &mut zero);
-
         let (client, server) = tcp_pair().await;
-        let (_, mut client_write) = client.into_split();
-        let (server_read, _) = server.into_split();
-        let mut reader: SnellStreamReader<_, V4Decoder> =
-            SnellStreamReader::new::<V4Mode>(server_read, psk);
+        let (_, client_write) = client.into_split();
+        let (_server_read, _server_write) = server.into_split();
+        let read_caps = Arc::new(Mutex::new(Vec::new()));
+        let reader = RecordingReader {
+            payload: Some(Bytes::from_static(b"x")),
+            read_caps: read_caps.clone(),
+        };
+        let mut state = WriteFromState::new(reader);
+        let mut writer: SnellStreamWriter<_, V4Encoder> =
+            SnellStreamWriter::new::<V4Mode>(client_write, psk).unwrap();
 
-        let split = HEADER_CIPHER_LEN.min(second.len());
-        let mut prefix = first;
-        prefix.extend_from_slice(&second[..split]);
-        client_write
-            .write_all(BytesMut::from(&prefix[..]))
-            .await
-            .unwrap();
-
-        let payload = time::timeout(Duration::from_secs(1), read_batch_vec(&mut reader))
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(payload, b"hello");
-
-        let mut suffix = Vec::from(&second[split..]);
-        suffix.extend_from_slice(&zero);
-        client_write
-            .write_all(BytesMut::from(&suffix[..]))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            read_batch_vec(&mut reader).await.unwrap().unwrap(),
-            b"world"
+        assert!(
+            poll_fn(|cx| writer.poll_write_from(cx, &mut state))
+                .await
+                .unwrap()
         );
-        assert!(read_batch_vec(&mut reader).await.unwrap().is_none());
+
+        assert_eq!(*read_caps.lock().unwrap(), vec![READ_AHEAD_LEN]);
     }
 
-    async fn read_batch_vec<R, D>(
+    struct RecordingReader {
+        payload: Option<Bytes>,
+        read_caps: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for RecordingReader {
+        async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
+            let capacity = buf.as_uninit().len();
+            self.read_caps.lock().unwrap().push(capacity);
+            let Some(payload) = self.payload.take() else {
+                return BufResult(Ok(0), buf);
+            };
+            let n = payload.len().min(capacity);
+            buf.ensure_init()[..n].copy_from_slice(&payload[..n]);
+            unsafe {
+                SetLen::set_len(&mut buf, n);
+            }
+            BufResult(Ok(n), buf)
+        }
+    }
+
+    async fn read_frame_vec<R, D>(
         reader: &mut SnellStreamReader<R, D>,
     ) -> io::Result<Option<Vec<u8>>>
     where
-        R: AsyncRead + AsyncReadManaged + 'static,
-        R::Buffer: IoBufMut + Into<PlaintextSegment> + 'static,
+        R: AsyncRead + 'static,
         D: SnellTcpDecoder,
     {
         let Some(batch) = poll_fn(|cx| reader.poll_read_frame_batch(cx)).await? else {
             return Ok(None);
         };
-        let mut out = Vec::new();
-        for slice in batch.iter_slice() {
-            out.extend_from_slice(slice);
-        }
-        Ok(Some(out))
+        let mut frames = batch.into_frames();
+        let frame = frames
+            .next()
+            .expect("plaintext batch should contain a frame")
+            .to_vec();
+        assert!(frames.next().is_none(), "expected one frame in batch");
+        Ok(Some(frame))
     }
 
-    fn ciphertext_chunk_bytes<B>(chunk: CiphertextChunk<B>) -> Vec<u8>
+    async fn read_batch_vec<R, D>(
+        reader: &mut SnellStreamReader<R, D>,
+    ) -> io::Result<Option<(Vec<Vec<u8>>, bool)>>
     where
-        B: IoBuf,
+        R: AsyncRead + 'static,
+        D: SnellTcpDecoder,
     {
-        match chunk {
-            CiphertextChunk::Managed(buffer) => buffer.as_init().to_vec(),
-            CiphertextChunk::Bytes(buffer) => buffer.to_vec(),
-        }
-    }
-
-    fn append_pending_wire(encoder: &mut V4Encoder, wire: &mut Vec<u8>) {
-        let pending = encoder.take_pending_wire();
-        for slice in pending.iter_slices() {
-            wire.extend_from_slice(slice);
-        }
+        let Some(batch) = poll_fn(|cx| reader.poll_read_frame_batch(cx)).await? else {
+            return Ok(None);
+        };
+        let ends_stream = batch.ends_stream();
+        let frames = batch
+            .into_frames()
+            .map(|frame| frame.to_vec())
+            .collect::<Vec<_>>();
+        Ok(Some((frames, ends_stream)))
     }
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {
