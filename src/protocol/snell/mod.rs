@@ -739,6 +739,10 @@ impl PendingWire {
         }
     }
 
+    pub(crate) fn append(&mut self, other: &mut Self) {
+        self.segments.append(&mut other.segments);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
     }

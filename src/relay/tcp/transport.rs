@@ -7,7 +7,7 @@ use std::{
 
 use compio::{
     buf::{BufResult, IoBufMut},
-    io::{AsyncRead, AsyncReadManaged, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadManaged, AsyncReadMulti, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -62,14 +62,14 @@ where
     transport.copy_bidirectional(peer)
 }
 
-enum PlainState<R: AsyncReadManaged> {
+enum PlainState<R: AsyncReadMulti> {
     Copying(WriteFromState<R>),
     Done,
 }
 
 impl<R> PlainState<R>
 where
-    R: AsyncReadManaged,
+    R: AsyncReadMulti,
 {
     fn new(reader: R) -> Self {
         Self::Copying(WriteFromState::new(reader))
@@ -171,7 +171,7 @@ fn poll_plain_to_snell<W, E, R>(
 where
     W: AsyncWrite + 'static,
     E: crate::protocol::snell::SnellTcpEncoder,
-    R: AsyncReadManaged + 'static,
+    R: AsyncReadMulti + 'static,
     R::Buffer: IoBufMut + Into<PendingWireSegment> + 'static,
 {
     loop {
