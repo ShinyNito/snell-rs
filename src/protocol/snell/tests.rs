@@ -165,6 +165,17 @@ fn v6_shaped_round_trips_through_trait() {
     );
 }
 
+#[test]
+fn v6_shaped_reads_payload_after_zero_chunk() {
+    assert_eq!(
+        round_trip_mode_frames::<V6ShapedMode>(
+            b"0123456789abcdef",
+            &[b"first".as_slice(), b"".as_slice(), b"second".as_slice()],
+        ),
+        vec![Some(b"first".to_vec()), None, Some(b"second".to_vec()),]
+    );
+}
+
 fn round_trip_mode<M>(psk: &[u8], payload: &[u8]) -> Vec<u8>
 where
     M: SnellMode,
@@ -203,6 +214,49 @@ where
             _ => continue,
         }
     }
+}
+
+fn round_trip_mode_frames<M>(psk: &[u8], payloads: &[&[u8]]) -> Vec<Option<Vec<u8>>>
+where
+    M: SnellMode,
+{
+    let mut encoder = M::new_encoder(psk).unwrap();
+    let mut wire = Vec::new();
+    for payload in payloads {
+        let reservation = encoder
+            .begin_plain_reservation(PlainPrefix::none(), payload.len())
+            .unwrap();
+        encoder.plain_slot(&reservation)[..payload.len()].copy_from_slice(payload);
+        encoder
+            .finish_plain_reservation(reservation, payload.len())
+            .unwrap();
+        let frame = collect_pending_trait(&encoder);
+        encoder.advance_wire(frame.len());
+        wire.extend_from_slice(&frame);
+    }
+
+    let mut decoder = M::new_decoder(Arc::from(psk));
+    let mut offset = 0;
+    let mut frames = Vec::new();
+    while offset < wire.len() {
+        let event = match decoder.next_ciphertext_slot() {
+            DecodeSlot::Read(slot) => {
+                let n = slot.len().min(wire.len() - offset);
+                slot[..n].copy_from_slice(&wire[offset..offset + n]);
+                offset += n;
+                decoder.commit_ciphertext(n).unwrap()
+            }
+            DecodeSlot::BlockedByPlaintext => DecodeEvent::PlainData,
+        };
+
+        match event {
+            DecodeEvent::NeedMore => {}
+            DecodeEvent::PlainData => frames.push(Some(collect_plaintext(&mut decoder))),
+            DecodeEvent::ZeroChunk => frames.push(None),
+            _ => {}
+        }
+    }
+    frames
 }
 
 fn collect_pending_trait<E>(encoder: &E) -> Vec<u8>

@@ -620,15 +620,16 @@ impl SnellTcpDecoder for V6ShapedDecoder {
                 }
                 let header = self.decode_header_in_place(prefix_len)?;
                 if header.body_len == 0 {
+                    let event = if self.finish_body(header)? {
+                        DecodeEvent::PlainData
+                    } else {
+                        DecodeEvent::ZeroChunk
+                    };
                     self.read_step = ShapedReadStep::Header {
                         prefix_len: self.next_prefix_len(),
                         filled: 0,
                     };
-                    return if self.finish_body(header)? {
-                        Ok(DecodeEvent::PlainData)
-                    } else {
-                        Ok(DecodeEvent::ZeroChunk)
-                    };
+                    return Ok(event);
                 }
                 self.read_step = ShapedReadStep::Body { header, filled: 0 };
                 Ok(DecodeEvent::NeedMore)
