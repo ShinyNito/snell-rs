@@ -205,7 +205,7 @@ where
     loop {
         let (stream, peer_addr) = listener.accept()?;
         let psk = psk.clone();
-        dispatcher
+        let _ = dispatcher
             .dispatch(move || async move {
                 // ponytail: per-connection on Windows; add worker-local pools if resume throughput matters.
                 let snell_client = Rc::new(SnellConnector::<M>::new(server, psk, resume));

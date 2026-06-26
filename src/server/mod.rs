@@ -107,7 +107,7 @@ pub async fn bind_tcp_listener_with_dispatcher(
         let (stream, peer_addr) = listener.accept()?;
         let psk = psk.clone();
         let outbound = outbound.clone();
-        dispatcher
+        let _ = dispatcher
             .dispatch(move || async move {
                 let stream = match TcpStream::from_std(stream) {
                     Ok(stream) => stream,
