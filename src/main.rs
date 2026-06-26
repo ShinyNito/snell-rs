@@ -234,8 +234,13 @@ where
 {
     let mut cpus = HashSet::new();
     cpus.insert(worker);
+    let mut proactor = compio::driver::Proactor::builder();
+    proactor
+        .buffer_pool_size(std::num::NonZero::<u16>::new(32).expect("nonzero buffer pool size"))
+        .buffer_pool_buffer_len(64 * 1024);
     compio::runtime::Runtime::builder()
         .thread_affinity(cpus)
+        .with_proactor(proactor)
         .build()?
         .block_on(future)
 }
