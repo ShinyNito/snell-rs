@@ -658,27 +658,6 @@ where
     ProbeCandidate::new(M::new_decoder(psk)).probe(bytes)
 }
 
-#[cfg(test)]
-fn probe_plaintext<D>(decoder: &D) -> ProbePlaintext
-where
-    D: SnellTcpDecoder,
-{
-    let mut pending = [std::io::IoSlice::new(&[]); 4];
-    let nbufs = decoder.pending_plaintext(&mut pending);
-    let mut buf = [0u8; MAX_CONNECT_REQUEST_LEN];
-    let mut len = 0;
-    for slice in &pending[..nbufs] {
-        let remaining = buf.len() - len;
-        let copied = slice.len().min(remaining);
-        buf[len..len + copied].copy_from_slice(&slice[..copied]);
-        len += copied;
-        if len == buf.len() {
-            break;
-        }
-    }
-    probe_control_plaintext(&buf[..len])
-}
-
 fn probe_control_plaintext(buf: &[u8]) -> ProbePlaintext {
     probe_control_prefix(snell::decode_connect_request_prefix(buf).map(|_| ()))
         .or_else(|| probe_control_prefix(snell::decode_udp_setup_request_prefix(buf).map(|_| ())))
@@ -714,40 +693,6 @@ mod tests {
         net::{TcpListener, TcpStream, UdpSocket},
         runtime, time,
     };
-
-    struct PendingPlaintext(Vec<u8>);
-
-    impl SnellTcpDecoder for PendingPlaintext {
-        fn next_cipher_len(&self) -> usize {
-            0
-        }
-
-        fn decode_ciphertext<B>(&mut self, _input: B) -> io::Result<DecodeEvent<'_>>
-        where
-            B: compio::buf::IoBufMut + Into<snell::PlaintextSegment>,
-        {
-            Ok(DecodeEvent::PlainData)
-        }
-
-        fn pending_plaintext<'a>(&'a self, out: &mut [std::io::IoSlice<'a>]) -> usize {
-            if out.is_empty() {
-                return 0;
-            }
-            out[0] = std::io::IoSlice::new(&self.0);
-            1
-        }
-
-        fn advance_plaintext(&mut self, _n: usize) {}
-
-        fn take_pending_plaintext(&mut self) -> Option<snell::PlaintextFrame> {
-            if self.0.is_empty() {
-                return None;
-            }
-            let body = std::mem::take(&mut self.0);
-            let len = body.len();
-            Some(snell::PlaintextFrame::from_segment(body, 0..len))
-        }
-    }
 
     fn encode_v6_shaped_connect_and_payload(
         psk: &[u8],
@@ -792,7 +737,10 @@ mod tests {
         auto_server_round_trip::<V6ShapedMode>().await;
     }
 
-    #[compio::test]
+    #[compio::test(with_proactor(
+        buffer_pool_size = std::num::NonZero::<u16>::new(32).expect("nonzero buffer pool size"),
+        buffer_pool_buffer_len = 64 * 1024
+    ))]
     async fn server_relays_large_tcp_upload() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let total = 32 * 1024 * 1024;
@@ -805,10 +753,12 @@ mod tests {
             let mut buf = [0u8; 64 * 1024];
             while received < total {
                 let n = read_once(&mut stream, &mut buf).await.unwrap();
-                assert_ne!(n, 0);
+                if n == 0 {
+                    break;
+                }
                 received += n;
             }
-            assert_eq!(received, total);
+            received
         });
 
         let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -842,12 +792,13 @@ mod tests {
         }
         local.shutdown().await.unwrap();
 
-        time::timeout(std::time::Duration::from_secs(5), target)
+        let received = time::timeout(std::time::Duration::from_secs(5), target)
             .await
             .unwrap()
             .unwrap();
         relay.await.unwrap();
         server.await.unwrap();
+        assert_eq!(received, total);
     }
 
     #[test]
@@ -910,11 +861,32 @@ mod tests {
 
     #[test]
     fn probe_plaintext_accepts_large_coalesced_payload() {
-        let mut plaintext = b"\x01\x05\x03abc\x0bexample.com\x01\xbb".to_vec();
-        plaintext.resize(plaintext.len() + MAX_CONNECT_REQUEST_LEN, b'x');
-        let decoder = PendingPlaintext(plaintext);
+        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
+        let destination = Address::domain("example.com", 443).unwrap();
 
-        assert_eq!(probe_plaintext(&decoder), ProbePlaintext::Match);
+        let mut encoder = V4Mode::new_encoder(psk.as_ref()).unwrap();
+        let request_len = snell::connect_request_len(destination.as_view()).unwrap();
+        let payload_len = encoder.next_plain_capacity() - request_len;
+        let mut plaintext = BytesMut::with_capacity(request_len + payload_len);
+        plaintext.resize(request_len, 0);
+        let n = snell::encode_connect_request_into(&mut plaintext, destination.as_view(), false)
+            .unwrap();
+        plaintext.truncate(n);
+        plaintext.resize(plaintext.len() + payload_len, b'x');
+
+        encoder.seal_plain(plaintext).unwrap();
+        let pending = encoder.take_pending_wire();
+        let mut wire = Vec::with_capacity(pending.total_len());
+        for slice in pending.iter_slices() {
+            wire.extend_from_slice(slice);
+        }
+
+        assert_eq!(
+            probe_mode::<V4Mode>(psk, &wire),
+            ProbeResult::Match {
+                consumed: wire.len()
+            }
+        );
     }
 
     #[test]
