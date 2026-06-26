@@ -2,11 +2,12 @@ use std::{
     future::{Future, poll_fn},
     io,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
+use compio::{
+    buf::BufResult,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -16,6 +17,9 @@ use super::{
     client::SnellTransport,
     driver::{SnellStreamReader, SnellStreamWriter, WriteFromState},
 };
+
+type PlainWriteFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), Vec<u8>>)>>>;
+type ShutdownFuture<W> = Pin<Box<dyn Future<Output = (W, io::Result<()>)>>>;
 
 pub(crate) struct InboundRequest {
     pub destination: Address,
@@ -55,25 +59,60 @@ where
     transport.copy_bidirectional(peer)
 }
 
-#[derive(Debug)]
-enum PlainState<R> {
-    Copying(WriteFromState<R>),
+enum PlainState<R, Reservation> {
+    Copying(WriteFromState<R, Reservation>),
     Done,
 }
 
-impl<R> Default for PlainState<R> {
-    fn default() -> Self {
-        Self::Copying(WriteFromState::default())
+impl<R, Reservation> PlainState<R, Reservation> {
+    fn new(reader: R) -> Self {
+        Self::Copying(WriteFromState::new(reader))
     }
 }
 
-#[derive(Debug, Default)]
-enum TunnelState {
-    #[default]
-    Reading,
-    Writing,
-    ShuttingDown,
+enum TunnelState<W> {
+    Reading(Option<W>),
+    Writing(PlainWriteFuture<W>),
+    ShuttingDown(ShutdownFuture<W>),
     Done,
+}
+
+impl<W> TunnelState<W> {
+    fn new(writer: W) -> Self {
+        Self::Reading(Some(writer))
+    }
+
+    fn take_writer(&mut self) -> W {
+        match self {
+            Self::Reading(writer) => writer.take().expect("plain writer missing"),
+            Self::Writing(_) | Self::ShuttingDown(_) | Self::Done => {
+                unreachable!("plain writer is busy")
+            }
+        }
+    }
+}
+
+impl<W> TunnelState<W>
+where
+    W: AsyncWrite + 'static,
+{
+    fn start_write(&mut self, payload: Vec<u8>) {
+        let mut writer = self.take_writer();
+        let future = Box::pin(async move {
+            let result = writer.write_all(payload).await;
+            (writer, result)
+        });
+        *self = Self::Writing(future);
+    }
+
+    fn start_shutdown(&mut self) {
+        let mut writer = self.take_writer();
+        let future = Box::pin(async move {
+            let result = writer.shutdown().await;
+            (writer, result)
+        });
+        *self = Self::ShuttingDown(future);
+    }
 }
 
 impl<M> CopyBidirectional for SnellTransport<M>
@@ -87,10 +126,11 @@ where
     type Output = Self;
 
     fn copy_bidirectional(self, peer: TcpStream) -> impl Future<Output = io::Result<Self>> {
-        let (mut peer_read, mut peer_write) = peer.into_split();
+        let (peer_read, peer_write) = peer.into_split();
         let mut transport = Some(self);
-        let mut plain_state = PlainState::default();
-        let mut tunnel_state = TunnelState::default();
+        let mut plain_state = PlainState::new(peer_read);
+        let mut tunnel_state = TunnelState::new(peer_write);
+        let mut tunnel_buf = Vec::new();
 
         poll_fn(move |cx| {
             let transport_ref = transport
@@ -98,12 +138,7 @@ where
                 .expect("snell transport polled after done");
             let mut pending = false;
 
-            match poll_plain_to_snell(
-                cx,
-                &mut transport_ref.writer,
-                &mut peer_read,
-                &mut plain_state,
-            ) {
+            match poll_plain_to_snell(cx, &mut transport_ref.writer, &mut plain_state) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => pending = true,
@@ -112,8 +147,8 @@ where
             match poll_snell_to_plain(
                 cx,
                 &mut transport_ref.reader,
-                &mut peer_write,
                 &mut tunnel_state,
+                &mut tunnel_buf,
             ) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -132,27 +167,24 @@ where
 fn poll_plain_to_snell<W, E, R>(
     cx: &mut Context<'_>,
     writer: &mut SnellStreamWriter<W, E>,
-    plain_read: &mut R,
-    state: &mut PlainState<E::Reservation>,
+    state: &mut PlainState<R, E::Reservation>,
 ) -> Poll<io::Result<()>>
 where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + 'static,
     E: crate::protocol::snell::SnellTcpEncoder,
-    R: AsyncRead + Unpin,
+    R: AsyncRead + 'static,
 {
     loop {
         match state {
-            PlainState::Copying(copy_state) => {
-                match writer.poll_write_from(cx, plain_read, copy_state) {
-                    Poll::Ready(Ok(true)) => continue,
-                    Poll::Ready(Ok(false)) => {
-                        *state = PlainState::Done;
-                        return Poll::Ready(Ok(()));
-                    }
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                    Poll::Pending => return Poll::Pending,
+            PlainState::Copying(copy_state) => match writer.poll_write_from(cx, copy_state) {
+                Poll::Ready(Ok(true)) => continue,
+                Poll::Ready(Ok(false)) => {
+                    *state = PlainState::Done;
+                    return Poll::Ready(Ok(()));
                 }
-            }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            },
             PlainState::Done => return Poll::Ready(Ok(())),
         }
     }
@@ -161,36 +193,36 @@ where
 fn poll_snell_to_plain<R, D, W>(
     cx: &mut Context<'_>,
     reader: &mut SnellStreamReader<R, D>,
-    plain_write: &mut W,
-    state: &mut TunnelState,
+    state: &mut TunnelState<W>,
+    buf: &mut Vec<u8>,
 ) -> Poll<io::Result<()>>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + 'static,
     D: crate::protocol::snell::SnellTcpDecoder,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + 'static,
 {
     loop {
         match state {
-            TunnelState::Reading => match reader.poll_read_next_plain(cx) {
-                Poll::Ready(Ok(true)) => *state = TunnelState::Writing,
-                Poll::Ready(Ok(false)) => *state = TunnelState::ShuttingDown,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            },
-            TunnelState::Writing => match reader.poll_write_pending_plaintext_to(cx, plain_write) {
-                Poll::Ready(Ok(0)) => *state = TunnelState::Reading,
-                Poll::Ready(Ok(_)) => continue,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            },
-            TunnelState::ShuttingDown => match Pin::new(&mut *plain_write).poll_shutdown(cx) {
-                Poll::Ready(Ok(())) => {
-                    *state = TunnelState::Done;
-                    return Poll::Ready(Ok(()));
+            TunnelState::Reading(_) => match reader.poll_read_frame_vec(cx, buf) {
+                Poll::Ready(Ok(true)) => {
+                    let payload = std::mem::take(buf);
+                    state.start_write(payload);
                 }
+                Poll::Ready(Ok(false)) => state.start_shutdown(),
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => return Poll::Pending,
             },
+            TunnelState::Writing(future) => {
+                let (writer, BufResult(result, _payload)) = ready!(future.as_mut().poll(cx));
+                *state = TunnelState::Reading(Some(writer));
+                result?;
+            }
+            TunnelState::ShuttingDown(future) => {
+                let (_writer, result) = ready!(future.as_mut().poll(cx));
+                result?;
+                *state = TunnelState::Done;
+                return Poll::Ready(Ok(()));
+            }
             TunnelState::Done => return Poll::Ready(Ok(())),
         }
     }

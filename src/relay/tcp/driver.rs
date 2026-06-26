@@ -1,33 +1,62 @@
 use std::{
+    future::{Future, poll_fn},
     io,
+    io::IoSlice,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, ready},
 };
 
-use std::io::IoSlice;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use compio::{
+    buf::BufResult,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+};
 
 use crate::protocol::snell::{
     DecodeEvent, DecodeSlot, PlainPrefix, SnellMode, SnellTcpDecoder, SnellTcpEncoder,
 };
 
-#[derive(Debug)]
+type ReadFuture<R> = Pin<Box<dyn Future<Output = (R, BufResult<usize, Vec<u8>>)>>>;
+type WriteAllFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), Vec<u8>>)>>>;
+type FlushFuture<W> = Pin<Box<dyn Future<Output = (W, io::Result<()>)>>>;
+
 pub struct SnellStreamReader<R, D> {
-    inner: R,
+    inner: ReaderIo<R>,
     decoder: D,
 }
 
-#[derive(Debug)]
 pub struct SnellStreamWriter<W, E> {
-    inner: W,
+    inner: WriterIo<W>,
     encoder: E,
 }
 
-#[derive(Debug)]
-pub(crate) enum WriteFromState<R> {
-    Reading(Option<R>),
-    Flushing { eof: bool },
+enum ReaderIo<R> {
+    Idle(Option<R>),
+    Reading(ReadFuture<R>),
+}
+
+enum WriterIo<W> {
+    Idle(Option<W>),
+    Writing {
+        advance: usize,
+        future: WriteAllFuture<W>,
+    },
+    Flushing(FlushFuture<W>),
+}
+
+pub(crate) enum WriteFromState<R, Reservation> {
+    Reading {
+        reader: Option<R>,
+        reservation: Option<Reservation>,
+    },
+    ReadPending {
+        reservation: Reservation,
+        future: ReadFuture<R>,
+    },
+    Flushing {
+        reader: Option<R>,
+        eof: bool,
+    },
     Done,
 }
 
@@ -38,15 +67,81 @@ pub(crate) enum WriteFrameState {
     Flushing,
 }
 
-impl<R> Default for WriteFromState<R> {
-    fn default() -> Self {
-        Self::Reading(None)
+impl<R, Reservation> WriteFromState<R, Reservation> {
+    pub(crate) fn new(reader: R) -> Self {
+        Self::Reading {
+            reader: Some(reader),
+            reservation: None,
+        }
+    }
+}
+
+impl<R> ReaderIo<R> {
+    fn new(inner: R) -> Self {
+        Self::Idle(Some(inner))
+    }
+
+    fn take_idle(&mut self) -> R {
+        match self {
+            Self::Idle(inner) => inner.take().expect("reader io missing"),
+            Self::Reading(_) => unreachable!("reader io is busy"),
+        }
+    }
+}
+
+impl<R> ReaderIo<R>
+where
+    R: AsyncRead + 'static,
+{
+    fn start_read(&mut self, len: usize) {
+        let mut inner = self.take_idle();
+        let future = Box::pin(async move {
+            let result = inner.read(Vec::with_capacity(len)).await;
+            (inner, result)
+        });
+        *self = Self::Reading(future);
+    }
+}
+
+impl<W> WriterIo<W> {
+    fn new(inner: W) -> Self {
+        Self::Idle(Some(inner))
+    }
+
+    fn take_idle(&mut self) -> W {
+        match self {
+            Self::Idle(inner) => inner.take().expect("writer io missing"),
+            Self::Writing { .. } | Self::Flushing(_) => unreachable!("writer io is busy"),
+        }
+    }
+}
+
+impl<W> WriterIo<W>
+where
+    W: AsyncWrite + 'static,
+{
+    fn start_write_all(&mut self, buf: Vec<u8>, advance: usize) {
+        let mut inner = self.take_idle();
+        let future = Box::pin(async move {
+            let result = inner.write_all(buf).await;
+            (inner, result)
+        });
+        *self = Self::Writing { advance, future };
+    }
+
+    fn start_flush(&mut self) {
+        let mut inner = self.take_idle();
+        let future = Box::pin(async move {
+            let result = inner.flush().await;
+            (inner, result)
+        });
+        *self = Self::Flushing(future);
     }
 }
 
 impl<R, D> SnellStreamReader<R, D>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + 'static,
     D: SnellTcpDecoder,
 {
     pub fn new<M>(inner: R, psk: Arc<[u8]>) -> Self
@@ -54,16 +149,16 @@ where
         M: SnellMode<Decoder = D>,
     {
         Self {
-            inner,
+            inner: ReaderIo::new(inner),
             decoder: M::new_decoder(psk),
         }
     }
 
-    pub(crate) fn poll_read_next_plain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        if self.decoder.has_pending_plaintext() {
-            return Poll::Ready(Ok(true));
+    pub(crate) fn from_decoder(inner: R, decoder: D) -> Self {
+        Self {
+            inner: ReaderIo::new(inner),
+            decoder,
         }
-        self.poll_read_frame(cx)
     }
 
     pub(crate) fn poll_read_frame_vec(
@@ -126,28 +221,6 @@ where
         }
     }
 
-    pub(crate) fn poll_write_pending_plaintext_to<W>(
-        &mut self,
-        cx: &mut Context<'_>,
-        writer: &mut W,
-    ) -> Poll<io::Result<usize>>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let mut bufs = [IoSlice::new(&[]); 4];
-        let nbufs = self.decoder.pending_plaintext(&mut bufs);
-        if nbufs == 0 {
-            return Poll::Ready(Ok(0));
-        }
-
-        let n = ready!(Pin::new(writer).poll_write_vectored(cx, &bufs[..nbufs]))?;
-        if n == 0 {
-            return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-        }
-        self.decoder.advance_plaintext(n);
-        Poll::Ready(Ok(n))
-    }
-
     pub async fn read_exact_plain(&mut self, dst: &mut [u8]) -> io::Result<()> {
         let mut filled = 0;
         while filled < dst.len() {
@@ -157,7 +230,7 @@ where
                 continue;
             }
 
-            if !self.read_frame().await? {
+            if !poll_fn(|cx| self.poll_read_frame(cx)).await? {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "snell zero chunk while reading control data",
@@ -167,43 +240,49 @@ where
         Ok(())
     }
 
-    async fn read_frame(&mut self) -> io::Result<bool> {
-        loop {
-            let slot = match self.decoder.next_ciphertext_slot() {
-                DecodeSlot::Read(slot) => slot,
-                DecodeSlot::BlockedByPlaintext => {
-                    return Ok(true);
-                }
-            };
-            let n = self.inner.read(slot).await?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "early eof"));
-            }
-
-            match self.decoder.commit_ciphertext(n)? {
-                DecodeEvent::PlainData => return Ok(true),
-                DecodeEvent::ZeroChunk => return Ok(false),
-                _ => continue,
-            }
+    #[cfg(test)]
+    pub(crate) async fn read_frame_vec(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut out = Vec::new();
+        if poll_fn(|cx| self.poll_read_frame_vec(cx, &mut out)).await? {
+            Ok(Some(out))
+        } else {
+            Ok(None)
         }
     }
 
     fn poll_read_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
         loop {
-            let slot = match self.decoder.next_ciphertext_slot() {
-                DecodeSlot::Read(slot) => slot,
-                DecodeSlot::BlockedByPlaintext => {
-                    return Poll::Ready(Ok(true));
+            match self.decoder.next_ciphertext_slot() {
+                DecodeSlot::Read(slot) => {
+                    if matches!(self.inner, ReaderIo::Idle(_)) {
+                        self.inner.start_read(slot.len());
+                    }
                 }
+                DecodeSlot::BlockedByPlaintext => return Poll::Ready(Ok(true)),
+            }
+
+            let (inner, BufResult(result, buf)) = match &mut self.inner {
+                ReaderIo::Idle(_) => continue,
+                ReaderIo::Reading(future) => ready!(future.as_mut().poll(cx)),
             };
-            let mut buf = ReadBuf::new(slot);
-            ready!(Pin::new(&mut self.inner).poll_read(cx, &mut buf))?;
-            let n = buf.filled().len();
+            self.inner = ReaderIo::Idle(Some(inner));
+
+            let n = result?;
             if n == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "early eof",
                 )));
+            }
+
+            match self.decoder.next_ciphertext_slot() {
+                DecodeSlot::Read(slot) => slot[..n].copy_from_slice(&buf[..n]),
+                DecodeSlot::BlockedByPlaintext => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snell decoder blocked after socket read",
+                    )));
+                }
             }
 
             match self.decoder.commit_ciphertext(n)? {
@@ -240,27 +319,11 @@ where
         self.decoder.advance_plaintext(copied);
         copied
     }
-
-    #[cfg(test)]
-    pub(crate) async fn read_frame_vec(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if !self.read_frame().await? {
-            return Ok(None);
-        }
-
-        let mut out = Vec::new();
-        while self.decoder.has_pending_plaintext() {
-            let copied = self.copy_pending_plaintext_to_vec(&mut out);
-            if copied == 0 {
-                break;
-            }
-        }
-        Ok(Some(out))
-    }
 }
 
 impl<W, E> SnellStreamWriter<W, E>
 where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + 'static,
     E: SnellTcpEncoder,
 {
     pub fn new<M>(inner: W, psk: Arc<[u8]>) -> io::Result<Self>
@@ -268,7 +331,7 @@ where
         M: SnellMode<Encoder = E>,
     {
         Ok(Self {
-            inner,
+            inner: WriterIo::new(inner),
             encoder: M::new_encoder(&psk)?,
         })
     }
@@ -285,7 +348,7 @@ where
             if written == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "snell v4 encoder accepted no payload",
+                    "snell encoder accepted no payload",
                 ));
             }
             offset += written;
@@ -296,15 +359,17 @@ where
     pub(crate) fn poll_write_from<R>(
         &mut self,
         cx: &mut Context<'_>,
-        reader: &mut R,
-        state: &mut WriteFromState<E::Reservation>,
+        state: &mut WriteFromState<R, E::Reservation>,
     ) -> Poll<io::Result<bool>>
     where
-        R: AsyncRead + Unpin,
+        R: AsyncRead + 'static,
     {
         loop {
             match state {
-                WriteFromState::Reading(reservation) => {
+                WriteFromState::Reading {
+                    reader,
+                    reservation,
+                } => {
                     if reservation.is_none() {
                         *reservation = Some(
                             self.encoder
@@ -312,34 +377,56 @@ where
                         );
                     }
 
-                    let n = {
-                        let reservation_ref =
-                            reservation.as_ref().expect("reservation just created");
-                        let slot = self.encoder.plain_slot(reservation_ref);
-                        let mut buf = ReadBuf::new(slot);
-                        match Pin::new(&mut *reader).poll_read(cx, &mut buf) {
-                            Poll::Ready(Ok(())) => buf.filled().len(),
-                            Poll::Ready(Err(error)) => {
-                                let reservation =
-                                    reservation.take().expect("reservation just created");
-                                self.encoder.cancel_plain_reservation(reservation);
-                                return Poll::Ready(Err(error));
-                            }
-                            Poll::Pending => return Poll::Pending,
-                        }
+                    let reservation_ref = reservation.as_ref().expect("reservation just created");
+                    let slot_len = self.encoder.plain_slot(reservation_ref).len();
+                    let mut plain_read = reader.take().expect("plain reader missing");
+                    let reservation = reservation.take().expect("reservation just created");
+                    let future = Box::pin(async move {
+                        let result = plain_read.read(Vec::with_capacity(slot_len)).await;
+                        (plain_read, result)
+                    });
+                    *state = WriteFromState::ReadPending {
+                        reservation,
+                        future,
+                    };
+                }
+                WriteFromState::ReadPending { future, .. } => {
+                    let (reader, BufResult(result, buf)) = ready!(future.as_mut().poll(cx));
+                    let old_state = std::mem::replace(state, WriteFromState::Done);
+                    let reservation = match old_state {
+                        WriteFromState::ReadPending { reservation, .. } => reservation,
+                        _ => unreachable!("write-from state changed while polling"),
                     };
 
-                    let reservation = reservation.take().expect("reservation just created");
+                    let n = match result {
+                        Ok(n) => n,
+                        Err(error) => {
+                            self.encoder.cancel_plain_reservation(reservation);
+                            *state = WriteFromState::Reading {
+                                reader: Some(reader),
+                                reservation: None,
+                            };
+                            return Poll::Ready(Err(error));
+                        }
+                    };
+                    self.encoder.plain_slot(&reservation)[..n].copy_from_slice(&buf[..n]);
                     self.encoder.finish_plain_reservation(reservation, n)?;
-                    *state = WriteFromState::Flushing { eof: n == 0 };
+                    *state = WriteFromState::Flushing {
+                        reader: Some(reader),
+                        eof: n == 0,
+                    };
                 }
-                WriteFromState::Flushing { eof } => {
+                WriteFromState::Flushing { reader, eof } => {
                     ready!(self.poll_drain_pending(cx))?;
+                    let reader = reader.take().expect("plain reader missing");
                     if *eof {
                         *state = WriteFromState::Done;
                         return Poll::Ready(Ok(false));
                     }
-                    *state = WriteFromState::Reading(None);
+                    *state = WriteFromState::Reading {
+                        reader: Some(reader),
+                        reservation: None,
+                    };
                     return Poll::Ready(Ok(true));
                 }
                 WriteFromState::Done => return Poll::Ready(Ok(false)),
@@ -409,35 +496,41 @@ where
     }
 
     async fn drain_pending(&mut self) -> io::Result<()> {
-        while self.encoder.has_pending_wire() {
-            let mut pending = [IoSlice::new(&[]); 5];
-            let nbufs = self.encoder.pending_wire(&mut pending);
-            let n = self.inner.write_vectored(&pending[..nbufs]).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "snell writer made no progress",
-                ));
-            }
-            self.encoder.advance_wire(n);
-        }
-        self.inner.flush().await
+        poll_fn(|cx| self.poll_drain_pending(cx)).await
     }
 
     fn poll_drain_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while self.encoder.has_pending_wire() {
-            let mut pending = [IoSlice::new(&[]); 5];
-            let nbufs = self.encoder.pending_wire(&mut pending);
-            let n = ready!(Pin::new(&mut self.inner).poll_write_vectored(cx, &pending[..nbufs]))?;
-            if n == 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "snell writer made no progress",
-                )));
+        loop {
+            match &mut self.inner {
+                WriterIo::Idle(_) => {
+                    if self.encoder.has_pending_wire() {
+                        let mut pending = [IoSlice::new(&[]); 5];
+                        let nbufs = self.encoder.pending_wire(&mut pending);
+                        let mut wire = Vec::new();
+                        for slice in &pending[..nbufs] {
+                            wire.extend_from_slice(slice);
+                        }
+                        let len = wire.len();
+                        // ponytail: coalesce vectored chunks; restore vectored writes if this costs throughput.
+                        self.inner.start_write_all(wire, len);
+                        continue;
+                    }
+                    self.inner.start_flush();
+                }
+                WriterIo::Writing { advance, future } => {
+                    let advance = *advance;
+                    let (inner, BufResult(result, _buf)) = ready!(future.as_mut().poll(cx));
+                    self.inner = WriterIo::Idle(Some(inner));
+                    result?;
+                    self.encoder.advance_wire(advance);
+                }
+                WriterIo::Flushing(future) => {
+                    let (inner, result) = ready!(future.as_mut().poll(cx));
+                    self.inner = WriterIo::Idle(Some(inner));
+                    return Poll::Ready(result);
+                }
             }
-            self.encoder.advance_wire(n);
         }
-        Pin::new(&mut self.inner).poll_flush(cx)
     }
 }
 
@@ -445,13 +538,14 @@ where
 mod tests {
     use super::*;
     use crate::protocol::snell::{V4Decoder, V4Encoder, V4Mode};
+    use compio::net::{TcpListener, TcpStream};
 
-    #[tokio::test]
+    #[compio::test]
     async fn round_trips_payload_and_zero_chunk() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
-        let (client, server) = tokio::io::duplex(4096);
-        let (server_read, _) = tokio::io::split(server);
-        let (_, client_write) = tokio::io::split(client);
+        let (client, server) = tcp_pair().await;
+        let (server_read, _) = server.into_split();
+        let (_, client_write) = client.into_split();
         let mut writer: SnellStreamWriter<_, V4Encoder> =
             SnellStreamWriter::new::<V4Mode>(client_write, psk.clone()).unwrap();
         let mut reader: SnellStreamReader<_, V4Decoder> =
@@ -463,5 +557,16 @@ mod tests {
         let payload = reader.read_frame_vec().await.unwrap().unwrap();
         assert_eq!(payload, b"hello");
         assert!(reader.read_frame_vec().await.unwrap().is_none());
+    }
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) =
+            futures::future::try_join(TcpStream::connect(addr), listener.accept())
+                .await
+                .unwrap();
+        let (server, _) = accepted;
+        (client, server)
     }
 }

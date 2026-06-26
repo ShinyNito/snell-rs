@@ -16,7 +16,7 @@ ring = "0.17"
 argon2 = "0.5"
 blake2 = "0.10"
 rand = "0.8"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+compio = { version = "0.19", features = ["dispatcher", "iocp-global", "macros", "net", "time"] }
 mimalloc = { version = "0.1", default-features = false }
 clap = { version = "4", features = ["derive"] }
 rust-ini = "0.21"
@@ -32,4 +32,3 @@ rustix = { version = "1", features = ["net"] }
 
 [dev-dependencies]
 hex = "0.4"
-tokio = { version = "1", features = ["test-util", "macros", "rt", "time"] }

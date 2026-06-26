@@ -9,11 +9,12 @@ use std::{
     time::Duration,
 };
 
-use lru_time_cache::LruCache;
-use tokio::{
-    io::{AsyncRead, ReadBuf},
+use compio::{
+    buf::BufResult,
+    io::AsyncRead,
     net::{TcpStream, UdpSocket},
 };
+use lru_time_cache::LruCache;
 
 use crate::{
     protocol::{
@@ -29,6 +30,10 @@ use crate::{
 
 pub(crate) const UDP_ASSOCIATION_TTL: Duration = Duration::from_mins(5);
 pub(crate) const MAX_UDP_DATAGRAM_LEN: usize = 65_535;
+
+type TcpReadFuture = Pin<Box<dyn Future<Output = (TcpStream, BufResult<usize, Vec<u8>>)>>>;
+type UdpSendFuture = Pin<Box<dyn Future<Output = BufResult<usize, Vec<u8>>>>>;
+type UdpRecvFuture = Pin<Box<dyn Future<Output = BufResult<(usize, SocketAddr), Vec<u8>>>>>;
 
 pub(crate) trait Outbound {
     type Transport: DatagramTransport;
@@ -128,17 +133,7 @@ where
             }
         }
     }
-}
 
-impl<M, O> SnellUdpRelay<M, O>
-where
-    M: SnellMode + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
-    O: DatagramTransport + Unpin,
-    O::SendState: Unpin,
-{
     fn poll_snell_to_outbound(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
         let outbound = &mut self.outbound;
         let send_state = &mut self.outbound_send_state;
@@ -194,12 +189,12 @@ where
     <M::Encoder as SnellTcpEncoder>::Reservation: Send,
 {
     let mut relay = Socks5UdpRelay {
-        control,
+        control: TcpControlState::new(control),
         socket,
         connector,
         nat: LruCache::with_expiry_duration(UDP_ASSOCIATION_TTL),
         client_in: vec![0; MAX_UDP_DATAGRAM_LEN],
-        control_buf: [0],
+        client_recv_state: UdpRecvState::default(),
     };
     poll_fn(move |cx| relay.poll(cx))
 }
@@ -208,12 +203,12 @@ struct Socks5UdpRelay<M>
 where
     M: SnellMode,
 {
-    control: TcpStream,
+    control: TcpControlState,
     socket: UdpSocket,
     connector: Arc<SnellConnector<M>>,
     nat: LruCache<SocketAddr, RefCell<ClientUdpAssociation<M>>>,
     client_in: Vec<u8>,
-    control_buf: [u8; 1],
+    client_recv_state: UdpRecvState,
 }
 
 impl<M> Socks5UdpRelay<M>
@@ -227,7 +222,7 @@ where
         loop {
             let mut progressed = false;
 
-            match self.poll_control(cx) {
+            match self.control.poll(cx) {
                 Poll::Ready(Ok(true)) => progressed = true,
                 Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -272,25 +267,14 @@ where
             }
         }
     }
-}
-
-impl<M> Socks5UdpRelay<M>
-where
-    M: SnellMode + Send + Sync + 'static + Unpin,
-    M::Encoder: Send + Unpin,
-    M::Decoder: Send + Unpin,
-    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
-{
-    fn poll_control(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        let mut buf = ReadBuf::new(&mut self.control_buf);
-        ready!(Pin::new(&mut self.control).poll_read(cx, &mut buf))?;
-        Poll::Ready(Ok(!buf.filled().is_empty()))
-    }
 
     fn poll_client_udp(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        let mut buf = ReadBuf::new(&mut self.client_in);
-        let peer = ready!(self.socket.poll_recv_from(cx, &mut buf))?;
-        let n = buf.filled().len();
+        let (n, peer) = ready!(poll_udp_recv_from(
+            &self.socket,
+            cx,
+            &mut self.client_recv_state,
+            &mut self.client_in,
+        ))?;
         let Ok(packet) = socks5::parse_udp_packet(&self.client_in[..n]) else {
             return Poll::Ready(Ok(true));
         };
@@ -315,7 +299,38 @@ where
     }
 }
 
-type ConnectFuture<M> = Pin<Box<dyn Future<Output = io::Result<SnellTransport<M>>> + Send>>;
+enum TcpControlState {
+    Idle(Option<TcpStream>),
+    Reading(TcpReadFuture),
+}
+
+impl TcpControlState {
+    fn new(control: TcpStream) -> Self {
+        Self::Idle(Some(control))
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        loop {
+            match self {
+                Self::Idle(control) => {
+                    let mut control = control.take().expect("control stream missing");
+                    let future = Box::pin(async move {
+                        let result = control.read(Vec::with_capacity(1)).await;
+                        (control, result)
+                    });
+                    *self = Self::Reading(future);
+                }
+                Self::Reading(future) => {
+                    let (control, BufResult(result, _buf)) = ready!(future.as_mut().poll(cx));
+                    *self = Self::Idle(Some(control));
+                    return Poll::Ready(result.map(|n| n != 0));
+                }
+            }
+        }
+    }
+}
+
+type ConnectFuture<M> = Pin<Box<dyn Future<Output = io::Result<SnellTransport<M>>>>>;
 
 enum ClientUdpTransport<M>
 where
@@ -434,13 +449,23 @@ fn is_clean_udp_close(error: &io::Error) -> bool {
 }
 
 #[derive(Default)]
-enum UdpSendState {
+pub(crate) enum UdpSendState {
     #[default]
     Ready,
-    Sending,
+    Sending {
+        len: usize,
+        future: UdpSendFuture,
+    },
 }
 
-fn poll_udp_send_to(
+#[derive(Default)]
+pub(crate) enum UdpRecvState {
+    #[default]
+    Ready,
+    Receiving(UdpRecvFuture),
+}
+
+pub(crate) fn poll_udp_send_to(
     socket: &UdpSocket,
     cx: &mut Context<'_>,
     destination: SocketAddr,
@@ -449,17 +474,58 @@ fn poll_udp_send_to(
 ) -> Poll<io::Result<()>> {
     loop {
         match state {
-            UdpSendState::Ready => *state = UdpSendState::Sending,
-            UdpSendState::Sending => {
-                let n = ready!(socket.poll_send_to(cx, packet, destination))?;
+            UdpSendState::Ready => {
+                let socket = socket.clone();
+                let packet = packet.to_vec();
+                let len = packet.len();
+                let future = Box::pin(async move { socket.send_to(packet, destination).await });
+                *state = UdpSendState::Sending { len, future };
+            }
+            UdpSendState::Sending { len, future } => {
+                let len = *len;
+                let BufResult(result, _packet) = ready!(future.as_mut().poll(cx));
                 *state = UdpSendState::Ready;
-                if n != packet.len() {
+                if result? != len {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "udp socket sent a partial datagram",
                     )));
                 }
                 return Poll::Ready(Ok(()));
+            }
+        }
+    }
+}
+
+pub(crate) fn poll_udp_recv_from(
+    socket: &UdpSocket,
+    cx: &mut Context<'_>,
+    state: &mut UdpRecvState,
+    buf: &mut [u8],
+) -> Poll<io::Result<(usize, SocketAddr)>> {
+    loop {
+        match state {
+            UdpRecvState::Ready => {
+                let socket = socket.clone();
+                let future = Box::pin(async move {
+                    socket
+                        .recv_from(Vec::with_capacity(MAX_UDP_DATAGRAM_LEN))
+                        .await
+                });
+                *state = UdpRecvState::Receiving(future);
+            }
+            UdpRecvState::Receiving(future) => {
+                let BufResult(result, packet) = ready!(future.as_mut().poll(cx));
+                *state = UdpRecvState::Ready;
+                let (n, source) = result?;
+                if n > buf.len() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "udp packet is larger than receive buffer",
+                    )));
+                }
+                buf[..n].copy_from_slice(&packet[..n]);
+                return Poll::Ready(Ok((n, source)));
             }
         }
     }
@@ -472,7 +538,10 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::net::TcpListener;
+    use compio::{
+        net::{TcpListener, TcpStream},
+        runtime, time,
+    };
 
     use super::*;
     use crate::{
@@ -483,14 +552,16 @@ mod tests {
         },
     };
 
-    #[tokio::test]
+    #[compio::test]
     async fn snell_udp_keeps_plaintext_pending_when_outbound_send_pends() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
-        let (server, _) = listener.accept().await.unwrap();
-        let client = client.await.unwrap();
+        let (client, accepted) =
+            futures::future::try_join(TcpStream::connect(addr), listener.accept())
+                .await
+                .unwrap();
+        let (server, _) = accepted;
 
         let (server_read, server_write) = server.into_split();
         let server_transport: SnellTransport<V4Mode> = SnellTransport::new(
@@ -504,7 +575,7 @@ mod tests {
         let outbound = PendingOnceOutbound {
             state: state.clone(),
         };
-        let relay = tokio::spawn(relay_snell_udp(server_transport, outbound));
+        let relay = runtime::spawn(relay_snell_udp(server_transport, outbound));
 
         let destination = Address::from(SocketAddr::from(([127, 0, 0, 1], 53)));
         let destination_view = destination.as_view();
@@ -514,12 +585,12 @@ mod tests {
         packet[header_len..].copy_from_slice(b"ping");
         client_writer.write_frame(&packet).await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        time::timeout(Duration::from_secs(1), async {
             loop {
                 if state.lock().unwrap().payload.is_some() {
                     break;
                 }
-                tokio::task::yield_now().await;
+                time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -532,8 +603,7 @@ mod tests {
             assert_eq!(state.payload.as_deref(), Some(&b"ping"[..]));
         }
 
-        relay.abort();
-        let _ = relay.await;
+        drop(relay);
     }
 
     #[derive(Default)]

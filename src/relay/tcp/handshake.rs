@@ -18,8 +18,10 @@
 //! （否则上游 Error/dial 失败时客户端误以为 CONNECT 已建立）。本模块只到
 //! 拿到 target 为止；dial/ConnectCmd/WaitTunnel/Succeeded 在后续阶段。
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use compio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 use crate::protocol::address::Address;
 use crate::protocol::socks5::{self, Command, METHOD_NO_AUTH, ParseState, Socks5Error};
@@ -77,7 +79,7 @@ async fn read_greeting(local: &mut TcpStream) -> Result<(), HandshakeError> {
             return Err(Socks5Error::Malformed("oversized greeting").into());
         }
         if filled < need {
-            local.read_exact(&mut buf[filled..need]).await?;
+            read_exact_into(local, &mut buf[filled..need]).await?;
             filled = need;
         }
     };
@@ -93,7 +95,8 @@ async fn read_greeting(local: &mut TcpStream) -> Result<(), HandshakeError> {
 async fn write_method_selection(local: &mut TcpStream) -> Result<(), HandshakeError> {
     let mut reply = [0u8; 2];
     let n = socks5::encode_method_selection(&mut reply, METHOD_NO_AUTH)?;
-    local.write_all(&reply[..n]).await?;
+    let (result, _reply) = local.write_all(reply[..n].to_vec()).await.into_parts();
+    result?;
     Ok(())
 }
 
@@ -113,10 +116,20 @@ async fn read_request(local: &mut TcpStream) -> Result<(Command, Address), Hands
             return Err(Socks5Error::Malformed("oversized request").into());
         }
         if filled < need {
-            local.read_exact(&mut buf[filled..need]).await?;
+            read_exact_into(local, &mut buf[filled..need]).await?;
             filled = need;
         }
     };
     // request.destination 借用 buf，但 buf 是局部——返回 owned 形态避免悬空。
     Ok((request.command, request.destination.into_owned()))
+}
+
+async fn read_exact_into(stream: &mut TcpStream, dst: &mut [u8]) -> std::io::Result<()> {
+    let (result, buf) = stream
+        .read_exact(Vec::with_capacity(dst.len()))
+        .await
+        .into_parts();
+    result?;
+    dst.copy_from_slice(&buf);
+    Ok(())
 }

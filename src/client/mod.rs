@@ -1,7 +1,10 @@
 use std::{error::Error, io::Result, net::SocketAddr, sync::Arc};
 
-use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
-use tokio::{io::AsyncWriteExt, time};
+use compio::{
+    io::AsyncWriteExt,
+    net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
+    runtime, time,
+};
 
 use crate::{
     keepalive::apply_tcp_keepalive,
@@ -32,15 +35,30 @@ pub struct ClientConfig {
 }
 
 pub async fn bind_tcp_listener(config: ClientConfig) -> Result<()> {
-    let socket = if config.listen.is_ipv4() {
-        TcpSocket::new_v4()?
+    let listener = bind_listener(config.listen).await?;
+    serve_socks5_listener(listener, config).await
+}
+
+async fn bind_listener(listen: SocketAddr) -> Result<TcpListener> {
+    let socket = if listen.is_ipv4() {
+        TcpSocket::new_v4().await?
     } else {
-        TcpSocket::new_v6()?
+        TcpSocket::new_v6().await?
     };
     socket.set_reuseaddr(true)?;
+    #[cfg(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin"),
+    ))]
+    socket.set_reuseport(true)?;
     socket.set_nodelay(true)?;
-    socket.bind(config.listen)?;
-    let listener = socket.listen(4096)?;
+    socket.bind(listen).await?;
+    socket.listen(4096).await
+}
+
+async fn serve_socks5_listener(listener: TcpListener, config: ClientConfig) -> Result<()> {
     match config.version {
         ProtocolVersion::V4 | ProtocolVersion::V5 => {
             serve_socks5_listener_typed::<V4Mode>(
@@ -81,6 +99,56 @@ pub async fn bind_tcp_listener(config: ClientConfig) -> Result<()> {
     }
 }
 
+#[cfg(windows)]
+pub async fn bind_tcp_listener_with_dispatcher(
+    config: ClientConfig,
+    dispatcher: Arc<compio::dispatcher::Dispatcher>,
+) -> Result<()> {
+    let listener = bind_listener(config.listen).await?;
+    match config.version {
+        ProtocolVersion::V4 | ProtocolVersion::V5 => {
+            serve_socks5_listener_typed_with_dispatcher::<V4Mode>(
+                listener,
+                config.server,
+                config.psk,
+                config.resume,
+                dispatcher,
+            )
+            .await
+        }
+        ProtocolVersion::V6(V6Mode::Default) => {
+            serve_socks5_listener_typed_with_dispatcher::<V6ShapedMode>(
+                listener,
+                config.server,
+                config.psk,
+                config.resume,
+                dispatcher,
+            )
+            .await
+        }
+        ProtocolVersion::V6(V6Mode::Unshaped) => {
+            serve_socks5_listener_typed_with_dispatcher::<V6UnshapedMode>(
+                listener,
+                config.server,
+                config.psk,
+                config.resume,
+                dispatcher,
+            )
+            .await
+        }
+        ProtocolVersion::V6(V6Mode::UnsafeRaw) => {
+            serve_socks5_listener_typed_with_dispatcher::<V6UnsafeRawMode>(
+                listener,
+                config.server,
+                config.psk,
+                config.resume,
+                dispatcher,
+            )
+            .await
+        }
+    }
+}
+
 async fn serve_socks5_listener_typed<M>(
     listener: TcpListener,
     server: SocketAddr,
@@ -100,12 +168,45 @@ where
             tracing::warn!(%peer_addr, %error, "SOCKS5 inbound tcp keepalive could not be enabled");
         }
         let snell_client = snell_client.clone();
-        tokio::spawn(async move {
+        runtime::spawn(async move {
             match serve_socks5_inbound(stream, snell_client).await {
                 Ok(()) => tracing::info!(%peer_addr, "client inbound ended"),
                 Err(error) => tracing::info!(%peer_addr, %error, "client inbound failed"),
             }
-        });
+        })
+        .detach();
+    }
+}
+
+#[cfg(windows)]
+async fn serve_socks5_listener_typed_with_dispatcher<M>(
+    listener: TcpListener,
+    server: SocketAddr,
+    psk: Vec<u8>,
+    resume: bool,
+    dispatcher: Arc<compio::dispatcher::Dispatcher>,
+) -> Result<()>
+where
+    M: SnellMode + Send + Sync + 'static + Unpin,
+    M::Encoder: Send + Unpin,
+    M::Decoder: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+{
+    let snell_client = Arc::new(SnellConnector::<M>::new(server, psk, resume));
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        if let Err(error) = apply_tcp_keepalive(&stream) {
+            tracing::warn!(%peer_addr, %error, "SOCKS5 inbound tcp keepalive could not be enabled");
+        }
+        let snell_client = snell_client.clone();
+        dispatcher
+            .dispatch(move || async move {
+                match serve_socks5_inbound(stream, snell_client).await {
+                    Ok(()) => tracing::info!(%peer_addr, "client inbound ended"),
+                    Err(error) => tracing::info!(%peer_addr, %error, "client inbound failed"),
+                }
+            })
+            .map_err(|_| std::io::Error::other("dispatcher workers stopped"))?;
     }
 }
 
@@ -171,5 +272,6 @@ async fn write_socks5_reply_with_bind(
 ) -> Result<()> {
     let mut buf = [0u8; socks5::MAX_REPLY_LEN];
     let n = socks5::encode_reply(&mut buf, reply, bind)?;
-    stream.write_all(&buf[..n]).await
+    let (result, _buf) = stream.write_all(buf[..n].to_vec()).await.into_parts();
+    result
 }

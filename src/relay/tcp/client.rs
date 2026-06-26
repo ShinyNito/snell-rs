@@ -1,12 +1,6 @@
 use std::{io, marker::PhantomData, net::SocketAddr, sync::Arc};
 
-use tokio::{
-    io::AsyncRead,
-    net::{
-        TcpStream,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
-};
+use compio::{io::AsyncRead, net::TcpStream};
 
 use crate::protocol::{
     address::Address,
@@ -37,8 +31,8 @@ pub struct SnellTransport<M>
 where
     M: SnellMode,
 {
-    pub(crate) reader: SnellStreamReader<OwnedReadHalf, M::Decoder>,
-    pub(crate) writer: SnellStreamWriter<OwnedWriteHalf, M::Encoder>,
+    pub(crate) reader: SnellStreamReader<TcpStream, M::Decoder>,
+    pub(crate) writer: SnellStreamWriter<TcpStream, M::Encoder>,
 }
 
 pub struct PooledSnellTransport<M>
@@ -190,8 +184,8 @@ where
     M: SnellMode,
 {
     pub(crate) fn new(
-        reader: SnellStreamReader<OwnedReadHalf, M::Decoder>,
-        writer: SnellStreamWriter<OwnedWriteHalf, M::Encoder>,
+        reader: SnellStreamReader<TcpStream, M::Decoder>,
+        writer: SnellStreamWriter<TcpStream, M::Encoder>,
     ) -> Self {
         Self { reader, writer }
     }
@@ -230,7 +224,7 @@ fn is_retriable_pool_error(error: &io::Error) -> bool {
 
 async fn read_server_reply<R, D>(reader: &mut SnellStreamReader<R, D>) -> io::Result<()>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + 'static,
     D: SnellTcpDecoder,
 {
     let mut command = [0u8; 1];
@@ -262,9 +256,10 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+    use compio::{
+        io::{AsyncRead, AsyncWrite},
         net::{TcpListener, TcpStream},
+        runtime,
     };
 
     use super::*;
@@ -273,7 +268,7 @@ mod tests {
         snell::{self, COMMAND_TUNNEL, MAX_CONNECT_REQUEST_LEN, V4Mode},
     };
 
-    #[tokio::test]
+    #[compio::test]
     async fn reuses_one_upstream_tcp_for_two_transports() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let destination = Address::domain("example.com", 443).unwrap();
@@ -283,7 +278,7 @@ mod tests {
         let server_accepts = accepts.clone();
         let server_psk = psk.clone();
 
-        let server = tokio::spawn(async move {
+        let server = runtime::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             server_accepts.fetch_add(1, Ordering::SeqCst);
             let mut transport = snell_transport::<V4Mode>(stream, server_psk);
@@ -309,7 +304,7 @@ mod tests {
         assert_eq!(accepts.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn resume_disabled_opens_new_upstream_for_each_transport() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let destination = Address::domain("example.com", 443).unwrap();
@@ -319,7 +314,7 @@ mod tests {
         let server_accepts = accepts.clone();
         let server_psk = psk.clone();
 
-        let server = tokio::spawn(async move {
+        let server = runtime::spawn(async move {
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await.unwrap();
                 server_accepts.fetch_add(1, Ordering::SeqCst);
@@ -350,11 +345,11 @@ mod tests {
     ) {
         let transport = Outbound::connect(client, destination).await.unwrap();
         let (local, mut peer) = tcp_pair().await;
-        let relay = tokio::spawn(copy_bidirectional(transport, local));
+        let relay = runtime::spawn(copy_bidirectional(transport, local));
         peer.shutdown().await.unwrap();
 
         let mut buf = [0u8; 1];
-        assert_eq!(peer.read(&mut buf).await.unwrap(), 0);
+        assert_eq!(read_once(&mut peer, &mut buf).await.unwrap(), 0);
         relay.await.unwrap().unwrap();
     }
 
@@ -415,12 +410,25 @@ mod tests {
     async fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr);
-        let server = async {
-            let (stream, _) = listener.accept().await.unwrap();
-            stream
-        };
-        let (client, server) = tokio::join!(client, server);
-        (server, client.unwrap())
+        let (client, server) = futures::future::try_join(TcpStream::connect(addr), async {
+            let (stream, _) = listener.accept().await?;
+            Ok::<_, io::Error>(stream)
+        })
+        .await
+        .unwrap();
+        (server, client)
+    }
+
+    async fn read_once<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<usize>
+    where
+        R: AsyncRead + 'static,
+    {
+        let (result, buf) = reader
+            .read(Vec::with_capacity(dst.len()))
+            .await
+            .into_parts();
+        let n = result?;
+        dst[..n].copy_from_slice(&buf[..n]);
+        Ok(n)
     }
 }

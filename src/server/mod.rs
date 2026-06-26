@@ -1,9 +1,9 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
-use tokio::{
+use compio::{
     io::{AsyncRead, AsyncWrite},
-    net::{TcpSocket, TcpStream},
-    time,
+    net::{TcpListener, TcpSocket, TcpStream},
+    runtime, time,
 };
 
 use crate::{
@@ -11,7 +11,8 @@ use crate::{
     keepalive::apply_tcp_keepalive,
     protocol::snell::{
         self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, DecodeSlot, MAX_CONNECT_REQUEST_LEN,
-        SnellMode, SnellTcpDecoder, SnellTcpEncoder, V4Mode, V6ShapedMode,
+        SnellMode, SnellTcpDecoder, SnellTcpEncoder, V4Decoder, V4Mode, V6ShapedDecoder,
+        V6ShapedMode,
     },
     relay::tcp::{
         client::SnellTransport,
@@ -39,16 +40,30 @@ pub struct ServerConfig {
 
 pub async fn bind_tcp_listener(config: ServerConfig) -> io::Result<()> {
     validate_tcp_brutal_available(config.tcp_brutal).await?;
+    let listener = bind_listener(config.listen).await?;
+    serve_snell_listener(listener, config).await
+}
 
-    let socket = if config.listen.is_ipv4() {
-        TcpSocket::new_v4()?
+async fn bind_listener(listen: SocketAddr) -> io::Result<TcpListener> {
+    let socket = if listen.is_ipv4() {
+        TcpSocket::new_v4().await?
     } else {
-        TcpSocket::new_v6()?
+        TcpSocket::new_v6().await?
     };
     socket.set_reuseaddr(true)?;
+    #[cfg(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin"),
+    ))]
+    socket.set_reuseport(true)?;
     socket.set_nodelay(true)?;
-    socket.bind(config.listen)?;
-    let listener = socket.listen(4096)?;
+    socket.bind(listen).await?;
+    socket.listen(4096).await
+}
+
+async fn serve_snell_listener(listener: TcpListener, config: ServerConfig) -> io::Result<()> {
     let psk: Arc<[u8]> = Arc::from(config.psk.into_boxed_slice());
     let outbound = config.outbound;
     let tcp_brutal = config.tcp_brutal;
@@ -63,12 +78,45 @@ pub async fn bind_tcp_listener(config: ServerConfig) -> io::Result<()> {
         }
         let psk = psk.clone();
         let outbound = outbound.clone();
-        tokio::spawn(async move {
+        runtime::spawn(async move {
             match serve_snell_inbound_auto(stream, psk, outbound, peer_addr).await {
                 Ok(()) => tracing::info!(%peer_addr, "snell inbound ended"),
                 Err(error) => tracing::info!(%peer_addr, %error, "snell inbound failed"),
             }
-        });
+        })
+        .detach();
+    }
+}
+
+#[cfg(windows)]
+pub async fn bind_tcp_listener_with_dispatcher(
+    config: ServerConfig,
+    dispatcher: Arc<compio::dispatcher::Dispatcher>,
+) -> io::Result<()> {
+    validate_tcp_brutal_available(config.tcp_brutal).await?;
+    let listener = bind_listener(config.listen).await?;
+    let psk: Arc<[u8]> = Arc::from(config.psk.into_boxed_slice());
+    let outbound = config.outbound;
+    let tcp_brutal = config.tcp_brutal;
+
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        if let Err(error) = apply_tcp_keepalive(&stream) {
+            tracing::warn!(%peer_addr, %error, "snell inbound tcp keepalive could not be enabled");
+        }
+        if let Err(error) = apply_tcp_brutal(&stream, tcp_brutal) {
+            tracing::warn!(%peer_addr, %error, "snell inbound tcp_brutal could not be enabled");
+        }
+        let psk = psk.clone();
+        let outbound = outbound.clone();
+        dispatcher
+            .dispatch(move || async move {
+                match serve_snell_inbound_auto(stream, psk, outbound, peer_addr).await {
+                    Ok(()) => tracing::info!(%peer_addr, "snell inbound ended"),
+                    Err(error) => tracing::info!(%peer_addr, %error, "snell inbound failed"),
+                }
+            })
+            .map_err(|_| io::Error::other("dispatcher workers stopped"))?;
     }
 }
 
@@ -78,24 +126,31 @@ async fn serve_snell_inbound_auto(
     outbound: Outbound,
     peer_addr: SocketAddr,
 ) -> io::Result<()> {
-    let mode = probe_snell_mode(&stream, psk.clone())
+    let probed = probe_snell_mode(stream, psk.clone())
         .await
         .map_err(|error| {
             tracing::warn!(%peer_addr, %error, "snell probe failed");
             error
         })?;
-    match mode {
-        DetectedMode::V6Shaped => {
-            serve_snell_inbound_typed::<V6ShapedMode>(stream, psk, outbound, peer_addr).await
+    match probed {
+        ProbedStream::V6Shaped { stream, decoder } => {
+            serve_snell_inbound_typed_with_decoder::<V6ShapedMode>(
+                stream, decoder, psk, outbound, peer_addr,
+            )
+            .await
         }
-        DetectedMode::V4 => {
-            serve_snell_inbound_typed::<V4Mode>(stream, psk, outbound, peer_addr).await
+        ProbedStream::V4 { stream, decoder } => {
+            serve_snell_inbound_typed_with_decoder::<V4Mode>(
+                stream, decoder, psk, outbound, peer_addr,
+            )
+            .await
         }
     }
 }
 
-async fn serve_snell_inbound_typed<M>(
+async fn serve_snell_inbound_typed_with_decoder<M>(
     stream: TcpStream,
+    decoder: M::Decoder,
     psk: Arc<[u8]>,
     outbound: Outbound,
     peer_addr: SocketAddr,
@@ -108,9 +163,23 @@ where
 {
     let (read_half, write_half) = stream.into_split();
     let transport: SnellTransport<M> = SnellTransport::new(
-        SnellStreamReader::new::<M>(read_half, psk.clone()),
+        SnellStreamReader::from_decoder(read_half, decoder),
         SnellStreamWriter::new::<M>(write_half, psk)?,
     );
+    serve_snell_transport::<M>(transport, outbound, peer_addr).await
+}
+
+async fn serve_snell_transport<M>(
+    transport: SnellTransport<M>,
+    outbound: Outbound,
+    peer_addr: SocketAddr,
+) -> io::Result<()>
+where
+    M: SnellMode + Send + Sync + 'static + Unpin,
+    M::Encoder: Send + Unpin,
+    M::Decoder: Send + Unpin,
+    <M::Encoder as SnellTcpEncoder>::Reservation: Send,
+{
     let mut inbound = SnellInbound::new(transport);
 
     let first = inbound.receive_snell().await?;
@@ -185,7 +254,7 @@ async fn read_snell_request<R, D>(
     reader: &mut SnellStreamReader<R, D>,
 ) -> io::Result<SnellInboundRequest>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + 'static,
     D: SnellTcpDecoder,
 {
     let mut head = [0u8; 3];
@@ -234,7 +303,7 @@ async fn write_server_error<W, E>(
     message: &str,
 ) -> io::Result<()>
 where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + 'static,
     E: SnellTcpEncoder,
 {
     let message = message.as_bytes();
@@ -305,17 +374,27 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DetectedMode {
-    V6Shaped,
-    V4,
+enum ProbedStream {
+    V6Shaped {
+        stream: TcpStream,
+        decoder: V6ShapedDecoder,
+    },
+    V4 {
+        stream: TcpStream,
+        decoder: V4Decoder,
+    },
 }
 
-async fn probe_snell_mode(stream: &TcpStream, psk: Arc<[u8]>) -> io::Result<DetectedMode> {
+async fn probe_snell_mode(mut stream: TcpStream, psk: Arc<[u8]>) -> io::Result<ProbedStream> {
     time::timeout(PROBE_TIMEOUT, async {
-        let mut buf = [0u8; PROBE_BUF_LEN];
+        let mut v6 = Some(V6ShapedMode::new_decoder(psk.clone()));
+        let mut v4 = Some(V4Mode::new_decoder(psk));
         loop {
-            let n = stream.peek(&mut buf).await?;
+            let (result, buf) = stream
+                .read(Vec::with_capacity(PROBE_BUF_LEN))
+                .await
+                .into_parts();
+            let n = result?;
             if n == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -323,20 +402,37 @@ async fn probe_snell_mode(stream: &TcpStream, psk: Arc<[u8]>) -> io::Result<Dete
                 ));
             }
 
-            let v6 = probe_mode::<V6ShapedMode>(psk.clone(), &buf[..n]);
-            let v4 = probe_mode::<V4Mode>(psk.clone(), &buf[..n]);
-            match (v6, v4) {
-                (ProbeResult::Match, _) => return Ok(DetectedMode::V6Shaped),
-                (_, ProbeResult::Match) => return Ok(DetectedMode::V4),
-                (ProbeResult::NeedMore, _) | (_, ProbeResult::NeedMore) if n < buf.len() => {
-                    time::sleep(Duration::from_millis(1)).await;
+            if let Some(decoder) = &mut v6 {
+                match probe_decoder(decoder, &buf[..n]) {
+                    ProbeResult::Match => {
+                        return Ok(ProbedStream::V6Shaped {
+                            stream,
+                            decoder: v6.take().expect("v6 decoder present"),
+                        });
+                    }
+                    ProbeResult::NeedMore => {}
+                    ProbeResult::Invalid => v6 = None,
                 }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "snell probe could not detect v6-default or v4/v5",
-                    ));
+            }
+
+            if let Some(decoder) = &mut v4 {
+                match probe_decoder(decoder, &buf[..n]) {
+                    ProbeResult::Match => {
+                        return Ok(ProbedStream::V4 {
+                            stream,
+                            decoder: v4.take().expect("v4 decoder present"),
+                        });
+                    }
+                    ProbeResult::NeedMore => {}
+                    ProbeResult::Invalid => v4 = None,
                 }
+            }
+
+            if v6.is_none() && v4.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snell probe could not detect v6-default or v4/v5",
+                ));
             }
         }
     })
@@ -351,11 +447,19 @@ enum ProbeResult {
     Invalid,
 }
 
+#[cfg(test)]
 fn probe_mode<M>(psk: Arc<[u8]>, bytes: &[u8]) -> ProbeResult
 where
     M: SnellMode,
 {
     let mut decoder = M::new_decoder(psk);
+    probe_decoder(&mut decoder, bytes)
+}
+
+fn probe_decoder<D>(decoder: &mut D, bytes: &[u8]) -> ProbeResult
+where
+    D: SnellTcpDecoder,
+{
     let mut offset = 0;
     loop {
         match decoder.next_ciphertext_slot() {
@@ -368,12 +472,12 @@ where
                 offset += n;
 
                 match decoder.commit_ciphertext(n) {
-                    Ok(DecodeEvent::PlainData) => return probe_plaintext(&decoder),
+                    Ok(DecodeEvent::PlainData) => return probe_plaintext(decoder),
                     Ok(DecodeEvent::ZeroChunk) | Err(_) => return ProbeResult::Invalid,
                     Ok(_) => {}
                 }
             }
-            DecodeSlot::BlockedByPlaintext => return probe_plaintext(&decoder),
+            DecodeSlot::BlockedByPlaintext => return probe_plaintext(decoder),
         }
     }
 }
@@ -422,9 +526,12 @@ mod tests {
         },
         relay::tcp::client::SnellConnector,
     };
-    use tokio::{
-        io::{self, AsyncReadExt, AsyncWriteExt},
+    use std::io;
+
+    use compio::{
+        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
         net::{TcpListener, TcpStream, UdpSocket},
+        runtime, time,
     };
 
     struct PendingPlaintext(Vec<u8>);
@@ -449,29 +556,29 @@ mod tests {
         fn advance_plaintext(&mut self, _n: usize) {}
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn auto_server_accepts_v4_v5_tcp_codec() {
         auto_server_round_trip::<V4Mode>().await;
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn auto_server_accepts_v6_default() {
         auto_server_round_trip::<V6ShapedMode>().await;
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn server_relays_large_tcp_upload() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let total = 32 * 1024 * 1024;
 
         let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target_listener.local_addr().unwrap();
-        let target = tokio::spawn(async move {
+        let target = runtime::spawn(async move {
             let (mut stream, _) = target_listener.accept().await.unwrap();
             let mut received = 0;
             let mut buf = [0u8; 64 * 1024];
             while received < total {
-                let n = stream.read(&mut buf).await.unwrap();
+                let n = read_once(&mut stream, &mut buf).await.unwrap();
                 assert_ne!(n, 0);
                 received += n;
             }
@@ -481,7 +588,7 @@ mod tests {
         let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
-        let server = tokio::spawn(async move {
+        let server = runtime::spawn(async move {
             let (stream, peer_addr) = server_listener.accept().await.unwrap();
             serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr)
                 .await
@@ -495,7 +602,7 @@ mod tests {
             .unwrap();
         let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = local_listener.local_addr().unwrap();
-        let relay = tokio::spawn(async move {
+        let relay = runtime::spawn(async move {
             let (local, _) = local_listener.accept().await.unwrap();
             copy_bidirectional(transport, local).await.unwrap();
         });
@@ -504,12 +611,12 @@ mod tests {
         let chunk = vec![0x5a; 64 * 1024];
         let mut sent = 0;
         while sent < total {
-            local.write_all(&chunk).await.unwrap();
+            write_all_bytes(&mut local, &chunk).await.unwrap();
             sent += chunk.len();
         }
         local.shutdown().await.unwrap();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), target)
+        time::timeout(std::time::Duration::from_secs(5), target)
             .await
             .unwrap()
             .unwrap();
@@ -572,23 +679,23 @@ mod tests {
         assert_eq!(probe_plaintext(&decoder), ProbeResult::Match);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn server_uses_socks5_outbound() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
 
         let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target_listener.local_addr().unwrap();
-        let target = tokio::spawn(async move {
+        let target = runtime::spawn(async move {
             let (mut stream, _) = target_listener.accept().await.unwrap();
             let mut buf = [0u8; 4];
-            stream.read_exact(&mut buf).await.unwrap();
+            read_exact_into(&mut stream, &mut buf).await.unwrap();
             assert_eq!(&buf, b"ping");
-            stream.write_all(b"pong").await.unwrap();
+            write_all_bytes(&mut stream, b"pong").await.unwrap();
         });
 
         let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socks_addr = socks_listener.local_addr().unwrap();
-        let proxy = tokio::spawn(async move {
+        let proxy = runtime::spawn(async move {
             let (stream, _) = socks_listener.accept().await.unwrap();
             serve_socks5_proxy_once(stream, target_addr).await.unwrap();
         });
@@ -596,7 +703,7 @@ mod tests {
         let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
-        let server = tokio::spawn(async move {
+        let server = runtime::spawn(async move {
             let (stream, peer_addr) = server_listener.accept().await.unwrap();
             serve_snell_inbound_auto(
                 stream,
@@ -619,27 +726,28 @@ mod tests {
     /// `REUSE_IDLE_TIMEOUT`（1h）后主动关闭。用 `start_paused` 虚拟时钟，避免
     /// 真实等待 1h。注意：客户端 connector 必须保持 pool 里的连接活着（不要
     /// drop），否则服务端 read 会先 EOF 而不是 idle 超时。
-    #[tokio::test(start_paused = true)]
+    #[compio::test]
+    #[ignore = "compio time has no paused-clock equivalent for the 1h reuse idle timeout"]
     async fn reuse_idle_times_out_when_no_next_s0_arrives() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
 
         let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target_listener.local_addr().unwrap();
-        let target = tokio::spawn(async move {
+        let target = runtime::spawn(async move {
             let (mut stream, _) = target_listener.accept().await.unwrap();
             let mut buf = [0u8; 4];
-            stream.read_exact(&mut buf).await.unwrap();
+            read_exact_into(&mut stream, &mut buf).await.unwrap();
             assert_eq!(&buf, b"ping");
-            stream.write_all(b"pong").await.unwrap();
+            write_all_bytes(&mut stream, b"pong").await.unwrap();
             // 等客户端关 → sub-stream 双向 EOF（copy_bidirectional 要求两侧都关）。
             let mut tail = [0u8; 1];
-            assert_eq!(stream.read(&mut tail).await.unwrap(), 0);
+            assert_eq!(read_once(&mut stream, &mut tail).await.unwrap(), 0);
         });
 
         let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
-        let server = tokio::spawn(async move {
+        let server = runtime::spawn(async move {
             let (stream, peer_addr) = server_listener.accept().await.unwrap();
             serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr).await
         });
@@ -661,25 +769,25 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn server_closes_socks5_connect_before_next_reused_substream() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
 
         let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target_listener.local_addr().unwrap();
-        let target = tokio::spawn(async move {
+        let target = runtime::spawn(async move {
             for _ in 0..2 {
                 let (mut stream, _) = target_listener.accept().await.unwrap();
                 let mut buf = [0u8; 4];
-                stream.read_exact(&mut buf).await.unwrap();
+                read_exact_into(&mut stream, &mut buf).await.unwrap();
                 assert_eq!(&buf, b"ping");
-                stream.write_all(b"pong").await.unwrap();
+                write_all_bytes(&mut stream, b"pong").await.unwrap();
             }
         });
 
         let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socks_addr = socks_listener.local_addr().unwrap();
-        let proxy = tokio::spawn(async move {
+        let proxy = runtime::spawn(async move {
             for _ in 0..2 {
                 let (stream, _) = socks_listener.accept().await.unwrap();
                 serve_socks5_proxy_once(stream, target_addr).await.unwrap();
@@ -689,7 +797,7 @@ mod tests {
         let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
-        let server = tokio::spawn(async move {
+        let server = runtime::spawn(async move {
             let (stream, peer_addr) = server_listener.accept().await.unwrap();
             let _ = serve_snell_inbound_auto(
                 stream,
@@ -705,33 +813,32 @@ mod tests {
             run_client_round_trip_with_connector(&connector, &Address::from(target_addr)).await;
         }
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), proxy)
+        time::timeout(std::time::Duration::from_secs(5), proxy)
             .await
             .unwrap()
             .unwrap();
         target.await.unwrap();
         drop(connector);
-        server.abort();
-        let _ = server.await;
+        drop(server);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn server_relays_udp_direct() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
 
         let target_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target_socket.local_addr().unwrap();
-        let target = tokio::spawn(async move {
+        let target = runtime::spawn(async move {
             let mut buf = [0u8; 64];
-            let (n, peer) = target_socket.recv_from(&mut buf).await.unwrap();
+            let (n, peer) = udp_recv_from(&target_socket, &mut buf).await.unwrap();
             assert_eq!(&buf[..n], b"ping");
-            target_socket.send_to(b"pong", peer).await.unwrap();
+            udp_send_to(&target_socket, b"pong", peer).await.unwrap();
         });
 
         let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
-        let server = tokio::spawn(async move {
+        let server = runtime::spawn(async move {
             let (stream, peer_addr) = server_listener.accept().await.unwrap();
             let _ = serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr).await;
         });
@@ -739,19 +846,18 @@ mod tests {
         run_udp_client_round_trip::<V6ShapedMode>(server_addr, psk, Address::from(target_addr))
             .await;
 
-        server.abort();
-        let _ = server.await;
+        drop(server);
         target.await.unwrap();
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn server_treats_udp_carrier_close_as_normal() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
 
         let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
-        let server = tokio::spawn(async move {
+        let server = runtime::spawn(async move {
             let (stream, peer_addr) = server_listener.accept().await.unwrap();
             serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr).await
         });
@@ -760,14 +866,14 @@ mod tests {
         let transport = connector.connect_udp().await.unwrap();
         drop(transport);
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        time::timeout(std::time::Duration::from_secs(2), server)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn server_relays_udp_via_socks5_outbound() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let target_addr = SocketAddr::from(([127, 0, 0, 1], 53053));
@@ -776,7 +882,7 @@ mod tests {
         let socks_addr = socks_listener.local_addr().unwrap();
         let proxy_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let proxy_udp_addr = proxy_udp.local_addr().unwrap();
-        let proxy = tokio::spawn(async move {
+        let proxy = runtime::spawn(async move {
             let (stream, _) = socks_listener.accept().await.unwrap();
             serve_socks5_udp_proxy_once(stream, proxy_udp, proxy_udp_addr, target_addr)
                 .await
@@ -786,7 +892,7 @@ mod tests {
         let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
-        let server = tokio::spawn(async move {
+        let server = runtime::spawn(async move {
             let (stream, peer_addr) = server_listener.accept().await.unwrap();
             let _ = serve_snell_inbound_auto(
                 stream,
@@ -800,8 +906,7 @@ mod tests {
         run_udp_client_round_trip::<V6ShapedMode>(server_addr, psk, Address::from(target_addr))
             .await;
 
-        server.abort();
-        let _ = server.await;
+        drop(server);
         proxy.await.unwrap();
     }
 
@@ -816,18 +921,18 @@ mod tests {
 
         let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target_listener.local_addr().unwrap();
-        let target = tokio::spawn(async move {
+        let target = runtime::spawn(async move {
             let (mut stream, _) = target_listener.accept().await.unwrap();
             let mut buf = [0u8; 4];
-            stream.read_exact(&mut buf).await.unwrap();
+            read_exact_into(&mut stream, &mut buf).await.unwrap();
             assert_eq!(&buf, b"ping");
-            stream.write_all(b"pong").await.unwrap();
+            write_all_bytes(&mut stream, b"pong").await.unwrap();
         });
 
         let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_listener.local_addr().unwrap();
         let server_psk = psk.clone();
-        let server = tokio::spawn(async move {
+        let server = runtime::spawn(async move {
             let (stream, peer_addr) = server_listener.accept().await.unwrap();
             serve_snell_inbound_auto(stream, server_psk, Outbound::Direct, peer_addr)
                 .await
@@ -864,16 +969,15 @@ mod tests {
 
         let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = local_listener.local_addr().unwrap();
-        let relay = tokio::spawn(async move {
+        let relay = runtime::spawn(async move {
             let (local, _) = local_listener.accept().await.unwrap();
             copy_bidirectional(transport, local).await.unwrap();
         });
 
         let mut local = TcpStream::connect(local_addr).await.unwrap();
-        local.write_all(b"ping").await.unwrap();
+        write_all_bytes(&mut local, b"ping").await.unwrap();
         local.shutdown().await.unwrap();
-        let mut out = Vec::new();
-        local.read_to_end(&mut out).await.unwrap();
+        let out = read_to_end_vec(&mut local).await.unwrap();
         assert_eq!(out, b"pong");
 
         relay.await.unwrap();
@@ -899,7 +1003,7 @@ mod tests {
         packet[header_len..].copy_from_slice(b"ping");
         transport.writer.write_frame(&packet).await.unwrap();
 
-        let response = tokio::time::timeout(
+        let response = time::timeout(
             std::time::Duration::from_secs(2),
             transport.reader.read_frame_vec(),
         )
@@ -919,14 +1023,14 @@ mod tests {
     ) -> io::Result<()> {
         let mut buf = [0u8; socks5::MAX_REQUEST_LEN];
 
-        inbound.read_exact(&mut buf[..3]).await?;
+        read_exact_into(&mut inbound, &mut buf[..3]).await?;
         let ParseState::Done(greeting) = socks5::greeting_need(&buf[..3])? else {
             unreachable!("no-auth greeting is exactly 3 bytes");
         };
         assert!(greeting.supports(METHOD_NO_AUTH));
 
         let n = socks5::encode_method_selection(&mut buf, METHOD_NO_AUTH)?;
-        inbound.write_all(&buf[..n]).await?;
+        write_all_bytes(&mut inbound, &buf[..n]).await?;
 
         let mut filled = 0;
         loop {
@@ -937,7 +1041,7 @@ mod tests {
                     break;
                 }
                 ParseState::Need(total) => {
-                    inbound.read_exact(&mut buf[filled..total]).await?;
+                    read_exact_into(&mut inbound, &mut buf[filled..total]).await?;
                     filled = total;
                 }
             }
@@ -945,8 +1049,16 @@ mod tests {
 
         let mut target = TcpStream::connect(target_addr).await?;
         let n = socks5::encode_reply(&mut buf, Reply::Succeeded, socks5::unspecified_ipv4_bind())?;
-        inbound.write_all(&buf[..n]).await?;
-        io::copy_bidirectional(&mut inbound, &mut target).await?;
+        write_all_bytes(&mut inbound, &buf[..n]).await?;
+        let mut request = [0u8; 1024];
+        let n = read_once(&mut inbound, &mut request).await?;
+        if n != 0 {
+            write_all_bytes(&mut target, &request[..n]).await?;
+            target.shutdown().await?;
+        }
+        let response = read_to_end_vec(&mut target).await?;
+        write_all_bytes(&mut inbound, &response).await?;
+        inbound.shutdown().await?;
         Ok(())
     }
 
@@ -958,14 +1070,14 @@ mod tests {
     ) -> io::Result<()> {
         let mut buf = [0u8; socks5::MAX_REQUEST_LEN];
 
-        inbound.read_exact(&mut buf[..3]).await?;
+        read_exact_into(&mut inbound, &mut buf[..3]).await?;
         let ParseState::Done(greeting) = socks5::greeting_need(&buf[..3])? else {
             unreachable!("no-auth greeting is exactly 3 bytes");
         };
         assert!(greeting.supports(METHOD_NO_AUTH));
 
         let n = socks5::encode_method_selection(&mut buf, METHOD_NO_AUTH)?;
-        inbound.write_all(&buf[..n]).await?;
+        write_all_bytes(&mut inbound, &buf[..n]).await?;
 
         let mut filled = 0;
         loop {
@@ -975,17 +1087,17 @@ mod tests {
                     break;
                 }
                 ParseState::Need(total) => {
-                    inbound.read_exact(&mut buf[filled..total]).await?;
+                    read_exact_into(&mut inbound, &mut buf[filled..total]).await?;
                     filled = total;
                 }
             }
         }
 
         let n = socks5::encode_reply(&mut buf, Reply::Succeeded, AddressRef::Ip(udp_addr))?;
-        inbound.write_all(&buf[..n]).await?;
+        write_all_bytes(&mut inbound, &buf[..n]).await?;
 
         let mut packet = [0u8; 1500];
-        let (n, peer) = udp.recv_from(&mut packet).await?;
+        let (n, peer) = udp_recv_from(&udp, &mut packet).await?;
         let request = socks5::parse_udp_packet(&packet[..n])?;
         assert_eq!(request.frag, 0);
         assert_eq!(request.destination.into_owned(), Address::from(target_addr));
@@ -995,7 +1107,72 @@ mod tests {
         let mut response = vec![0u8; header_len + 4];
         socks5::encode_udp_header(&mut response, 0, AddressRef::Ip(target_addr))?;
         response[header_len..].copy_from_slice(b"pong");
-        udp.send_to(&response, peer).await?;
+        udp_send_to(&udp, &response, peer).await?;
+        Ok(())
+    }
+
+    async fn read_exact_into<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<()>
+    where
+        R: AsyncRead + 'static,
+    {
+        let (result, buf) = reader
+            .read_exact(Vec::with_capacity(dst.len()))
+            .await
+            .into_parts();
+        result?;
+        dst.copy_from_slice(&buf);
+        Ok(())
+    }
+
+    async fn read_once<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<usize>
+    where
+        R: AsyncRead + 'static,
+    {
+        let (result, buf) = reader
+            .read(Vec::with_capacity(dst.len()))
+            .await
+            .into_parts();
+        let n = result?;
+        dst[..n].copy_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    async fn read_to_end_vec<R>(reader: &mut R) -> io::Result<Vec<u8>>
+    where
+        R: AsyncRead + 'static,
+    {
+        let (result, buf) = reader.read_to_end(Vec::new()).await.into_parts();
+        result?;
+        Ok(buf)
+    }
+
+    async fn write_all_bytes<W>(writer: &mut W, bytes: &[u8]) -> io::Result<()>
+    where
+        W: AsyncWrite + 'static,
+    {
+        let (result, _buf) = writer.write_all(bytes.to_vec()).await.into_parts();
+        result
+    }
+
+    async fn udp_recv_from(socket: &UdpSocket, dst: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let (result, buf) = socket
+            .recv_from(Vec::with_capacity(dst.len()))
+            .await
+            .into_parts();
+        let (n, peer) = result?;
+        dst[..n].copy_from_slice(&buf[..n]);
+        Ok((n, peer))
+    }
+
+    async fn udp_send_to(socket: &UdpSocket, payload: &[u8], peer: SocketAddr) -> io::Result<()> {
+        let len = payload.len();
+        let (result, _payload) = socket.send_to(payload.to_vec(), peer).await.into_parts();
+        if result? != len {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "udp socket sent a partial datagram",
+            ));
+        }
         Ok(())
     }
 }

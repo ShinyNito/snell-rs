@@ -1,6 +1,6 @@
 use std::{io, time::Duration};
 
-use tokio::net::TcpStream;
+use compio::net::TcpStream;
 
 #[cfg(any(unix, windows))]
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(5 * 60);

@@ -6,10 +6,10 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
-    net::{TcpStream, UdpSocket, lookup_host},
-    time::{Instant, Sleep},
+use compio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpStream, ToSocketAddrsAsync, UdpSocket},
+    time,
 };
 
 use crate::{
@@ -19,9 +19,15 @@ use crate::{
         address::{Address, AddressRef},
         socks5::{self, Command, METHOD_NO_AUTH, Reply},
     },
-    relay::udp::UDP_ASSOCIATION_TTL,
+    relay::udp::{
+        DatagramTransport, MAX_UDP_DATAGRAM_LEN, UDP_ASSOCIATION_TTL, UdpRecvState, UdpSendState,
+        poll_udp_recv_from, poll_udp_send_to,
+    },
     timeout::{with_tcp_connect_timeout, with_tcp_timeout},
 };
+
+type ResolveFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>>>>;
+type TimerFuture = Pin<Box<dyn Future<Output = ()>>>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Outbound {
@@ -65,7 +71,7 @@ pub(crate) struct UdpOutboundSendState {
     socks5: Socks5UdpSendState,
 }
 
-impl crate::relay::udp::DatagramTransport for UdpOutbound {
+impl DatagramTransport for UdpOutbound {
     type SendState = UdpOutboundSendState;
 
     fn poll_send_to(
@@ -101,8 +107,8 @@ async fn connect_direct(destination: &Address) -> io::Result<TcpStream> {
     let stream = with_tcp_connect_timeout(
         async {
             match destination {
-                Address::Ip(addr) => TcpStream::connect(addr).await,
-                Address::Domain { host, port } => TcpStream::connect((host.as_str(), *port)).await,
+                Address::Ip(addr) => TcpStream::connect(*addr).await,
+                Address::Domain { host, port } => TcpStream::connect((host.clone(), *port)).await,
             }
         },
         "direct tcp connect",
@@ -121,13 +127,18 @@ async fn connect_direct_udp() -> io::Result<DirectUdpOutbound> {
     let v6 = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
         .await
         .ok();
-    Ok(DirectUdpOutbound { v4, v6 })
+    Ok(DirectUdpOutbound {
+        v4,
+        v6,
+        v4_recv_state: UdpRecvState::default(),
+        v6_recv_state: UdpRecvState::default(),
+    })
 }
 
 async fn connect_socks5(server: SocketAddr, destination: &Address) -> io::Result<TcpStream> {
     let stream =
         with_tcp_connect_timeout(TcpStream::connect(server), "socks5 outbound tcp connect").await;
-    let stream = match stream {
+    let mut stream = match stream {
         Ok(stream) => stream,
         Err(error) => {
             tracing::debug!(server = %server, %destination, %error, "socks5 outbound dial failed");
@@ -139,13 +150,12 @@ async fn connect_socks5(server: SocketAddr, destination: &Address) -> io::Result
     let log_destination = destination.clone();
     with_tcp_timeout(
         async move {
-            let mut stream = stream;
             let mut buf = [0u8; socks5::MAX_REQUEST_LEN];
 
             let n = socks5::encode_no_auth_greeting(&mut buf)?;
-            stream.write_all(&buf[..n]).await?;
+            write_all_bytes(&mut stream, &buf[..n]).await?;
 
-            stream.read_exact(&mut buf[..2]).await?;
+            read_exact_into(&mut stream, &mut buf[..2]).await?;
             let selection = match socks5::method_selection_need(&buf[..2])? {
                 ParseState::Done(selection) => selection,
                 ParseState::Need(_) => unreachable!("method selection buffer is exactly 2 bytes"),
@@ -155,7 +165,7 @@ async fn connect_socks5(server: SocketAddr, destination: &Address) -> io::Result
             }
 
             let n = socks5::encode_request(&mut buf, Command::Connect, destination.as_view())?;
-            stream.write_all(&buf[..n]).await?;
+            write_all_bytes(&mut stream, &buf[..n]).await?;
 
             let reply = read_reply(&mut stream, &mut buf).await?;
             if reply != Reply::Succeeded {
@@ -176,7 +186,7 @@ async fn connect_socks5(server: SocketAddr, destination: &Address) -> io::Result
 }
 
 async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound> {
-    let control =
+    let mut control =
         with_tcp_connect_timeout(TcpStream::connect(server), "socks5 udp control tcp connect")
             .await?;
     apply_tcp_keepalive(&control)?;
@@ -184,13 +194,12 @@ async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound>
     let local_addr = socket.local_addr()?;
     let (control, relay) = with_tcp_timeout(
         async move {
-            let mut control = control;
             let mut buf = [0u8; socks5::MAX_REQUEST_LEN];
 
             let n = socks5::encode_no_auth_greeting(&mut buf)?;
-            control.write_all(&buf[..n]).await?;
+            write_all_bytes(&mut control, &buf[..n]).await?;
 
-            control.read_exact(&mut buf[..2]).await?;
+            read_exact_into(&mut control, &mut buf[..2]).await?;
             let selection = match socks5::method_selection_need(&buf[..2])? {
                 ParseState::Done(selection) => selection,
                 ParseState::Need(_) => unreachable!("method selection buffer is exactly 2 bytes"),
@@ -204,7 +213,7 @@ async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound>
                 Command::UdpAssociate,
                 AddressRef::Ip(local_addr),
             )?;
-            control.write_all(&buf[..n]).await?;
+            write_all_bytes(&mut control, &buf[..n]).await?;
 
             let reply = read_reply_message(&mut control, &mut buf).await?;
             if reply.reply != Reply::Succeeded {
@@ -224,21 +233,22 @@ async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound>
         _control: control,
         socket,
         relay,
-        recv_buf: vec![0; crate::relay::udp::MAX_UDP_DATAGRAM_LEN],
-        control_ttl: Box::pin(tokio::time::sleep(UDP_ASSOCIATION_TTL)),
+        recv_buf: vec![0; MAX_UDP_DATAGRAM_LEN],
+        recv_state: UdpRecvState::default(),
+        control_ttl: ttl_timer(),
     })
 }
 
 async fn read_reply<R>(stream: &mut R, buf: &mut [u8]) -> io::Result<Reply>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + 'static,
 {
     Ok(read_reply_message(stream, buf).await?.reply)
 }
 
 async fn read_reply_message<R>(stream: &mut R, buf: &mut [u8]) -> io::Result<socks5::ReplyMessage>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + 'static,
 {
     let mut filled = 0;
     loop {
@@ -251,11 +261,32 @@ where
                         "socks5 reply too large",
                     ));
                 }
-                stream.read_exact(&mut buf[filled..total]).await?;
+                read_exact_into(stream, &mut buf[filled..total]).await?;
                 filled = total;
             }
         }
     }
+}
+
+async fn read_exact_into<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<()>
+where
+    R: AsyncRead + 'static,
+{
+    let (result, buf) = reader
+        .read_exact(Vec::with_capacity(dst.len()))
+        .await
+        .into_parts();
+    result?;
+    dst.copy_from_slice(&buf);
+    Ok(())
+}
+
+async fn write_all_bytes<W>(writer: &mut W, bytes: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + 'static,
+{
+    let (result, _buf) = writer.write_all(bytes.to_vec()).await.into_parts();
+    result
 }
 
 fn udp_bind_addr_for(server: SocketAddr) -> SocketAddr {
@@ -281,7 +312,8 @@ async fn socks5_udp_relay_addr(server: SocketAddr, bind: Address) -> io::Result<
             };
             Ok(SocketAddr::new(ip, port))
         }
-        Address::Domain { host, port } => lookup_host((host, port))
+        Address::Domain { host, port } => (host, port)
+            .to_socket_addrs_async()
             .await?
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "socks5 udp relay not found")),
@@ -291,16 +323,19 @@ async fn socks5_udp_relay_addr(server: SocketAddr, bind: Address) -> io::Result<
 pub(crate) struct DirectUdpOutbound {
     v4: UdpSocket,
     v6: Option<UdpSocket>,
+    v4_recv_state: UdpRecvState,
+    v6_recv_state: UdpRecvState,
 }
-
-type ResolveFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
 
 #[derive(Default)]
 enum DirectUdpSendState {
     #[default]
     Ready,
     Resolving(ResolveFuture),
-    Sending(SocketAddr),
+    Sending {
+        addr: SocketAddr,
+        state: UdpSendState,
+    },
 }
 
 impl DirectUdpOutbound {
@@ -314,12 +349,17 @@ impl DirectUdpOutbound {
         loop {
             match state {
                 DirectUdpSendState::Ready => match destination {
-                    Address::Ip(addr) => *state = DirectUdpSendState::Sending(*addr),
+                    Address::Ip(addr) => {
+                        *state = DirectUdpSendState::Sending {
+                            addr: *addr,
+                            state: UdpSendState::default(),
+                        };
+                    }
                     Address::Domain { host, port } => {
                         let host = host.clone();
                         let port = *port;
                         *state = DirectUdpSendState::Resolving(Box::pin(async move {
-                            Ok(lookup_host((host, port)).await?.collect())
+                            Ok((host, port).to_socket_addrs_async().await?.collect())
                         }));
                     }
                 },
@@ -328,46 +368,41 @@ impl DirectUdpOutbound {
                     let addr = addrs.drain(..).next().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::NotFound, "udp destination not found")
                     })?;
-                    *state = DirectUdpSendState::Sending(addr);
+                    *state = DirectUdpSendState::Sending {
+                        addr,
+                        state: UdpSendState::default(),
+                    };
                 }
-                DirectUdpSendState::Sending(addr) => {
-                    let socket = self.socket_for(*addr)?;
-                    let n = ready!(socket.poll_send_to(cx, payload, *addr))?;
+                DirectUdpSendState::Sending { addr, state: send } => {
+                    let payload_len = payload.len();
+                    ready!(poll_udp_send_to(
+                        self.socket_for(*addr)?,
+                        cx,
+                        *addr,
+                        payload,
+                        send,
+                    ))?;
                     *state = DirectUdpSendState::Ready;
-                    if n != payload.len() {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "udp socket sent a partial datagram",
-                        )));
-                    }
-                    return Poll::Ready(Ok(n));
+                    return Poll::Ready(Ok(payload_len));
                 }
             }
         }
     }
 
     fn poll_recv_from(
-        &self,
+        &mut self,
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<(usize, Address)>> {
-        {
-            let mut read = ReadBuf::new(buf);
-            match self.v4.poll_recv_from(cx, &mut read) {
-                Poll::Ready(Ok(source)) => {
-                    return Poll::Ready(Ok((read.filled().len(), Address::Ip(source))));
-                }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => {}
-            }
+        match poll_udp_recv_from(&self.v4, cx, &mut self.v4_recv_state, buf) {
+            Poll::Ready(Ok((n, source))) => return Poll::Ready(Ok((n, Address::Ip(source)))),
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => {}
         }
 
         if let Some(v6) = &self.v6 {
-            let mut read = ReadBuf::new(buf);
-            match v6.poll_recv_from(cx, &mut read) {
-                Poll::Ready(Ok(source)) => {
-                    return Poll::Ready(Ok((read.filled().len(), Address::Ip(source))));
-                }
+            match poll_udp_recv_from(v6, cx, &mut self.v6_recv_state, buf) {
+                Poll::Ready(Ok((n, source))) => return Poll::Ready(Ok((n, Address::Ip(source)))),
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => {}
             }
@@ -395,7 +430,8 @@ pub(crate) struct Socks5UdpOutbound {
     socket: UdpSocket,
     relay: SocketAddr,
     recv_buf: Vec<u8>,
-    control_ttl: Pin<Box<Sleep>>,
+    recv_state: UdpRecvState,
+    control_ttl: TimerFuture,
 }
 
 #[derive(Default)]
@@ -405,6 +441,7 @@ enum Socks5UdpSendState {
     Sending {
         packet: Vec<u8>,
         payload_len: usize,
+        state: UdpSendState,
     },
 }
 
@@ -420,9 +457,7 @@ impl Socks5UdpOutbound {
     }
 
     fn refresh_control_ttl(&mut self) {
-        self.control_ttl
-            .as_mut()
-            .reset(Instant::now() + UDP_ASSOCIATION_TTL);
+        self.control_ttl = ttl_timer();
     }
 
     fn poll_send_to(
@@ -444,21 +479,22 @@ impl Socks5UdpOutbound {
                     *state = Socks5UdpSendState::Sending {
                         packet,
                         payload_len: payload.len(),
+                        state: UdpSendState::default(),
                     };
                 }
                 Socks5UdpSendState::Sending {
                     packet,
                     payload_len,
+                    state: send_state,
                 } => {
-                    let n = ready!(self.socket.poll_send_to(cx, packet, self.relay))?;
-                    if n != packet.len() {
-                        *state = Socks5UdpSendState::Ready;
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "socks5 udp outbound sent a partial datagram",
-                        )));
-                    }
                     let payload_len = *payload_len;
+                    ready!(poll_udp_send_to(
+                        &self.socket,
+                        cx,
+                        self.relay,
+                        packet,
+                        send_state,
+                    ))?;
                     *state = Socks5UdpSendState::Ready;
                     self.refresh_control_ttl();
                     return Poll::Ready(Ok(payload_len));
@@ -474,11 +510,12 @@ impl Socks5UdpOutbound {
     ) -> Poll<io::Result<(usize, Address)>> {
         self.check_control_ttl(cx)?;
         loop {
-            let (n, source) = {
-                let mut read = ReadBuf::new(&mut self.recv_buf);
-                let source = ready!(self.socket.poll_recv_from(cx, &mut read))?;
-                (read.filled().len(), source)
-            };
+            let (n, source) = ready!(poll_udp_recv_from(
+                &self.socket,
+                cx,
+                &mut self.recv_state,
+                &mut self.recv_buf,
+            ))?;
             if source != self.relay {
                 continue;
             }
@@ -501,4 +538,8 @@ impl Socks5UdpOutbound {
             return Poll::Ready(Ok((payload_len, destination)));
         }
     }
+}
+
+fn ttl_timer() -> TimerFuture {
+    Box::pin(time::sleep(UDP_ASSOCIATION_TTL))
 }

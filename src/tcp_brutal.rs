@@ -1,6 +1,6 @@
 use std::io;
 
-use tokio::net::{TcpListener, TcpStream};
+use compio::net::{TcpListener, TcpStream};
 
 use crate::config::TcpBrutalConfig;
 
@@ -23,7 +23,10 @@ pub(crate) async fn validate_tcp_brutal_available(
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let addr = listener.local_addr()?;
-    let (_client, (server, _peer)) = tokio::try_join!(TcpStream::connect(addr), listener.accept())?;
+    let (client, accepted) =
+        futures::future::try_join(TcpStream::connect(addr), listener.accept()).await?;
+    let (server, _peer) = accepted;
+    drop(client);
     apply_tcp_brutal(&server, Some(config))
 }
 
@@ -93,13 +96,13 @@ fn apply_tcp_brutal_enabled(_stream: &TcpStream, _config: TcpBrutalConfig) -> io
 mod tests {
     use super::validate_tcp_brutal_available;
 
-    #[tokio::test]
+    #[compio::test]
     async fn disabled_tcp_brutal_validation_is_noop() {
         validate_tcp_brutal_available(None).await.unwrap();
     }
 
     #[cfg(not(target_os = "linux"))]
-    #[tokio::test]
+    #[compio::test]
     async fn enabled_tcp_brutal_validation_fails_on_non_linux() {
         let result = validate_tcp_brutal_available(Some(crate::config::TcpBrutalConfig {
             rate_bytes_per_sec: 1_000_000,

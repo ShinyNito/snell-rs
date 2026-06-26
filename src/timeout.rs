@@ -1,6 +1,6 @@
 use std::{future::Future, io, time::Duration};
 
-use tokio::time;
+use compio::time;
 
 pub(crate) const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const TCP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -64,7 +64,7 @@ mod tests {
         assert_eq!(REUSE_IDLE_TIMEOUT, Duration::from_secs(3600));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn maps_elapsed_to_timed_out() {
         let err = with_deadline(
             Duration::from_millis(1),

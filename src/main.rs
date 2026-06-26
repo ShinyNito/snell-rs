@@ -1,17 +1,34 @@
-use std::{io, net::SocketAddr, path::PathBuf, process::ExitCode};
+use std::{
+    collections::HashSet, future::Future, io, net::SocketAddr, path::PathBuf, process::ExitCode,
+};
+#[cfg(windows)]
+use std::{num::NonZeroUsize, sync::Arc, thread};
+#[cfg(all(
+    unix,
+    not(target_os = "solaris"),
+    not(target_os = "illumos"),
+    not(target_os = "cygwin"),
+))]
+use std::{
+    sync::{Arc, mpsc},
+    thread,
+};
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use snell_rs::{
-    client::{ClientConfig as RuntimeClientConfig, bind_tcp_listener as bind_client_tcp_listener},
-    config::{
-        ClientConfig as FileClientConfig, ServerConfig as FileServerConfig, psk_from_str,
-        server_protocol_from_cli,
-    },
-    protocol::snell::version::ProtocolVersion,
-    server::{
-        Outbound, ServerConfig as RuntimeServerConfig,
-        bind_tcp_listener as bind_server_tcp_listener,
-    },
+#[cfg(windows)]
+use snell_rs::client::bind_tcp_listener_with_dispatcher as bind_client_tcp_listener_with_dispatcher;
+use snell_rs::client::{
+    ClientConfig as RuntimeClientConfig, bind_tcp_listener as bind_client_tcp_listener,
+};
+use snell_rs::config::{
+    ClientConfig as FileClientConfig, ServerConfig as FileServerConfig, psk_from_str,
+    server_protocol_from_cli,
+};
+use snell_rs::protocol::snell::version::ProtocolVersion;
+#[cfg(windows)]
+use snell_rs::server::bind_tcp_listener_with_dispatcher as bind_server_tcp_listener_with_dispatcher;
+use snell_rs::server::{
+    Outbound, ServerConfig as RuntimeServerConfig, bind_tcp_listener as bind_server_tcp_listener,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -79,11 +96,10 @@ struct ServerArgs {
     socks5_outbound: Option<SocketAddr>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     init_tracing();
 
-    match run().await {
+    match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
@@ -92,7 +108,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> io::Result<()> {
+fn run() -> io::Result<()> {
     match Cli::parse().cmd {
         Cmd::Client(args) => {
             let config = client_config(args)?;
@@ -103,7 +119,7 @@ async fn run() -> io::Result<()> {
                 version = ?config.version,
                 "snell-rs client listening",
             );
-            bind_client_tcp_listener(config).await
+            run_client(config)
         }
         Cmd::Server(args) => {
             let (config, protocol) = server_config(args)?;
@@ -116,9 +132,111 @@ async fn run() -> io::Result<()> {
                 parsed_protocol = ?protocol,
                 "snell-rs server listening",
             );
-            bind_server_tcp_listener(config).await
+            run_server(config)
         }
     }
+}
+
+#[cfg(not(windows))]
+fn run_client(config: RuntimeClientConfig) -> io::Result<()> {
+    run_per_core(move |worker| block_on_worker(worker, bind_client_tcp_listener(config.clone())))
+}
+
+#[cfg(windows)]
+fn run_client(config: RuntimeClientConfig) -> io::Result<()> {
+    run_with_dispatcher(move |dispatcher| {
+        bind_client_tcp_listener_with_dispatcher(config, dispatcher)
+    })
+}
+
+#[cfg(not(windows))]
+fn run_server(config: RuntimeServerConfig) -> io::Result<()> {
+    run_per_core(move |worker| block_on_worker(worker, bind_server_tcp_listener(config.clone())))
+}
+
+#[cfg(windows)]
+fn run_server(config: RuntimeServerConfig) -> io::Result<()> {
+    run_with_dispatcher(move |dispatcher| {
+        bind_server_tcp_listener_with_dispatcher(config, dispatcher)
+    })
+}
+
+#[cfg(windows)]
+fn run_with_dispatcher<F, Fut>(run_acceptor: F) -> io::Result<()>
+where
+    F: FnOnce(Arc<compio::dispatcher::Dispatcher>) -> Fut,
+    Fut: Future<Output = io::Result<()>>,
+{
+    block_on_worker(0, async move {
+        let workers =
+            thread::available_parallelism().unwrap_or_else(|_| NonZeroUsize::new(1).unwrap());
+        let dispatcher = Arc::new(
+            compio::dispatcher::Dispatcher::builder()
+                .worker_threads(workers)
+                .thread_affinity(|worker| {
+                    let mut cpus = HashSet::new();
+                    cpus.insert(worker);
+                    cpus
+                })
+                .thread_names(|worker| format!("snell-rs-worker-{worker}"))
+                .build()?,
+        );
+        run_acceptor(dispatcher).await
+    })
+}
+
+fn run_per_core<F>(run_worker: F) -> io::Result<()>
+where
+    F: Fn(usize) -> io::Result<()> + Send + Sync + 'static,
+{
+    #[cfg(not(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin"),
+    )))]
+    {
+        return run_worker(0);
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin"),
+    ))]
+    {
+        let workers = thread::available_parallelism().map_or(1, usize::from);
+        let run_worker = Arc::new(run_worker);
+        let (tx, rx) = mpsc::channel();
+
+        for worker in 0..workers {
+            let tx = tx.clone();
+            let run_worker = run_worker.clone();
+            thread::Builder::new()
+                .name(format!("snell-rs-worker-{worker}"))
+                .spawn(move || {
+                    let result = run_worker(worker);
+                    let _ = tx.send(result);
+                })?;
+        }
+        drop(tx);
+
+        rx.recv()
+            .unwrap_or_else(|_| Err(io::Error::other("all runtime workers exited")))
+    }
+}
+
+fn block_on_worker<F>(worker: usize, future: F) -> io::Result<()>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    let mut cpus = HashSet::new();
+    cpus.insert(worker);
+    compio::runtime::Runtime::builder()
+        .thread_affinity(cpus)
+        .build()?
+        .block_on(future)
 }
 
 fn client_config(args: ClientArgs) -> io::Result<RuntimeClientConfig> {
