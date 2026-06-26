@@ -205,7 +205,8 @@ where
     loop {
         let (stream, peer_addr) = listener.accept()?;
         let psk = psk.clone();
-        let _ = dispatcher
+        std::mem::drop(
+            dispatcher
             .dispatch(move || async move {
                 // ponytail: per-connection on Windows; add worker-local pools if resume throughput matters.
                 let snell_client = Rc::new(SnellConnector::<M>::new(server, psk, resume));
@@ -224,7 +225,8 @@ where
                     Err(error) => tracing::info!(%peer_addr, %error, "client inbound failed"),
                 }
             })
-            .map_err(|_| std::io::Error::other("dispatcher workers stopped"))?;
+            .map_err(|_| std::io::Error::other("dispatcher workers stopped"))?,
+        );
     }
 }
 

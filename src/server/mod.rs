@@ -107,7 +107,8 @@ pub async fn bind_tcp_listener_with_dispatcher(
         let (stream, peer_addr) = listener.accept()?;
         let psk = psk.clone();
         let outbound = outbound.clone();
-        let _ = dispatcher
+        std::mem::drop(
+            dispatcher
             .dispatch(move || async move {
                 let stream = match TcpStream::from_std(stream) {
                     Ok(stream) => stream,
@@ -127,7 +128,8 @@ pub async fn bind_tcp_listener_with_dispatcher(
                     Err(error) => tracing::info!(%peer_addr, %error, "snell inbound failed"),
                 }
             })
-            .map_err(|_| io::Error::other("dispatcher workers stopped"))?;
+            .map_err(|_| io::Error::other("dispatcher workers stopped"))?,
+        );
     }
 }
 
