@@ -31,14 +31,14 @@
 //!   next_plain_capacity()
 //!      |  profile-driven chunk_size
 //!      v
-//!   seal_plain(&[u8])
+//!   seal_plain(BytesMut)
 //!      |  write_v6_plain_header(padding_len, payload_len)
 //!      |  seal header   (nonce++, AAD = prefix)
 //!      |  fill padding  (profile.fill_official)
 //!      |  seal payload  (nonce++, AAD = padding) -> detached TAG
 //!      |  mix_padding_payload (bit-interleave)
 //!      v
-//!   Bytes -> flush
+//!   Vec<Bytes> -> vectored flush
 //! ```
 //!
 //! # Decode flow (state machine)
@@ -68,7 +68,7 @@ use ring::aead::{Aad, LessSafeKey, Tag};
 
 use super::super::{
     DecodeEvent, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, NONCE_LEN,
-    SALT_LEN, SnellTcpDecoder, SnellTcpEncoder, TAG_LEN,
+    SALT_LEN, SnellTcpDecoder, SnellTcpEncoder,
     common::{
         current_nonce, decode_v6_shaped_header, increment_nonce, invalid_data, invalid_input,
         next_nonce, seal_header, seal_payload_detached, v6_key, write_v6_plain_header,
@@ -159,7 +159,7 @@ impl V6ShapedEncoder {
         })
     }
 
-    fn seal_payload(&mut self, payload: &[u8]) -> io::Result<Bytes> {
+    fn seal_payload(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>> {
         let now = Instant::now();
         let base_chunk_size = self.base_chunk_size(now);
         let max_payload_len = self.chunk_limit_for(base_chunk_size);
@@ -181,31 +181,26 @@ impl V6ShapedEncoder {
             self.profile
                 .final_padding_len(self.seq, prefix_len, payload_len, first_record);
 
+        // head segment: [salt_block?][prefix][header_cipher]
         let head_len = salt_block_len + prefix_len + HEADER_CIPHER_LEN;
-        let body_len = padding_len
-            + if payload_len == 0 {
-                0
-            } else {
-                payload_len + TAG_LEN
-            };
-        let mut wire = BytesMut::with_capacity(head_len + body_len);
-        wire.resize(head_len + body_len, 0);
+        let mut head = BytesMut::with_capacity(head_len);
+        head.resize(head_len, 0);
 
         if first_record {
             self.profile
-                .write_salt_block(&self.salt, &mut wire[..salt_block_len])
+                .write_salt_block(&self.salt, &mut head[..salt_block_len])
                 .map_err(|_| invalid_data("snell v6 shaped salt block failed"))?;
         }
         self.profile
-            .fill_official(self.seq, &mut wire[prefix_start..prefix_start + prefix_len]);
+            .fill_official(self.seq, &mut head[prefix_start..prefix_start + prefix_len]);
 
         write_v6_plain_header(
-            &mut wire[header_start..header_start + HEADER_PLAIN_LEN],
+            &mut head[header_start..header_start + HEADER_PLAIN_LEN],
             padding_len,
             payload_len,
         )?;
         {
-            let (before_header, header_and_after) = wire.split_at_mut(header_start);
+            let (before_header, header_and_after) = head.split_at_mut(header_start);
             seal_header(
                 &self.key,
                 &mut self.nonce,
@@ -215,34 +210,46 @@ impl V6ShapedEncoder {
             )?;
         }
 
-        let (padding, payload_cipher_and_tag) = wire[head_len..].split_at_mut(padding_len);
-        self.profile.fill_official(self.seq, padding);
+        let mut segments =
+            Vec::with_capacity(1 + (padding_len > 0) as usize + (payload_len > 0) as usize * 2);
+        segments.push(head.freeze());
+
+        // padding segment (independent of payload so the payload buffer can stay
+        // the caller's, encrypted in place).
+        let mut padding = vec![0u8; padding_len];
+        self.profile.fill_official(self.seq, &mut padding);
 
         if payload_len > 0 {
-            let (payload_cipher, tag_dst) = payload_cipher_and_tag.split_at_mut(payload_len);
-            payload_cipher.copy_from_slice(payload);
+            // payload_cipher is the caller's buffer, encrypted in place.
+            let mut payload_cipher = payload;
             let mut payload_tag = seal_payload_detached(
                 &self.key,
                 &mut self.nonce,
-                padding,
-                payload_cipher,
+                &padding,
+                payload_cipher.as_mut(),
                 "snell v6 shaped payload encrypt failed",
             )?;
             mix_padding_payload_split(
                 &self.profile,
                 self.seq,
-                padding,
-                payload_cipher,
+                &mut padding,
+                payload_cipher.as_mut(),
                 &mut payload_tag,
             );
-            tag_dst.copy_from_slice(&payload_tag);
+            if padding_len > 0 {
+                segments.push(Bytes::from(padding));
+            }
+            segments.push(payload_cipher.freeze());
+            segments.push(Bytes::from(payload_tag.to_vec()));
+        } else if padding_len > 0 {
+            segments.push(Bytes::from(padding));
         }
 
         self.salt_sent = true;
         self.chunk_size = self.profile.advance_chunk_size(base_chunk_size, None);
         self.last_write = Some(now);
         self.seq = self.seq.wrapping_add(1);
-        Ok(wire.freeze())
+        Ok(segments)
     }
 
     fn base_chunk_size(&self, now: Instant) -> usize {
@@ -459,7 +466,7 @@ impl SnellTcpEncoder for V6ShapedEncoder {
         self.plain_capacity()
     }
 
-    fn seal_plain(&mut self, payload: &[u8]) -> io::Result<Bytes> {
+    fn seal_plain(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>> {
         self.seal_payload(payload)
     }
 }
@@ -494,14 +501,22 @@ mod tests {
 
     const PSK: &[u8] = b"0123456789abcdef";
 
+    fn flatten_wire(wire: Vec<bytes::Bytes>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for s in wire {
+            out.extend_from_slice(&s);
+        }
+        out
+    }
+
     #[test]
     fn owned_payload_round_trips() {
         let mut encoder = V6ShapedEncoder::new(PSK).unwrap();
         let payload = b"owned shaped payload";
-        let wire = encoder.seal_plain(payload).unwrap();
+        let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&payload[..])).unwrap());
 
         let mut decoder = V6ShapedDecoder::new(Arc::<[u8]>::from(PSK));
-        let mut src = wire.as_ref();
+        let mut src = wire.as_slice();
         assert_eq!(
             decode_until_record(&mut decoder, &mut src),
             DecodeEvent::PlainData
@@ -512,10 +527,10 @@ mod tests {
     #[test]
     fn zero_chunk_can_carry_profile_padding() {
         let mut encoder = V6ShapedEncoder::new(PSK).unwrap();
-        let wire = encoder.seal_plain(&[]).unwrap();
+        let wire = flatten_wire(encoder.seal_plain(BytesMut::new()).unwrap());
 
         let mut decoder = V6ShapedDecoder::new(Arc::<[u8]>::from(PSK));
-        let mut src = wire.as_ref();
+        let mut src = wire.as_slice();
         assert_eq!(
             decode_until_record(&mut decoder, &mut src),
             DecodeEvent::ZeroChunk

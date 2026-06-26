@@ -1,8 +1,19 @@
 use super::v4::{V4_FIRST_RECORD_OVERHEAD, V4_MSS_BASE, next_v4_chunk_limit};
 use super::*;
 use crate::protocol::{ParseState, address::Address};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::{net::SocketAddr, sync::Arc};
+
+/// Flatten a vectored wire record (`Vec<Bytes>`) into a contiguous byte vec.
+/// Tests assert on the on-the-wire bytes, so they concatenate the segments.
+fn flatten_wire(wire: Vec<Bytes>) -> Vec<u8> {
+    let total = wire.iter().map(|s| s.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for s in wire {
+        out.extend_from_slice(&s);
+    }
+    out
+}
 
 #[test]
 fn connect_v2_header_matches_wire_shape() {
@@ -123,10 +134,10 @@ fn udp_response_packet_round_trips_domain_and_ip() {
 fn v4_codec_round_trips_in_place() {
     let psk = b"0123456789abcdef";
     let mut encoder = V4Encoder::new(psk).unwrap();
-    let wire = encoder.seal_plain(b"hello").unwrap();
+    let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&b"hello"[..])).unwrap());
 
     let mut decoder = V4Decoder::new(&psk[..]);
-    let mut src = wire.as_ref();
+    let mut src = wire.as_slice();
     loop {
         match decode_next(&mut decoder, &mut src) {
             DecodeEvent::NeedMore => assert!(
@@ -148,7 +159,7 @@ fn v4_encoder_applies_padding_and_chunk_size() {
     let first_limit = V4_MSS_BASE - V4_FIRST_RECORD_OVERHEAD - 8;
     assert_eq!(encoder.next_plain_capacity(), first_limit);
     let payload = vec![0x42; first_limit];
-    let wire = encoder.seal_plain(&payload).unwrap();
+    let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&payload[..])).unwrap());
     assert_eq!(
         wire.len(),
         SALT_LEN + HEADER_CIPHER_LEN + 8 + first_limit + TAG_LEN
@@ -200,10 +211,10 @@ where
     M: SnellMode,
 {
     let mut encoder = M::new_encoder(psk).unwrap();
-    let wire = encoder.seal_plain(payload).unwrap();
+    let wire = flatten_wire(encoder.seal_plain(BytesMut::from(payload)).unwrap());
 
     let mut decoder = M::new_decoder(Arc::from(psk));
-    let mut src = wire.as_ref();
+    let mut src = wire.as_slice();
     loop {
         let event = decode_next(&mut decoder, &mut src);
         match event {
@@ -227,7 +238,7 @@ where
     let mut encoder = M::new_encoder(psk).unwrap();
     let mut wire = Vec::new();
     for payload in payloads {
-        let frame = encoder.seal_plain(payload).unwrap();
+        let frame = flatten_wire(encoder.seal_plain(BytesMut::from(*payload)).unwrap());
         wire.extend_from_slice(&frame);
     }
 

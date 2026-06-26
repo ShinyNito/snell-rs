@@ -23,7 +23,7 @@
 //! # Encode / Decode flow
 //!
 //! Same as V4 minus padding interleave and congestion window:
-//! - Encoder: `seal_plain(&[u8]) → Bytes`
+//! - Encoder: `seal_plain(BytesMut) → Vec<Bytes>`
 //! - Decoder: `Salt → Header (decrypt) → Body (swap_padding is a no-op) → plaintext`
 
 use std::{fmt, io, sync::Arc};
@@ -34,7 +34,7 @@ use ring::aead::{Aad, LessSafeKey, Tag};
 
 use super::super::{
     DecodeEvent, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE, NONCE_LEN,
-    SALT_LEN, SnellTcpDecoder, SnellTcpEncoder, TAG_LEN,
+    SALT_LEN, SnellTcpDecoder, SnellTcpEncoder,
     common::{
         ReadStep, decode_v6_unshaped_header, invalid_data, invalid_input, next_nonce, seal_header,
         seal_payload_detached, v6_key, write_v6_plain_header,
@@ -91,28 +91,23 @@ impl V6UnshapedEncoder {
         })
     }
 
-    fn seal_payload(&mut self, payload: &[u8]) -> io::Result<Bytes> {
+    fn seal_payload(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>> {
         let payload_len = payload.len();
         if payload_len > MAX_PACKET_SIZE {
             return Err(invalid_input("snell payload exceeds record capacity"));
         }
         let first_record = !self.salt_sent;
 
-        let salt_len = if first_record { SALT_LEN } else { 0 };
-        let body_len = if payload_len == 0 {
-            0
-        } else {
-            payload_len + TAG_LEN
-        };
-        let mut wire = BytesMut::with_capacity(salt_len + HEADER_CIPHER_LEN + body_len);
+        // head segment: [salt?][header_cipher]
+        let mut head =
+            BytesMut::with_capacity((first_record as usize) * SALT_LEN + HEADER_CIPHER_LEN);
         if first_record {
-            wire.extend_from_slice(&self.salt);
+            head.extend_from_slice(&self.salt);
         }
-
-        let header_start = wire.len();
-        wire.resize(header_start + HEADER_CIPHER_LEN, 0);
+        let header_start = head.len();
+        head.resize(header_start + HEADER_CIPHER_LEN, 0);
         write_v6_plain_header(
-            &mut wire[header_start..header_start + HEADER_PLAIN_LEN],
+            &mut head[header_start..header_start + HEADER_PLAIN_LEN],
             0,
             payload_len,
         )?;
@@ -120,28 +115,30 @@ impl V6UnshapedEncoder {
             &self.key,
             &mut self.nonce,
             &[],
-            &mut wire[header_start..header_start + HEADER_CIPHER_LEN],
+            &mut head[header_start..header_start + HEADER_CIPHER_LEN],
             "snell v6 unshaped header encrypt failed",
         )?;
 
+        let mut segments =
+            Vec::with_capacity(1 + (payload_len > 0) as usize + (payload_len > 0) as usize);
+        segments.push(head.freeze());
+
         if payload_len > 0 {
-            let body_start = wire.len();
-            wire.resize(body_start + body_len, 0);
-            let (payload_cipher, tag_dst) =
-                wire[body_start..body_start + body_len].split_at_mut(payload_len);
-            payload_cipher.copy_from_slice(payload);
+            // payload_cipher is the caller's buffer, encrypted in place.
+            let mut payload_cipher = payload;
             let tag = seal_payload_detached(
                 &self.key,
                 &mut self.nonce,
                 &[],
-                payload_cipher,
+                payload_cipher.as_mut(),
                 "snell v6 unshaped payload encrypt failed",
             )?;
-            tag_dst.copy_from_slice(&tag);
+            segments.push(payload_cipher.freeze());
+            segments.push(Bytes::from(tag.to_vec()));
         }
 
         self.salt_sent = true;
-        Ok(wire.freeze())
+        Ok(segments)
     }
 }
 
@@ -283,7 +280,7 @@ impl SnellTcpEncoder for V6UnshapedEncoder {
         MAX_PACKET_SIZE
     }
 
-    fn seal_plain(&mut self, payload: &[u8]) -> io::Result<Bytes> {
+    fn seal_plain(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>> {
         self.seal_payload(payload)
     }
 }

@@ -149,18 +149,16 @@ impl SnellTcpEncoder for V6UnsafeRawEncoder {
         MAX_PACKET_SIZE_V6
     }
 
-    fn seal_plain(&mut self, payload: &[u8]) -> io::Result<Bytes> {
+    fn seal_plain(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>> {
         let payload_len = payload.len();
         if payload_len > MAX_PACKET_SIZE_V6 {
             return Err(invalid_input("snell payload exceeds record capacity"));
         }
 
-        let mut wire = BytesMut::with_capacity(HEADER_PLAIN_LEN + payload_len);
         let mut header = [0u8; HEADER_PLAIN_LEN];
         write_v6_plain_header(&mut header, 0, payload_len)?;
-        wire.extend_from_slice(&header);
-        wire.extend_from_slice(payload);
-        Ok(wire.freeze())
+        // Two segments: plaintext header, then the payload buffer moved as-is.
+        Ok(vec![Bytes::from(header.to_vec()), payload.freeze()])
     }
 }
 

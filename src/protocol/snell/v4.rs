@@ -43,13 +43,13 @@
 //!   next_plain_capacity()
 //!      |  budget = chunk_limit(now)  (MSS - overhead, grows each record)
 //!      v
-//!   seal_plain(&[u8])
+//!   seal_plain(BytesMut)
 //!      |  write HEADER_PLAIN (padding_len, payload_len)
 //!      |  seal header  (AEAD, nonce++, AAD empty)
 //!      |  seal payload (AEAD, nonce++, AAD empty) -> detached TAG
 //!      |  if padding > 0: make_padding() then swap_padding()
 //!      v
-//!   Bytes -> flush SALT? + HEADER_CIPHER + BODY
+//!   Vec<Bytes> -> flush SALT? + HEADER_CIPHER + BODY
 //! ```
 //!
 //! # Decode flow (state machine)
@@ -175,7 +175,7 @@ impl V4Encoder {
         })
     }
 
-    fn seal_payload(&mut self, payload: &[u8]) -> io::Result<Bytes> {
+    fn seal_payload(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>> {
         let now = Instant::now();
         let max_payload_len = self.budget_for(now).min(MAX_PACKET_SIZE);
         let payload_len = payload.len();
@@ -189,22 +189,16 @@ impl V4Encoder {
             0
         };
 
-        let salt_len = if first_record { SALT_LEN } else { 0 };
-        let body_len = padding_len
-            + if payload_len == 0 {
-                0
-            } else {
-                payload_len + super::TAG_LEN
-            };
-        let mut wire = BytesMut::with_capacity(salt_len + HEADER_CIPHER_LEN + body_len);
+        // head segment: [salt?][header_cipher]
+        let head_capacity = (first_record as usize) * SALT_LEN + HEADER_CIPHER_LEN;
+        let mut head = BytesMut::with_capacity(head_capacity);
         if first_record {
-            wire.extend_from_slice(&self.salt);
+            head.extend_from_slice(&self.salt);
         }
-
-        let header_start = wire.len();
-        wire.resize(header_start + HEADER_CIPHER_LEN, 0);
+        let header_start = head.len();
+        head.resize(header_start + HEADER_CIPHER_LEN, 0);
         write_plain_header(
-            &mut wire[header_start..header_start + HEADER_PLAIN_LEN],
+            &mut head[header_start..header_start + HEADER_PLAIN_LEN],
             padding_len,
             payload_len,
         )?;
@@ -212,36 +206,42 @@ impl V4Encoder {
             &self.key,
             &mut self.nonce,
             &[],
-            &mut wire[header_start..header_start + HEADER_CIPHER_LEN],
+            &mut head[header_start..header_start + HEADER_CIPHER_LEN],
             "snell v4 header encrypt failed",
         )?;
 
+        let mut segments = Vec::with_capacity(1 + (padding_len > 0) as usize + (payload_len > 0) as usize + 1);
+        segments.push(head.freeze());
+
         if payload_len > 0 {
-            let body_start = wire.len();
-            wire.resize(body_start + body_len, 0);
-            let (padding, payload_cipher_and_tag) =
-                wire[body_start..body_start + body_len].split_at_mut(padding_len);
-            let (payload_cipher, tag_dst) = payload_cipher_and_tag.split_at_mut(payload_len);
-            payload_cipher.copy_from_slice(payload);
+            // payload_cipher is the caller's buffer, encrypted in place.
+            let mut payload_cipher = payload;
             let mut payload_tag = seal_payload_detached(
                 &self.key,
                 &mut self.nonce,
                 &[],
-                payload_cipher,
+                payload_cipher.as_mut(),
                 "snell v4 payload encrypt failed",
             )?;
 
             if padding_len > 0 {
-                make_padding_split(padding, payload_cipher, &payload_tag);
-                swap_padding_split(padding, payload_cipher, &mut payload_tag);
+                let mut padding = vec![0u8; padding_len];
+                make_padding_split(&mut padding, &payload_cipher[..], &payload_tag);
+                swap_padding_split(
+                    &mut padding,
+                    payload_cipher.as_mut(),
+                    &mut payload_tag,
+                );
+                segments.push(Bytes::from(padding));
             }
-            tag_dst.copy_from_slice(&payload_tag);
+            segments.push(payload_cipher.freeze());
+            segments.push(Bytes::from(payload_tag.to_vec()));
         }
 
         self.salt_sent = true;
         self.chunk_limit = next_v4_chunk_limit(max_payload_len);
         self.last_write = Some(now);
-        Ok(wire.freeze())
+        Ok(segments)
     }
 
     fn plain_capacity(&self) -> usize {
@@ -463,7 +463,7 @@ impl SnellTcpEncoder for V4Encoder {
         self.plain_capacity()
     }
 
-    fn seal_plain(&mut self, payload: &[u8]) -> io::Result<Bytes> {
+    fn seal_plain(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>> {
         self.seal_payload(payload)
     }
 }

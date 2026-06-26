@@ -54,24 +54,22 @@
 //!   V6 shaped BODY  = PADDING || PAYLOAD_CIPHER || TAG   // profile-driven
 //!   V6 unsafe-raw   = PAYLOAD (plaintext, no tag)        // debug only
 //!
-//!   zero chunk      = payload_len == 0  -> no BODY, used as keepalive/end
+//!   zero chunk      = payload_len == 0  -> keepalive/end; shaped may still carry PADDING
 //! ```
 //!
 //! # Encode flow (writer side)
 //!
 //! ```text
-//!   next_plain_capacity()
+//!   runtime reads plaintext into BytesMut
 //!        |
+//!        | split by next_plain_capacity() when the mode has a window
 //!        v
-//!   runtime reads at most that many plaintext bytes
-//!        |
-//!        v
-//!   seal_plain(&[u8])
+//!   seal_plain(BytesMut)
 //!        |
 //!        | write header (padding/payload lens) -> seal header (AEAD, nonce++)
 //!        | seal payload (AEAD, nonce++)         -> make/swap padding (V4/shaped)
 //!        v
-//!   Bytes (one owned record) -----------------> async write to socket
+//!   Vec<Bytes> (one vectored record) --------> async vectored write to socket
 //! ```
 //!
 //! # Decode flow (reader side)
@@ -779,19 +777,25 @@ pub enum DecodeEvent<'a> {
 
 /// Streaming Snell TCP encoder.
 ///
-/// The runtime calls [`SnellTcpEncoder::seal_plain`] with a plaintext slice;
-/// the encoder produces one owned [`Bytes`] record ready for an async write.
-/// The codec owns no buffer pool and no compio types — it depends only on the
-/// `bytes` crate, so the protocol layer stays runtime-free.
+/// The runtime calls [`SnellTcpEncoder::seal_plain`] with an owned plaintext
+/// buffer; the encoder encrypts it **in place** and emits the wire record as
+/// a vectored sequence of owned [`Bytes`] segments, ready for a vectored
+/// async write. Taking ownership (rather than a `&[u8]` borrow) is what lets
+/// the encoder reuse the caller's buffer as the AEAD payload region with zero
+/// additional copy. The codec owns no buffer pool and no compio types — it
+/// depends only on the `bytes` crate, so the protocol layer stays runtime-free.
 pub trait SnellTcpEncoder {
     /// Maximum plaintext bytes accepted by the next record (congestion window).
     fn next_plain_capacity(&self) -> usize;
 
-    /// Seal one plaintext record, returning the owned wire bytes.
+    /// Seal one plaintext record, taking ownership of the payload buffer.
     ///
-    /// `payload.len()` must not exceed [`next_plain_capacity`](Self::next_plain_capacity).
-    /// A zero-length payload encodes a keepalive / end-of-stream zero chunk.
-    fn seal_plain(&mut self, payload: &[u8]) -> io::Result<Bytes>;
+    /// The payload is encrypted **in place** and returned as one of the wire
+    /// segments, so no per-record memcpy of the application data happens.
+    /// `payload.len()` must not exceed
+    /// [`next_plain_capacity`](Self::next_plain_capacity). An empty buffer
+    /// encodes a keepalive / end-of-stream zero chunk.
+    fn seal_plain(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>>;
 }
 
 /// Streaming Snell TCP decoder.

@@ -589,6 +589,14 @@ mod tests {
     };
     use std::io;
 
+    fn flatten_wire(wire: Vec<bytes::Bytes>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for s in wire {
+            out.extend_from_slice(&s);
+        }
+        out
+    }
+
     use compio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
         net::{TcpListener, TcpStream, UdpSocket},
@@ -608,9 +616,11 @@ mod tests {
         request.resize(request_len, 0);
         let n = snell::encode_connect_request_into(&mut request, destination, false).unwrap();
         request.truncate(n);
-        wire.extend_from_slice(&encoder.seal_plain(&request).unwrap());
+        wire.extend_from_slice(&flatten_wire(encoder.seal_plain(request).unwrap()));
 
-        wire.extend_from_slice(&encoder.seal_plain(payload).unwrap());
+        wire.extend_from_slice(&flatten_wire(
+            encoder.seal_plain(BytesMut::from(payload)).unwrap(),
+        ));
 
         wire
     }
@@ -694,7 +704,7 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = b"\x01\x05\x03abc\x0bexample.com\x01\xbbhello";
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let wire = encoder.seal_plain(plaintext).unwrap();
+        let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&plaintext[..])).unwrap());
 
         assert_eq!(
             probe_mode::<V6ShapedMode>(psk, &wire),
@@ -721,7 +731,7 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = [snell::PROTOCOL_VERSION, snell::COMMAND_UDP, 0];
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let wire = encoder.seal_plain(&plaintext).unwrap();
+        let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&plaintext[..])).unwrap());
 
         assert_eq!(
             probe_mode::<V6ShapedMode>(psk, &wire),
@@ -746,7 +756,7 @@ mod tests {
         plaintext.truncate(n);
         plaintext.resize(plaintext.len() + payload_len, b'x');
 
-        let wire = encoder.seal_plain(&plaintext).unwrap();
+        let wire = flatten_wire(encoder.seal_plain(plaintext.clone()).unwrap());
 
         assert_eq!(
             probe_mode::<V4Mode>(psk, &wire),
@@ -761,7 +771,7 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = b"\x01\x05\x03abc\x0bexample.com\x01\xbbhello";
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let wire = encoder.seal_plain(plaintext).unwrap();
+        let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&plaintext[..])).unwrap());
 
         let split_points = [1, 5, 16, 30, wire.len() / 2, wire.len()];
         let mut acc = Vec::new();
@@ -834,11 +844,13 @@ mod tests {
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
         let mut wire = Vec::new();
         let split = 5;
-        wire.extend_from_slice(&encoder.seal_plain(&request[..split]).unwrap());
+        wire.extend_from_slice(&flatten_wire(
+            encoder.seal_plain(request[..split].into()).unwrap(),
+        ));
 
         let mut rest = BytesMut::from(&request[split..]);
         rest.extend_from_slice(b"ping");
-        wire.extend_from_slice(&encoder.seal_plain(&rest).unwrap());
+        wire.extend_from_slice(&flatten_wire(encoder.seal_plain(rest).unwrap()));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use compio::{
     buf::{BufResult, IoVectoredBuf},
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -17,7 +17,7 @@ use crate::protocol::snell::{
 };
 
 type ReadFuture<R> = Pin<Box<dyn Future<Output = (R, BufResult<usize, BytesMut>)>>>;
-type WriteFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), Bytes>)>>>;
+type WriteFuture<W> = Pin<Box<dyn Future<Output = (W, BufResult<(), Vec<Bytes>>)>>>;
 type FlushFuture<W> = Pin<Box<dyn Future<Output = (W, io::Result<()>)>>>;
 
 const READ_AHEAD_LEN: usize = 64 * 1024;
@@ -139,10 +139,10 @@ impl<W> WriterIo<W>
 where
     W: AsyncWrite + 'static,
 {
-    fn start_write_all(&mut self, wire: Bytes) {
+    fn start_write_all(&mut self, wire: Vec<Bytes>) {
         let mut inner = self.take_idle();
         let future = Box::pin(async move {
-            let result = inner.write_all(wire).await;
+            let result = inner.write_vectored_all(wire).await;
             (inner, result)
         });
         *self = Self::Writing(future);
@@ -435,7 +435,7 @@ where
                     let eof = n == 0;
                     payload.truncate(n);
                     if eof {
-                        let wire = self.encoder.seal_plain(&[])?;
+                        let wire = self.encoder.seal_plain(BytesMut::new())?;
                         self.inner.start_write_all(wire);
                         *state = WriteFromState::Flushing {
                             reader: Some(reader),
@@ -471,15 +471,17 @@ where
                         )));
                     }
                     let n = (payload.len() - *offset).min(capacity);
-                    let next_offset = *offset + n;
-                    let wire = self.encoder.seal_plain(&payload[*offset..next_offset])?;
+                    // Take ownership so we can split the frame off zero-copy.
+                    let mut payload = std::mem::take(payload);
+                    payload.advance(*offset);
+                    let frame = payload.split_to(n);
+                    let wire = self.encoder.seal_plain(frame)?;
                     self.inner.start_write_all(wire);
                     let reader = reader.take().expect("plain reader missing");
-                    let payload = std::mem::take(payload);
                     *state = WriteFromState::Flushing {
                         reader: Some(reader),
                         payload,
-                        offset: next_offset,
+                        offset: 0,
                         eof: false,
                     };
                 }
@@ -532,7 +534,7 @@ where
                         "snell udp packet is larger than one frame",
                     )));
                 }
-                let wire = self.encoder.seal_plain(payload)?;
+                let wire = self.encoder.seal_plain(BytesMut::from(payload))?;
                 self.inner.start_write_all(wire);
                 *state = WriteFrameState::Flushing;
             }
@@ -572,7 +574,7 @@ where
             ));
         }
         payload.truncate(n);
-        let wire = self.encoder.seal_plain(&payload)?;
+        let wire = self.encoder.seal_plain(payload)?;
         self.inner.start_write_all(wire);
         self.drain_pending().await
     }
@@ -590,7 +592,7 @@ where
         } else {
             payload.len().min(capacity)
         };
-        let wire = self.encoder.seal_plain(&payload[..n])?;
+        let wire = self.encoder.seal_plain(BytesMut::from(&payload[..n]))?;
         self.inner.start_write_all(wire);
         self.drain_pending().await?;
         Ok(n)
@@ -659,9 +661,15 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let mut encoder = V4Encoder::new(&psk).unwrap();
         let mut wire = BytesMut::new();
-        wire.extend_from_slice(&encoder.seal_plain(b"hello").unwrap());
-        wire.extend_from_slice(&encoder.seal_plain(b"world").unwrap());
-        wire.extend_from_slice(&encoder.seal_plain(&[]).unwrap());
+        for s in encoder.seal_plain(BytesMut::from(&b"hello"[..])).unwrap() {
+            wire.extend_from_slice(&s);
+        }
+        for s in encoder.seal_plain(BytesMut::from(&b"world"[..])).unwrap() {
+            wire.extend_from_slice(&s);
+        }
+        for s in encoder.seal_plain(BytesMut::new()).unwrap() {
+            wire.extend_from_slice(&s);
+        }
 
         let (_client, server) = tcp_pair().await;
         let (server_read, _) = server.into_split();
@@ -682,7 +690,13 @@ mod tests {
     async fn reads_frame_split_across_socket_reads() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let mut encoder = V4Encoder::new(&psk).unwrap();
-        let wire = encoder.seal_plain(b"hello").unwrap();
+        let wire: Vec<u8> = {
+            let mut v = Vec::new();
+            for s in encoder.seal_plain(BytesMut::from(&b"hello"[..])).unwrap() {
+                v.extend_from_slice(&s);
+            }
+            v
+        };
 
         let (client, server) = tcp_pair().await;
         let (_, mut client_write) = client.into_split();
