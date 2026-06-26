@@ -8,7 +8,7 @@ use bytes::BytesMut;
 #[cfg(test)]
 use compio::buf::IoVectoredBuf;
 use compio::{
-    buf::IoBufMut,
+    buf::{IoBuf, IoBufMut},
     io::{AsyncRead, AsyncReadManaged, AsyncWrite},
     net::{TcpListener, TcpSocket, TcpStream},
     runtime, time,
@@ -18,7 +18,7 @@ use crate::{
     config::TcpBrutalConfig,
     keepalive::apply_tcp_keepalive,
     protocol::snell::{
-        self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, MAX_CONNECT_REQUEST_LEN,
+        self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, MAX_CONNECT_REQUEST_LEN, PlaintextFrame,
         PlaintextSegment, SnellMode, SnellTcpDecoder, SnellTcpEncoder, V4Decoder, V4Mode,
         V6ShapedDecoder, V6ShapedMode, V6UnsafeRawMode, V6UnshapedMode,
         version::{ProtocolVersion, V6Mode},
@@ -186,6 +186,7 @@ where
         stream,
         decoder,
         Vec::new(),
+        BytesMut::new(),
         psk,
         outbound,
         peer_addr,
@@ -209,11 +210,13 @@ async fn serve_snell_inbound_auto(
         ProbedStream::V6Shaped {
             stream,
             decoder,
+            pending_plaintext,
             pending_ciphertext,
         } => {
             serve_snell_inbound_typed_with_decoder::<V6ShapedMode>(
                 stream,
                 decoder,
+                pending_plaintext,
                 pending_ciphertext,
                 psk,
                 outbound,
@@ -224,11 +227,13 @@ async fn serve_snell_inbound_auto(
         ProbedStream::V4 {
             stream,
             decoder,
+            pending_plaintext,
             pending_ciphertext,
         } => {
             serve_snell_inbound_typed_with_decoder::<V4Mode>(
                 stream,
                 decoder,
+                pending_plaintext,
                 pending_ciphertext,
                 psk,
                 outbound,
@@ -242,7 +247,8 @@ async fn serve_snell_inbound_auto(
 async fn serve_snell_inbound_typed_with_decoder<M>(
     stream: TcpStream,
     decoder: M::Decoder,
-    pending_ciphertext: Vec<u8>,
+    pending_plaintext: Vec<PlaintextFrame>,
+    pending_ciphertext: BytesMut,
     psk: Arc<[u8]>,
     outbound: Outbound,
     peer_addr: SocketAddr,
@@ -254,9 +260,10 @@ where
 {
     let (read_half, write_half) = stream.into_split();
     let transport: SnellTransport<M> = SnellTransport::new(
-        SnellStreamReader::from_decoder_with_pending_ciphertext(
+        SnellStreamReader::from_decoder_with_pending(
             read_half,
             decoder,
+            pending_plaintext,
             pending_ciphertext,
         ),
         SnellStreamWriter::new::<M>(write_half, psk)?,
@@ -467,23 +474,25 @@ enum ProbedStream {
     V6Shaped {
         stream: TcpStream,
         decoder: V6ShapedDecoder,
-        pending_ciphertext: Vec<u8>,
+        pending_plaintext: Vec<PlaintextFrame>,
+        pending_ciphertext: BytesMut,
     },
     V4 {
         stream: TcpStream,
         decoder: V4Decoder,
-        pending_ciphertext: Vec<u8>,
+        pending_plaintext: Vec<PlaintextFrame>,
+        pending_ciphertext: BytesMut,
     },
 }
 
 async fn probe_snell_mode(mut stream: TcpStream, psk: Arc<[u8]>) -> io::Result<ProbedStream> {
     time::timeout(PROBE_TIMEOUT, async {
-        let mut acc: Vec<u8> = Vec::new();
-        let mut v6_possible = true;
-        let mut v4_possible = true;
+        let mut acc = BytesMut::new();
+        let mut v6 = ProbeCandidate::new(V6ShapedMode::new_decoder(psk.clone()));
+        let mut v4 = ProbeCandidate::new(V4Mode::new_decoder(psk));
         loop {
             let (result, buf) = stream
-                .read(Vec::with_capacity(PROBE_BUF_LEN))
+                .read(BytesMut::with_capacity(PROBE_BUF_LEN))
                 .await
                 .into_parts();
             let n = result?;
@@ -495,37 +504,45 @@ async fn probe_snell_mode(mut stream: TcpStream, psk: Arc<[u8]>) -> io::Result<P
             }
             acc.extend_from_slice(&buf[..n]);
 
-            if v6_possible {
-                let mut decoder = V6ShapedMode::new_decoder(psk.clone());
-                match probe_decoder(&mut decoder, &acc) {
+            if v6.possible {
+                match v6.probe(&acc) {
                     ProbeResult::Match { consumed } => {
+                        let pending_ciphertext = acc.split_off(consumed);
+                        let ProbeCandidate {
+                            decoder, plaintext, ..
+                        } = v6;
                         return Ok(ProbedStream::V6Shaped {
                             stream,
                             decoder,
-                            pending_ciphertext: acc[consumed..].to_vec(),
+                            pending_plaintext: plaintext,
+                            pending_ciphertext,
                         });
                     }
                     ProbeResult::NeedMore => {}
-                    ProbeResult::Invalid => v6_possible = false,
+                    ProbeResult::Invalid => {}
                 }
             }
 
-            if v4_possible {
-                let mut decoder = V4Mode::new_decoder(psk.clone());
-                match probe_decoder(&mut decoder, &acc) {
+            if v4.possible {
+                match v4.probe(&acc) {
                     ProbeResult::Match { consumed } => {
+                        let pending_ciphertext = acc.split_off(consumed);
+                        let ProbeCandidate {
+                            decoder, plaintext, ..
+                        } = v4;
                         return Ok(ProbedStream::V4 {
                             stream,
                             decoder,
-                            pending_ciphertext: acc[consumed..].to_vec(),
+                            pending_plaintext: plaintext,
+                            pending_ciphertext,
                         });
                     }
                     ProbeResult::NeedMore => {}
-                    ProbeResult::Invalid => v4_possible = false,
+                    ProbeResult::Invalid => {}
                 }
             }
 
-            if !v6_possible && !v4_possible {
+            if !v6.possible && !v4.possible {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "snell probe could not detect v6-default or v4/v5",
@@ -551,44 +568,97 @@ enum ProbePlaintext {
     Invalid,
 }
 
+struct ProbeCandidate<D> {
+    decoder: D,
+    consumed: usize,
+    plaintext: Vec<PlaintextFrame>,
+    control_prefix: BytesMut,
+    possible: bool,
+}
+
+impl<D> ProbeCandidate<D> {
+    fn new(decoder: D) -> Self {
+        Self {
+            decoder,
+            consumed: 0,
+            plaintext: Vec::new(),
+            control_prefix: BytesMut::new(),
+            possible: true,
+        }
+    }
+}
+
+impl<D> ProbeCandidate<D>
+where
+    D: SnellTcpDecoder,
+{
+    fn probe(&mut self, bytes: &[u8]) -> ProbeResult {
+        loop {
+            let need = self.decoder.next_cipher_len();
+            if need == 0 {
+                return ProbeResult::NeedMore;
+            }
+            let Some(end) = self
+                .consumed
+                .checked_add(need)
+                .filter(|end| *end <= bytes.len())
+            else {
+                return ProbeResult::NeedMore;
+            };
+            let chunk = BytesMut::from(&bytes[self.consumed..end]);
+            match self.decoder.decode_ciphertext(chunk) {
+                Ok(DecodeEvent::PlainData) => {
+                    self.consumed = end;
+                    match self.drain_plaintext() {
+                        ProbePlaintext::Match => {
+                            return ProbeResult::Match {
+                                consumed: self.consumed,
+                            };
+                        }
+                        ProbePlaintext::NeedMore => {}
+                        ProbePlaintext::Invalid => return self.invalid(),
+                    }
+                }
+                Ok(DecodeEvent::ZeroChunk) | Err(_) => return self.invalid(),
+                Ok(_) => self.consumed = end,
+            }
+        }
+    }
+
+    fn drain_plaintext(&mut self) -> ProbePlaintext {
+        while let Some(frame) = self.decoder.take_pending_plaintext() {
+            let remaining = MAX_CONNECT_REQUEST_LEN.saturating_sub(self.control_prefix.len());
+            if remaining != 0 {
+                let take = frame.as_init().len().min(remaining);
+                self.control_prefix
+                    .extend_from_slice(&frame.as_init()[..take]);
+            }
+            self.plaintext.push(frame);
+        }
+
+        match probe_control_plaintext(&self.control_prefix) {
+            ProbePlaintext::NeedMore if self.control_prefix.len() == MAX_CONNECT_REQUEST_LEN => {
+                ProbePlaintext::Invalid
+            }
+            result => result,
+        }
+    }
+
+    fn invalid(&mut self) -> ProbeResult {
+        self.possible = false;
+        ProbeResult::Invalid
+    }
+}
+
 #[cfg(test)]
 fn probe_mode<M>(psk: Arc<[u8]>, bytes: &[u8]) -> ProbeResult
 where
     M: SnellMode,
 {
-    let mut decoder = M::new_decoder(psk);
-    probe_decoder(&mut decoder, bytes)
+    ProbeCandidate::new(M::new_decoder(psk)).probe(bytes)
 }
 
-fn probe_decoder<D>(decoder: &mut D, bytes: &[u8]) -> ProbeResult
-where
-    D: SnellTcpDecoder,
-{
-    let mut offset: usize = 0;
-    loop {
-        let need = decoder.next_cipher_len();
-        if need == 0 {
-            return ProbeResult::NeedMore;
-        }
-        let Some(end) = offset.checked_add(need).filter(|end| *end <= bytes.len()) else {
-            return ProbeResult::NeedMore;
-        };
-        let chunk = BytesMut::from(&bytes[offset..end]);
-        offset = end;
-        match decoder.decode_ciphertext(chunk) {
-            Ok(DecodeEvent::PlainData) => {
-                return match probe_plaintext(decoder) {
-                    ProbePlaintext::Match => ProbeResult::Match { consumed: offset },
-                    ProbePlaintext::NeedMore => ProbeResult::NeedMore,
-                    ProbePlaintext::Invalid => ProbeResult::Invalid,
-                };
-            }
-            Ok(DecodeEvent::ZeroChunk) | Err(_) => return ProbeResult::Invalid,
-            Ok(_) => {}
-        }
-    }
-}
-
+#[cfg(test)]
 fn probe_plaintext<D>(decoder: &D) -> ProbePlaintext
 where
     D: SnellTcpDecoder,
@@ -606,10 +676,12 @@ where
             break;
         }
     }
-    probe_control_prefix(snell::decode_connect_request_prefix(&buf[..len]).map(|_| ()))
-        .or_else(|| {
-            probe_control_prefix(snell::decode_udp_setup_request_prefix(&buf[..len]).map(|_| ()))
-        })
+    probe_control_plaintext(&buf[..len])
+}
+
+fn probe_control_plaintext(buf: &[u8]) -> ProbePlaintext {
+    probe_control_prefix(snell::decode_connect_request_prefix(buf).map(|_| ()))
+        .or_else(|| probe_control_prefix(snell::decode_udp_setup_request_prefix(buf).map(|_| ())))
         .unwrap_or(ProbePlaintext::Invalid)
 }
 
@@ -846,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_accumulated_split_reads_v6_shaped() {
+    fn probe_streaming_split_reads_v6_shaped() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = b"\x01\x05\x03abc\x0bexample.com\x01\xbbhello";
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
@@ -860,14 +932,14 @@ mod tests {
 
         let split_points = [1, 5, 16, 30, wire.len() / 2, wire.len()];
         let mut acc = Vec::new();
+        let mut candidate = ProbeCandidate::new(V6ShapedMode::new_decoder(psk));
         let mut prev = 0;
         for &end in split_points.iter().filter(|&&e| e > 0 && e <= wire.len()) {
             if end <= prev {
                 continue;
             }
             acc.extend_from_slice(&wire[prev..end]);
-            let mut decoder = V6ShapedMode::new_decoder(psk.clone());
-            let result = probe_decoder(&mut decoder, &acc);
+            let result = candidate.probe(&acc);
             match result {
                 ProbeResult::Match { .. } => return,
                 ProbeResult::NeedMore => {}
@@ -909,6 +981,81 @@ mod tests {
         write_all_bytes(&mut client, &wire[..8]).await.unwrap();
         time::sleep(std::time::Duration::from_millis(10)).await;
         write_all_bytes(&mut client, &wire[8..]).await.unwrap();
+
+        time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[compio::test]
+    async fn probe_accepts_connect_split_across_v6_records() {
+        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
+        let destination = Address::domain("example.com", 443).unwrap();
+
+        let request_len = snell::connect_request_len(destination.as_view()).unwrap();
+        let mut request = BytesMut::with_capacity(request_len);
+        request.resize(request_len, 0);
+        let n =
+            snell::encode_connect_request_into(&mut request, destination.as_view(), false).unwrap();
+        request.truncate(n);
+
+        let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
+        let mut wire = Vec::new();
+        let split = 5;
+        encoder
+            .seal_plain(BytesMut::from(&request[..split]))
+            .unwrap();
+        append_pending_wire(&mut encoder, &mut wire);
+
+        let mut rest = BytesMut::from(&request[split..]);
+        rest.extend_from_slice(b"ping");
+        encoder.seal_plain(rest).unwrap();
+        append_pending_wire(&mut encoder, &mut wire);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_psk = psk.clone();
+        let server = runtime::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ProbedStream::V6Shaped {
+                stream,
+                decoder,
+                pending_plaintext,
+                pending_ciphertext,
+            } = probe_snell_mode(stream, server_psk).await.unwrap()
+            else {
+                panic!("split v6 probe matched v4");
+            };
+            assert!(!pending_plaintext.is_empty());
+
+            let (read_half, _) = stream.into_split();
+            let mut reader = SnellStreamReader::from_decoder_with_pending(
+                read_half,
+                decoder,
+                pending_plaintext,
+                pending_ciphertext,
+            );
+            let request = read_snell_request(&mut reader).await.unwrap();
+            let SnellInboundRequest::Connect(request) = request else {
+                panic!("split connect probe returned udp request");
+            };
+            assert_eq!(request.destination, destination);
+            assert!(!request.reuse);
+
+            let batch = std::future::poll_fn(|cx| reader.poll_read_frame_batch(cx))
+                .await
+                .unwrap()
+                .expect("coalesced payload");
+            let mut payload = Vec::new();
+            for slice in batch.iter_slice() {
+                payload.extend_from_slice(slice);
+            }
+            assert_eq!(payload, b"ping");
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        write_all_bytes(&mut client, &wire).await.unwrap();
 
         time::timeout(std::time::Duration::from_secs(5), server)
             .await

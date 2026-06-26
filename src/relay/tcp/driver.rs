@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::{Future, poll_fn},
     io,
     io::IoSlice,
@@ -35,7 +36,8 @@ type FlushFuture<W> = Pin<Box<dyn Future<Output = (W, io::Result<()>)>>>;
 
 pub struct SnellStreamReader<R: AsyncReadManaged, D> {
     inner: ReaderIo<R>,
-    prefetched_ciphertext: Option<ReadBuffer<Vec<u8>>>,
+    prefetched_plaintext: VecDeque<PlaintextFrame>,
+    prefetched_ciphertext: Option<ReadBuffer<BytesMut>>,
     pending_zero_chunk: bool,
     decoder: D,
 }
@@ -198,32 +200,24 @@ where
     {
         Self {
             inner: ReaderIo::new(inner),
+            prefetched_plaintext: VecDeque::new(),
             prefetched_ciphertext: None,
             pending_zero_chunk: false,
             decoder: M::new_decoder(psk),
         }
     }
 
-    pub(crate) fn from_decoder(inner: R, decoder: D) -> Self {
-        Self {
-            inner: ReaderIo::new(inner),
-            prefetched_ciphertext: None,
-            pending_zero_chunk: false,
-            decoder,
-        }
-    }
-
-    pub(crate) fn from_decoder_with_pending_ciphertext(
+    pub(crate) fn from_decoder_with_pending(
         inner: R,
         decoder: D,
-        pending_ciphertext: Vec<u8>,
+        pending_plaintext: Vec<PlaintextFrame>,
+        pending_ciphertext: BytesMut,
     ) -> Self {
-        if pending_ciphertext.is_empty() {
-            return Self::from_decoder(inner, decoder);
-        }
         Self {
             inner: ReaderIo::new(inner),
-            prefetched_ciphertext: Some(ReadBuffer::new(pending_ciphertext)),
+            prefetched_plaintext: pending_plaintext.into(),
+            prefetched_ciphertext: (!pending_ciphertext.is_empty())
+                .then(|| ReadBuffer::new(pending_ciphertext)),
             pending_zero_chunk: false,
             decoder,
         }
@@ -238,6 +232,13 @@ where
         if self.pending_zero_chunk {
             self.pending_zero_chunk = false;
             return Poll::Ready(Ok(None));
+        }
+
+        while let Some(frame) = self.prefetched_plaintext.pop_front() {
+            batch.push(frame);
+        }
+        if !batch.is_empty() {
+            return Poll::Ready(Ok(Some(batch)));
         }
 
         loop {
@@ -267,6 +268,18 @@ where
     where
         F: FnOnce(&mut Context<'_>, &[u8]) -> Poll<io::Result<()>>,
     {
+        if let Some(prefetched) = self.prefetched_plaintext.front() {
+            let result = f(cx, IoBuf::as_init(prefetched));
+            match result {
+                Poll::Ready(Ok(())) => {
+                    self.prefetched_plaintext.pop_front();
+                    return Poll::Ready(Ok(true));
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
         if !self.decoder.has_pending_plaintext() && !ready!(self.poll_read_frame(cx))? {
             return Poll::Ready(Ok(false));
         }
@@ -303,6 +316,12 @@ where
     pub async fn read_exact_plain(&mut self, dst: &mut [u8]) -> io::Result<()> {
         let mut filled = 0;
         while filled < dst.len() {
+            let copied = self.copy_prefetched_plaintext(&mut dst[filled..]);
+            if copied != 0 {
+                filled += copied;
+                continue;
+            }
+
             let copied = self.copy_pending_control_plaintext(&mut dst[filled..]);
             if copied != 0 {
                 filled += copied;
@@ -317,6 +336,22 @@ where
             }
         }
         Ok(())
+    }
+
+    fn copy_prefetched_plaintext(&mut self, dst: &mut [u8]) -> usize {
+        let Some((take, drained)) = self.prefetched_plaintext.front_mut().map(|prefetched| {
+            let plain_len = IoBuf::as_init(&*prefetched).len();
+            let take = dst.len().min(plain_len);
+            dst[..take].copy_from_slice(&IoBuf::as_init(&*prefetched)[..take]);
+            prefetched.advance(take);
+            (take, take == plain_len)
+        }) else {
+            return 0;
+        };
+        if drained {
+            self.prefetched_plaintext.pop_front();
+        }
+        take
     }
 
     fn poll_read_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
@@ -804,10 +839,11 @@ mod tests {
 
         let (_client, server) = tcp_pair().await;
         let (server_read, _) = server.into_split();
-        let mut reader = SnellStreamReader::from_decoder_with_pending_ciphertext(
+        let mut reader = SnellStreamReader::from_decoder_with_pending(
             server_read,
             V4Decoder::new(psk),
-            wire,
+            Vec::new(),
+            BytesMut::from(&wire[..]),
         );
 
         let payload = read_batch_vec(&mut reader).await.unwrap().unwrap();
