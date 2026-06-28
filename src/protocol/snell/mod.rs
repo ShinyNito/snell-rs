@@ -1,9 +1,8 @@
 //! Snell protocol codecs.
 //!
-//! This module depends only on the `bytes` crate — no Tokio, no async traits,
-//! no concrete runtime. The codec self-buffers ciphertext (`BytesMut`) and
-//! decrypts in place, so the runtime can feed any-size socket reads directly
-//! via [`SnellTcpDecoder::feed_owned`] without an external reassembly queue.
+//! This module owns the Snell wire codec and the completion-I/O buffer boundary.
+//! TCP hot paths may pass compio buffer-pool reads directly into the codec, while
+//! tests and small control paths can still use `BytesMut`.
 //!
 //! Design constraints:
 //! - The connect request must not read-ahead into application payload.
@@ -60,27 +59,27 @@
 //! # Encode flow (writer side)
 //!
 //! ```text
-//!   runtime reads plaintext into BytesMut
+//!   runtime reads plaintext into SnellBuffer
 //!        |
 //!        | split by next_plain_capacity() when the mode has a window
 //!        v
-//!   seal_plain(BytesMut)
+//!   seal_plain(SnellBuffer)
 //!        |
 //!        | write header (padding/payload lens) -> seal header (AEAD, nonce++)
 //!        | seal payload (AEAD, nonce++)         -> make/swap padding (V4/shaped)
 //!        v
-//!   Vec<Bytes> (one vectored record) --------> async vectored write to socket
+//!   SnellWire (one vectored record) --------> async vectored write to socket
 //! ```
 //!
 //! # Decode flow (reader side)
 //!
-//! The decoder self-buffers: it accepts any-size owned ciphertext chunks and
-//! accumulates partial records internally, so records that span multiple socket
-//! reads need no runtime-side copy or reassembly.
+//! The TCP reader asks the decoder for the next exact ciphertext length and
+//! feeds compio pool-backed chunks as [`SnellBuffer`]. If a record is split,
+//! the decoder falls back to internal reassembly.
 //!
 //! ```text
 //!   loop {
-//!     input = stream.read(BytesMut)           // any size
+//!     input = stream.read_managed(next_ciphertext_read_len())
 //!     feed_owned(input)
 //!        |
 //!        +-- NeedMore              read more ciphertext
@@ -106,11 +105,16 @@
 use std::{
     io,
     net::{IpAddr, SocketAddr},
+    ops::Range,
     str,
     sync::Arc,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
+use compio::{
+    buf::{IoBuf, IoVectoredBuf},
+    driver::BufferRef,
+};
 
 use crate::protocol::{
     ParseState,
@@ -775,15 +779,215 @@ pub enum DecodeEvent<'a> {
     Pong,
 }
 
+#[derive(Debug)]
+pub struct PoolBytes {
+    buffer: BufferRef,
+    range: Range<usize>,
+}
+
+impl PoolBytes {
+    pub(crate) fn new(buffer: BufferRef) -> Self {
+        let len = buffer.as_init().len();
+        Self {
+            buffer,
+            range: 0..len,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.range.end - self.range.start
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.buffer.as_init()[self.range.clone()]
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buffer[self.range.clone()]
+    }
+
+    pub(crate) fn advance(&mut self, n: usize) {
+        self.range.start += n.min(self.len());
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.range.end = self.range.start + len.min(self.len());
+    }
+}
+
+impl IoBuf for PoolBytes {
+    fn as_init(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+#[derive(Debug)]
+pub enum SnellBuffer {
+    Bytes(BytesMut),
+    Pool(PoolBytes),
+}
+
+impl SnellBuffer {
+    pub(crate) fn empty() -> Self {
+        Self::Bytes(BytesMut::new())
+    }
+
+    pub(crate) fn from_pool(buffer: BufferRef) -> Self {
+        Self::Pool(PoolBytes::new(buffer))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Bytes(buf) => buf.len(),
+            Self::Pool(buf) => buf.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Bytes(buf) => buf,
+            Self::Pool(buf) => buf.as_slice(),
+        }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Bytes(buf) => buf.as_mut(),
+            Self::Pool(buf) => buf.as_mut_slice(),
+        }
+    }
+
+    pub(crate) fn advance(&mut self, n: usize) {
+        match self {
+            Self::Bytes(buf) => buf.advance(n.min(buf.len())),
+            Self::Pool(buf) => buf.advance(n),
+        }
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        match self {
+            Self::Bytes(buf) => buf.truncate(len),
+            Self::Pool(buf) => buf.truncate(len),
+        }
+    }
+
+    pub(crate) fn into_bytes_mut(self) -> BytesMut {
+        match self {
+            Self::Bytes(buf) => buf,
+            Self::Pool(buf) => BytesMut::from(buf.as_slice()),
+        }
+    }
+
+    pub(crate) fn into_segment(self) -> SnellSegment {
+        match self {
+            Self::Bytes(buf) => SnellSegment::Bytes(buf.freeze()),
+            Self::Pool(buf) => SnellSegment::Pool(buf),
+        }
+    }
+
+    pub(crate) fn into_bytes(self) -> Bytes {
+        self.into_segment().into_bytes()
+    }
+}
+
+impl From<BytesMut> for SnellBuffer {
+    fn from(value: BytesMut) -> Self {
+        Self::Bytes(value)
+    }
+}
+
+impl AsRef<[u8]> for SnellBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl IoBuf for SnellBuffer {
+    fn as_init(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+#[derive(Debug)]
+pub enum SnellSegment {
+    Bytes(Bytes),
+    Pool(PoolBytes),
+}
+
+impl SnellSegment {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Bytes(buf) => buf,
+            Self::Pool(buf) => buf.as_slice(),
+        }
+    }
+
+    pub(crate) fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Bytes(buf) => buf,
+            Self::Pool(buf) => Bytes::copy_from_slice(buf.as_slice()),
+        }
+    }
+}
+
+impl AsRef<[u8]> for SnellSegment {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl IoBuf for SnellSegment {
+    fn as_init(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+#[derive(Debug)]
+pub struct SnellWire {
+    segments: Vec<SnellSegment>,
+}
+
+impl SnellWire {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            segments: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn push_bytes(&mut self, bytes: impl Into<Bytes>) {
+        self.segments.push(SnellSegment::Bytes(bytes.into()));
+    }
+
+    pub(crate) fn push_buffer(&mut self, buffer: SnellBuffer) {
+        if !buffer.is_empty() {
+            self.segments.push(buffer.into_segment());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_bytes_vec(self) -> Vec<Bytes> {
+        self.segments
+            .into_iter()
+            .map(SnellSegment::into_bytes)
+            .collect()
+    }
+}
+
+impl IoVectoredBuf for SnellWire {
+    fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
+        self.segments.iter().map(SnellSegment::as_slice)
+    }
+}
+
 /// Streaming Snell TCP encoder.
 ///
 /// The runtime calls [`SnellTcpEncoder::seal_plain`] with an owned plaintext
 /// buffer; the encoder encrypts it **in place** and emits the wire record as
-/// a vectored sequence of owned [`Bytes`] segments, ready for a vectored
-/// async write. Taking ownership (rather than a `&[u8]` borrow) is what lets
-/// the encoder reuse the caller's buffer as the AEAD payload region with zero
-/// additional copy. The codec owns no buffer pool and no compio types — it
-/// depends only on the `bytes` crate, so the protocol layer stays runtime-free.
+/// an owned vectored buffer, ready for a vectored async write.
 pub trait SnellTcpEncoder {
     /// Maximum plaintext bytes accepted by the next record (congestion window).
     fn next_plain_capacity(&self) -> usize;
@@ -795,28 +999,29 @@ pub trait SnellTcpEncoder {
     /// `payload.len()` must not exceed
     /// [`next_plain_capacity`](Self::next_plain_capacity). An empty buffer
     /// encodes a keepalive / end-of-stream zero chunk.
-    fn seal_plain(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>>;
+    fn seal_plain(&mut self, payload: SnellBuffer) -> io::Result<SnellWire>;
 }
 
 /// Streaming Snell TCP decoder.
 ///
 /// The decode lifecycle: hand owned ciphertext buffers to
 /// [`SnellTcpDecoder::feed_owned`] until a record completes. The decoder
-/// accumulates partial records internally and decrypts each fed buffer in
-/// place, so records that span multiple socket reads require no runtime-side
-/// copy or reassembly. On [`PlainData`](DecodeEvent::PlainData) or a control
-/// frame, drain plaintext via [`pending_plain`](Self::pending_plain) /
+/// accumulates partial records internally and decrypts pool-backed exact body
+/// reads in place. On [`PlainData`](DecodeEvent::PlainData) or a control frame,
+/// drain plaintext via [`pending_plain`](Self::pending_plain) /
 /// [`consume_plain`](Self::consume_plain). Bulk relay callers use
-/// [`take_plain`](Self::take_plain); the built-in decoders override it to move
-/// their internal `BytesMut` out without copying.
+/// [`take_plain`](Self::take_plain) to move the owned plaintext buffer out.
 pub trait SnellTcpDecoder {
+    /// Bytes required for the next ciphertext read.
+    fn next_ciphertext_read_len(&self) -> usize;
+
     /// Append ciphertext and advance the decode state machine.
     ///
     /// Returns [`DecodeEvent::NeedMore`] when the fed bytes are not yet enough
     /// to complete the current record (the caller should read more and feed
     /// again). Any other variant means a record completed and the decoder is
     /// ready for the next feed.
-    fn feed_owned(&mut self, chunk: BytesMut) -> io::Result<DecodeEvent<'_>>;
+    fn feed_owned(&mut self, chunk: SnellBuffer) -> io::Result<DecodeEvent<'_>>;
 
     /// The decrypted plaintext region of the current record (the sole source).
     fn pending_plain(&self) -> &[u8];
@@ -826,12 +1031,12 @@ pub trait SnellTcpDecoder {
 
     /// Move the pending plaintext region out of the decoder.
     ///
-    /// Implementations MUST hand off their owned `BytesMut` with
-    /// `std::mem::take(&mut self.plain)` — the bulk relay path drains every
-    /// frame through this method, so a copying implementation would add a
-    /// per-record memcpy on the hot path. This is a required method (no
-    /// default) precisely so a new decoder cannot silently regress to a copy.
-    fn take_plain(&mut self) -> BytesMut;
+    /// Implementations MUST move out their owned plaintext buffer — the bulk
+    /// relay path drains every frame through this method, so a copying
+    /// implementation would add a per-record memcpy on the hot path. This is a
+    /// required method (no default) precisely so a new decoder cannot silently
+    /// regress to a copy.
+    fn take_plain(&mut self) -> SnellBuffer;
 
     /// Whether decrypted plaintext is awaiting drain.
     fn has_pending_plain(&self) -> bool {

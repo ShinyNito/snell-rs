@@ -2,7 +2,8 @@ use std::{future::Future, io};
 
 use compio::{
     buf::BufResult,
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    driver::BufferRef,
+    io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -84,7 +85,7 @@ async fn copy_plain_to_snell<W, E, R>(
 where
     W: AsyncWrite + 'static,
     E: crate::protocol::snell::SnellTcpEncoder,
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
 {
     writer.write_from(reader).await
 }
@@ -94,7 +95,7 @@ async fn copy_snell_to_plain<R, D, W>(
     mut writer: W,
 ) -> io::Result<()>
 where
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
     D: crate::protocol::snell::SnellTcpDecoder,
     W: AsyncWrite + 'static,
 {

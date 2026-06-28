@@ -3,15 +3,55 @@ use std::{io, sync::Arc};
 use bytes::{Bytes, BytesMut};
 use compio::{
     buf::{BufResult, IoVectoredBuf},
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    driver::BufferRef,
+    io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
 };
 
 use crate::protocol::snell::{
-    DecodeEvent, SnellMode, SnellPlainReader, SnellTcpDecoder, SnellTcpEncoder,
+    DecodeEvent, SnellBuffer, SnellMode, SnellPlainReader, SnellTcpDecoder, SnellTcpEncoder,
+    SnellWire,
 };
 
 const READ_AHEAD_LEN: usize = 64 * 1024;
 const PLAINTEXT_BATCH_LEN: usize = 64 * 1024;
+
+pub(crate) async fn read_exact_managed<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<()>
+where
+    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
+{
+    let mut filled = 0;
+    while filled < dst.len() {
+        let Some(buf) = reader.read_managed(dst.len() - filled).await? else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "tcp stream ended early",
+            ));
+        };
+        if buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "tcp stream returned empty buffer",
+            ));
+        }
+        let n = buf.len().min(dst.len() - filled);
+        dst[filled..filled + n].copy_from_slice(&buf[..n]);
+        filled += n;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn read_once_managed<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<usize>
+where
+    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
+{
+    let Some(buf) = reader.read_managed(dst.len()).await? else {
+        return Ok(0);
+    };
+    let n = buf.len().min(dst.len());
+    dst[..n].copy_from_slice(&buf[..n]);
+    Ok(n)
+}
 
 pub struct SnellStreamReader<R, D> {
     inner: R,
@@ -24,7 +64,7 @@ pub struct SnellStreamWriter<W, E> {
 }
 
 pub(crate) struct PlaintextBatch {
-    frames: Vec<BytesMut>,
+    frames: Vec<SnellBuffer>,
     len: usize,
     end: bool,
 }
@@ -52,7 +92,7 @@ impl PlaintextBatch {
         self.len >= PLAINTEXT_BATCH_LEN
     }
 
-    fn push(&mut self, frame: BytesMut) {
+    fn push(&mut self, frame: SnellBuffer) {
         if !frame.is_empty() {
             self.len += frame.len();
             self.frames.push(frame);
@@ -68,13 +108,13 @@ impl PlaintextBatch {
     }
 
     pub(crate) fn into_frames(self) -> impl Iterator<Item = Bytes> {
-        self.frames.into_iter().map(BytesMut::freeze)
+        self.frames.into_iter().map(SnellBuffer::into_bytes)
     }
 }
 
 impl IoVectoredBuf for PlaintextBatch {
     fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
-        self.frames.iter().map(BytesMut::as_ref)
+        self.frames.iter().map(SnellBuffer::as_slice)
     }
 
     fn total_len(&self) -> usize {
@@ -84,7 +124,7 @@ impl IoVectoredBuf for PlaintextBatch {
 
 impl<R, D> SnellStreamReader<R, D>
 where
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
     D: SnellTcpDecoder,
 {
     pub fn new<M>(inner: R, psk: Arc<[u8]>) -> Self
@@ -176,7 +216,7 @@ where
                 return Ok(true);
             }
 
-            match self.decoder.feed_owned(BytesMut::new())? {
+            match self.decoder.feed_owned(SnellBuffer::empty())? {
                 DecodeEvent::PlainData => return Ok(true),
                 DecodeEvent::ZeroChunk => return Ok(false),
                 DecodeEvent::NeedMore => {}
@@ -203,7 +243,7 @@ where
                 return Ok(Some(true));
             }
 
-            match self.decoder.feed_owned(BytesMut::new())? {
+            match self.decoder.feed_owned(SnellBuffer::empty())? {
                 DecodeEvent::PlainData => continue,
                 DecodeEvent::ZeroChunk => return Ok(Some(false)),
                 DecodeEvent::NeedMore => return Ok(None),
@@ -213,25 +253,32 @@ where
     }
 
     async fn read_ciphertext(&mut self) -> io::Result<CiphertextRead> {
-        let BufResult(result, mut chunk) = self
-            .inner
-            .read(BytesMut::with_capacity(READ_AHEAD_LEN))
-            .await;
-        let n = result?;
-        if n == 0 {
+        let read_len = self.decoder.next_ciphertext_read_len();
+        if read_len == 0 {
+            return Ok(match self.decoder.feed_owned(SnellBuffer::empty())? {
+                DecodeEvent::ZeroChunk => CiphertextRead::ZeroChunk,
+                _ => CiphertextRead::Progress,
+            });
+        }
+
+        let Some(chunk) = self.inner.read_managed(read_len).await? else {
+            return Ok(CiphertextRead::Eof);
+        };
+        if chunk.is_empty() {
             return Ok(CiphertextRead::Eof);
         }
-        chunk.truncate(n);
-        Ok(match self.decoder.feed_owned(chunk)? {
-            DecodeEvent::ZeroChunk => CiphertextRead::ZeroChunk,
-            _ => CiphertextRead::Progress,
-        })
+        Ok(
+            match self.decoder.feed_owned(SnellBuffer::from_pool(chunk))? {
+                DecodeEvent::ZeroChunk => CiphertextRead::ZeroChunk,
+                _ => CiphertextRead::Progress,
+            },
+        )
     }
 }
 
 impl<R, D> SnellPlainReader for SnellStreamReader<R, D>
 where
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
     D: SnellTcpDecoder,
 {
     async fn read_exact_plain(&mut self, dst: &mut [u8]) -> io::Result<()> {
@@ -276,31 +323,31 @@ where
 
     pub(crate) async fn write_from<R>(&mut self, mut reader: R) -> io::Result<()>
     where
-        R: AsyncRead + 'static,
+        R: AsyncReadManaged<Buffer = BufferRef> + 'static,
     {
         loop {
-            let BufResult(result, mut payload) =
-                reader.read(BytesMut::with_capacity(READ_AHEAD_LEN)).await;
-            let n = result?;
-            payload.truncate(n);
-            if n == 0 {
-                let wire = self.encoder.seal_plain(BytesMut::new())?;
-                self.write_wire(wire).await?;
-                return Ok(());
+            let capacity = self.encoder.next_plain_capacity();
+            if capacity == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "snell encoder returned zero plaintext capacity",
+                ));
             }
 
-            while !payload.is_empty() {
-                let capacity = self.encoder.next_plain_capacity();
-                if capacity == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "snell encoder returned zero plaintext capacity",
-                    ));
-                }
-                let n = payload.len().min(capacity);
-                let wire = self.encoder.seal_plain(payload.split_to(n))?;
+            let Some(payload) = reader.read_managed(capacity.min(READ_AHEAD_LEN)).await? else {
+                let wire = self.encoder.seal_plain(SnellBuffer::empty())?;
                 self.write_wire(wire).await?;
+                return Ok(());
+            };
+            let payload = SnellBuffer::from_pool(payload);
+            if payload.len() > capacity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "snell managed read exceeded encoder capacity",
+                ));
             }
+            let wire = self.encoder.seal_plain(payload)?;
+            self.write_wire(wire).await?;
         }
     }
 
@@ -311,7 +358,7 @@ where
                 "snell udp packet is larger than one frame",
             ));
         }
-        let wire = self.encoder.seal_plain(payload)?;
+        let wire = self.encoder.seal_plain(SnellBuffer::from(payload))?;
         self.write_wire(wire).await
     }
 
@@ -330,7 +377,7 @@ where
             ));
         }
         payload.truncate(n);
-        let wire = self.encoder.seal_plain(payload)?;
+        let wire = self.encoder.seal_plain(SnellBuffer::from(payload))?;
         self.write_wire(wire).await
     }
 
@@ -347,12 +394,14 @@ where
         } else {
             payload.len().min(capacity)
         };
-        let wire = self.encoder.seal_plain(BytesMut::from(&payload[..n]))?;
+        let wire = self
+            .encoder
+            .seal_plain(SnellBuffer::from(BytesMut::from(&payload[..n])))?;
         self.write_wire(wire).await?;
         Ok(n)
     }
 
-    async fn write_wire(&mut self, wire: Vec<Bytes>) -> io::Result<()> {
+    async fn write_wire(&mut self, wire: SnellWire) -> io::Result<()> {
         let BufResult(result, _wire) = self.inner.write_vectored_all(wire).await;
         result?;
         self.inner.flush().await
@@ -364,12 +413,11 @@ mod tests {
     use super::*;
     use crate::protocol::snell::{V4Decoder, V4Encoder, V4Mode};
     use compio::{
-        buf::{BufResult, IoBufMut, SetLen},
         io::AsyncWriteExt,
         net::{TcpListener, TcpStream},
         runtime, time,
     };
-    use std::{sync::Mutex, time::Duration};
+    use std::time::Duration;
 
     #[compio::test]
     async fn round_trips_payload_and_zero_chunk() {
@@ -397,13 +445,25 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let mut encoder = V4Encoder::new(&psk).unwrap();
         let mut wire = BytesMut::new();
-        for s in encoder.seal_plain(BytesMut::from(&b"hello"[..])).unwrap() {
+        for s in encoder
+            .seal_plain(SnellBuffer::from(BytesMut::from(&b"hello"[..])))
+            .unwrap()
+            .into_bytes_vec()
+        {
             wire.extend_from_slice(&s);
         }
-        for s in encoder.seal_plain(BytesMut::from(&b"world"[..])).unwrap() {
+        for s in encoder
+            .seal_plain(SnellBuffer::from(BytesMut::from(&b"world"[..])))
+            .unwrap()
+            .into_bytes_vec()
+        {
             wire.extend_from_slice(&s);
         }
-        for s in encoder.seal_plain(BytesMut::new()).unwrap() {
+        for s in encoder
+            .seal_plain(SnellBuffer::empty())
+            .unwrap()
+            .into_bytes_vec()
+        {
             wire.extend_from_slice(&s);
         }
 
@@ -414,7 +474,7 @@ mod tests {
         // would: the bytes sit in the decoder's internal buffer, and the reader
         // drains them before touching the socket.
         let mut decoder = V4Decoder::new(psk);
-        decoder.feed_owned(wire).unwrap();
+        decoder.feed_owned(SnellBuffer::from(wire)).unwrap();
         let mut reader = SnellStreamReader::from_decoder(server_read, decoder);
 
         let (frames, ends_stream) = read_batch_vec(&mut reader).await.unwrap().unwrap();
@@ -428,7 +488,11 @@ mod tests {
         let mut encoder = V4Encoder::new(&psk).unwrap();
         let wire: Vec<u8> = {
             let mut v = Vec::new();
-            for s in encoder.seal_plain(BytesMut::from(&b"hello"[..])).unwrap() {
+            for s in encoder
+                .seal_plain(SnellBuffer::from(BytesMut::from(&b"hello"[..])))
+                .unwrap()
+                .into_bytes_vec()
+            {
                 v.extend_from_slice(&s);
             }
             v
@@ -455,50 +519,77 @@ mod tests {
     }
 
     #[compio::test]
-    async fn write_from_reads_fixed_read_ahead_before_framing() {
+    async fn write_from_relays_tcp_payload() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
-        let (client, server) = tcp_pair().await;
-        let (_, client_write) = client.into_split();
-        let (_server_read, _server_write) = server.into_split();
-        let read_caps = Arc::new(Mutex::new(Vec::new()));
-        let reader = RecordingReader {
-            payload: Some(Bytes::from_static(b"x")),
-            read_caps: read_caps.clone(),
-        };
+        let (source_write, source_read) = tcp_pair().await;
+        let (snell_read, snell_write) = tcp_pair().await;
+        let (_, mut source_write) = source_write.into_split();
+        let (source_read, _) = source_read.into_split();
+        let (snell_read, _) = snell_read.into_split();
+        let (_, snell_write) = snell_write.into_split();
+        let write = runtime::spawn(async move {
+            let BufResult(result, _) = source_write.write_all(BytesMut::from(&b"x"[..])).await;
+            result.unwrap();
+            source_write.shutdown().await.unwrap();
+        });
         let mut writer: SnellStreamWriter<_, V4Encoder> =
-            SnellStreamWriter::new::<V4Mode>(client_write, psk).unwrap();
+            SnellStreamWriter::new::<V4Mode>(snell_write, psk.clone()).unwrap();
+        let mut reader: SnellStreamReader<_, V4Decoder> =
+            SnellStreamReader::new::<V4Mode>(snell_read, psk);
 
-        writer.write_from(reader).await.unwrap();
+        writer.write_from(source_read).await.unwrap();
+        write.await.unwrap();
 
-        assert_eq!(read_caps.lock().unwrap()[0], READ_AHEAD_LEN);
+        let (frames, ends_stream) = read_batch_vec(&mut reader).await.unwrap().unwrap();
+        assert_eq!(frames, vec![b"x".to_vec()]);
+        assert!(!ends_stream);
+        assert!(read_batch_vec(&mut reader).await.unwrap().is_none());
     }
 
-    struct RecordingReader {
-        payload: Option<Bytes>,
-        read_caps: Arc<Mutex<Vec<usize>>>,
-    }
-
-    impl AsyncRead for RecordingReader {
-        async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
-            let capacity = buf.as_uninit().len();
-            self.read_caps.lock().unwrap().push(capacity);
-            let Some(payload) = self.payload.take() else {
-                return BufResult(Ok(0), buf);
-            };
-            let n = payload.len().min(capacity);
-            buf.ensure_init()[..n].copy_from_slice(&payload[..n]);
-            unsafe {
-                SetLen::set_len(&mut buf, n);
+    #[compio::test(with_proactor(
+        buffer_pool_size = std::num::NonZero::<u16>::new(1).expect("nonzero buffer pool size"),
+        buffer_pool_buffer_len = 64 * 1024
+    ))]
+    async fn read_exact_plain_releases_consumed_pool_buffer() {
+        let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
+        let (server, client) = tcp_pair().await;
+        let (server_read, _) = server.into_split();
+        let (_, mut client_write) = client.into_split();
+        let write_psk = psk.clone();
+        let write = runtime::spawn(async move {
+            let mut encoder = V4Encoder::new(&write_psk).unwrap();
+            let mut wire = BytesMut::new();
+            for payload in [b"a".as_slice(), b"b".as_slice()] {
+                for segment in encoder
+                    .seal_plain(SnellBuffer::from(BytesMut::from(payload)))
+                    .unwrap()
+                    .into_bytes_vec()
+                {
+                    wire.extend_from_slice(&segment);
+                }
             }
-            BufResult(Ok(n), buf)
-        }
+            let BufResult(result, _) = client_write.write_all(wire).await;
+            result.unwrap();
+        });
+        let mut reader: SnellStreamReader<_, V4Decoder> =
+            SnellStreamReader::new::<V4Mode>(server_read, psk);
+
+        let mut first = [0u8; 1];
+        reader.read_exact_plain(&mut first).await.unwrap();
+        assert_eq!(&first, b"a");
+
+        let mut second = [0u8; 1];
+        reader.read_exact_plain(&mut second).await.unwrap();
+        assert_eq!(&second, b"b");
+
+        write.await.unwrap();
     }
 
     async fn read_frame_vec<R, D>(
         reader: &mut SnellStreamReader<R, D>,
     ) -> io::Result<Option<Vec<u8>>>
     where
-        R: AsyncRead + 'static,
+        R: AsyncReadManaged<Buffer = BufferRef> + 'static,
         D: SnellTcpDecoder,
     {
         let Some(batch) = reader.read_frame_batch().await? else {
@@ -517,7 +608,7 @@ mod tests {
         reader: &mut SnellStreamReader<R, D>,
     ) -> io::Result<Option<(Vec<Vec<u8>>, bool)>>
     where
-        R: AsyncRead + 'static,
+        R: AsyncReadManaged<Buffer = BufferRef> + 'static,
         D: SnellTcpDecoder,
     {
         let Some(batch) = reader.read_frame_batch().await? else {

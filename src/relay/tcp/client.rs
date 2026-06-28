@@ -1,6 +1,6 @@
 use std::{io, marker::PhantomData, net::SocketAddr, rc::Rc, sync::Arc};
 
-use compio::{io::AsyncRead, net::TcpStream};
+use compio::{driver::BufferRef, io::AsyncReadManaged, net::TcpStream};
 
 use crate::protocol::{
     address::Address,
@@ -217,7 +217,7 @@ fn is_retriable_pool_error(error: &io::Error) -> bool {
 
 async fn read_server_reply<R, D>(reader: &mut SnellStreamReader<R, D>) -> io::Result<()>
 where
-    R: AsyncRead + Unpin + 'static,
+    R: AsyncReadManaged<Buffer = BufferRef> + Unpin + 'static,
     D: SnellTcpDecoder,
 {
     let mut command = [0u8; 1];
@@ -253,7 +253,7 @@ mod tests {
     };
 
     use compio::{
-        io::{AsyncRead, AsyncWrite},
+        io::AsyncWrite,
         net::{TcpListener, TcpStream},
         runtime,
     };
@@ -263,6 +263,7 @@ mod tests {
         address::Address,
         snell::{self, COMMAND_TUNNEL, V4Mode},
     };
+    use crate::relay::tcp::driver::read_once_managed;
 
     #[compio::test]
     async fn reuses_one_upstream_tcp_for_two_transports() {
@@ -391,14 +392,8 @@ mod tests {
 
     async fn read_once<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<usize>
     where
-        R: AsyncRead + 'static,
+        R: AsyncReadManaged<Buffer = BufferRef> + 'static,
     {
-        let (result, buf) = reader
-            .read(Vec::with_capacity(dst.len()))
-            .await
-            .into_parts();
-        let n = result?;
-        dst[..n].copy_from_slice(&buf[..n]);
-        Ok(n)
+        read_once_managed(reader, dst).await
     }
 }

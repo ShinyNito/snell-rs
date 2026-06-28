@@ -20,8 +20,8 @@ use std::{fmt, io};
 use bytes::{Buf, Bytes, BytesMut};
 
 use super::super::{
-    DecodeEvent, DecodedHeader, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, SnellTcpDecoder,
-    SnellTcpEncoder,
+    DecodeEvent, DecodedHeader, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, SnellBuffer, SnellTcpDecoder,
+    SnellTcpEncoder, SnellWire,
     common::{invalid_input, parse_done, parse_v6_raw_header_need, write_v6_plain_header},
 };
 
@@ -52,7 +52,7 @@ impl fmt::Debug for V6UnsafeRawEncoder {
 pub struct V6UnsafeRawDecoder {
     step: RawReadStep,
     buf: BytesMut,
-    plain: BytesMut,
+    plain: SnellBuffer,
 }
 
 /// Decoder state machine arms.
@@ -80,19 +80,22 @@ impl V6UnsafeRawDecoder {
         Self {
             step: RawReadStep::Header { filled: 0 },
             buf: BytesMut::new(),
-            plain: BytesMut::new(),
+            plain: SnellBuffer::empty(),
         }
     }
 
     /// The decrypted plaintext region of the current record (the sole source).
     pub fn pending_plain(&self) -> &[u8] {
-        &self.plain
+        self.plain.as_slice()
     }
 
     /// Mark `n` bytes from [`pending_plain`](Self::pending_plain) as consumed.
     pub fn consume_plain(&mut self, n: usize) {
         let n = n.min(self.plain.len());
         self.plain.advance(n);
+        if self.plain.is_empty() {
+            self.plain = SnellBuffer::empty();
+        }
     }
 
     /// Advance the decode state machine as far as `buf` allows.
@@ -127,13 +130,44 @@ impl V6UnsafeRawDecoder {
                 RawReadStep::Body { header, filled } => {
                     if filled >= header.body_len {
                         // Raw mode has no crypto: the plaintext is the body.
-                        self.plain = self.buf.split_to(header.payload_len);
+                        self.plain = SnellBuffer::from(self.buf.split_to(header.payload_len));
                         self.step = RawReadStep::Header { filled: 0 };
                         return Ok(DecodeEvent::PlainData);
                     }
                     return Ok(DecodeEvent::NeedMore);
                 }
             }
+        }
+    }
+
+    fn try_feed_direct(
+        &mut self,
+        mut chunk: SnellBuffer,
+    ) -> io::Result<Result<DecodeEvent<'static>, SnellBuffer>> {
+        if !self.buf.is_empty() || !self.plain.is_empty() {
+            return Ok(Err(chunk));
+        }
+
+        match self.step {
+            RawReadStep::Header { filled: 0 } if chunk.len() == HEADER_PLAIN_LEN => {
+                let header = parse_done(
+                    parse_v6_raw_header_need(chunk.as_slice())?,
+                    "snell v6 raw short header",
+                )?;
+                if header.body_len == 0 {
+                    self.step = RawReadStep::Header { filled: 0 };
+                    return Ok(Ok(DecodeEvent::ZeroChunk));
+                }
+                self.step = RawReadStep::Body { header, filled: 0 };
+                Ok(Ok(DecodeEvent::NeedMore))
+            }
+            RawReadStep::Body { header, filled: 0 } if chunk.len() == header.body_len => {
+                chunk.truncate(header.payload_len);
+                self.plain = chunk;
+                self.step = RawReadStep::Header { filled: 0 };
+                Ok(Ok(DecodeEvent::PlainData))
+            }
+            _ => Ok(Err(chunk)),
         }
     }
 }
@@ -149,7 +183,7 @@ impl SnellTcpEncoder for V6UnsafeRawEncoder {
         MAX_PACKET_SIZE_V6
     }
 
-    fn seal_plain(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>> {
+    fn seal_plain(&mut self, payload: SnellBuffer) -> io::Result<SnellWire> {
         let payload_len = payload.len();
         if payload_len > MAX_PACKET_SIZE_V6 {
             return Err(invalid_input("snell payload exceeds record capacity"));
@@ -157,13 +191,30 @@ impl SnellTcpEncoder for V6UnsafeRawEncoder {
 
         let mut header = [0u8; HEADER_PLAIN_LEN];
         write_v6_plain_header(&mut header, 0, payload_len)?;
-        // Two segments: plaintext header, then the payload buffer moved as-is.
-        Ok(vec![Bytes::from(header.to_vec()), payload.freeze()])
+        let mut wire = SnellWire::with_capacity(1 + (payload_len > 0) as usize);
+        wire.push_bytes(Bytes::from(header.to_vec()));
+        wire.push_buffer(payload);
+        Ok(wire)
     }
 }
 
 impl SnellTcpDecoder for V6UnsafeRawDecoder {
-    fn feed_owned(&mut self, chunk: BytesMut) -> io::Result<DecodeEvent<'_>> {
+    fn next_ciphertext_read_len(&self) -> usize {
+        if !self.plain.is_empty() {
+            return 0;
+        }
+        match self.step {
+            RawReadStep::Header { filled } => HEADER_PLAIN_LEN.saturating_sub(filled),
+            RawReadStep::Body { header, filled } => header.body_len.saturating_sub(filled),
+        }
+    }
+
+    fn feed_owned(&mut self, chunk: SnellBuffer) -> io::Result<DecodeEvent<'_>> {
+        let chunk = match self.try_feed_direct(chunk)? {
+            Ok(event) => return Ok(event),
+            Err(chunk) => chunk,
+        };
+        let chunk = chunk.into_bytes_mut();
         // The `filled` cursor counts bytes consumed from `buf` for the current
         // step. Feeding a new chunk grows `buf`; recompute how many bytes of
         // the current step's target are now available and clamp the cursor.
@@ -194,7 +245,7 @@ impl SnellTcpDecoder for V6UnsafeRawDecoder {
         V6UnsafeRawDecoder::consume_plain(self, n);
     }
 
-    fn take_plain(&mut self) -> BytesMut {
-        std::mem::take(&mut self.plain)
+    fn take_plain(&mut self) -> SnellBuffer {
+        std::mem::replace(&mut self.plain, SnellBuffer::empty())
     }
 }

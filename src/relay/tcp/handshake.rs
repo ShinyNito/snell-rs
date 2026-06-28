@@ -18,13 +18,12 @@
 //! （否则上游 Error/dial 失败时客户端误以为 CONNECT 已建立）。本模块只到
 //! 拿到 target 为止；dial/ConnectCmd/WaitTunnel/Succeeded 在后续阶段。
 
-use compio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use compio::{io::AsyncWriteExt, net::TcpStream};
 
 use crate::protocol::address::Address;
 use crate::protocol::socks5::{self, Command, METHOD_NO_AUTH, ParseState, Socks5Error};
+
+use super::driver::read_exact_managed;
 
 /// SOCKS5 握手错误。由调用方负责写对应 SOCKS5 错误回复（或关闭）。
 #[derive(Debug, thiserror::Error)]
@@ -125,11 +124,5 @@ async fn read_request(local: &mut TcpStream) -> Result<(Command, Address), Hands
 }
 
 async fn read_exact_into(stream: &mut TcpStream, dst: &mut [u8]) -> std::io::Result<()> {
-    let (result, buf) = stream
-        .read_exact(Vec::with_capacity(dst.len()))
-        .await
-        .into_parts();
-    result?;
-    dst.copy_from_slice(&buf);
-    Ok(())
+    read_exact_managed(stream, dst).await
 }

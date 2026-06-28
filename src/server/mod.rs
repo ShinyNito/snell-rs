@@ -6,7 +6,8 @@ use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use compio::{
-    io::{AsyncRead, AsyncWrite},
+    driver::BufferRef,
+    io::{AsyncReadManaged, AsyncWrite},
     net::{TcpListener, TcpSocket, TcpStream},
     runtime, time,
 };
@@ -15,7 +16,7 @@ use crate::{
     config::TcpBrutalConfig,
     keepalive::apply_tcp_keepalive,
     protocol::snell::{
-        self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, SnellMode, SnellTcpDecoder,
+        self, COMMAND_ERROR, COMMAND_TUNNEL, DecodeEvent, SnellBuffer, SnellMode, SnellTcpDecoder,
         SnellTcpEncoder, V4Decoder, V4Mode, V6ShapedDecoder, V6ShapedMode, V6UnsafeRawMode,
         V6UnshapedMode,
         version::{ProtocolVersion, V6Mode},
@@ -314,7 +315,7 @@ async fn read_snell_request<R, D>(
     reader: &mut SnellStreamReader<R, D>,
 ) -> io::Result<SnellInboundRequest>
 where
-    R: AsyncRead + Unpin + 'static,
+    R: AsyncReadManaged<Buffer = BufferRef> + Unpin + 'static,
     D: SnellTcpDecoder,
 {
     let mut head = [0u8; 3];
@@ -418,18 +419,19 @@ async fn probe_snell_mode(mut stream: TcpStream, psk: Arc<[u8]>) -> io::Result<P
         let mut v6 = ProbeCandidate::new(V6ShapedMode::new_decoder(psk.clone()));
         let mut v4 = ProbeCandidate::new(V4Mode::new_decoder(psk));
         loop {
-            let (result, buf) = stream
-                .read(BytesMut::with_capacity(PROBE_BUF_LEN))
-                .await
-                .into_parts();
-            let n = result?;
-            if n == 0 {
+            let Some(buf) = stream.read_managed(PROBE_BUF_LEN).await? else {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "snell probe early eof",
                 ));
+            };
+            if buf.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "snell probe empty read",
+                ));
             }
-            acc.extend_from_slice(&buf[..n]);
+            acc.extend_from_slice(&buf);
 
             if v6.possible {
                 match v6.probe(&acc) {
@@ -510,7 +512,7 @@ where
 
         let chunk = BytesMut::from(&bytes[self.consumed..]);
         self.consumed = bytes.len();
-        match self.decoder.feed_owned(chunk) {
+        match self.decoder.feed_owned(SnellBuffer::from(chunk)) {
             Ok(DecodeEvent::PlainData) => self.probe_pending_plaintext(),
             Ok(DecodeEvent::NeedMore) => ProbeResult::NeedMore,
             Ok(DecodeEvent::ZeroChunk) | Err(_) => self.invalid(),
@@ -582,26 +584,30 @@ mod tests {
         protocol::{
             ParseState,
             address::{Address, AddressRef},
-            snell::{V4Mode, V6ShapedMode},
+            snell::{SnellBuffer, SnellWire, V4Mode, V6ShapedMode},
             socks5::{self, Command, METHOD_NO_AUTH, Reply},
         },
         relay::{
-            tcp::client::SnellConnector,
+            tcp::{
+                client::SnellConnector,
+                driver::{read_exact_managed, read_once_managed},
+            },
             udp::{recv_udp_packet, recv_udp_stream},
         },
     };
     use std::io;
 
-    fn flatten_wire(wire: Vec<bytes::Bytes>) -> Vec<u8> {
+    fn flatten_wire(wire: SnellWire) -> Vec<u8> {
         let mut out = Vec::new();
-        for s in wire {
+        for s in wire.into_bytes_vec() {
             out.extend_from_slice(&s);
         }
         out
     }
 
     use compio::{
-        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+        driver::BufferRef,
+        io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
         net::{TcpListener, TcpStream, UdpSocket},
         runtime, time,
     };
@@ -619,10 +625,14 @@ mod tests {
         request.resize(request_len, 0);
         let n = snell::encode_connect_request_into(&mut request, destination, false).unwrap();
         request.truncate(n);
-        wire.extend_from_slice(&flatten_wire(encoder.seal_plain(request).unwrap()));
+        wire.extend_from_slice(&flatten_wire(
+            encoder.seal_plain(SnellBuffer::from(request)).unwrap(),
+        ));
 
         wire.extend_from_slice(&flatten_wire(
-            encoder.seal_plain(BytesMut::from(payload)).unwrap(),
+            encoder
+                .seal_plain(SnellBuffer::from(BytesMut::from(payload)))
+                .unwrap(),
         ));
 
         wire
@@ -707,7 +717,11 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = b"\x01\x05\x03abc\x0bexample.com\x01\xbbhello";
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&plaintext[..])).unwrap());
+        let wire = flatten_wire(
+            encoder
+                .seal_plain(SnellBuffer::from(BytesMut::from(&plaintext[..])))
+                .unwrap(),
+        );
 
         assert_eq!(
             probe_mode::<V6ShapedMode>(psk, &wire),
@@ -734,7 +748,11 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = [snell::PROTOCOL_VERSION, snell::COMMAND_UDP, 0];
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&plaintext[..])).unwrap());
+        let wire = flatten_wire(
+            encoder
+                .seal_plain(SnellBuffer::from(BytesMut::from(&plaintext[..])))
+                .unwrap(),
+        );
 
         assert_eq!(
             probe_mode::<V6ShapedMode>(psk, &wire),
@@ -759,7 +777,11 @@ mod tests {
         plaintext.truncate(n);
         plaintext.resize(plaintext.len() + payload_len, b'x');
 
-        let wire = flatten_wire(encoder.seal_plain(plaintext.clone()).unwrap());
+        let wire = flatten_wire(
+            encoder
+                .seal_plain(SnellBuffer::from(plaintext.clone()))
+                .unwrap(),
+        );
 
         assert_eq!(
             probe_mode::<V4Mode>(psk, &wire),
@@ -774,7 +796,11 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = b"\x01\x05\x03abc\x0bexample.com\x01\xbbhello";
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&plaintext[..])).unwrap());
+        let wire = flatten_wire(
+            encoder
+                .seal_plain(SnellBuffer::from(BytesMut::from(&plaintext[..])))
+                .unwrap(),
+        );
 
         let split_points = [1, 5, 16, 30, wire.len() / 2, wire.len()];
         let mut acc = Vec::new();
@@ -848,12 +874,16 @@ mod tests {
         let mut wire = Vec::new();
         let split = 5;
         wire.extend_from_slice(&flatten_wire(
-            encoder.seal_plain(request[..split].into()).unwrap(),
+            encoder
+                .seal_plain(SnellBuffer::from(BytesMut::from(&request[..split])))
+                .unwrap(),
         ));
 
         let mut rest = BytesMut::from(&request[split..]);
         rest.extend_from_slice(b"ping");
-        wire.extend_from_slice(&flatten_wire(encoder.seal_plain(rest).unwrap()));
+        wire.extend_from_slice(&flatten_wire(
+            encoder.seal_plain(SnellBuffer::from(rest)).unwrap(),
+        ));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1404,37 +1434,30 @@ mod tests {
 
     async fn read_exact_into<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<()>
     where
-        R: AsyncRead + 'static,
+        R: AsyncReadManaged<Buffer = BufferRef> + 'static,
     {
-        let (result, buf) = reader
-            .read_exact(Vec::with_capacity(dst.len()))
-            .await
-            .into_parts();
-        result?;
-        dst.copy_from_slice(&buf);
-        Ok(())
+        read_exact_managed(reader, dst).await
     }
 
     async fn read_once<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<usize>
     where
-        R: AsyncRead + 'static,
+        R: AsyncReadManaged<Buffer = BufferRef> + 'static,
     {
-        let (result, buf) = reader
-            .read(Vec::with_capacity(dst.len()))
-            .await
-            .into_parts();
-        let n = result?;
-        dst[..n].copy_from_slice(&buf[..n]);
-        Ok(n)
+        read_once_managed(reader, dst).await
     }
 
     async fn read_to_end_vec<R>(reader: &mut R) -> io::Result<Vec<u8>>
     where
-        R: AsyncRead + 'static,
+        R: AsyncReadManaged<Buffer = BufferRef> + 'static,
     {
-        let (result, buf) = reader.read_to_end(Vec::new()).await.into_parts();
-        result?;
-        Ok(buf)
+        let mut out = Vec::new();
+        while let Some(buf) = reader.read_managed(4 * 1024).await? {
+            if buf.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&buf);
+        }
+        Ok(out)
     }
 
     async fn write_all_bytes<W>(writer: &mut W, bytes: &[u8]) -> io::Result<()>

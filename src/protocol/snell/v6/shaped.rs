@@ -31,14 +31,14 @@
 //!   next_plain_capacity()
 //!      |  profile-driven chunk_size
 //!      v
-//!   seal_plain(BytesMut)
+//!   seal_plain(SnellBuffer)
 //!      |  write_v6_plain_header(padding_len, payload_len)
 //!      |  seal header   (nonce++, AAD = prefix)
 //!      |  fill padding  (profile.fill_official)
 //!      |  seal payload  (nonce++, AAD = padding) -> detached TAG
 //!      |  mix_padding_payload (bit-interleave)
 //!      v
-//!   Vec<Bytes> -> vectored flush
+//!   SnellWire -> vectored flush
 //! ```
 //!
 //! # Decode flow (state machine)
@@ -62,13 +62,13 @@
 
 use std::{fmt, io, rc::Rc, sync::Arc, time::Instant};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use rand::RngCore;
 use ring::aead::{Aad, LessSafeKey, Tag};
 
 use super::super::{
     DecodeEvent, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, NONCE_LEN,
-    SALT_LEN, SnellTcpDecoder, SnellTcpEncoder,
+    SALT_LEN, SnellBuffer, SnellTcpDecoder, SnellTcpEncoder, SnellWire,
     common::{
         current_nonce, decode_v6_shaped_header, increment_nonce, invalid_data, invalid_input,
         next_nonce, seal_header, seal_payload_detached, v6_key, write_v6_plain_header,
@@ -116,7 +116,7 @@ pub struct V6ShapedDecoder {
     seq: u32,
     read_step: ShapedReadStep,
     buf: BytesMut,
-    plain: BytesMut,
+    plain: SnellBuffer,
 }
 
 /// Decoder state machine arms for the shaped variant.
@@ -159,7 +159,7 @@ impl V6ShapedEncoder {
         })
     }
 
-    fn seal_payload(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>> {
+    fn seal_payload(&mut self, mut payload: SnellBuffer) -> io::Result<SnellWire> {
         let now = Instant::now();
         let base_chunk_size = self.base_chunk_size(now);
         let max_payload_len = self.chunk_limit_for(base_chunk_size);
@@ -210,9 +210,10 @@ impl V6ShapedEncoder {
             )?;
         }
 
-        let mut segments =
-            Vec::with_capacity(1 + (padding_len > 0) as usize + (payload_len > 0) as usize * 2);
-        segments.push(head.freeze());
+        let mut wire = SnellWire::with_capacity(
+            1 + (padding_len > 0) as usize + (payload_len > 0) as usize * 2,
+        );
+        wire.push_bytes(head.freeze());
 
         // padding segment (independent of payload so the payload buffer can stay
         // the caller's, encrypted in place).
@@ -221,35 +222,34 @@ impl V6ShapedEncoder {
 
         if payload_len > 0 {
             // payload_cipher is the caller's buffer, encrypted in place.
-            let mut payload_cipher = payload;
             let mut payload_tag = seal_payload_detached(
                 &self.key,
                 &mut self.nonce,
                 &padding,
-                payload_cipher.as_mut(),
+                payload.as_mut_slice(),
                 "snell v6 shaped payload encrypt failed",
             )?;
             mix_padding_payload_split(
                 &self.profile,
                 self.seq,
                 &mut padding,
-                payload_cipher.as_mut(),
+                payload.as_mut_slice(),
                 &mut payload_tag,
             );
             if padding_len > 0 {
-                segments.push(Bytes::from(padding));
+                wire.push_bytes(Bytes::from(padding));
             }
-            segments.push(payload_cipher.freeze());
-            segments.push(Bytes::from(payload_tag.to_vec()));
+            wire.push_buffer(payload);
+            wire.push_bytes(Bytes::from(payload_tag.to_vec()));
         } else if padding_len > 0 {
-            segments.push(Bytes::from(padding));
+            wire.push_bytes(Bytes::from(padding));
         }
 
         self.salt_sent = true;
         self.chunk_size = self.profile.advance_chunk_size(base_chunk_size, None);
         self.last_write = Some(now);
         self.seq = self.seq.wrapping_add(1);
-        Ok(segments)
+        Ok(wire)
     }
 
     fn base_chunk_size(&self, now: Instant) -> usize {
@@ -291,7 +291,7 @@ impl V6ShapedDecoder {
             seq: 0,
             read_step: ShapedReadStep::Salt { filled: 0 },
             buf: BytesMut::new(),
-            plain: BytesMut::new(),
+            plain: SnellBuffer::empty(),
         }
     }
 
@@ -348,8 +348,8 @@ impl V6ShapedDecoder {
     ///   4. self.plain = padding_len .. padding_len + payload_len
     ///   5. seq++
     /// ```
-    fn finish_body(&mut self, mut body: BytesMut, header: DecodedHeader) -> io::Result<bool> {
-        self.plain.clear();
+    fn finish_body(&mut self, mut body: SnellBuffer, header: DecodedHeader) -> io::Result<bool> {
+        self.plain = SnellBuffer::empty();
         increment_nonce(&mut self.nonce);
         if header.payload_len == 0 {
             self.seq = self.seq.wrapping_add(1);
@@ -364,7 +364,8 @@ impl V6ShapedDecoder {
         if body.len() != header.body_len {
             return Err(invalid_data("snell v6 shaped body length mismatch"));
         }
-        let (padding, payload_cipher_and_tag) = body.split_at_mut(header.padding_len);
+        let (padding, payload_cipher_and_tag) =
+            body.as_mut_slice().split_at_mut(header.padding_len);
         mix_padding_payload(&self.profile, seq, padding, payload_cipher_and_tag);
         let (payload_cipher, tag) = payload_cipher_and_tag.split_at_mut(header.payload_len);
         let tag = Tag::try_from(&tag[..]).map_err(|_| invalid_data("snell v6 invalid tag"))?;
@@ -380,13 +381,16 @@ impl V6ShapedDecoder {
 
     /// Borrow the decrypted plaintext region from the current record.
     pub fn pending_plain(&self) -> &[u8] {
-        &self.plain
+        self.plain.as_slice()
     }
 
     /// Mark `n` bytes from [`V6ShapedDecoder::pending_plain`] as consumed.
     pub fn consume_plain(&mut self, n: usize) {
         let n = n.min(self.plain.len());
         self.plain.advance(n);
+        if self.plain.is_empty() {
+            self.plain = SnellBuffer::empty();
+        }
     }
 
     fn try_drain(&mut self) -> io::Result<DecodeEvent<'_>> {
@@ -423,7 +427,7 @@ impl V6ShapedDecoder {
                     let mut header_buf = self.buf.split_to(header_len);
                     let header = self.decode_header_in_place(prefix_len, &mut header_buf)?;
                     if header.body_len == 0 {
-                        let event = if self.finish_body(BytesMut::new(), header)? {
+                        let event = if self.finish_body(SnellBuffer::empty(), header)? {
                             DecodeEvent::PlainData
                         } else {
                             DecodeEvent::ZeroChunk
@@ -445,7 +449,7 @@ impl V6ShapedDecoder {
                         return Ok(DecodeEvent::NeedMore);
                     }
                     let body = self.buf.split_to(header.body_len);
-                    let event = if self.finish_body(body, header)? {
+                    let event = if self.finish_body(SnellBuffer::from(body), header)? {
                         DecodeEvent::PlainData
                     } else {
                         DecodeEvent::ZeroChunk
@@ -459,6 +463,59 @@ impl V6ShapedDecoder {
             }
         }
     }
+
+    fn try_feed_direct(
+        &mut self,
+        mut chunk: SnellBuffer,
+    ) -> io::Result<Result<DecodeEvent<'static>, SnellBuffer>> {
+        if !self.buf.is_empty() || !self.plain.is_empty() {
+            return Ok(Err(chunk));
+        }
+
+        match self.read_step {
+            ShapedReadStep::Salt { filled: 0 } if chunk.len() == self.profile.salt_block_len() => {
+                self.init_salt_block(chunk.as_slice())?;
+                self.read_step = ShapedReadStep::Header {
+                    prefix_len: self.next_prefix_len(),
+                    filled: 0,
+                };
+                Ok(Ok(DecodeEvent::NeedMore))
+            }
+            ShapedReadStep::Header {
+                prefix_len,
+                filled: 0,
+            } if chunk.len() == prefix_len + HEADER_CIPHER_LEN => {
+                let header = self.decode_header_in_place(prefix_len, chunk.as_mut_slice())?;
+                if header.body_len == 0 {
+                    let event = if self.finish_body(SnellBuffer::empty(), header)? {
+                        DecodeEvent::PlainData
+                    } else {
+                        DecodeEvent::ZeroChunk
+                    };
+                    self.read_step = ShapedReadStep::Header {
+                        prefix_len: self.next_prefix_len(),
+                        filled: 0,
+                    };
+                    return Ok(Ok(event));
+                }
+                self.read_step = ShapedReadStep::Body { header, filled: 0 };
+                Ok(Ok(DecodeEvent::NeedMore))
+            }
+            ShapedReadStep::Body { header, filled: 0 } if chunk.len() == header.body_len => {
+                let event = if self.finish_body(chunk, header)? {
+                    DecodeEvent::PlainData
+                } else {
+                    DecodeEvent::ZeroChunk
+                };
+                self.read_step = ShapedReadStep::Header {
+                    prefix_len: self.next_prefix_len(),
+                    filled: 0,
+                };
+                Ok(Ok(event))
+            }
+            _ => Ok(Err(chunk)),
+        }
+    }
 }
 
 impl SnellTcpEncoder for V6ShapedEncoder {
@@ -466,13 +523,31 @@ impl SnellTcpEncoder for V6ShapedEncoder {
         self.plain_capacity()
     }
 
-    fn seal_plain(&mut self, payload: BytesMut) -> io::Result<Vec<Bytes>> {
+    fn seal_plain(&mut self, payload: SnellBuffer) -> io::Result<SnellWire> {
         self.seal_payload(payload)
     }
 }
 
 impl SnellTcpDecoder for V6ShapedDecoder {
-    fn feed_owned(&mut self, chunk: BytesMut) -> io::Result<DecodeEvent<'_>> {
+    fn next_ciphertext_read_len(&self) -> usize {
+        if !self.plain.is_empty() {
+            return 0;
+        }
+        match self.read_step {
+            ShapedReadStep::Salt { filled } => self.profile.salt_block_len().saturating_sub(filled),
+            ShapedReadStep::Header { prefix_len, filled } => {
+                (prefix_len + HEADER_CIPHER_LEN).saturating_sub(filled)
+            }
+            ShapedReadStep::Body { header, filled } => header.body_len.saturating_sub(filled),
+        }
+    }
+
+    fn feed_owned(&mut self, chunk: SnellBuffer) -> io::Result<DecodeEvent<'_>> {
+        let chunk = match self.try_feed_direct(chunk)? {
+            Ok(event) => return Ok(event),
+            Err(chunk) => chunk,
+        };
+        let chunk = chunk.into_bytes_mut();
         if self.buf.is_empty() {
             self.buf = chunk;
         } else if !chunk.is_empty() {
@@ -489,8 +564,8 @@ impl SnellTcpDecoder for V6ShapedDecoder {
         V6ShapedDecoder::consume_plain(self, n);
     }
 
-    fn take_plain(&mut self) -> BytesMut {
-        std::mem::take(&mut self.plain)
+    fn take_plain(&mut self) -> SnellBuffer {
+        std::mem::replace(&mut self.plain, SnellBuffer::empty())
     }
 }
 
@@ -501,9 +576,9 @@ mod tests {
 
     const PSK: &[u8] = b"0123456789abcdef";
 
-    fn flatten_wire(wire: Vec<bytes::Bytes>) -> Vec<u8> {
+    fn flatten_wire(wire: SnellWire) -> Vec<u8> {
         let mut out = Vec::new();
-        for s in wire {
+        for s in wire.into_bytes_vec() {
             out.extend_from_slice(&s);
         }
         out
@@ -513,7 +588,11 @@ mod tests {
     fn owned_payload_round_trips() {
         let mut encoder = V6ShapedEncoder::new(PSK).unwrap();
         let payload = b"owned shaped payload";
-        let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&payload[..])).unwrap());
+        let wire = flatten_wire(
+            encoder
+                .seal_plain(SnellBuffer::from(BytesMut::from(&payload[..])))
+                .unwrap(),
+        );
 
         let mut decoder = V6ShapedDecoder::new(Arc::<[u8]>::from(PSK));
         let mut src = wire.as_slice();
@@ -527,7 +606,7 @@ mod tests {
     #[test]
     fn zero_chunk_can_carry_profile_padding() {
         let mut encoder = V6ShapedEncoder::new(PSK).unwrap();
-        let wire = flatten_wire(encoder.seal_plain(BytesMut::new()).unwrap());
+        let wire = flatten_wire(encoder.seal_plain(SnellBuffer::empty()).unwrap());
 
         let mut decoder = V6ShapedDecoder::new(Arc::<[u8]>::from(PSK));
         let mut src = wire.as_slice();
@@ -554,11 +633,11 @@ mod tests {
 
     fn decode_next<'a>(decoder: &'a mut V6ShapedDecoder, src: &mut &[u8]) -> DecodeEvent<'a> {
         if src.is_empty() {
-            return decoder.feed_owned(BytesMut::new()).unwrap();
+            return decoder.feed_owned(SnellBuffer::empty()).unwrap();
         }
         let n = src.len().min(1);
         let chunk = BytesMut::from(&src[..n]);
         *src = &src[n..];
-        decoder.feed_owned(chunk).unwrap()
+        decoder.feed_owned(SnellBuffer::from(chunk)).unwrap()
     }
 }

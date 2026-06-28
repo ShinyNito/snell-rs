@@ -1,12 +1,38 @@
 use super::v4::{V4_FIRST_RECORD_OVERHEAD, V4_MSS_BASE, next_v4_chunk_limit};
 use super::*;
 use crate::protocol::{ParseState, address::Address};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use std::{net::SocketAddr, sync::Arc};
 
-/// Flatten a vectored wire record (`Vec<Bytes>`) into a contiguous byte vec.
+#[derive(Debug, Eq, PartialEq)]
+enum TcpDecodeEvent {
+    NeedMore,
+    PlainData,
+    ZeroChunk,
+    ServerTunnel,
+    ServerError,
+    Ping,
+    Pong,
+}
+
+impl From<DecodeEvent<'_>> for TcpDecodeEvent {
+    fn from(event: DecodeEvent<'_>) -> Self {
+        match event {
+            DecodeEvent::NeedMore => Self::NeedMore,
+            DecodeEvent::PlainData => Self::PlainData,
+            DecodeEvent::ZeroChunk => Self::ZeroChunk,
+            DecodeEvent::ServerTunnel => Self::ServerTunnel,
+            DecodeEvent::ServerError { .. } => Self::ServerError,
+            DecodeEvent::Ping => Self::Ping,
+            DecodeEvent::Pong => Self::Pong,
+        }
+    }
+}
+
+/// Flatten a vectored wire record into a contiguous byte vec.
 /// Tests assert on the on-the-wire bytes, so they concatenate the segments.
-fn flatten_wire(wire: Vec<Bytes>) -> Vec<u8> {
+fn flatten_wire(wire: SnellWire) -> Vec<u8> {
+    let wire = wire.into_bytes_vec();
     let total = wire.iter().map(|s| s.len()).sum();
     let mut out = Vec::with_capacity(total);
     for s in wire {
@@ -134,17 +160,21 @@ fn udp_response_packet_round_trips_domain_and_ip() {
 fn v4_codec_round_trips_in_place() {
     let psk = b"0123456789abcdef";
     let mut encoder = V4Encoder::new(psk).unwrap();
-    let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&b"hello"[..])).unwrap());
+    let wire = flatten_wire(
+        encoder
+            .seal_plain(SnellBuffer::from(BytesMut::from(&b"hello"[..])))
+            .unwrap(),
+    );
 
     let mut decoder = V4Decoder::new(&psk[..]);
     let mut src = wire.as_slice();
     loop {
         match decode_next(&mut decoder, &mut src) {
-            DecodeEvent::NeedMore => assert!(
+            TcpDecodeEvent::NeedMore => assert!(
                 !src.is_empty(),
                 "decoder needs more bytes than encoder emitted"
             ),
-            DecodeEvent::PlainData => break,
+            TcpDecodeEvent::PlainData => break,
             event => panic!("unexpected decode event: {event:?}"),
         }
     }
@@ -159,7 +189,11 @@ fn v4_encoder_applies_padding_and_chunk_size() {
     let first_limit = V4_MSS_BASE - V4_FIRST_RECORD_OVERHEAD - 8;
     assert_eq!(encoder.next_plain_capacity(), first_limit);
     let payload = vec![0x42; first_limit];
-    let wire = flatten_wire(encoder.seal_plain(BytesMut::from(&payload[..])).unwrap());
+    let wire = flatten_wire(
+        encoder
+            .seal_plain(SnellBuffer::from(BytesMut::from(&payload[..])))
+            .unwrap(),
+    );
     assert_eq!(
         wire.len(),
         SALT_LEN + HEADER_CIPHER_LEN + 8 + first_limit + TAG_LEN
@@ -211,21 +245,25 @@ where
     M: SnellMode,
 {
     let mut encoder = M::new_encoder(psk).unwrap();
-    let wire = flatten_wire(encoder.seal_plain(BytesMut::from(payload)).unwrap());
+    let wire = flatten_wire(
+        encoder
+            .seal_plain(SnellBuffer::from(BytesMut::from(payload)))
+            .unwrap(),
+    );
 
     let mut decoder = M::new_decoder(Arc::from(psk));
     let mut src = wire.as_slice();
     loop {
         let event = decode_next(&mut decoder, &mut src);
         match event {
-            DecodeEvent::NeedMore => {
+            TcpDecodeEvent::NeedMore => {
                 assert!(
                     !src.is_empty(),
                     "decoder needs more bytes than encoder emitted"
                 );
             }
-            DecodeEvent::PlainData => return collect_plaintext(&mut decoder),
-            DecodeEvent::ZeroChunk => panic!("unexpected zero chunk"),
+            TcpDecodeEvent::PlainData => return collect_plaintext(&mut decoder),
+            TcpDecodeEvent::ZeroChunk => panic!("unexpected zero chunk"),
             _ => continue,
         }
     }
@@ -238,7 +276,11 @@ where
     let mut encoder = M::new_encoder(psk).unwrap();
     let mut wire = Vec::new();
     for payload in payloads {
-        let frame = flatten_wire(encoder.seal_plain(BytesMut::from(*payload)).unwrap());
+        let frame = flatten_wire(
+            encoder
+                .seal_plain(SnellBuffer::from(BytesMut::from(*payload)))
+                .unwrap(),
+        );
         wire.extend_from_slice(&frame);
     }
 
@@ -248,31 +290,31 @@ where
     while !src.is_empty() {
         let event = decode_next(&mut decoder, &mut src);
         match event {
-            DecodeEvent::NeedMore => {
+            TcpDecodeEvent::NeedMore => {
                 assert!(
                     !src.is_empty(),
                     "decoder needs more bytes than encoder emitted"
                 );
             }
-            DecodeEvent::PlainData => frames.push(Some(collect_plaintext(&mut decoder))),
-            DecodeEvent::ZeroChunk => frames.push(None),
+            TcpDecodeEvent::PlainData => frames.push(Some(collect_plaintext(&mut decoder))),
+            TcpDecodeEvent::ZeroChunk => frames.push(None),
             _ => {}
         }
     }
     frames
 }
 
-fn decode_next<'a, D>(decoder: &'a mut D, src: &mut &[u8]) -> DecodeEvent<'a>
+fn decode_next<D>(decoder: &mut D, src: &mut &[u8]) -> TcpDecodeEvent
 where
     D: SnellTcpDecoder,
 {
-    if src.is_empty() {
-        return decoder.feed_owned(BytesMut::new()).unwrap();
+    if (*src).is_empty() {
+        return decoder.feed_owned(SnellBuffer::empty()).unwrap().into();
     }
-    let n = src.len().min(1);
-    let chunk = BytesMut::from(&src[..n]);
-    *src = &src[n..];
-    decoder.feed_owned(chunk).unwrap()
+    let n = (*src).len().min(1);
+    let chunk = BytesMut::from(&(*src)[..n]);
+    *src = &(*src)[n..];
+    decoder.feed_owned(SnellBuffer::from(chunk)).unwrap().into()
 }
 
 fn collect_plaintext<D>(decoder: &mut D) -> Vec<u8>

@@ -7,7 +7,7 @@ use compio::{
         BufferPool, SharedFd, ToSharedFd,
         op::{RecvFlags, RecvFromMulti, RecvFromMultiResult},
     },
-    io::AsyncRead,
+    io::AsyncReadManaged,
     net::{TcpStream, UdpSocket},
     runtime::{self, JoinHandle, Runtime, SubmitMultiManaged},
 };
@@ -179,7 +179,7 @@ async fn relay_snell_to_outbound<R, D, S>(
     mut sender: S,
 ) -> io::Result<()>
 where
-    R: compio::io::AsyncRead + 'static,
+    R: AsyncReadManaged<Buffer = compio::driver::BufferRef> + 'static,
     D: crate::protocol::snell::SnellTcpDecoder,
     S: DatagramSender,
 {
@@ -246,12 +246,12 @@ where
 }
 
 async fn watch_tcp_control(mut control: TcpStream) -> io::Result<()> {
-    loop {
-        let BufResult(result, _buf) = control.read(Vec::with_capacity(1)).await;
-        if result? == 0 {
+    while let Some(buf) = control.read_managed(1).await? {
+        if buf.is_empty() {
             return Ok(());
         }
     }
+    Ok(())
 }
 
 async fn relay_socks5_client_udp<M>(
@@ -387,7 +387,7 @@ async fn association_snell_to_client<R, D>(
     peer: SocketAddr,
 ) -> io::Result<()>
 where
-    R: compio::io::AsyncRead + 'static,
+    R: AsyncReadManaged<Buffer = compio::driver::BufferRef> + 'static,
     D: crate::protocol::snell::SnellTcpDecoder,
 {
     while let Some(batch) = reader.read_frame_batch().await? {

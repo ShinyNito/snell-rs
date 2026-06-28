@@ -8,7 +8,8 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use compio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    driver::BufferRef,
+    io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, ToSocketAddrsAsync, UdpSocket},
     time,
 };
@@ -21,6 +22,7 @@ use crate::{
         address::{Address, AddressRef},
         socks5::{self, Command, METHOD_NO_AUTH, Reply},
     },
+    relay::tcp::driver::read_exact_managed,
     relay::udp::{
         DatagramReceiver, DatagramSender, DatagramTransport, ReceivedDatagram, UDP_ASSOCIATION_TTL,
         UdpRecvStream, recv_udp_packet, recv_udp_stream, send_udp_bytes_to,
@@ -260,14 +262,14 @@ async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound>
 
 async fn read_reply<R>(stream: &mut R, buf: &mut [u8]) -> io::Result<Reply>
 where
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
 {
     Ok(read_reply_message(stream, buf).await?.reply)
 }
 
 async fn read_reply_message<R>(stream: &mut R, buf: &mut [u8]) -> io::Result<socks5::ReplyMessage>
 where
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
 {
     let mut filled = 0;
     loop {
@@ -289,15 +291,9 @@ where
 
 async fn read_exact_into<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<()>
 where
-    R: AsyncRead + 'static,
+    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
 {
-    let (result, buf) = reader
-        .read_exact(Vec::with_capacity(dst.len()))
-        .await
-        .into_parts();
-    result?;
-    dst.copy_from_slice(&buf);
-    Ok(())
+    read_exact_managed(reader, dst).await
 }
 
 async fn write_all_bytes<W>(writer: &mut W, bytes: &[u8]) -> io::Result<()>
