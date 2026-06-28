@@ -310,7 +310,11 @@ where
     if (*src).is_empty() {
         return decoder.feed_owned(SnellBuffer::empty()).unwrap().into();
     }
-    let n = (*src).len().min(1);
+    let n = decoder.next_ciphertext_read_len();
+    assert!(
+        n <= (*src).len(),
+        "decoder asked for bytes past encoded input"
+    );
     let chunk = BytesMut::from(&(*src)[..n]);
     *src = &(*src)[n..];
     decoder.feed_owned(SnellBuffer::from(chunk)).unwrap().into()

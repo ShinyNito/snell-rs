@@ -28,16 +28,15 @@
 
 use std::{fmt, io, sync::Arc};
 
-use bytes::BytesMut;
+use aws_lc_rs::aead::LessSafeKey;
 use rand::RngCore;
-use ring::aead::{Aad, LessSafeKey, Tag};
 
 use super::super::{
     DecodeEvent, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE, NONCE_LEN,
     SALT_LEN, SnellBuffer, SnellTcpDecoder, SnellTcpEncoder, SnellWire,
     common::{
-        ReadStep, decode_v6_unshaped_header, invalid_data, invalid_input, next_nonce, seal_header,
-        seal_payload_detached, v6_key, write_v6_plain_header,
+        ReadStep, decode_v6_unshaped_header, invalid_data, invalid_input, next_nonce, open_header,
+        open_payload, seal_header, seal_payload, v6_key, write_v6_plain_header,
     },
 };
 
@@ -70,7 +69,6 @@ pub struct V6UnshapedDecoder {
     key: Option<LessSafeKey>,
     nonce: [u8; NONCE_LEN],
     read_step: ReadStep,
-    buf: BytesMut,
     plain: SnellBuffer,
 }
 
@@ -122,16 +120,18 @@ impl V6UnshapedEncoder {
         }
 
         if payload_len > 0 {
+            let tag = wire.prepare_tag();
             // payload_cipher is the caller's buffer, encrypted in place.
-            let tag = seal_payload_detached(
+            seal_payload(
                 &self.key,
                 &mut self.nonce,
                 &[],
                 payload.as_mut_slice(),
+                tag,
                 "snell v6 unshaped payload encrypt failed",
             )?;
             wire.push_buffer(payload);
-            wire.push_tag(tag);
+            wire.push_tag();
         }
 
         self.salt_sent = true;
@@ -146,8 +146,7 @@ impl V6UnshapedDecoder {
             psk: psk.into(),
             key: None,
             nonce: [0; NONCE_LEN],
-            read_step: ReadStep::Salt { filled: 0 },
-            buf: BytesMut::new(),
+            read_step: ReadStep::Salt,
             plain: SnellBuffer::empty(),
         }
     }
@@ -158,20 +157,22 @@ impl V6UnshapedDecoder {
         Ok(())
     }
 
-    /// Decrypt the header currently buffered in `read_buf`.
+    /// Decrypt an exact header chunk in place.
     ///
     /// Steps: `AEAD open(HEADER_PLAIN, TAG, nonce++, AAD empty)`.
     fn decode_header_in_place(&mut self, header_cipher: &mut [u8]) -> io::Result<DecodedHeader> {
         let nonce = next_nonce(&mut self.nonce);
-        let (cipher, tag) = header_cipher.split_at_mut(HEADER_PLAIN_LEN);
-        let tag = Tag::try_from(&tag[..]).map_err(|_| invalid_data("snell v6 invalid tag"))?;
         let key = self
             .key
             .as_ref()
             .ok_or_else(|| invalid_data("snell v6 unshaped reader key not initialized"))?;
-        let header = key
-            .open_in_place_separate_tag(nonce, Aad::empty(), tag, cipher, 0..)
-            .map_err(|_| invalid_data("snell v6 unshaped header decrypt failed"))?;
+        let header = open_header(
+            key,
+            nonce,
+            &[],
+            header_cipher,
+            "snell v6 unshaped header decrypt failed",
+        )?;
         decode_v6_unshaped_header(header)
     }
 
@@ -192,10 +193,15 @@ impl V6UnshapedDecoder {
             return Err(invalid_data("snell v6 unshaped body length mismatch"));
         }
         let (payload_cipher, tag) = body.as_mut_slice().split_at_mut(header.payload_len);
-        let tag = Tag::try_from(&tag[..]).map_err(|_| invalid_data("snell v6 invalid tag"))?;
         let nonce = next_nonce(&mut self.nonce);
-        key.open_in_place_separate_tag(nonce, Aad::empty(), tag, payload_cipher, 0..)
-            .map_err(|_| invalid_data("snell v6 unshaped payload decrypt failed"))?;
+        open_payload(
+            key,
+            nonce,
+            &[],
+            payload_cipher,
+            tag,
+            "snell v6 unshaped payload decrypt failed",
+        )?;
         body.truncate(header.payload_len);
         self.plain = body;
         Ok(true)
@@ -215,103 +221,12 @@ impl V6UnshapedDecoder {
         }
     }
 
-    fn try_drain(&mut self) -> io::Result<DecodeEvent<'_>> {
-        if !self.pending_plain().is_empty() {
-            return Ok(DecodeEvent::PlainData);
-        }
-
-        loop {
-            match self.read_step {
-                ReadStep::Salt { .. } => {
-                    if self.buf.len() < SALT_LEN {
-                        self.read_step = ReadStep::Salt {
-                            filled: self.buf.len(),
-                        };
-                        return Ok(DecodeEvent::NeedMore);
-                    }
-                    let salt_bytes = self.buf.split_to(SALT_LEN);
-                    let salt: [u8; SALT_LEN] =
-                        salt_bytes[..].try_into().expect("salt buffer filled");
-                    self.init_salt(salt)?;
-                    self.read_step = ReadStep::Header { filled: 0 };
-                }
-                ReadStep::Header { .. } => {
-                    if self.buf.len() < HEADER_CIPHER_LEN {
-                        self.read_step = ReadStep::Header {
-                            filled: self.buf.len(),
-                        };
-                        return Ok(DecodeEvent::NeedMore);
-                    }
-                    let mut header_cipher = self.buf.split_to(HEADER_CIPHER_LEN);
-                    let header = self.decode_header_in_place(&mut header_cipher)?;
-                    if header.body_len == 0 {
-                        self.read_step = ReadStep::Header { filled: 0 };
-                        return if self.finish_body(SnellBuffer::empty(), header)? {
-                            Ok(DecodeEvent::PlainData)
-                        } else {
-                            Ok(DecodeEvent::ZeroChunk)
-                        };
-                    }
-                    self.read_step = ReadStep::Body { header, filled: 0 };
-                }
-                ReadStep::Body { header, .. } => {
-                    if self.buf.len() < header.body_len {
-                        self.read_step = ReadStep::Body {
-                            header,
-                            filled: self.buf.len(),
-                        };
-                        return Ok(DecodeEvent::NeedMore);
-                    }
-                    let body = self.buf.split_to(header.body_len);
-                    self.read_step = ReadStep::Header { filled: 0 };
-                    return if self.finish_body(SnellBuffer::from(body), header)? {
-                        Ok(DecodeEvent::PlainData)
-                    } else {
-                        Ok(DecodeEvent::ZeroChunk)
-                    };
-                }
-            }
-        }
-    }
-
-    fn try_feed_direct(
-        &mut self,
-        mut chunk: SnellBuffer,
-    ) -> io::Result<Result<DecodeEvent<'static>, SnellBuffer>> {
-        if !self.buf.is_empty() || !self.plain.is_empty() {
-            return Ok(Err(chunk));
-        }
-
-        match self.read_step {
-            ReadStep::Salt { filled: 0 } if chunk.len() == SALT_LEN => {
-                let salt: [u8; SALT_LEN] = chunk.as_slice().try_into().expect("salt buffer filled");
-                self.init_salt(salt)?;
-                self.read_step = ReadStep::Header { filled: 0 };
-                Ok(Ok(DecodeEvent::NeedMore))
-            }
-            ReadStep::Header { filled: 0 } if chunk.len() == HEADER_CIPHER_LEN => {
-                let header = self.decode_header_in_place(chunk.as_mut_slice())?;
-                if header.body_len == 0 {
-                    self.read_step = ReadStep::Header { filled: 0 };
-                    return if self.finish_body(SnellBuffer::empty(), header)? {
-                        Ok(Ok(DecodeEvent::PlainData))
-                    } else {
-                        Ok(Ok(DecodeEvent::ZeroChunk))
-                    };
-                }
-                self.read_step = ReadStep::Body { header, filled: 0 };
-                Ok(Ok(DecodeEvent::NeedMore))
-            }
-            ReadStep::Body { header, filled: 0 } if chunk.len() == header.body_len => {
-                self.read_step = ReadStep::Header { filled: 0 };
-                if self.finish_body(chunk, header)? {
-                    Ok(Ok(DecodeEvent::PlainData))
-                } else {
-                    Ok(Ok(DecodeEvent::ZeroChunk))
-                }
-            }
-            _ => Ok(Err(chunk)),
-        }
+    fn exact_chunk_mismatch(&self) -> io::Error {
+        invalid_input(match self.read_step {
+            ReadStep::Salt => "snell v6 unshaped salt chunk length mismatch",
+            ReadStep::Header => "snell v6 unshaped header chunk length mismatch",
+            ReadStep::Body { .. } => "snell v6 unshaped body chunk length mismatch",
+        })
     }
 }
 
@@ -331,19 +246,56 @@ impl SnellTcpDecoder for V6UnshapedDecoder {
             return 0;
         }
         match self.read_step {
-            ReadStep::Salt { filled } => SALT_LEN.saturating_sub(filled),
-            ReadStep::Header { filled } => HEADER_CIPHER_LEN.saturating_sub(filled),
-            ReadStep::Body { header, filled } => header.body_len.saturating_sub(filled),
+            ReadStep::Salt => SALT_LEN,
+            ReadStep::Header => HEADER_CIPHER_LEN,
+            ReadStep::Body { header } => header.body_len,
         }
     }
 
     fn feed_owned(&mut self, chunk: SnellBuffer) -> io::Result<DecodeEvent<'_>> {
-        let chunk = match self.try_feed_direct(chunk)? {
-            Ok(event) => return Ok(event),
-            Err(chunk) => chunk,
-        };
-        chunk.append_to_bytes_mut(&mut self.buf);
-        self.try_drain()
+        if !self.pending_plain().is_empty() {
+            if chunk.is_empty() {
+                return Ok(DecodeEvent::PlainData);
+            }
+            return Err(self.exact_chunk_mismatch());
+        }
+
+        let expected = self.next_ciphertext_read_len();
+        if chunk.len() != expected {
+            return Err(self.exact_chunk_mismatch());
+        }
+
+        match self.read_step {
+            ReadStep::Salt => {
+                let salt: [u8; SALT_LEN] = chunk.as_slice().try_into().expect("exact salt chunk");
+                self.init_salt(salt)?;
+                self.read_step = ReadStep::Header;
+                Ok(DecodeEvent::NeedMore)
+            }
+            ReadStep::Header => {
+                let mut chunk = chunk;
+                let header = self.decode_header_in_place(chunk.as_mut_slice())?;
+                if header.body_len == 0 {
+                    self.read_step = ReadStep::Header;
+                    if self.finish_body(SnellBuffer::empty(), header)? {
+                        Ok(DecodeEvent::PlainData)
+                    } else {
+                        Ok(DecodeEvent::ZeroChunk)
+                    }
+                } else {
+                    self.read_step = ReadStep::Body { header };
+                    Ok(DecodeEvent::NeedMore)
+                }
+            }
+            ReadStep::Body { header } => {
+                self.read_step = ReadStep::Header;
+                if self.finish_body(chunk, header)? {
+                    Ok(DecodeEvent::PlainData)
+                } else {
+                    Ok(DecodeEvent::ZeroChunk)
+                }
+            }
+        }
     }
 
     fn pending_plain(&self) -> &[u8] {

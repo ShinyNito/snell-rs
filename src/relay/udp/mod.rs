@@ -4,10 +4,10 @@ use bytes::BytesMut;
 use compio::{
     buf::{BufResult, IoBuf, IoVectoredBuf},
     driver::{
-        BufferPool, SharedFd, ToSharedFd,
+        BufferPool, BufferRef, SharedFd, ToSharedFd,
         op::{RecvFlags, RecvFromMulti, RecvFromMultiResult},
     },
-    io::AsyncReadManaged,
+    io::{AsyncRead, AsyncReadManaged},
     net::{TcpStream, UdpSocket},
     runtime::{self, JoinHandle, Runtime, SubmitMultiManaged},
 };
@@ -180,7 +180,7 @@ async fn relay_snell_to_outbound<R, D, S>(
     mut sender: S,
 ) -> io::Result<()>
 where
-    R: AsyncReadManaged<Buffer = compio::driver::BufferRef> + 'static,
+    R: AsyncRead + AsyncReadManaged<Buffer = BufferRef> + 'static,
     D: crate::protocol::snell::SnellTcpDecoder,
     S: DatagramSender,
 {
@@ -440,7 +440,7 @@ async fn association_snell_to_client<R, D>(
     peer: SocketAddr,
 ) -> io::Result<()>
 where
-    R: AsyncReadManaged<Buffer = compio::driver::BufferRef> + 'static,
+    R: AsyncRead + AsyncReadManaged<Buffer = BufferRef> + 'static,
     D: crate::protocol::snell::SnellTcpDecoder,
 {
     let mut response_header = BytesMut::with_capacity(socks5::MAX_UDP_HEADER_LEN);

@@ -79,17 +79,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::BytesMut;
+use aws_lc_rs::aead::LessSafeKey;
 use rand::RngCore;
-use ring::aead::{Aad, LessSafeKey, Tag};
 
 use super::{
     DecodeEvent, DecodedHeader, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE, NONCE_LEN,
     SALT_LEN, SnellBuffer, SnellTcpDecoder, SnellTcpEncoder, SnellWire,
     common::{
         ReadStep, decode_plain_header, invalid_data, invalid_input, make_padding_split, next_nonce,
-        seal_header, seal_payload_detached, swap_padding, swap_padding_split, v4_key,
-        write_plain_header,
+        open_header, open_payload, seal_header, seal_payload, swap_padding, swap_padding_split,
+        v4_key, write_plain_header,
     },
 };
 
@@ -139,7 +138,6 @@ pub struct V4Decoder {
     key: Option<LessSafeKey>,
     nonce: [u8; NONCE_LEN],
     read_step: ReadStep,
-    buf: BytesMut,
     plain: SnellBuffer,
 }
 
@@ -213,23 +211,34 @@ impl V4Encoder {
         }
 
         if payload_len > 0 {
-            // payload_cipher is the caller's buffer, encrypted in place.
-            let mut payload_tag = seal_payload_detached(
-                &self.key,
-                &mut self.nonce,
-                &[],
-                payload.as_mut_slice(),
-                "snell v4 payload encrypt failed",
-            )?;
-
             if padding_len > 0 {
-                let padding = wire.prepare_padding(padding_len);
-                make_padding_split(&mut *padding, payload.as_slice(), &payload_tag);
-                swap_padding_split(&mut *padding, payload.as_mut_slice(), &mut payload_tag);
+                let (padding, payload_tag) = wire.prepare_padding_and_tag(padding_len);
+                // payload_cipher is the caller's buffer, encrypted in place.
+                seal_payload(
+                    &self.key,
+                    &mut self.nonce,
+                    &[],
+                    payload.as_mut_slice(),
+                    payload_tag,
+                    "snell v4 payload encrypt failed",
+                )?;
+                make_padding_split(&mut *padding, payload.as_slice(), &*payload_tag);
+                swap_padding_split(&mut *padding, payload.as_mut_slice(), payload_tag);
                 wire.push_padding();
+            } else {
+                let payload_tag = wire.prepare_tag();
+                // payload_cipher is the caller's buffer, encrypted in place.
+                seal_payload(
+                    &self.key,
+                    &mut self.nonce,
+                    &[],
+                    payload.as_mut_slice(),
+                    payload_tag,
+                    "snell v4 payload encrypt failed",
+                )?;
             }
             wire.push_buffer(payload);
-            wire.push_tag(payload_tag);
+            wire.push_tag();
         }
 
         self.salt_sent = true;
@@ -288,8 +297,7 @@ impl V4Decoder {
             psk: psk.into(),
             key: None,
             nonce: [0; NONCE_LEN],
-            read_step: ReadStep::Salt { filled: 0 },
-            buf: BytesMut::new(),
+            read_step: ReadStep::Salt,
             plain: SnellBuffer::empty(),
         }
     }
@@ -313,27 +321,30 @@ impl V4Decoder {
         header_cipher: &mut [u8; HEADER_CIPHER_LEN],
     ) -> io::Result<DecodedHeader> {
         let nonce = next_nonce(&mut self.nonce);
-        let (cipher, tag) = header_cipher.split_at_mut(HEADER_PLAIN_LEN);
-        let tag = Tag::try_from(&tag[..]).map_err(|_| invalid_data("snell v4 invalid tag"))?;
-        let header = self
-            .key()?
-            .open_in_place_separate_tag(nonce, Aad::empty(), tag, cipher, 0..)
-            .map_err(|_| invalid_data("snell v4 header decrypt failed"))?;
+        let header = open_header(
+            self.key()?,
+            nonce,
+            &[],
+            header_cipher,
+            "snell v4 header decrypt failed",
+        )?;
         decode_plain_header(header)
     }
 
-    /// Decrypt the header currently buffered in `read_buf` (streaming path).
+    /// Decrypt an exact header chunk in place.
     fn decode_header_in_place(&mut self, header_cipher: &mut [u8]) -> io::Result<DecodedHeader> {
         let nonce = next_nonce(&mut self.nonce);
-        let (cipher, tag) = header_cipher.split_at_mut(HEADER_PLAIN_LEN);
-        let tag = Tag::try_from(&tag[..]).map_err(|_| invalid_data("snell v4 invalid tag"))?;
         let key = self
             .key
             .as_ref()
             .ok_or_else(|| invalid_data("snell v4 reader key not initialized"))?;
-        let header = key
-            .open_in_place_separate_tag(nonce, Aad::empty(), tag, cipher, 0..)
-            .map_err(|_| invalid_data("snell v4 header decrypt failed"))?;
+        let header = open_header(
+            key,
+            nonce,
+            &[],
+            header_cipher,
+            "snell v4 header decrypt failed",
+        )?;
         decode_plain_header(header)
     }
 
@@ -370,10 +381,15 @@ impl V4Decoder {
             body.as_mut_slice().split_at_mut(header.padding_len);
         swap_padding(padding, payload_cipher_and_tag);
         let (payload_cipher, tag) = payload_cipher_and_tag.split_at_mut(header.payload_len);
-        let tag = Tag::try_from(&tag[..]).map_err(|_| invalid_data("snell v4 invalid tag"))?;
         let nonce = next_nonce(&mut self.nonce);
-        key.open_in_place_separate_tag(nonce, Aad::empty(), tag, payload_cipher, 0..)
-            .map_err(|_| invalid_data("snell v4 payload decrypt failed"))?;
+        open_payload(
+            key,
+            nonce,
+            &[],
+            payload_cipher,
+            tag,
+            "snell v4 payload decrypt failed",
+        )?;
         body.advance(header.padding_len);
         body.truncate(header.payload_len);
         self.plain = body;
@@ -400,103 +416,18 @@ impl V4Decoder {
             .ok_or_else(|| invalid_data("snell v4 reader key not initialized"))
     }
 
-    fn try_drain(&mut self) -> io::Result<DecodeEvent<'_>> {
-        if !self.pending_plain().is_empty() {
-            return Ok(DecodeEvent::PlainData);
-        }
-
-        loop {
-            match self.read_step {
-                ReadStep::Salt { .. } => {
-                    if self.buf.len() < SALT_LEN {
-                        self.read_step = ReadStep::Salt {
-                            filled: self.buf.len(),
-                        };
-                        return Ok(DecodeEvent::NeedMore);
-                    }
-                    let salt_bytes = self.buf.split_to(SALT_LEN);
-                    let salt: [u8; SALT_LEN] =
-                        salt_bytes[..].try_into().expect("salt buffer filled");
-                    self.init_salt(salt)?;
-                    self.read_step = ReadStep::Header { filled: 0 };
-                }
-                ReadStep::Header { .. } => {
-                    if self.buf.len() < HEADER_CIPHER_LEN {
-                        self.read_step = ReadStep::Header {
-                            filled: self.buf.len(),
-                        };
-                        return Ok(DecodeEvent::NeedMore);
-                    }
-                    let mut header_cipher = self.buf.split_to(HEADER_CIPHER_LEN);
-                    let header = self.decode_header_in_place(&mut header_cipher)?;
-                    if header.body_len == 0 {
-                        self.read_step = ReadStep::Header { filled: 0 };
-                        return if self.finish_body(SnellBuffer::empty(), header)? {
-                            Ok(DecodeEvent::PlainData)
-                        } else {
-                            Ok(DecodeEvent::ZeroChunk)
-                        };
-                    }
-                    self.read_step = ReadStep::Body { header, filled: 0 };
-                }
-                ReadStep::Body { header, .. } => {
-                    if self.buf.len() < header.body_len {
-                        self.read_step = ReadStep::Body {
-                            header,
-                            filled: self.buf.len(),
-                        };
-                        return Ok(DecodeEvent::NeedMore);
-                    }
-                    let body = self.buf.split_to(header.body_len);
-                    self.read_step = ReadStep::Header { filled: 0 };
-                    return if self.finish_body(SnellBuffer::from(body), header)? {
-                        Ok(DecodeEvent::PlainData)
-                    } else {
-                        Ok(DecodeEvent::ZeroChunk)
-                    };
-                }
-            }
-        }
-    }
-
-    fn try_feed_direct(
-        &mut self,
-        mut chunk: SnellBuffer,
-    ) -> io::Result<Result<DecodeEvent<'static>, SnellBuffer>> {
-        if !self.buf.is_empty() || !self.plain.is_empty() {
-            return Ok(Err(chunk));
-        }
-
-        match self.read_step {
-            ReadStep::Salt { filled: 0 } if chunk.len() == SALT_LEN => {
-                let salt: [u8; SALT_LEN] = chunk.as_slice().try_into().expect("salt buffer filled");
-                self.init_salt(salt)?;
-                self.read_step = ReadStep::Header { filled: 0 };
-                Ok(Ok(DecodeEvent::NeedMore))
-            }
-            ReadStep::Header { filled: 0 } if chunk.len() == HEADER_CIPHER_LEN => {
-                let header = self.decode_header_in_place(chunk.as_mut_slice())?;
-                if header.body_len == 0 {
-                    self.read_step = ReadStep::Header { filled: 0 };
-                    return if self.finish_body(SnellBuffer::empty(), header)? {
-                        Ok(Ok(DecodeEvent::PlainData))
-                    } else {
-                        Ok(Ok(DecodeEvent::ZeroChunk))
-                    };
-                }
-                self.read_step = ReadStep::Body { header, filled: 0 };
-                Ok(Ok(DecodeEvent::NeedMore))
-            }
-            ReadStep::Body { header, filled: 0 } if chunk.len() == header.body_len => {
-                self.read_step = ReadStep::Header { filled: 0 };
-                if self.finish_body(chunk, header)? {
-                    Ok(Ok(DecodeEvent::PlainData))
+    fn exact_chunk_mismatch(&self, actual: usize) -> io::Error {
+        invalid_input(match self.read_step {
+            ReadStep::Salt => {
+                if actual == 0 {
+                    "snell v4 decoder needs salt bytes"
                 } else {
-                    Ok(Ok(DecodeEvent::ZeroChunk))
+                    "snell v4 salt chunk length mismatch"
                 }
             }
-            _ => Ok(Err(chunk)),
-        }
+            ReadStep::Header => "snell v4 header chunk length mismatch",
+            ReadStep::Body { .. } => "snell v4 body chunk length mismatch",
+        })
     }
 }
 
@@ -516,19 +447,56 @@ impl SnellTcpDecoder for V4Decoder {
             return 0;
         }
         match self.read_step {
-            ReadStep::Salt { filled } => SALT_LEN.saturating_sub(filled),
-            ReadStep::Header { filled } => HEADER_CIPHER_LEN.saturating_sub(filled),
-            ReadStep::Body { header, filled } => header.body_len.saturating_sub(filled),
+            ReadStep::Salt => SALT_LEN,
+            ReadStep::Header => HEADER_CIPHER_LEN,
+            ReadStep::Body { header } => header.body_len,
         }
     }
 
     fn feed_owned(&mut self, chunk: SnellBuffer) -> io::Result<DecodeEvent<'_>> {
-        let chunk = match self.try_feed_direct(chunk)? {
-            Ok(event) => return Ok(event),
-            Err(chunk) => chunk,
-        };
-        chunk.append_to_bytes_mut(&mut self.buf);
-        self.try_drain()
+        if !self.pending_plain().is_empty() {
+            if chunk.is_empty() {
+                return Ok(DecodeEvent::PlainData);
+            }
+            return Err(self.exact_chunk_mismatch(chunk.len()));
+        }
+
+        let expected = self.next_ciphertext_read_len();
+        if chunk.len() != expected {
+            return Err(self.exact_chunk_mismatch(chunk.len()));
+        }
+
+        match self.read_step {
+            ReadStep::Salt => {
+                let salt: [u8; SALT_LEN] = chunk.as_slice().try_into().expect("exact salt chunk");
+                self.init_salt(salt)?;
+                self.read_step = ReadStep::Header;
+                Ok(DecodeEvent::NeedMore)
+            }
+            ReadStep::Header => {
+                let mut chunk = chunk;
+                let header = self.decode_header_in_place(chunk.as_mut_slice())?;
+                if header.body_len == 0 {
+                    self.read_step = ReadStep::Header;
+                    if self.finish_body(SnellBuffer::empty(), header)? {
+                        Ok(DecodeEvent::PlainData)
+                    } else {
+                        Ok(DecodeEvent::ZeroChunk)
+                    }
+                } else {
+                    self.read_step = ReadStep::Body { header };
+                    Ok(DecodeEvent::NeedMore)
+                }
+            }
+            ReadStep::Body { header } => {
+                self.read_step = ReadStep::Header;
+                if self.finish_body(chunk, header)? {
+                    Ok(DecodeEvent::PlainData)
+                } else {
+                    Ok(DecodeEvent::ZeroChunk)
+                }
+            }
+        }
     }
 
     fn pending_plain(&self) -> &[u8] {

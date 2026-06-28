@@ -75,6 +75,43 @@ pub fn expand_stream(namespace: u64, label: u32, seq: u64, len_hint: u64, out: &
     }
 }
 
+/// Fill `out` with `expand_stream` bytes transformed by `map(index, byte)`.
+pub(crate) fn expand_stream_mapped<F>(
+    namespace: u64,
+    label: u32,
+    seq: u64,
+    len_hint: u64,
+    out: &mut [u8],
+    mut map: F,
+) where
+    F: FnMut(usize, u8) -> u8,
+{
+    debug_assert_eq!(
+        out.len() as u64,
+        len_hint,
+        "len_hint must match out.len(); the length is mixed into the PRF state"
+    );
+    let mut state = expand_initial_state(namespace, label, seq, len_hint);
+    let mut offset = 0usize;
+
+    let (full, tail) = split_at_mut8(out);
+    for block in full.chunks_exact_mut(8) {
+        state = state.wrapping_add(GOLDEN_GAMMA);
+        let bytes = splitmix64(state).to_le_bytes();
+        for (i, dst) in block.iter_mut().enumerate() {
+            *dst = map(offset + i, bytes[i]);
+        }
+        offset += 8;
+    }
+    if !tail.is_empty() {
+        state = state.wrapping_add(GOLDEN_GAMMA);
+        let bytes = splitmix64(state).to_le_bytes();
+        for (i, dst) in tail.iter_mut().enumerate() {
+            *dst = map(offset + i, bytes[i]);
+        }
+    }
+}
+
 /// Split `slice` into `[&mut [u8; 8]; N]`-equivalent full blocks and a tail.
 ///
 /// Helper to keep [`expand_stream`]'s main loop branch-free per block.

@@ -17,8 +17,6 @@
 
 use std::{fmt, io};
 
-use bytes::{Buf, BytesMut};
-
 use super::super::{
     DecodeEvent, DecodedHeader, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, SnellBuffer, SnellTcpDecoder,
     SnellTcpEncoder, SnellWire,
@@ -45,26 +43,21 @@ impl fmt::Debug for V6UnsafeRawEncoder {
 
 /// V6 unsafe-raw decoder — plaintext frames, no crypto.
 ///
-/// Read state machine: `Header → Body → Header → ...`. Partial records are
-/// accumulated in `buf`; each completed body is decrypted (a no-op here) in
-/// place and exposed via `plain`.
+/// Read state machine: `Header → Body → Header → ...`. The reader feeds exact
+/// chunks; completed bodies are exposed through `plain`.
 #[derive(Debug)]
 pub struct V6UnsafeRawDecoder {
     step: RawReadStep,
-    buf: BytesMut,
     plain: SnellBuffer,
 }
 
 /// Decoder state machine arms.
 #[derive(Clone, Copy, Debug)]
 enum RawReadStep {
-    /// Reading the 7-byte plaintext frame header; `filled` bytes already consumed from `buf`.
-    Header { filled: usize },
-    /// Reading the frame body; `filled` bytes of `header.body_len` already consumed from `buf`.
-    Body {
-        header: DecodedHeader,
-        filled: usize,
-    },
+    /// Reading the 7-byte plaintext frame header.
+    Header,
+    /// Reading the frame body described by `header`.
+    Body { header: DecodedHeader },
 }
 
 impl V6UnsafeRawEncoder {
@@ -78,8 +71,7 @@ impl V6UnsafeRawDecoder {
     /// Create a decoder with no crypto state.
     pub fn new() -> Self {
         Self {
-            step: RawReadStep::Header { filled: 0 },
-            buf: BytesMut::new(),
+            step: RawReadStep::Header,
             plain: SnellBuffer::empty(),
         }
     }
@@ -98,77 +90,11 @@ impl V6UnsafeRawDecoder {
         }
     }
 
-    /// Advance the decode state machine as far as `buf` allows.
-    ///
-    /// Emits a non-`NeedMore` event as soon as one record finishes; the caller
-    /// drains plaintext (or handles a control frame) before feeding again.
-    /// Raw mode never produces a borrowed `ServerError`, so the event borrows
-    /// nothing.
-    fn try_drain(&mut self) -> io::Result<DecodeEvent<'static>> {
-        if !self.pending_plain().is_empty() {
-            return Ok(DecodeEvent::PlainData);
-        }
-
-        loop {
-            match self.step {
-                RawReadStep::Header { filled } => {
-                    if filled >= HEADER_PLAIN_LEN {
-                        let header = parse_done(
-                            parse_v6_raw_header_need(&self.buf[..HEADER_PLAIN_LEN])?,
-                            "snell v6 raw short header",
-                        )?;
-                        self.buf.advance(HEADER_PLAIN_LEN);
-                        if header.body_len == 0 {
-                            self.step = RawReadStep::Header { filled: 0 };
-                            return Ok(DecodeEvent::ZeroChunk);
-                        }
-                        self.step = RawReadStep::Body { header, filled: 0 };
-                        continue;
-                    }
-                    return Ok(DecodeEvent::NeedMore);
-                }
-                RawReadStep::Body { header, filled } => {
-                    if filled >= header.body_len {
-                        // Raw mode has no crypto: the plaintext is the body.
-                        self.plain = SnellBuffer::from(self.buf.split_to(header.payload_len));
-                        self.step = RawReadStep::Header { filled: 0 };
-                        return Ok(DecodeEvent::PlainData);
-                    }
-                    return Ok(DecodeEvent::NeedMore);
-                }
-            }
-        }
-    }
-
-    fn try_feed_direct(
-        &mut self,
-        mut chunk: SnellBuffer,
-    ) -> io::Result<Result<DecodeEvent<'static>, SnellBuffer>> {
-        if !self.buf.is_empty() || !self.plain.is_empty() {
-            return Ok(Err(chunk));
-        }
-
-        match self.step {
-            RawReadStep::Header { filled: 0 } if chunk.len() == HEADER_PLAIN_LEN => {
-                let header = parse_done(
-                    parse_v6_raw_header_need(chunk.as_slice())?,
-                    "snell v6 raw short header",
-                )?;
-                if header.body_len == 0 {
-                    self.step = RawReadStep::Header { filled: 0 };
-                    return Ok(Ok(DecodeEvent::ZeroChunk));
-                }
-                self.step = RawReadStep::Body { header, filled: 0 };
-                Ok(Ok(DecodeEvent::NeedMore))
-            }
-            RawReadStep::Body { header, filled: 0 } if chunk.len() == header.body_len => {
-                chunk.truncate(header.payload_len);
-                self.plain = chunk;
-                self.step = RawReadStep::Header { filled: 0 };
-                Ok(Ok(DecodeEvent::PlainData))
-            }
-            _ => Ok(Err(chunk)),
-        }
+    fn exact_chunk_mismatch(&self) -> io::Error {
+        invalid_input(match self.step {
+            RawReadStep::Header => "snell v6 raw header chunk length mismatch",
+            RawReadStep::Body { .. } => "snell v6 raw body chunk length mismatch",
+        })
     }
 }
 
@@ -205,32 +131,46 @@ impl SnellTcpDecoder for V6UnsafeRawDecoder {
             return 0;
         }
         match self.step {
-            RawReadStep::Header { filled } => HEADER_PLAIN_LEN.saturating_sub(filled),
-            RawReadStep::Body { header, filled } => header.body_len.saturating_sub(filled),
+            RawReadStep::Header => HEADER_PLAIN_LEN,
+            RawReadStep::Body { header } => header.body_len,
         }
     }
 
     fn feed_owned(&mut self, chunk: SnellBuffer) -> io::Result<DecodeEvent<'_>> {
-        let chunk = match self.try_feed_direct(chunk)? {
-            Ok(event) => return Ok(event),
-            Err(chunk) => chunk,
-        };
-        // The `filled` cursor counts bytes consumed from `buf` for the current
-        // step. Feeding a new chunk grows `buf`; recompute how many bytes of
-        // the current step's target are now available and clamp the cursor.
-        let target = match self.step {
-            RawReadStep::Header { .. } => HEADER_PLAIN_LEN,
-            RawReadStep::Body { header, .. } => header.body_len,
-        };
-        chunk.append_to_bytes_mut(&mut self.buf);
-        let available = self.buf.len();
-        let filled = target.min(available);
-        self.step = match self.step {
-            RawReadStep::Header { .. } => RawReadStep::Header { filled },
-            RawReadStep::Body { header, .. } => RawReadStep::Body { header, filled },
-        };
+        if !self.pending_plain().is_empty() {
+            if chunk.is_empty() {
+                return Ok(DecodeEvent::PlainData);
+            }
+            return Err(self.exact_chunk_mismatch());
+        }
 
-        self.try_drain()
+        let expected = self.next_ciphertext_read_len();
+        if chunk.len() != expected {
+            return Err(self.exact_chunk_mismatch());
+        }
+
+        match self.step {
+            RawReadStep::Header => {
+                let header = parse_done(
+                    parse_v6_raw_header_need(chunk.as_slice())?,
+                    "snell v6 raw short header",
+                )?;
+                if header.body_len == 0 {
+                    self.step = RawReadStep::Header;
+                    Ok(DecodeEvent::ZeroChunk)
+                } else {
+                    self.step = RawReadStep::Body { header };
+                    Ok(DecodeEvent::NeedMore)
+                }
+            }
+            RawReadStep::Body { header } => {
+                let mut chunk = chunk;
+                chunk.truncate(header.payload_len);
+                self.plain = chunk;
+                self.step = RawReadStep::Header;
+                Ok(DecodeEvent::PlainData)
+            }
+        }
     }
 
     fn pending_plain(&self) -> &[u8] {

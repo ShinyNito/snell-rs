@@ -9,8 +9,8 @@
 use std::io;
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use aws_lc_rs::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use rand::{Rng, RngCore};
-use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 
 use crate::protocol::ParseState;
 
@@ -23,28 +23,18 @@ use super::{
 
 /// Streaming read state machine shared by V4 and V6-unshaped decoders.
 ///
-/// Each record is consumed in three phases: salt (V4/unshaped) or salt block
-/// (shaped, see shaped.rs), AEAD header, then body. `filled` tracks how many
-/// bytes of the current phase are already in the read buffer.
-#[allow(dead_code)]
+/// Each record is consumed in exact phases: salt (V4/unshaped), AEAD header,
+/// then body. TCP split/reassembly happens before chunks reach the decoder.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ReadStep {
     /// Reading the 16-byte salt that seeds the session key.
-    Salt {
-        /// Bytes of the salt already received.
-        filled: usize,
-    },
+    Salt,
     /// Reading the AEAD-protected frame header.
-    Header {
-        /// Bytes of the header already received.
-        filled: usize,
-    },
+    Header,
     /// Reading the frame body (padding + ciphertext payload + tag).
     Body {
         /// Decoded header describing the body that follows.
         header: DecodedHeader,
-        /// Bytes of the body already received.
-        filled: usize,
     },
 }
 
@@ -236,7 +226,7 @@ pub(super) fn decode_v6_shaped_header(header: &[u8]) -> io::Result<DecodedHeader
     )
 }
 
-/// AEAD-seal a frame header in place, appending the tag after the plaintext.
+/// AEAD-seal a frame header in place, writing the tag after the plaintext.
 ///
 /// `aad` is the associated data (e.g. the obfuscation prefix) bound to the tag.
 pub(super) fn seal_header(
@@ -250,27 +240,55 @@ pub(super) fn seal_header(
         return Err(invalid_input("snell header buffer too small"));
     }
     let (cipher, tag_dst) = header.split_at_mut(HEADER_PLAIN_LEN);
-    let tag = key
-        .seal_in_place_separate_tag(next_nonce(nonce), Aad::from(aad), cipher)
-        .map_err(|_| invalid_data(error))?;
-    tag_dst.copy_from_slice(tag.as_ref());
-    Ok(())
+    seal_payload(key, nonce, aad, cipher, tag_dst, error)
 }
 
-/// AEAD-seal a payload in place and return the detached tag.
-pub(super) fn seal_payload_detached(
+/// AEAD-open a frame header in place, returning the decrypted plaintext header.
+pub(super) fn open_header<'a>(
+    key: &LessSafeKey,
+    nonce: Nonce,
+    aad: &[u8],
+    header_cipher: &'a mut [u8],
+    error: &'static str,
+) -> io::Result<&'a mut [u8]> {
+    if header_cipher.len() != HEADER_CIPHER_LEN {
+        return Err(invalid_data("snell header buffer too small"));
+    }
+    let (cipher, tag) = header_cipher.split_at_mut(HEADER_PLAIN_LEN);
+    open_payload(key, nonce, aad, cipher, tag, error)
+}
+
+/// AEAD-seal a payload in place and write the detached tag to `tag_dst`.
+pub(super) fn seal_payload(
     key: &LessSafeKey,
     nonce: &mut [u8; NONCE_LEN],
     aad: &[u8],
     payload: &mut [u8],
+    tag_dst: &mut [u8],
     error: &'static str,
-) -> io::Result<[u8; TAG_LEN]> {
-    let tag = key
-        .seal_in_place_separate_tag(next_nonce(nonce), Aad::from(aad), payload)
+) -> io::Result<()> {
+    if tag_dst.len() != TAG_LEN {
+        return Err(invalid_input("snell tag buffer has invalid length"));
+    }
+    key.seal_in_place_scatter(next_nonce(nonce), Aad::from(aad), payload, &[], tag_dst)
         .map_err(|_| invalid_data(error))?;
-    let mut out = [0; TAG_LEN];
-    out.copy_from_slice(tag.as_ref());
-    Ok(out)
+    Ok(())
+}
+
+/// AEAD-open a payload in place with a detached tag.
+pub(super) fn open_payload<'a>(
+    key: &LessSafeKey,
+    nonce: Nonce,
+    aad: &[u8],
+    payload_cipher: &'a mut [u8],
+    tag: &[u8],
+    error: &'static str,
+) -> io::Result<&'a mut [u8]> {
+    if tag.len() != TAG_LEN {
+        return Err(invalid_data("snell tag has invalid length"));
+    }
+    key.open_in_place_separate_tag(nonce, Aad::from(aad), tag, payload_cipher)
+        .map_err(|_| invalid_data(error))
 }
 
 /// Derive a V4 session key: Argon2id(psk, salt) → AES-128-GCM.

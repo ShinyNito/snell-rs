@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use super::crypto::GOLDEN_GAMMA;
-use super::crypto::expand::expand_stream;
+use super::crypto::expand::{expand_stream, expand_stream_mapped};
 use super::crypto::kdf::profile_secret;
 use super::crypto::prf::{prf32, prf32_seq};
 use super::crypto::splitmix::splitmix64;
@@ -133,13 +133,17 @@ impl Namespaces {
         prf32(self.for_label(label), label, domain)
     }
 
-    fn expand_slice(self, label: u32, seq: u32, out: &mut [u8]) {
-        expand_stream(
+    fn expand_slice_mapped<F>(self, label: u32, seq: u32, out: &mut [u8], map: F)
+    where
+        F: FnMut(usize, u8) -> u8,
+    {
+        expand_stream_mapped(
             self.for_label(label),
             label,
             u64::from(seq),
             out.len() as u64,
             out,
+            map,
         );
     }
 
@@ -699,5 +703,58 @@ mod tests {
 
         assert_eq!(padding, original_padding);
         assert_eq!(payload, original_payload);
+    }
+
+    #[test]
+    fn split_mixing_matches_contiguous_mixing() {
+        for mix_mode in 0..=2 {
+            let mut profile = ShapedProfile::derive(TEST_PSK);
+            profile.mix_mode = mix_mode;
+            profile.mix_rounds = 3;
+            profile.mix_stride = 2;
+            profile.mix_offset_base = 1;
+
+            let cipher_len = profile.mix_block - 1;
+            let tag_len = profile.mix_block * 4;
+            let mut split_padding = (0..profile.mix_block * 5)
+                .map(|value| (value as u8).wrapping_mul(3))
+                .collect::<Vec<_>>();
+            let mut payload_cipher = (0..cipher_len)
+                .map(|value| 0x80u8.wrapping_add(value as u8))
+                .collect::<Vec<_>>();
+            let mut payload_tag = (0..tag_len)
+                .map(|value| 0x20u8.wrapping_add(value as u8))
+                .collect::<Vec<_>>();
+            let mut contiguous_padding = split_padding.clone();
+            let mut contiguous_payload = payload_cipher.clone();
+            contiguous_payload.extend_from_slice(&payload_tag);
+
+            mix_padding_payload_split(
+                &profile,
+                3,
+                &mut split_padding,
+                &mut payload_cipher,
+                &mut payload_tag,
+            );
+            mix_padding_payload(
+                &profile,
+                3,
+                &mut contiguous_padding,
+                &mut contiguous_payload,
+            );
+
+            let mut split_payload = payload_cipher;
+            split_payload.extend_from_slice(&payload_tag);
+            assert_eq!(
+                split_padding, contiguous_padding,
+                "padding mismatch for mix mode {}",
+                mix_mode
+            );
+            assert_eq!(
+                split_payload, contiguous_payload,
+                "payload mismatch for mix mode {}",
+                mix_mode
+            );
+        }
     }
 }

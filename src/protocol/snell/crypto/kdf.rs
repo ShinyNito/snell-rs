@@ -89,7 +89,7 @@ pub fn aead_key_raw(psk: &[u8], salt_16: &[u8; 16]) -> Result<[u8; 32], KdfError
 
 /// Convenience: the 16-byte AES-128-GCM key derived from `aead_key_raw`.
 ///
-/// This is the AES-128-GCM key passed to `ring::aead`.
+/// This is the AES-128-GCM key passed to `aws_lc_rs::aead`.
 pub fn aead_key(psk: &[u8], salt_16: &[u8; 16]) -> Result<[u8; 16], KdfError> {
     let raw = aead_key_raw(psk, salt_16)?;
     let mut key = [0u8; 16];

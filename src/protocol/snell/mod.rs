@@ -73,13 +73,14 @@
 //!
 //! # Decode flow (reader side)
 //!
-//! The TCP reader asks the decoder for the next exact ciphertext length and
-//! feeds compio pool-backed chunks as [`SnellBuffer`]. If a record is split,
-//! the decoder falls back to internal reassembly.
+//! The TCP reader asks the decoder for the next exact ciphertext length,
+//! performs exact reads, then feeds exactly that many bytes as [`SnellBuffer`].
+//! Pool-backed body buffers keep ownership through decoder/plain relay; TCP
+//! split/reassembly stays in the reader/probe layer.
 //!
 //! ```text
 //!   loop {
-//!     input = stream.read_managed(next_ciphertext_read_len())
+//!     input = stream.read_exact(next_ciphertext_read_len())
 //!     feed_owned(input)
 //!        |
 //!        +-- NeedMore              read more ciphertext
@@ -877,23 +878,6 @@ impl SnellBuffer {
         }
     }
 
-    pub(crate) fn append_to_bytes_mut(self, dst: &mut BytesMut) {
-        match self {
-            Self::Bytes(buf) => {
-                if BytesMut::is_empty(dst) && dst.capacity() < buf.len() {
-                    *dst = buf;
-                } else if !buf.is_empty() {
-                    dst.extend_from_slice(&buf);
-                }
-            }
-            Self::Pool(buf) => {
-                if buf.len() > 0 {
-                    dst.extend_from_slice(buf.as_slice());
-                }
-            }
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn into_bytes(self) -> Bytes {
         match self {
@@ -932,6 +916,7 @@ impl IoBuf for SnellBuffer {
 pub struct SnellWire {
     head: InlineBytes<SNELL_WIRE_HEAD_CAP>,
     padding: BytesMut,
+    padding_initialized_len: usize,
     payload: Option<SnellBuffer>,
     tag: InlineBytes<TAG_LEN>,
     parts: [SnellWirePart; SNELL_WIRE_MAX_PARTS],
@@ -944,6 +929,7 @@ impl SnellWire {
         Self {
             head: InlineBytes::new(),
             padding: BytesMut::new(),
+            padding_initialized_len: 0,
             payload: None,
             tag: InlineBytes::new(),
             parts: [SnellWirePart::Head; SNELL_WIRE_MAX_PARTS],
@@ -967,15 +953,39 @@ impl SnellWire {
         self.head.as_mut_slice()
     }
 
-    pub(crate) fn push_tag(&mut self, tag: [u8; TAG_LEN]) {
-        self.tag.copy_from_slice(&tag);
+    pub(crate) fn prepare_tag(&mut self) -> &mut [u8] {
+        self.tag.resize_zeroed(TAG_LEN);
+        self.tag.as_mut_slice()
+    }
+
+    pub(crate) fn push_tag(&mut self) {
         self.push_part(SnellWirePart::Tag, TAG_LEN);
     }
 
     pub(crate) fn prepare_padding(&mut self, len: usize) -> &mut [u8] {
-        self.padding.clear();
-        self.padding.resize(len, 0);
+        self.prepare_padding_storage(len);
         &mut self.padding
+    }
+
+    pub(crate) fn prepare_padding_and_tag(&mut self, padding_len: usize) -> (&mut [u8], &mut [u8]) {
+        self.prepare_padding_storage(padding_len);
+        self.tag.resize_zeroed(TAG_LEN);
+        (&mut self.padding, self.tag.as_mut_slice())
+    }
+
+    fn prepare_padding_storage(&mut self, len: usize) {
+        if len <= self.padding_initialized_len {
+            // SAFETY: `padding_initialized_len` is raised only after `resize`
+            // initialized bytes up to that length. `clear`/shorter records do
+            // not deinitialize the allocation, so restoring len within this
+            // range satisfies `BytesMut::set_len`.
+            unsafe {
+                self.padding.set_len(len);
+            }
+        } else {
+            self.padding.resize(len, 0);
+            self.padding_initialized_len = len;
+        }
     }
 
     pub(crate) fn push_padding(&mut self) {
@@ -1080,12 +1090,6 @@ impl<const N: usize> InlineBytes<N> {
         self.len = len;
     }
 
-    fn copy_from_slice(&mut self, src: &[u8]) {
-        assert!(src.len() <= N, "inline snell wire segment too large");
-        self.buf[..src.len()].copy_from_slice(src);
-        self.len = src.len();
-    }
-
     fn as_slice(&self) -> &[u8] {
         &self.buf[..self.len]
     }
@@ -1116,23 +1120,23 @@ pub trait SnellTcpEncoder {
 
 /// Streaming Snell TCP decoder.
 ///
-/// The decode lifecycle: hand owned ciphertext buffers to
-/// [`SnellTcpDecoder::feed_owned`] until a record completes. The decoder
-/// accumulates partial records internally and decrypts pool-backed exact body
-/// reads in place. On [`PlainData`](DecodeEvent::PlainData) or a control frame,
-/// drain plaintext via [`pending_plain`](Self::pending_plain) /
+/// The decode lifecycle: ask [`next_ciphertext_read_len`](Self::next_ciphertext_read_len),
+/// read exactly that many bytes, and pass them to [`feed_owned`](Self::feed_owned).
+/// The decoder does not reassemble arbitrary TCP chunks; IO split/reassembly is
+/// owned by the reader/probe layer. On [`PlainData`](DecodeEvent::PlainData) or
+/// a control frame, drain plaintext via [`pending_plain`](Self::pending_plain) /
 /// [`consume_plain`](Self::consume_plain). Bulk relay callers use
 /// [`take_plain`](Self::take_plain) to move the owned plaintext buffer out.
 pub trait SnellTcpDecoder {
     /// Bytes required for the next ciphertext read.
     fn next_ciphertext_read_len(&self) -> usize;
 
-    /// Append ciphertext and advance the decode state machine.
+    /// Feed the exact ciphertext chunk requested by [`next_ciphertext_read_len`](Self::next_ciphertext_read_len).
     ///
-    /// Returns [`DecodeEvent::NeedMore`] when the fed bytes are not yet enough
-    /// to complete the current record (the caller should read more and feed
-    /// again). Any other variant means a record completed and the decoder is
-    /// ready for the next feed.
+    /// Returns [`DecodeEvent::NeedMore`] when the exact chunk was accepted but
+    /// the current record still needs another protocol segment. Any other
+    /// variant means a record completed and the decoder is ready for the next
+    /// feed.
     fn feed_owned(&mut self, chunk: SnellBuffer) -> io::Result<DecodeEvent<'_>>;
 
     /// The decrypted plaintext region of the current record (the sole source).

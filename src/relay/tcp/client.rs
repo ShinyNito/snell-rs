@@ -1,6 +1,10 @@
 use std::{io, marker::PhantomData, net::SocketAddr, rc::Rc, sync::Arc};
 
-use compio::{driver::BufferRef, io::AsyncReadManaged, net::TcpStream};
+use compio::{
+    driver::BufferRef,
+    io::{AsyncRead, AsyncReadManaged},
+    net::TcpStream,
+};
 
 use crate::protocol::{
     address::Address,
@@ -217,7 +221,7 @@ fn is_retriable_pool_error(error: &io::Error) -> bool {
 
 async fn read_server_reply<R, D>(reader: &mut SnellStreamReader<R, D>) -> io::Result<()>
 where
-    R: AsyncReadManaged<Buffer = BufferRef> + Unpin + 'static,
+    R: AsyncRead + AsyncReadManaged<Buffer = BufferRef> + Unpin + 'static,
     D: SnellTcpDecoder,
 {
     let mut command = [0u8; 1];
@@ -253,7 +257,8 @@ mod tests {
     };
 
     use compio::{
-        io::AsyncWrite,
+        driver::BufferRef,
+        io::{AsyncReadManaged, AsyncWrite},
         net::{TcpListener, TcpStream},
         runtime,
     };

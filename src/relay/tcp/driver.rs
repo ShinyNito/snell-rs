@@ -2,17 +2,15 @@ use std::{io, sync::Arc};
 
 use bytes::BytesMut;
 use compio::{
-    buf::BufResult,
+    buf::{BufResult, IntoInner, IoBuf, IoBufMut},
     driver::BufferRef,
-    io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncReadManaged, AsyncWrite, AsyncWriteExt},
 };
 
 use crate::protocol::snell::{
     DecodeEvent, SnellBuffer, SnellMode, SnellPlainReader, SnellTcpDecoder, SnellTcpEncoder,
     SnellWire,
 };
-
-const READ_AHEAD_LEN: usize = 64 * 1024;
 
 pub(crate) async fn read_exact_managed<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<()>
 where
@@ -55,6 +53,7 @@ where
 pub struct SnellStreamReader<R, D> {
     inner: R,
     decoder: D,
+    pending_ciphertext: BytesMut,
 }
 
 pub struct SnellStreamWriter<W, E> {
@@ -72,7 +71,7 @@ enum CiphertextRead {
 
 impl<R, D> SnellStreamReader<R, D>
 where
-    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
+    R: AsyncRead + AsyncReadManaged<Buffer = BufferRef> + 'static,
     D: SnellTcpDecoder,
 {
     pub fn new<M>(inner: R, psk: Arc<[u8]>) -> Self
@@ -82,29 +81,28 @@ where
         Self {
             inner,
             decoder: M::new_decoder(psk),
+            pending_ciphertext: BytesMut::new(),
         }
     }
 
-    /// Build a reader around an already-warmed decoder.
-    ///
-    /// After [`probe_snell_mode`] the decoder has already absorbed some
-    /// ciphertext into its internal buffer; the residual lives inside the
-    /// decoder itself, so no external `pending_ciphertext` parameter is needed.
-    pub(crate) fn from_decoder(inner: R, decoder: D) -> Self {
-        Self { inner, decoder }
+    /// Build a reader around a probed decoder and any ciphertext read past the
+    /// bytes consumed during probing.
+    pub(crate) fn from_decoder_with_pending(
+        inner: R,
+        decoder: D,
+        pending_ciphertext: BytesMut,
+    ) -> Self {
+        Self {
+            inner,
+            decoder,
+            pending_ciphertext,
+        }
     }
 
     pub(crate) async fn read_plain_frame(&mut self) -> io::Result<Option<SnellBuffer>> {
         loop {
             if self.decoder.has_pending_plain() {
                 return Ok(Some(self.decoder.take_plain()));
-            }
-
-            match self.decoder.feed_owned(SnellBuffer::empty())? {
-                DecodeEvent::PlainData => continue,
-                DecodeEvent::ZeroChunk => return Ok(None),
-                DecodeEvent::NeedMore => {}
-                _ => continue,
             }
 
             match self.read_ciphertext().await? {
@@ -148,13 +146,6 @@ where
                 return Ok(true);
             }
 
-            match self.decoder.feed_owned(SnellBuffer::empty())? {
-                DecodeEvent::PlainData => return Ok(true),
-                DecodeEvent::ZeroChunk => return Ok(false),
-                DecodeEvent::NeedMore => {}
-                _ => continue,
-            }
-
             match self.read_ciphertext().await? {
                 CiphertextRead::Progress => {}
                 CiphertextRead::ZeroChunk => return Ok(false),
@@ -177,24 +168,89 @@ where
             });
         }
 
-        let Some(chunk) = self.inner.read_managed(read_len).await? else {
+        let Some(chunk) = self.read_exact_ciphertext(read_len).await? else {
             return Ok(CiphertextRead::Eof);
         };
-        if chunk.is_empty() {
-            return Ok(CiphertextRead::Eof);
+        Ok(match self.decoder.feed_owned(chunk)? {
+            DecodeEvent::ZeroChunk => CiphertextRead::ZeroChunk,
+            _ => CiphertextRead::Progress,
+        })
+    }
+
+    async fn read_exact_ciphertext(&mut self, read_len: usize) -> io::Result<Option<SnellBuffer>> {
+        if self.pending_ciphertext.len() >= read_len {
+            return Ok(Some(SnellBuffer::from(
+                self.pending_ciphertext.split_to(read_len),
+            )));
         }
-        Ok(
-            match self.decoder.feed_owned(SnellBuffer::from_pool(chunk))? {
-                DecodeEvent::ZeroChunk => CiphertextRead::ZeroChunk,
-                _ => CiphertextRead::Progress,
-            },
-        )
+
+        if !self.pending_ciphertext.is_empty() {
+            let ciphertext = std::mem::take(&mut self.pending_ciphertext);
+            return self.read_exact_bytes_mut(ciphertext, read_len).await;
+        }
+
+        let Some(mut buffer) = self.inner.read_managed(read_len).await? else {
+            return Ok(None);
+        };
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+
+        if buffer.buf_capacity() < read_len {
+            let mut ciphertext = BytesMut::with_capacity(read_len);
+            ciphertext.extend_from_slice(&buffer);
+            return self.read_exact_bytes_mut(ciphertext, read_len).await;
+        }
+
+        if buffer.len() == read_len {
+            return Ok(Some(SnellBuffer::from_pool(buffer)));
+        }
+
+        let filled = buffer.len();
+        let BufResult(result, buffer_slice) =
+            self.inner.read_exact(buffer.slice(filled..read_len)).await;
+        buffer = buffer_slice.into_inner();
+        match result {
+            Ok(()) => {
+                debug_assert_eq!(buffer.len(), read_len);
+                Ok(Some(SnellBuffer::from_pool(buffer)))
+            }
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn read_exact_bytes_mut(
+        &mut self,
+        mut ciphertext: BytesMut,
+        read_len: usize,
+    ) -> io::Result<Option<SnellBuffer>> {
+        debug_assert!(ciphertext.len() < read_len);
+
+        if ciphertext.capacity() < read_len {
+            ciphertext.reserve(read_len - ciphertext.capacity());
+        }
+
+        let filled = ciphertext.len();
+        let BufResult(result, ciphertext_slice) = self
+            .inner
+            .read_exact(ciphertext.slice(filled..read_len))
+            .await;
+        ciphertext = ciphertext_slice.into_inner();
+        match result {
+            Ok(()) => {
+                debug_assert_eq!(ciphertext.len(), read_len);
+                Ok(Some(SnellBuffer::from(ciphertext)))
+            }
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 
 impl<R, D> SnellPlainReader for SnellStreamReader<R, D>
 where
-    R: AsyncReadManaged<Buffer = BufferRef> + 'static,
+    R: AsyncRead + AsyncReadManaged<Buffer = BufferRef> + 'static,
     D: SnellTcpDecoder,
 {
     async fn read_exact_plain(&mut self, dst: &mut [u8]) -> io::Result<()> {
@@ -232,11 +288,14 @@ where
                 ));
             }
 
-            let Some(payload) = reader.read_managed(capacity.min(READ_AHEAD_LEN)).await? else {
+            let Some(payload) = reader.read_managed(capacity).await? else {
                 self.write_sealed(SnellBuffer::empty()).await?;
                 return Ok(());
             };
             let payload = SnellBuffer::from_pool(payload);
+            if payload.is_empty() {
+                continue;
+            }
             if payload.len() > capacity {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -301,7 +360,6 @@ where
         wire.clear();
         self.wire = wire;
         result?;
-        self.inner.flush().await?;
         Ok(reusable_payload)
     }
 }
@@ -309,7 +367,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::snell::{V4Decoder, V4Encoder, V4Mode};
+    use crate::protocol::snell::{HEADER_CIPHER_LEN, SALT_LEN, V4Decoder, V4Encoder, V4Mode};
     use compio::{
         io::AsyncWriteExt,
         net::{TcpListener, TcpStream},
@@ -375,12 +433,11 @@ mod tests {
         let (_client, server) = tcp_pair().await;
         let (server_read, _) = server.into_split();
 
-        // Warm the decoder with the residual ciphertext the way probe_snell_mode
-        // would: the bytes sit in the decoder's internal buffer, and the reader
-        // drains them before touching the socket.
-        let mut decoder = V4Decoder::new(psk);
-        decoder.feed_owned(SnellBuffer::from(wire)).unwrap();
-        let mut reader = SnellStreamReader::from_decoder(server_read, decoder);
+        // probe_snell_mode may read past the bytes it needed to identify the
+        // mode. The unread ciphertext is passed to the stream reader and
+        // consumed before touching the socket again.
+        let decoder = V4Decoder::new(psk);
+        let mut reader = SnellStreamReader::from_decoder_with_pending(server_read, decoder, wire);
 
         assert_eq!(
             read_frame_vec(&mut reader).await.unwrap().unwrap(),
@@ -394,7 +451,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn reads_frame_split_across_socket_reads() {
+    async fn reads_body_split_across_socket_reads() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let mut encoder = V4Encoder::new(&psk).unwrap();
         let wire: Vec<u8> = {
@@ -409,6 +466,11 @@ mod tests {
             }
             v
         };
+        let body_split = SALT_LEN + HEADER_CIPHER_LEN + 1;
+        assert!(
+            body_split < wire.len(),
+            "test frame must include body bytes"
+        );
 
         let (client, server) = tcp_pair().await;
         let (_, mut client_write) = client.into_split();
@@ -418,12 +480,12 @@ mod tests {
 
         let read = runtime::spawn(async move { read_frame_vec(&mut reader).await.unwrap() });
         client_write
-            .write_all(BytesMut::from(&wire[..8]))
+            .write_all(BytesMut::from(&wire[..body_split]))
             .await
             .unwrap();
         time::sleep(Duration::from_millis(10)).await;
         client_write
-            .write_all(BytesMut::from(&wire[8..]))
+            .write_all(BytesMut::from(&wire[body_split..]))
             .await
             .unwrap();
 
@@ -498,7 +560,7 @@ mod tests {
         reader: &mut SnellStreamReader<R, D>,
     ) -> io::Result<Option<Vec<u8>>>
     where
-        R: AsyncReadManaged<Buffer = BufferRef> + 'static,
+        R: AsyncRead + AsyncReadManaged<Buffer = BufferRef> + 'static,
         D: SnellTcpDecoder,
     {
         let Some(frame) = reader.read_plain_frame().await? else {
