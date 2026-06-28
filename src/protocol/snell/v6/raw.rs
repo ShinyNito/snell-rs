@@ -17,7 +17,7 @@
 
 use std::{fmt, io};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BytesMut};
 
 use super::super::{
     DecodeEvent, DecodedHeader, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, SnellBuffer, SnellTcpDecoder,
@@ -183,7 +183,8 @@ impl SnellTcpEncoder for V6UnsafeRawEncoder {
         MAX_PACKET_SIZE_V6
     }
 
-    fn seal_plain(&mut self, payload: SnellBuffer) -> io::Result<SnellWire> {
+    fn seal_plain(&mut self, payload: SnellBuffer, wire: &mut SnellWire) -> io::Result<()> {
+        wire.clear();
         let payload_len = payload.len();
         if payload_len > MAX_PACKET_SIZE_V6 {
             return Err(invalid_input("snell payload exceeds record capacity"));
@@ -191,10 +192,10 @@ impl SnellTcpEncoder for V6UnsafeRawEncoder {
 
         let mut header = [0u8; HEADER_PLAIN_LEN];
         write_v6_plain_header(&mut header, 0, payload_len)?;
-        let mut wire = SnellWire::with_capacity(1 + (payload_len > 0) as usize);
-        wire.push_bytes(Bytes::from(header.to_vec()));
+        wire.push_head_zeroed(HEADER_PLAIN_LEN)
+            .copy_from_slice(&header);
         wire.push_buffer(payload);
-        Ok(wire)
+        Ok(())
     }
 }
 
@@ -214,7 +215,6 @@ impl SnellTcpDecoder for V6UnsafeRawDecoder {
             Ok(event) => return Ok(event),
             Err(chunk) => chunk,
         };
-        let chunk = chunk.into_bytes_mut();
         // The `filled` cursor counts bytes consumed from `buf` for the current
         // step. Feeding a new chunk grows `buf`; recompute how many bytes of
         // the current step's target are now available and clamp the cursor.
@@ -222,13 +222,9 @@ impl SnellTcpDecoder for V6UnsafeRawDecoder {
             RawReadStep::Header { .. } => HEADER_PLAIN_LEN,
             RawReadStep::Body { header, .. } => header.body_len,
         };
-        let available = self.buf.len() + chunk.len();
+        chunk.append_to_bytes_mut(&mut self.buf);
+        let available = self.buf.len();
         let filled = target.min(available);
-        if self.buf.is_empty() {
-            self.buf = chunk;
-        } else if !chunk.is_empty() {
-            self.buf.extend_from_slice(&chunk);
-        }
         self.step = match self.step {
             RawReadStep::Header { .. } => RawReadStep::Header { filled },
             RawReadStep::Body { header, .. } => RawReadStep::Body { header, filled },

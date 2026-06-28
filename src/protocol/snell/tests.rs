@@ -41,6 +41,15 @@ fn flatten_wire(wire: SnellWire) -> Vec<u8> {
     out
 }
 
+fn flatten_sealed<E>(encoder: &mut E, payload: SnellBuffer) -> Vec<u8>
+where
+    E: SnellTcpEncoder,
+{
+    let mut wire = SnellWire::new();
+    encoder.seal_plain(payload, &mut wire).unwrap();
+    flatten_wire(wire)
+}
+
 #[test]
 fn connect_v2_header_matches_wire_shape() {
     let address = Address::domain("example.com", 443).unwrap();
@@ -160,10 +169,9 @@ fn udp_response_packet_round_trips_domain_and_ip() {
 fn v4_codec_round_trips_in_place() {
     let psk = b"0123456789abcdef";
     let mut encoder = V4Encoder::new(psk).unwrap();
-    let wire = flatten_wire(
-        encoder
-            .seal_plain(SnellBuffer::from(BytesMut::from(&b"hello"[..])))
-            .unwrap(),
+    let wire = flatten_sealed(
+        &mut encoder,
+        SnellBuffer::from(BytesMut::from(&b"hello"[..])),
     );
 
     let mut decoder = V4Decoder::new(&psk[..]);
@@ -189,10 +197,9 @@ fn v4_encoder_applies_padding_and_chunk_size() {
     let first_limit = V4_MSS_BASE - V4_FIRST_RECORD_OVERHEAD - 8;
     assert_eq!(encoder.next_plain_capacity(), first_limit);
     let payload = vec![0x42; first_limit];
-    let wire = flatten_wire(
-        encoder
-            .seal_plain(SnellBuffer::from(BytesMut::from(&payload[..])))
-            .unwrap(),
+    let wire = flatten_sealed(
+        &mut encoder,
+        SnellBuffer::from(BytesMut::from(&payload[..])),
     );
     assert_eq!(
         wire.len(),
@@ -245,11 +252,7 @@ where
     M: SnellMode,
 {
     let mut encoder = M::new_encoder(psk).unwrap();
-    let wire = flatten_wire(
-        encoder
-            .seal_plain(SnellBuffer::from(BytesMut::from(payload)))
-            .unwrap(),
-    );
+    let wire = flatten_sealed(&mut encoder, SnellBuffer::from(BytesMut::from(payload)));
 
     let mut decoder = M::new_decoder(Arc::from(psk));
     let mut src = wire.as_slice();
@@ -276,11 +279,7 @@ where
     let mut encoder = M::new_encoder(psk).unwrap();
     let mut wire = Vec::new();
     for payload in payloads {
-        let frame = flatten_wire(
-            encoder
-                .seal_plain(SnellBuffer::from(BytesMut::from(*payload)))
-                .unwrap(),
-        );
+        let frame = flatten_sealed(&mut encoder, SnellBuffer::from(BytesMut::from(*payload)));
         wire.extend_from_slice(&frame);
     }
 

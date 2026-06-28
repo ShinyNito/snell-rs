@@ -17,7 +17,7 @@
 //!     obfuscation with salt blocks, per-record prefixes, and active shaping.
 //!   - V6 unsafe-raw ([`V6UnsafeRawEncoder`]/[`V6UnsafeRawDecoder`]):
 //!     unencrypted pass-through for local debugging only.
-//! - Encoding borrows plaintext and emits one owned wire [`Bytes`] record.
+//! - Encoding takes owned plaintext, encrypts it in place, and fills a reusable vectored wire record.
 //!
 //! # Connect request layout
 //!
@@ -63,12 +63,12 @@
 //!        |
 //!        | split by next_plain_capacity() when the mode has a window
 //!        v
-//!   seal_plain(SnellBuffer)
+//!   seal_plain(SnellBuffer, SnellWire)
 //!        |
 //!        | write header (padding/payload lens) -> seal header (AEAD, nonce++)
 //!        | seal payload (AEAD, nonce++)         -> make/swap padding (V4/shaped)
 //!        v
-//!   SnellWire (one vectored record) --------> async vectored write to socket
+//!   reusable SnellWire (one vectored record) --------> async vectored write to socket
 //! ```
 //!
 //! # Decode flow (reader side)
@@ -110,7 +110,9 @@ use std::{
     sync::Arc,
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+#[cfg(test)]
+use bytes::Bytes;
+use bytes::{Buf, BytesMut};
 use compio::{
     buf::{IoBuf, IoVectoredBuf},
     driver::BufferRef,
@@ -875,22 +877,36 @@ impl SnellBuffer {
         }
     }
 
-    pub(crate) fn into_bytes_mut(self) -> BytesMut {
+    pub(crate) fn append_to_bytes_mut(self, dst: &mut BytesMut) {
         match self {
-            Self::Bytes(buf) => buf,
-            Self::Pool(buf) => BytesMut::from(buf.as_slice()),
+            Self::Bytes(buf) => {
+                if BytesMut::is_empty(dst) && dst.capacity() < buf.len() {
+                    *dst = buf;
+                } else if !buf.is_empty() {
+                    dst.extend_from_slice(&buf);
+                }
+            }
+            Self::Pool(buf) => {
+                if buf.len() > 0 {
+                    dst.extend_from_slice(buf.as_slice());
+                }
+            }
         }
     }
 
-    pub(crate) fn into_segment(self) -> SnellSegment {
-        match self {
-            Self::Bytes(buf) => SnellSegment::Bytes(buf.freeze()),
-            Self::Pool(buf) => SnellSegment::Pool(buf),
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn into_bytes(self) -> Bytes {
-        self.into_segment().into_bytes()
+        match self {
+            Self::Bytes(buf) => buf.freeze(),
+            Self::Pool(_) => panic!("test flattening must not copy a pool-backed SnellBuffer"),
+        }
+    }
+
+    pub(crate) fn into_owned_bytes_mut(self) -> Option<BytesMut> {
+        match self {
+            Self::Bytes(buf) => Some(buf),
+            Self::Pool(_) => None,
+        }
     }
 }
 
@@ -913,93 +929,189 @@ impl IoBuf for SnellBuffer {
 }
 
 #[derive(Debug)]
-pub enum SnellSegment {
-    Bytes(Bytes),
-    Pool(PoolBytes),
-}
-
-impl SnellSegment {
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Bytes(buf) => buf,
-            Self::Pool(buf) => buf.as_slice(),
-        }
-    }
-
-    pub(crate) fn into_bytes(self) -> Bytes {
-        match self {
-            Self::Bytes(buf) => buf,
-            Self::Pool(buf) => Bytes::copy_from_slice(buf.as_slice()),
-        }
-    }
-}
-
-impl AsRef<[u8]> for SnellSegment {
-    fn as_ref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl IoBuf for SnellSegment {
-    fn as_init(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-#[derive(Debug)]
 pub struct SnellWire {
-    segments: Vec<SnellSegment>,
+    head: InlineBytes<SNELL_WIRE_HEAD_CAP>,
+    padding: BytesMut,
+    payload: Option<SnellBuffer>,
+    tag: InlineBytes<TAG_LEN>,
+    parts: [SnellWirePart; SNELL_WIRE_MAX_PARTS],
+    parts_len: usize,
+    total_len: usize,
 }
 
 impl SnellWire {
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            segments: Vec::with_capacity(capacity),
+            head: InlineBytes::new(),
+            padding: BytesMut::new(),
+            payload: None,
+            tag: InlineBytes::new(),
+            parts: [SnellWirePart::Head; SNELL_WIRE_MAX_PARTS],
+            parts_len: 0,
+            total_len: 0,
         }
     }
 
-    pub(crate) fn push_bytes(&mut self, bytes: impl Into<Bytes>) {
-        self.segments.push(SnellSegment::Bytes(bytes.into()));
+    pub(crate) fn clear(&mut self) {
+        self.head.clear();
+        self.padding.clear();
+        self.payload = None;
+        self.tag.clear();
+        self.parts_len = 0;
+        self.total_len = 0;
+    }
+
+    pub(crate) fn push_head_zeroed(&mut self, len: usize) -> &mut [u8] {
+        self.head.resize_zeroed(len);
+        self.push_part(SnellWirePart::Head, len);
+        self.head.as_mut_slice()
+    }
+
+    pub(crate) fn push_tag(&mut self, tag: [u8; TAG_LEN]) {
+        self.tag.copy_from_slice(&tag);
+        self.push_part(SnellWirePart::Tag, TAG_LEN);
+    }
+
+    pub(crate) fn prepare_padding(&mut self, len: usize) -> &mut [u8] {
+        self.padding.clear();
+        self.padding.resize(len, 0);
+        &mut self.padding
+    }
+
+    pub(crate) fn push_padding(&mut self) {
+        let len = self.padding.len();
+        if len > 0 {
+            self.push_part(SnellWirePart::Padding, len);
+        }
     }
 
     pub(crate) fn push_buffer(&mut self, buffer: SnellBuffer) {
         if !buffer.is_empty() {
-            self.segments.push(buffer.into_segment());
+            let len = buffer.len();
+            self.payload = Some(buffer);
+            self.push_part(SnellWirePart::Payload, len);
         }
     }
 
+    pub(crate) fn take_payload_bytes_mut(&mut self) -> Option<BytesMut> {
+        self.payload
+            .take()
+            .and_then(SnellBuffer::into_owned_bytes_mut)
+    }
+
+    fn push_part(&mut self, part: SnellWirePart, len: usize) {
+        debug_assert!(self.parts_len < SNELL_WIRE_MAX_PARTS);
+        self.parts[self.parts_len] = part;
+        self.parts_len += 1;
+        self.total_len += len;
+    }
+
     #[cfg(test)]
-    pub(crate) fn into_bytes_vec(self) -> Vec<Bytes> {
-        self.segments
-            .into_iter()
-            .map(SnellSegment::into_bytes)
-            .collect()
+    pub(crate) fn into_bytes_vec(mut self) -> Vec<Bytes> {
+        let parts = self.parts;
+        let parts_len = self.parts_len;
+        let mut payload = self.payload.take();
+        let mut out = Vec::with_capacity(parts_len);
+        for part in &parts[..parts_len] {
+            out.push(match part {
+                SnellWirePart::Head => Bytes::copy_from_slice(self.head.as_slice()),
+                SnellWirePart::Padding => std::mem::take(&mut self.padding).freeze(),
+                SnellWirePart::Payload => payload.take().expect("payload segment").into_bytes(),
+                SnellWirePart::Tag => Bytes::copy_from_slice(self.tag.as_slice()),
+            });
+        }
+        out
+    }
+}
+
+impl Default for SnellWire {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl IoVectoredBuf for SnellWire {
     fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
-        self.segments.iter().map(SnellSegment::as_slice)
+        self.parts[..self.parts_len].iter().map(|part| match part {
+            SnellWirePart::Head => self.head.as_slice(),
+            SnellWirePart::Padding => &self.padding[..],
+            SnellWirePart::Payload => self.payload.as_ref().expect("payload segment").as_slice(),
+            SnellWirePart::Tag => self.tag.as_slice(),
+        })
+    }
+
+    fn total_len(&self) -> usize {
+        self.total_len
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SnellWirePart {
+    Head,
+    Padding,
+    Payload,
+    Tag,
+}
+
+const SNELL_WIRE_MAX_PARTS: usize = 4;
+const SNELL_WIRE_HEAD_CAP: usize = salt::MAX_SALT_BLOCK_LEN + 0x80 + HEADER_CIPHER_LEN;
+
+#[derive(Debug)]
+struct InlineBytes<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> InlineBytes<N> {
+    const fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn resize_zeroed(&mut self, len: usize) {
+        assert!(len <= N, "inline snell wire segment too large");
+        self.buf[..len].fill(0);
+        self.len = len;
+    }
+
+    fn copy_from_slice(&mut self, src: &[u8]) {
+        assert!(src.len() <= N, "inline snell wire segment too large");
+        self.buf[..src.len()].copy_from_slice(src);
+        self.len = src.len();
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf[..self.len]
     }
 }
 
 /// Streaming Snell TCP encoder.
 ///
 /// The runtime calls [`SnellTcpEncoder::seal_plain`] with an owned plaintext
-/// buffer; the encoder encrypts it **in place** and emits the wire record as
-/// an owned vectored buffer, ready for a vectored async write.
+/// buffer and a reusable wire record; the encoder encrypts the payload
+/// **in place** and fills the wire record for a vectored async write.
 pub trait SnellTcpEncoder {
     /// Maximum plaintext bytes accepted by the next record (congestion window).
     fn next_plain_capacity(&self) -> usize;
 
     /// Seal one plaintext record, taking ownership of the payload buffer.
     ///
-    /// The payload is encrypted **in place** and returned as one of the wire
+    /// The payload is encrypted **in place** and stored as one of the wire
     /// segments, so no per-record memcpy of the application data happens.
     /// `payload.len()` must not exceed
     /// [`next_plain_capacity`](Self::next_plain_capacity). An empty buffer
     /// encodes a keepalive / end-of-stream zero chunk.
-    fn seal_plain(&mut self, payload: SnellBuffer) -> io::Result<SnellWire>;
+    fn seal_plain(&mut self, payload: SnellBuffer, wire: &mut SnellWire) -> io::Result<()>;
 }
 
 /// Streaming Snell TCP decoder.

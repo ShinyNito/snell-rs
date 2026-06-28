@@ -6,8 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use compio::{
+    buf::IoBuf,
     driver::BufferRef,
     io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, ToSocketAddrsAsync, UdpSocket},
@@ -20,12 +21,13 @@ use crate::{
     protocol::{
         ParseState,
         address::{Address, AddressRef},
+        snell::SnellBuffer,
         socks5::{self, Command, METHOD_NO_AUTH, Reply},
     },
     relay::tcp::driver::read_exact_managed,
     relay::udp::{
         DatagramReceiver, DatagramSender, DatagramTransport, ReceivedDatagram, UDP_ASSOCIATION_TTL,
-        UdpRecvStream, recv_udp_packet, recv_udp_stream, send_udp_bytes_to,
+        UdpRecvStream, recv_udp_packet, recv_udp_stream, send_udp_bytes_to, send_udp_vectored_to,
     },
     timeout::{with_tcp_connect_timeout, with_tcp_timeout},
 };
@@ -105,7 +107,7 @@ impl DatagramTransport for UdpOutbound {
 }
 
 impl DatagramSender for UdpOutboundSender {
-    async fn send_to(&mut self, destination: Address, payload: Bytes) -> io::Result<usize> {
+    async fn send_to(&mut self, destination: Address, payload: SnellBuffer) -> io::Result<usize> {
         match self {
             Self::Direct(sender) => sender.send_to(destination, payload).await,
             Self::Socks5(sender) => sender.send_to(destination, payload).await,
@@ -127,7 +129,7 @@ async fn connect_direct(destination: &Address) -> io::Result<TcpStream> {
         async {
             match destination {
                 Address::Ip(addr) => TcpStream::connect(*addr).await,
-                Address::Domain { host, port } => TcpStream::connect((host.clone(), *port)).await,
+                Address::Domain { host, port } => TcpStream::connect((host.as_str(), *port)).await,
             }
         },
         "direct tcp connect",
@@ -167,14 +169,14 @@ async fn connect_socks5(server: SocketAddr, destination: &Address) -> io::Result
         }
     };
     apply_tcp_keepalive(&stream)?;
-    let destination = destination.clone();
-    let log_destination = destination.clone();
+    let log_destination = destination.as_view();
     with_tcp_timeout(
         async move {
-            let mut buf = [0u8; socks5::MAX_REQUEST_LEN];
+            let mut buf = [0u8; socks5::MAX_REPLY_LEN];
 
-            let n = socks5::encode_no_auth_greeting(&mut buf)?;
-            write_all_bytes(&mut stream, &buf[..n]).await?;
+            let mut greeting = [0u8; socks5::MAX_GREETING_LEN];
+            let n = socks5::encode_no_auth_greeting(&mut greeting)?;
+            write_array_prefix(&mut stream, greeting, n).await?;
 
             read_exact_into(&mut stream, &mut buf[..2]).await?;
             let selection = match socks5::method_selection_need(&buf[..2])? {
@@ -185,8 +187,9 @@ async fn connect_socks5(server: SocketAddr, destination: &Address) -> io::Result
                 return Err(io::Error::other("socks5 outbound no-auth rejected"));
             }
 
-            let n = socks5::encode_request(&mut buf, Command::Connect, destination.as_view())?;
-            write_all_bytes(&mut stream, &buf[..n]).await?;
+            let mut request = [0u8; socks5::MAX_REQUEST_LEN];
+            let n = socks5::encode_request(&mut request, Command::Connect, destination.as_view())?;
+            write_array_prefix(&mut stream, request, n).await?;
 
             let reply = read_reply(&mut stream, &mut buf).await?;
             if reply != Reply::Succeeded {
@@ -215,10 +218,11 @@ async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound>
     let local_addr = socket.local_addr()?;
     let (control, relay) = with_tcp_timeout(
         async move {
-            let mut buf = [0u8; socks5::MAX_REQUEST_LEN];
+            let mut buf = [0u8; socks5::MAX_REPLY_LEN];
 
-            let n = socks5::encode_no_auth_greeting(&mut buf)?;
-            write_all_bytes(&mut control, &buf[..n]).await?;
+            let mut greeting = [0u8; socks5::MAX_GREETING_LEN];
+            let n = socks5::encode_no_auth_greeting(&mut greeting)?;
+            write_array_prefix(&mut control, greeting, n).await?;
 
             read_exact_into(&mut control, &mut buf[..2]).await?;
             let selection = match socks5::method_selection_need(&buf[..2])? {
@@ -229,12 +233,13 @@ async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound>
                 return Err(io::Error::other("socks5 outbound no-auth rejected"));
             }
 
+            let mut request = [0u8; socks5::MAX_REQUEST_LEN];
             let n = socks5::encode_request(
-                &mut buf,
+                &mut request,
                 Command::UdpAssociate,
                 AddressRef::Ip(local_addr),
             )?;
-            write_all_bytes(&mut control, &buf[..n]).await?;
+            write_array_prefix(&mut control, request, n).await?;
 
             let reply = read_reply_message(&mut control, &mut buf).await?;
             if reply.reply != Reply::Succeeded {
@@ -296,11 +301,15 @@ where
     read_exact_managed(reader, dst).await
 }
 
-async fn write_all_bytes<W>(writer: &mut W, bytes: &[u8]) -> io::Result<()>
+async fn write_array_prefix<W, const N: usize>(
+    writer: &mut W,
+    buf: [u8; N],
+    len: usize,
+) -> io::Result<()>
 where
     W: AsyncWrite + 'static,
 {
-    let (result, _buf) = writer.write_all(bytes.to_vec()).await.into_parts();
+    let (result, _buf) = writer.write_all(buf.slice(..len)).await.into_parts();
     result
 }
 
@@ -368,7 +377,7 @@ impl DirectUdpOutbound {
 }
 
 impl DatagramSender for DirectUdpSender {
-    async fn send_to(&mut self, destination: Address, payload: Bytes) -> io::Result<usize> {
+    async fn send_to(&mut self, destination: Address, payload: SnellBuffer) -> io::Result<usize> {
         let addr = resolve_udp_destination(destination).await?;
         let len = payload.len();
         send_udp_bytes_to(self.socket_for(addr)?, addr, payload).await?;
@@ -430,6 +439,7 @@ pub(crate) struct Socks5UdpSender {
     _control: Rc<TcpStream>,
     socket: UdpSocket,
     relay: SocketAddr,
+    header: BytesMut,
     last_activity: Rc<Cell<Instant>>,
 }
 
@@ -447,6 +457,7 @@ impl Socks5UdpOutbound {
                 _control: self.control.clone(),
                 socket: self.socket.clone(),
                 relay: self.relay,
+                header: BytesMut::new(),
                 last_activity: self.last_activity.clone(),
             },
             Socks5UdpReceiver {
@@ -460,20 +471,26 @@ impl Socks5UdpOutbound {
 }
 
 impl DatagramSender for Socks5UdpSender {
-    async fn send_to(&mut self, destination: Address, payload: Bytes) -> io::Result<usize> {
+    async fn send_to(&mut self, destination: Address, payload: SnellBuffer) -> io::Result<usize> {
         let destination = destination.as_view();
         let header_len = socks5::udp_header_len(destination)?;
-        let mut packet = BytesMut::zeroed(header_len + payload.len());
-        socks5::encode_udp_header(&mut packet, 0, destination)?;
-        packet[header_len..].copy_from_slice(&payload);
         let payload_len = payload.len();
+        let mut header = std::mem::take(&mut self.header);
+        if header.capacity() < header_len {
+            header.reserve(header_len - header.capacity());
+        }
+        header.clear();
+        header.resize(header_len, 0);
+        socks5::encode_udp_header(&mut header, 0, destination)?;
         let timeout = remaining_udp_ttl(&self.last_activity)?;
-        time::timeout(
+        let (header, (_payload,)) = time::timeout(
             timeout,
-            send_udp_bytes_to(&self.socket, self.relay, packet.freeze()),
+            send_udp_vectored_to(&self.socket, self.relay, (header, (payload,))),
         )
         .await
         .map_err(|_| socks5_udp_idle_timeout())??;
+        self.header = header;
+        self.header.clear();
         self.last_activity.set(Instant::now());
         Ok(payload_len)
     }

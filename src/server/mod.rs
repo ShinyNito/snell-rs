@@ -342,12 +342,15 @@ where
 {
     let message = message.as_bytes();
     let len = message.len().min(255);
-    let mut buf = [0u8; 3 + 255];
-    buf[0] = COMMAND_ERROR;
-    buf[1] = code;
-    buf[2] = len as u8;
-    buf[3..3 + len].copy_from_slice(&message[..len]);
-    writer.write_frame(&buf[..3 + len]).await
+    writer
+        .write_with(3 + len, |buf| {
+            buf[0] = COMMAND_ERROR;
+            buf[1] = code;
+            buf[2] = len as u8;
+            buf[3..3 + len].copy_from_slice(&message[..len]);
+            Ok(3 + len)
+        })
+        .await
 }
 
 struct SnellInbound<M>
@@ -390,7 +393,13 @@ where
     }
 
     async fn accept(&mut self) -> io::Result<()> {
-        self.transport.writer.write_frame(&[COMMAND_TUNNEL]).await
+        self.transport
+            .writer
+            .write_with(1, |buf| {
+                buf[0] = COMMAND_TUNNEL;
+                Ok(1)
+            })
+            .await
     }
 
     async fn reject(&mut self, error: &io::Error) -> io::Result<()> {
@@ -415,7 +424,6 @@ enum ProbedStream {
 
 async fn probe_snell_mode(mut stream: TcpStream, psk: Arc<[u8]>) -> io::Result<ProbedStream> {
     time::timeout(PROBE_TIMEOUT, async {
-        let mut acc = BytesMut::new();
         let mut v6 = ProbeCandidate::new(V6ShapedMode::new_decoder(psk.clone()));
         let mut v4 = ProbeCandidate::new(V4Mode::new_decoder(psk));
         loop {
@@ -431,28 +439,40 @@ async fn probe_snell_mode(mut stream: TcpStream, psk: Arc<[u8]>) -> io::Result<P
                     "snell probe empty read",
                 ));
             }
-            acc.extend_from_slice(&buf);
-
-            if v6.possible {
-                match v6.probe(&acc) {
+            match (v6.possible, v4.possible) {
+                (true, true) => {
+                    let chunk = SnellBuffer::from_pool(buf);
+                    let v6_chunk = SnellBuffer::from(BytesMut::from(chunk.as_slice()));
+                    match v6.probe_chunk(v6_chunk)? {
+                        ProbeResult::Match { .. } => {
+                            let ProbeCandidate { decoder, .. } = v6;
+                            return Ok(ProbedStream::V6Shaped { stream, decoder });
+                        }
+                        ProbeResult::NeedMore | ProbeResult::Invalid => {}
+                    }
+                    match v4.probe_chunk(chunk)? {
+                        ProbeResult::Match { .. } => {
+                            let ProbeCandidate { decoder, .. } = v4;
+                            return Ok(ProbedStream::V4 { stream, decoder });
+                        }
+                        ProbeResult::NeedMore | ProbeResult::Invalid => {}
+                    }
+                }
+                (true, false) => match v6.probe_chunk(SnellBuffer::from_pool(buf))? {
                     ProbeResult::Match { .. } => {
                         let ProbeCandidate { decoder, .. } = v6;
                         return Ok(ProbedStream::V6Shaped { stream, decoder });
                     }
-                    ProbeResult::NeedMore => {}
-                    ProbeResult::Invalid => {}
-                }
-            }
-
-            if v4.possible {
-                match v4.probe(&acc) {
+                    ProbeResult::NeedMore | ProbeResult::Invalid => {}
+                },
+                (false, true) => match v4.probe_chunk(SnellBuffer::from_pool(buf))? {
                     ProbeResult::Match { .. } => {
                         let ProbeCandidate { decoder, .. } = v4;
                         return Ok(ProbedStream::V4 { stream, decoder });
                     }
-                    ProbeResult::NeedMore => {}
-                    ProbeResult::Invalid => {}
-                }
+                    ProbeResult::NeedMore | ProbeResult::Invalid => {}
+                },
+                (false, false) => {}
             }
 
             if !v6.possible && !v4.possible {
@@ -501,22 +521,21 @@ impl<D> ProbeCandidate<D>
 where
     D: SnellTcpDecoder,
 {
-    fn probe(&mut self, bytes: &[u8]) -> ProbeResult {
+    fn probe_chunk(&mut self, chunk: SnellBuffer) -> io::Result<ProbeResult> {
         if !self.decoder.pending_plain().is_empty() {
-            return self.probe_pending_plaintext();
+            return Ok(self.probe_pending_plaintext());
         }
 
-        if self.consumed == bytes.len() {
-            return ProbeResult::NeedMore;
+        if chunk.is_empty() {
+            return Ok(ProbeResult::NeedMore);
         }
 
-        let chunk = BytesMut::from(&bytes[self.consumed..]);
-        self.consumed = bytes.len();
-        match self.decoder.feed_owned(SnellBuffer::from(chunk)) {
-            Ok(DecodeEvent::PlainData) => self.probe_pending_plaintext(),
-            Ok(DecodeEvent::NeedMore) => ProbeResult::NeedMore,
-            Ok(DecodeEvent::ZeroChunk) | Err(_) => self.invalid(),
-            Ok(_) => ProbeResult::NeedMore,
+        self.consumed += chunk.len();
+        match self.decoder.feed_owned(chunk) {
+            Ok(DecodeEvent::PlainData) => Ok(self.probe_pending_plaintext()),
+            Ok(DecodeEvent::NeedMore) => Ok(ProbeResult::NeedMore),
+            Ok(DecodeEvent::ZeroChunk) | Err(_) => Ok(self.invalid()),
+            Ok(_) => Ok(ProbeResult::NeedMore),
         }
     }
 
@@ -540,7 +559,9 @@ fn probe_mode<M>(psk: Arc<[u8]>, bytes: &[u8]) -> ProbeResult
 where
     M: SnellMode,
 {
-    ProbeCandidate::new(M::new_decoder(psk)).probe(bytes)
+    ProbeCandidate::new(M::new_decoder(psk))
+        .probe_chunk(SnellBuffer::from(BytesMut::from(bytes)))
+        .unwrap()
 }
 
 fn probe_control_plaintext(buf: &[u8]) -> ProbePlaintext {
@@ -605,6 +626,15 @@ mod tests {
         out
     }
 
+    fn flatten_sealed<E>(encoder: &mut E, payload: SnellBuffer) -> Vec<u8>
+    where
+        E: snell::SnellTcpEncoder,
+    {
+        let mut wire = SnellWire::new();
+        encoder.seal_plain(payload, &mut wire).unwrap();
+        flatten_wire(wire)
+    }
+
     use compio::{
         driver::BufferRef,
         io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
@@ -625,14 +655,11 @@ mod tests {
         request.resize(request_len, 0);
         let n = snell::encode_connect_request_into(&mut request, destination, false).unwrap();
         request.truncate(n);
-        wire.extend_from_slice(&flatten_wire(
-            encoder.seal_plain(SnellBuffer::from(request)).unwrap(),
-        ));
+        wire.extend_from_slice(&flatten_sealed(&mut encoder, SnellBuffer::from(request)));
 
-        wire.extend_from_slice(&flatten_wire(
-            encoder
-                .seal_plain(SnellBuffer::from(BytesMut::from(payload)))
-                .unwrap(),
+        wire.extend_from_slice(&flatten_sealed(
+            &mut encoder,
+            SnellBuffer::from(BytesMut::from(payload)),
         ));
 
         wire
@@ -717,10 +744,9 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = b"\x01\x05\x03abc\x0bexample.com\x01\xbbhello";
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let wire = flatten_wire(
-            encoder
-                .seal_plain(SnellBuffer::from(BytesMut::from(&plaintext[..])))
-                .unwrap(),
+        let wire = flatten_sealed(
+            &mut encoder,
+            SnellBuffer::from(BytesMut::from(&plaintext[..])),
         );
 
         assert_eq!(
@@ -748,10 +774,9 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = [snell::PROTOCOL_VERSION, snell::COMMAND_UDP, 0];
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let wire = flatten_wire(
-            encoder
-                .seal_plain(SnellBuffer::from(BytesMut::from(&plaintext[..])))
-                .unwrap(),
+        let wire = flatten_sealed(
+            &mut encoder,
+            SnellBuffer::from(BytesMut::from(&plaintext[..])),
         );
 
         assert_eq!(
@@ -777,11 +802,7 @@ mod tests {
         plaintext.truncate(n);
         plaintext.resize(plaintext.len() + payload_len, b'x');
 
-        let wire = flatten_wire(
-            encoder
-                .seal_plain(SnellBuffer::from(plaintext.clone()))
-                .unwrap(),
-        );
+        let wire = flatten_sealed(&mut encoder, SnellBuffer::from(plaintext.clone()));
 
         assert_eq!(
             probe_mode::<V4Mode>(psk, &wire),
@@ -796,22 +817,21 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let plaintext = b"\x01\x05\x03abc\x0bexample.com\x01\xbbhello";
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
-        let wire = flatten_wire(
-            encoder
-                .seal_plain(SnellBuffer::from(BytesMut::from(&plaintext[..])))
-                .unwrap(),
+        let wire = flatten_sealed(
+            &mut encoder,
+            SnellBuffer::from(BytesMut::from(&plaintext[..])),
         );
 
         let split_points = [1, 5, 16, 30, wire.len() / 2, wire.len()];
-        let mut acc = Vec::new();
         let mut candidate = ProbeCandidate::new(V6ShapedMode::new_decoder(psk));
         let mut prev = 0;
         for &end in split_points.iter().filter(|&&e| e > 0 && e <= wire.len()) {
             if end <= prev {
                 continue;
             }
-            acc.extend_from_slice(&wire[prev..end]);
-            let result = candidate.probe(&acc);
+            let result = candidate
+                .probe_chunk(SnellBuffer::from(BytesMut::from(&wire[prev..end])))
+                .unwrap();
             match result {
                 ProbeResult::Match { .. } => return,
                 ProbeResult::NeedMore => {}
@@ -873,17 +893,14 @@ mod tests {
         let mut encoder = V6ShapedMode::new_encoder(psk.as_ref()).unwrap();
         let mut wire = Vec::new();
         let split = 5;
-        wire.extend_from_slice(&flatten_wire(
-            encoder
-                .seal_plain(SnellBuffer::from(BytesMut::from(&request[..split])))
-                .unwrap(),
+        wire.extend_from_slice(&flatten_sealed(
+            &mut encoder,
+            SnellBuffer::from(BytesMut::from(&request[..split])),
         ));
 
         let mut rest = BytesMut::from(&request[split..]);
         rest.extend_from_slice(b"ping");
-        wire.extend_from_slice(&flatten_wire(
-            encoder.seal_plain(SnellBuffer::from(rest)).unwrap(),
-        ));
+        wire.extend_from_slice(&flatten_sealed(&mut encoder, SnellBuffer::from(rest)));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -905,15 +922,12 @@ mod tests {
             assert_eq!(request.destination, destination);
             assert!(!request.reuse);
 
-            let batch = reader
-                .read_frame_batch()
+            let payload = reader
+                .read_plain_frame()
                 .await
                 .unwrap()
                 .expect("coalesced payload");
-            let mut frames = batch.into_frames();
-            let payload = frames.next().expect("coalesced payload frame");
-            assert!(frames.next().is_none());
-            assert_eq!(payload.as_ref(), b"ping");
+            assert_eq!(payload.as_slice(), b"ping");
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1313,26 +1327,28 @@ mod tests {
 
         let destination_view = destination.as_view();
         let header_len = snell::udp_request_addr_len(destination_view).unwrap();
-        let mut packet = vec![0u8; header_len + 4];
-        snell::encode_udp_request_addr(&mut packet, destination_view).unwrap();
-        packet[header_len..].copy_from_slice(b"ping");
-        transport.writer.write_frame(&packet).await.unwrap();
+        transport
+            .writer
+            .write_with(header_len + 4, |packet| {
+                snell::encode_udp_request_addr(packet, destination_view)?;
+                packet[header_len..header_len + 4].copy_from_slice(b"ping");
+                Ok(header_len + 4)
+            })
+            .await
+            .unwrap();
 
         let response = time::timeout(std::time::Duration::from_secs(2), async {
-            let batch = transport
+            let response = transport
                 .reader
-                .read_frame_batch()
+                .read_plain_frame()
                 .await?
                 .expect("snell udp response frame");
-            let mut frames = batch.into_frames();
-            let response = frames.next().expect("snell udp response frame");
-            assert!(frames.next().is_none());
             io::Result::Ok(response)
         })
         .await
         .unwrap()
         .unwrap();
-        let response = snell::decode_udp_response_packet(&response).unwrap();
+        let response = snell::decode_udp_response_packet(response.as_slice()).unwrap();
 
         assert_eq!(response.address.into_owned(), destination);
         assert_eq!(response.payload, b"pong");

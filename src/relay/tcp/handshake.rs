@@ -18,7 +18,7 @@
 //! （否则上游 Error/dial 失败时客户端误以为 CONNECT 已建立）。本模块只到
 //! 拿到 target 为止；dial/ConnectCmd/WaitTunnel/Succeeded 在后续阶段。
 
-use compio::{io::AsyncWriteExt, net::TcpStream};
+use compio::{buf::IoBuf, io::AsyncWriteExt, net::TcpStream};
 
 use crate::protocol::address::Address;
 use crate::protocol::socks5::{self, Command, METHOD_NO_AUTH, ParseState, Socks5Error};
@@ -94,7 +94,7 @@ async fn read_greeting(local: &mut TcpStream) -> Result<(), HandshakeError> {
 async fn write_method_selection(local: &mut TcpStream) -> Result<(), HandshakeError> {
     let mut reply = [0u8; 2];
     let n = socks5::encode_method_selection(&mut reply, METHOD_NO_AUTH)?;
-    let (result, _reply) = local.write_all(reply[..n].to_vec()).await.into_parts();
+    let (result, _reply) = local.write_all(reply.slice(..n)).await.into_parts();
     result?;
     Ok(())
 }

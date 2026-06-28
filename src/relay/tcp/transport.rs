@@ -99,14 +99,9 @@ where
     D: crate::protocol::snell::SnellTcpDecoder,
     W: AsyncWrite + 'static,
 {
-    while let Some(payload) = reader.read_frame_batch().await? {
-        let ends_stream = payload.ends_stream();
-        let BufResult(result, _payload) = writer.write_vectored_all(payload).await;
+    while let Some(payload) = reader.read_plain_frame().await? {
+        let BufResult(result, _payload) = writer.write_all(payload).await;
         result?;
-        if ends_stream {
-            writer.shutdown().await?;
-            return Ok(());
-        }
     }
     writer.shutdown().await
 }

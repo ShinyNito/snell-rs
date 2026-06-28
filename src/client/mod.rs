@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::{error::Error, io::Result, net::SocketAddr, rc::Rc};
 
 use compio::{
+    buf::IoBuf,
     io::AsyncWriteExt,
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
     runtime, time,
@@ -289,6 +290,6 @@ async fn write_socks5_reply_with_bind(
 ) -> Result<()> {
     let mut buf = [0u8; socks5::MAX_REPLY_LEN];
     let n = socks5::encode_reply(&mut buf, reply, bind)?;
-    let (result, _buf) = stream.write_all(buf[..n].to_vec()).await.into_parts();
+    let (result, _buf) = stream.write_all(buf.slice(..n)).await.into_parts();
     result
 }

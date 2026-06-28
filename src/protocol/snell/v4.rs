@@ -43,13 +43,13 @@
 //!   next_plain_capacity()
 //!      |  budget = chunk_limit(now)  (MSS - overhead, grows each record)
 //!      v
-//!   seal_plain(SnellBuffer)
+//!   seal_plain(SnellBuffer, SnellWire)
 //!      |  write HEADER_PLAIN (padding_len, payload_len)
 //!      |  seal header  (AEAD, nonce++, AAD empty)
 //!      |  seal payload (AEAD, nonce++, AAD empty) -> detached TAG
 //!      |  if padding > 0: make_padding() then swap_padding()
 //!      v
-//!   SnellWire -> flush SALT? + HEADER_CIPHER + BODY
+//!   reusable SnellWire -> flush SALT? + HEADER_CIPHER + BODY
 //! ```
 //!
 //! # Decode flow (state machine)
@@ -79,7 +79,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use rand::RngCore;
 use ring::aead::{Aad, LessSafeKey, Tag};
 
@@ -175,7 +175,8 @@ impl V4Encoder {
         })
     }
 
-    fn seal_payload(&mut self, mut payload: SnellBuffer) -> io::Result<SnellWire> {
+    fn seal_payload(&mut self, mut payload: SnellBuffer, wire: &mut SnellWire) -> io::Result<()> {
+        wire.clear();
         let now = Instant::now();
         let max_payload_len = self.budget_for(now).min(MAX_PACKET_SIZE);
         let payload_len = payload.len();
@@ -190,30 +191,26 @@ impl V4Encoder {
         };
 
         // head segment: [salt?][header_cipher]
-        let head_capacity = (first_record as usize) * SALT_LEN + HEADER_CIPHER_LEN;
-        let mut head = BytesMut::with_capacity(head_capacity);
-        if first_record {
-            head.extend_from_slice(&self.salt);
+        let head_len = (first_record as usize) * SALT_LEN + HEADER_CIPHER_LEN;
+        {
+            let head = wire.push_head_zeroed(head_len);
+            if first_record {
+                head[..SALT_LEN].copy_from_slice(&self.salt);
+            }
+            let header_start = (first_record as usize) * SALT_LEN;
+            write_plain_header(
+                &mut head[header_start..header_start + HEADER_PLAIN_LEN],
+                padding_len,
+                payload_len,
+            )?;
+            seal_header(
+                &self.key,
+                &mut self.nonce,
+                &[],
+                &mut head[header_start..header_start + HEADER_CIPHER_LEN],
+                "snell v4 header encrypt failed",
+            )?;
         }
-        let header_start = head.len();
-        head.resize(header_start + HEADER_CIPHER_LEN, 0);
-        write_plain_header(
-            &mut head[header_start..header_start + HEADER_PLAIN_LEN],
-            padding_len,
-            payload_len,
-        )?;
-        seal_header(
-            &self.key,
-            &mut self.nonce,
-            &[],
-            &mut head[header_start..header_start + HEADER_CIPHER_LEN],
-            "snell v4 header encrypt failed",
-        )?;
-
-        let mut wire = SnellWire::with_capacity(
-            1 + (padding_len > 0) as usize + (payload_len > 0) as usize + 1,
-        );
-        wire.push_bytes(head.freeze());
 
         if payload_len > 0 {
             // payload_cipher is the caller's buffer, encrypted in place.
@@ -226,19 +223,19 @@ impl V4Encoder {
             )?;
 
             if padding_len > 0 {
-                let mut padding = vec![0u8; padding_len];
-                make_padding_split(&mut padding, payload.as_slice(), &payload_tag);
-                swap_padding_split(&mut padding, payload.as_mut_slice(), &mut payload_tag);
-                wire.push_bytes(Bytes::from(padding));
+                let padding = wire.prepare_padding(padding_len);
+                make_padding_split(&mut *padding, payload.as_slice(), &payload_tag);
+                swap_padding_split(&mut *padding, payload.as_mut_slice(), &mut payload_tag);
+                wire.push_padding();
             }
             wire.push_buffer(payload);
-            wire.push_bytes(Bytes::from(payload_tag.to_vec()));
+            wire.push_tag(payload_tag);
         }
 
         self.salt_sent = true;
         self.chunk_limit = next_v4_chunk_limit(max_payload_len);
         self.last_write = Some(now);
-        Ok(wire)
+        Ok(())
     }
 
     fn plain_capacity(&self) -> usize {
@@ -508,8 +505,8 @@ impl SnellTcpEncoder for V4Encoder {
         self.plain_capacity()
     }
 
-    fn seal_plain(&mut self, payload: SnellBuffer) -> io::Result<SnellWire> {
-        self.seal_payload(payload)
+    fn seal_plain(&mut self, payload: SnellBuffer, wire: &mut SnellWire) -> io::Result<()> {
+        self.seal_payload(payload, wire)
     }
 }
 
@@ -530,12 +527,7 @@ impl SnellTcpDecoder for V4Decoder {
             Ok(event) => return Ok(event),
             Err(chunk) => chunk,
         };
-        let chunk = chunk.into_bytes_mut();
-        if self.buf.is_empty() {
-            self.buf = chunk;
-        } else if !chunk.is_empty() {
-            self.buf.extend_from_slice(&chunk);
-        }
+        chunk.append_to_bytes_mut(&mut self.buf);
         self.try_drain()
     }
 

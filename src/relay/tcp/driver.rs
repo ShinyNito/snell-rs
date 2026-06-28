@@ -1,8 +1,8 @@
 use std::{io, sync::Arc};
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use compio::{
-    buf::{BufResult, IoVectoredBuf},
+    buf::BufResult,
     driver::BufferRef,
     io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
 };
@@ -13,7 +13,6 @@ use crate::protocol::snell::{
 };
 
 const READ_AHEAD_LEN: usize = 64 * 1024;
-const PLAINTEXT_BATCH_LEN: usize = 64 * 1024;
 
 pub(crate) async fn read_exact_managed<R>(reader: &mut R, dst: &mut [u8]) -> io::Result<()>
 where
@@ -61,65 +60,14 @@ pub struct SnellStreamReader<R, D> {
 pub struct SnellStreamWriter<W, E> {
     inner: W,
     encoder: E,
-}
-
-pub(crate) struct PlaintextBatch {
-    frames: Vec<SnellBuffer>,
-    len: usize,
-    end: bool,
+    wire: SnellWire,
+    control_payload: BytesMut,
 }
 
 enum CiphertextRead {
     Progress,
     ZeroChunk,
     Eof,
-}
-
-impl PlaintextBatch {
-    fn new() -> Self {
-        Self {
-            frames: Vec::new(),
-            len: 0,
-            end: false,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.frames.is_empty()
-    }
-
-    fn is_full(&self) -> bool {
-        self.len >= PLAINTEXT_BATCH_LEN
-    }
-
-    fn push(&mut self, frame: SnellBuffer) {
-        if !frame.is_empty() {
-            self.len += frame.len();
-            self.frames.push(frame);
-        }
-    }
-
-    fn finish(&mut self) {
-        self.end = true;
-    }
-
-    pub(crate) fn ends_stream(&self) -> bool {
-        self.end
-    }
-
-    pub(crate) fn into_frames(self) -> impl Iterator<Item = Bytes> {
-        self.frames.into_iter().map(SnellBuffer::into_bytes)
-    }
-}
-
-impl IoVectoredBuf for PlaintextBatch {
-    fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
-        self.frames.iter().map(SnellBuffer::as_slice)
-    }
-
-    fn total_len(&self) -> usize {
-        self.len
-    }
 }
 
 impl<R, D> SnellStreamReader<R, D>
@@ -146,38 +94,22 @@ where
         Self { inner, decoder }
     }
 
-    pub(crate) async fn read_frame_batch(&mut self) -> io::Result<Option<PlaintextBatch>> {
-        let mut batch = PlaintextBatch::new();
+    pub(crate) async fn read_plain_frame(&mut self) -> io::Result<Option<SnellBuffer>> {
         loop {
-            match self.drain_decoder(&mut batch)? {
-                Some(true) => {
-                    if batch.is_full() {
-                        return Ok(Some(batch));
-                    }
-                    continue;
-                }
-                Some(false) => {
-                    return if batch.is_empty() {
-                        Ok(None)
-                    } else {
-                        batch.finish();
-                        Ok(Some(batch))
-                    };
-                }
-                None if !batch.is_empty() => return Ok(Some(batch)),
-                None => {}
+            if self.decoder.has_pending_plain() {
+                return Ok(Some(self.decoder.take_plain()));
+            }
+
+            match self.decoder.feed_owned(SnellBuffer::empty())? {
+                DecodeEvent::PlainData => continue,
+                DecodeEvent::ZeroChunk => return Ok(None),
+                DecodeEvent::NeedMore => {}
+                _ => continue,
             }
 
             match self.read_ciphertext().await? {
                 CiphertextRead::Progress => {}
-                CiphertextRead::ZeroChunk => {
-                    return if batch.is_empty() {
-                        Ok(None)
-                    } else {
-                        batch.finish();
-                        Ok(Some(batch))
-                    };
-                }
+                CiphertextRead::ZeroChunk => return Ok(None),
                 CiphertextRead::Eof => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -236,22 +168,6 @@ where
         }
     }
 
-    fn drain_decoder(&mut self, batch: &mut PlaintextBatch) -> io::Result<Option<bool>> {
-        loop {
-            if self.decoder.has_pending_plain() {
-                batch.push(self.decoder.take_plain());
-                return Ok(Some(true));
-            }
-
-            match self.decoder.feed_owned(SnellBuffer::empty())? {
-                DecodeEvent::PlainData => continue,
-                DecodeEvent::ZeroChunk => return Ok(Some(false)),
-                DecodeEvent::NeedMore => return Ok(None),
-                _ => continue,
-            }
-        }
-    }
-
     async fn read_ciphertext(&mut self) -> io::Result<CiphertextRead> {
         let read_len = self.decoder.next_ciphertext_read_len();
         if read_len == 0 {
@@ -298,27 +214,9 @@ where
         Ok(Self {
             inner,
             encoder: M::new_encoder(&psk)?,
+            wire: SnellWire::new(),
+            control_payload: BytesMut::new(),
         })
-    }
-
-    pub async fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
-        if payload.is_empty() {
-            self.write_one_frame(payload).await?;
-            return Ok(());
-        }
-
-        let mut offset = 0;
-        while offset < payload.len() {
-            let written = self.write_one_frame(&payload[offset..]).await?;
-            if written == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "snell encoder accepted no payload",
-                ));
-            }
-            offset += written;
-        }
-        Ok(())
     }
 
     pub(crate) async fn write_from<R>(&mut self, mut reader: R) -> io::Result<()>
@@ -335,8 +233,7 @@ where
             }
 
             let Some(payload) = reader.read_managed(capacity.min(READ_AHEAD_LEN)).await? else {
-                let wire = self.encoder.seal_plain(SnellBuffer::empty())?;
-                self.write_wire(wire).await?;
+                self.write_sealed(SnellBuffer::empty()).await?;
                 return Ok(());
             };
             let payload = SnellBuffer::from_pool(payload);
@@ -346,65 +243,66 @@ where
                     "snell managed read exceeded encoder capacity",
                 ));
             }
-            let wire = self.encoder.seal_plain(payload)?;
-            self.write_wire(wire).await?;
+            self.write_sealed(payload).await?;
         }
-    }
-
-    pub(crate) async fn write_owned_frame(&mut self, payload: BytesMut) -> io::Result<()> {
-        if payload.len() > self.encoder.next_plain_capacity() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "snell udp packet is larger than one frame",
-            ));
-        }
-        let wire = self.encoder.seal_plain(SnellBuffer::from(payload))?;
-        self.write_wire(wire).await
     }
 
     pub async fn write_with<F>(&mut self, hint: usize, fill: F) -> io::Result<()>
     where
         F: FnOnce(&mut [u8]) -> io::Result<usize>,
     {
-        let capacity = hint.min(self.encoder.next_plain_capacity());
-        let mut payload = BytesMut::with_capacity(capacity);
+        let plain_capacity = self.encoder.next_plain_capacity();
+        if hint > plain_capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snell payload is larger than one frame",
+            ));
+        }
+        let capacity = hint;
+        let mut payload = std::mem::take(&mut self.control_payload);
+        if payload.capacity() < capacity {
+            payload.reserve(capacity - payload.capacity());
+        }
         payload.resize(capacity, 0);
-        let n = fill(&mut payload)?;
+        let n = match fill(&mut payload) {
+            Ok(n) => n,
+            Err(error) => {
+                payload.clear();
+                self.control_payload = payload;
+                return Err(error);
+            }
+        };
         if n > capacity {
+            payload.clear();
+            self.control_payload = payload;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "snell payload exceeds filled buffer",
             ));
         }
         payload.truncate(n);
-        let wire = self.encoder.seal_plain(SnellBuffer::from(payload))?;
-        self.write_wire(wire).await
+        self.control_payload = self
+            .write_sealed(SnellBuffer::from(payload))
+            .await?
+            .unwrap_or_default();
+        self.control_payload.clear();
+        Ok(())
     }
 
-    async fn write_one_frame(&mut self, payload: &[u8]) -> io::Result<usize> {
-        let capacity = self.encoder.next_plain_capacity();
-        if capacity == 0 && !payload.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "snell encoder returned zero plaintext capacity",
-            ));
+    async fn write_sealed(&mut self, payload: SnellBuffer) -> io::Result<Option<BytesMut>> {
+        let mut wire = std::mem::take(&mut self.wire);
+        if let Err(error) = self.encoder.seal_plain(payload, &mut wire) {
+            wire.clear();
+            self.wire = wire;
+            return Err(error);
         }
-        let n = if payload.is_empty() {
-            0
-        } else {
-            payload.len().min(capacity)
-        };
-        let wire = self
-            .encoder
-            .seal_plain(SnellBuffer::from(BytesMut::from(&payload[..n])))?;
-        self.write_wire(wire).await?;
-        Ok(n)
-    }
-
-    async fn write_wire(&mut self, wire: SnellWire) -> io::Result<()> {
-        let BufResult(result, _wire) = self.inner.write_vectored_all(wire).await;
+        let BufResult(result, mut wire) = self.inner.write_vectored_all(wire).await;
+        let reusable_payload = wire.take_payload_bytes_mut();
+        wire.clear();
+        self.wire = wire;
         result?;
-        self.inner.flush().await
+        self.inner.flush().await?;
+        Ok(reusable_payload)
     }
 }
 
@@ -419,6 +317,15 @@ mod tests {
     };
     use std::time::Duration;
 
+    fn seal_for_test<E>(encoder: &mut E, payload: SnellBuffer) -> SnellWire
+    where
+        E: SnellTcpEncoder,
+    {
+        let mut wire = SnellWire::new();
+        encoder.seal_plain(payload, &mut wire).unwrap();
+        wire
+    }
+
     #[compio::test]
     async fn round_trips_payload_and_zero_chunk() {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
@@ -430,14 +337,14 @@ mod tests {
         let mut reader: SnellStreamReader<_, V4Decoder> =
             SnellStreamReader::new::<V4Mode>(server_read, psk);
 
-        writer.write_frame(b"hello").await.unwrap();
-        writer.write_frame(&[]).await.unwrap();
+        write_plain_frame(&mut writer, b"hello").await;
+        write_plain_frame(&mut writer, b"").await;
 
-        let (frames, ends_stream) = read_batch_vec(&mut reader).await.unwrap().unwrap();
-        assert_eq!(frames, vec![b"hello".to_vec()]);
-        if !ends_stream {
-            assert!(read_batch_vec(&mut reader).await.unwrap().is_none());
-        }
+        assert_eq!(
+            read_frame_vec(&mut reader).await.unwrap().unwrap(),
+            b"hello"
+        );
+        assert!(read_frame_vec(&mut reader).await.unwrap().is_none());
     }
 
     #[compio::test]
@@ -445,25 +352,23 @@ mod tests {
         let psk: Arc<[u8]> = Arc::from(&b"0123456789abcdef"[..]);
         let mut encoder = V4Encoder::new(&psk).unwrap();
         let mut wire = BytesMut::new();
-        for s in encoder
-            .seal_plain(SnellBuffer::from(BytesMut::from(&b"hello"[..])))
-            .unwrap()
-            .into_bytes_vec()
+        for s in seal_for_test(
+            &mut encoder,
+            SnellBuffer::from(BytesMut::from(&b"hello"[..])),
+        )
+        .into_bytes_vec()
         {
             wire.extend_from_slice(&s);
         }
-        for s in encoder
-            .seal_plain(SnellBuffer::from(BytesMut::from(&b"world"[..])))
-            .unwrap()
-            .into_bytes_vec()
+        for s in seal_for_test(
+            &mut encoder,
+            SnellBuffer::from(BytesMut::from(&b"world"[..])),
+        )
+        .into_bytes_vec()
         {
             wire.extend_from_slice(&s);
         }
-        for s in encoder
-            .seal_plain(SnellBuffer::empty())
-            .unwrap()
-            .into_bytes_vec()
-        {
+        for s in seal_for_test(&mut encoder, SnellBuffer::empty()).into_bytes_vec() {
             wire.extend_from_slice(&s);
         }
 
@@ -477,9 +382,15 @@ mod tests {
         decoder.feed_owned(SnellBuffer::from(wire)).unwrap();
         let mut reader = SnellStreamReader::from_decoder(server_read, decoder);
 
-        let (frames, ends_stream) = read_batch_vec(&mut reader).await.unwrap().unwrap();
-        assert_eq!(frames, vec![b"hello".to_vec(), b"world".to_vec()]);
-        assert!(ends_stream);
+        assert_eq!(
+            read_frame_vec(&mut reader).await.unwrap().unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            read_frame_vec(&mut reader).await.unwrap().unwrap(),
+            b"world"
+        );
+        assert!(read_frame_vec(&mut reader).await.unwrap().is_none());
     }
 
     #[compio::test]
@@ -488,10 +399,11 @@ mod tests {
         let mut encoder = V4Encoder::new(&psk).unwrap();
         let wire: Vec<u8> = {
             let mut v = Vec::new();
-            for s in encoder
-                .seal_plain(SnellBuffer::from(BytesMut::from(&b"hello"[..])))
-                .unwrap()
-                .into_bytes_vec()
+            for s in seal_for_test(
+                &mut encoder,
+                SnellBuffer::from(BytesMut::from(&b"hello"[..])),
+            )
+            .into_bytes_vec()
             {
                 v.extend_from_slice(&s);
             }
@@ -540,10 +452,8 @@ mod tests {
         writer.write_from(source_read).await.unwrap();
         write.await.unwrap();
 
-        let (frames, ends_stream) = read_batch_vec(&mut reader).await.unwrap().unwrap();
-        assert_eq!(frames, vec![b"x".to_vec()]);
-        assert!(!ends_stream);
-        assert!(read_batch_vec(&mut reader).await.unwrap().is_none());
+        assert_eq!(read_frame_vec(&mut reader).await.unwrap().unwrap(), b"x");
+        assert!(read_frame_vec(&mut reader).await.unwrap().is_none());
     }
 
     #[compio::test(with_proactor(
@@ -560,10 +470,9 @@ mod tests {
             let mut encoder = V4Encoder::new(&write_psk).unwrap();
             let mut wire = BytesMut::new();
             for payload in [b"a".as_slice(), b"b".as_slice()] {
-                for segment in encoder
-                    .seal_plain(SnellBuffer::from(BytesMut::from(payload)))
-                    .unwrap()
-                    .into_bytes_vec()
+                for segment in
+                    seal_for_test(&mut encoder, SnellBuffer::from(BytesMut::from(payload)))
+                        .into_bytes_vec()
                 {
                     wire.extend_from_slice(&segment);
                 }
@@ -592,34 +501,24 @@ mod tests {
         R: AsyncReadManaged<Buffer = BufferRef> + 'static,
         D: SnellTcpDecoder,
     {
-        let Some(batch) = reader.read_frame_batch().await? else {
+        let Some(frame) = reader.read_plain_frame().await? else {
             return Ok(None);
         };
-        let mut frames = batch.into_frames();
-        let frame = frames
-            .next()
-            .expect("plaintext batch should contain a frame")
-            .to_vec();
-        assert!(frames.next().is_none(), "expected one frame in batch");
-        Ok(Some(frame))
+        Ok(Some(frame.as_slice().to_vec()))
     }
 
-    async fn read_batch_vec<R, D>(
-        reader: &mut SnellStreamReader<R, D>,
-    ) -> io::Result<Option<(Vec<Vec<u8>>, bool)>>
+    async fn write_plain_frame<W, E>(writer: &mut SnellStreamWriter<W, E>, payload: &[u8])
     where
-        R: AsyncReadManaged<Buffer = BufferRef> + 'static,
-        D: SnellTcpDecoder,
+        W: AsyncWrite + 'static,
+        E: SnellTcpEncoder,
     {
-        let Some(batch) = reader.read_frame_batch().await? else {
-            return Ok(None);
-        };
-        let ends_stream = batch.ends_stream();
-        let frames = batch
-            .into_frames()
-            .map(|frame| frame.to_vec())
-            .collect::<Vec<_>>();
-        Ok(Some((frames, ends_stream)))
+        writer
+            .write_with(payload.len(), |frame| {
+                frame.copy_from_slice(payload);
+                Ok(payload.len())
+            })
+            .await
+            .unwrap();
     }
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {

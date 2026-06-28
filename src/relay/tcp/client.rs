@@ -285,7 +285,10 @@ mod tests {
                 assert!(request.reuse);
                 transport
                     .writer
-                    .write_frame(&[COMMAND_TUNNEL])
+                    .write_with(1, |buf| {
+                        buf[0] = COMMAND_TUNNEL;
+                        Ok(1)
+                    })
                     .await
                     .unwrap();
                 transport = relay_closed_peer_transport(transport).await;
@@ -320,7 +323,10 @@ mod tests {
                 assert!(!request.reuse);
                 transport
                     .writer
-                    .write_frame(&[COMMAND_TUNNEL])
+                    .write_with(1, |buf| {
+                        buf[0] = COMMAND_TUNNEL;
+                        Ok(1)
+                    })
                     .await
                     .unwrap();
                 let _ = relay_closed_peer_transport(transport).await;
