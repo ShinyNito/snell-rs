@@ -173,6 +173,9 @@ where
     let snell_client = Rc::new(SnellConnector::<M>::new(server, psk, resume));
     loop {
         let (stream, peer_addr) = listener.accept().await?;
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::warn!(%peer_addr, %error, "SOCKS5 inbound TCP_NODELAY could not be enabled");
+        }
         if let Err(error) = apply_tcp_keepalive(&stream) {
             tracing::warn!(%peer_addr, %error, "SOCKS5 inbound tcp keepalive could not be enabled");
         }
@@ -216,6 +219,9 @@ where
                         return;
                     }
                 };
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::warn!(%peer_addr, %error, "SOCKS5 inbound TCP_NODELAY could not be enabled");
+                }
                 if let Err(error) = apply_tcp_keepalive(&stream) {
                     tracing::warn!(%peer_addr, %error, "SOCKS5 inbound tcp keepalive could not be enabled");
                 }

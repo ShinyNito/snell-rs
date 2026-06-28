@@ -79,6 +79,9 @@ async fn serve_snell_listener(listener: TcpListener, config: ServerConfig) -> io
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::warn!(%peer_addr, %error, "snell inbound TCP_NODELAY could not be enabled");
+        }
         if let Err(error) = apply_tcp_keepalive(&stream) {
             tracing::warn!(%peer_addr, %error, "snell inbound tcp keepalive could not be enabled");
         }
@@ -123,6 +126,9 @@ pub async fn bind_tcp_listener_with_dispatcher(
                         return;
                     }
                 };
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::warn!(%peer_addr, %error, "snell inbound TCP_NODELAY could not be enabled");
+                }
                 if let Err(error) = apply_tcp_keepalive(&stream) {
                     tracing::warn!(%peer_addr, %error, "snell inbound tcp keepalive could not be enabled");
                 }

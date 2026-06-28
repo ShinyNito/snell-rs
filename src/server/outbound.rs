@@ -140,6 +140,7 @@ async fn connect_direct(destination: &Address) -> io::Result<TcpStream> {
         error
     })?;
     apply_tcp_keepalive(&stream)?;
+    stream.set_nodelay(true)?;
     Ok(stream)
 }
 
@@ -169,6 +170,7 @@ async fn connect_socks5(server: SocketAddr, destination: &Address) -> io::Result
         }
     };
     apply_tcp_keepalive(&stream)?;
+    stream.set_nodelay(true)?;
     let log_destination = destination.as_view();
     with_tcp_timeout(
         async move {
@@ -214,6 +216,7 @@ async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound>
         with_tcp_connect_timeout(TcpStream::connect(server), "socks5 udp control tcp connect")
             .await?;
     apply_tcp_keepalive(&control)?;
+    control.set_nodelay(true)?;
     let socket = UdpSocket::bind(udp_bind_addr_for(server)).await?;
     let local_addr = socket.local_addr()?;
     let (control, relay) = with_tcp_timeout(
