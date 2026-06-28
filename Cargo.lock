@@ -1148,6 +1148,7 @@ dependencies = [
  "ring",
  "rust-ini",
  "rustix",
+ "socket2",
  "thiserror",
  "tracing",
  "tracing-subscriber",

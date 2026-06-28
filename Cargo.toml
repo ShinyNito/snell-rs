@@ -29,6 +29,7 @@ clap = { version = "4", features = ["derive"] }
 rust-ini = "0.21"
 futures = "0.3"
 bytes = "1.0"
+socket2 = "0.6"
 lru_time_cache = "0.11"
 thiserror = "2.0"
 tracing = "0.1"

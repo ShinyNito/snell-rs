@@ -1,9 +1,9 @@
 use std::{
-    future::Future,
+    cell::Cell,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
-    task::{Context, Poll, ready},
+    rc::Rc,
+    time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -12,6 +12,7 @@ use compio::{
     net::{TcpStream, ToSocketAddrsAsync, UdpSocket},
     time,
 };
+use futures::future::{self, Either};
 
 use crate::{
     keepalive::apply_tcp_keepalive,
@@ -21,14 +22,11 @@ use crate::{
         socks5::{self, Command, METHOD_NO_AUTH, Reply},
     },
     relay::udp::{
-        DatagramTransport, ReceivedDatagram, UDP_ASSOCIATION_TTL, UdpRecvState, UdpSendState,
-        poll_udp_recv_from, poll_udp_send_bytes_to, poll_udp_send_to,
+        DatagramReceiver, DatagramSender, DatagramTransport, ReceivedDatagram, UDP_ASSOCIATION_TTL,
+        UdpRecvStream, recv_udp_packet, recv_udp_stream, send_udp_bytes_to,
     },
     timeout::{with_tcp_connect_timeout, with_tcp_timeout},
 };
-
-type ResolveFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>>>>;
-type TimerFuture = Pin<Box<dyn Future<Output = ()>>>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Outbound {
@@ -61,41 +59,63 @@ impl crate::relay::udp::Outbound for Outbound {
     }
 }
 
+// ponytail: connection-level enum; boxing this would add allocation to shrink a cold value.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum UdpOutbound {
     Direct(DirectUdpOutbound),
     Socks5(Socks5UdpOutbound),
 }
 
-#[derive(Default)]
-pub(crate) struct UdpOutboundSendState {
-    direct: DirectUdpSendState,
-    socks5: Socks5UdpSendState,
+pub(crate) enum UdpOutboundSender {
+    Direct(DirectUdpSender),
+    Socks5(Socks5UdpSender),
+}
+
+// ponytail: keep concrete receive streams here instead of heap-indirecting the hot UDP path.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum UdpOutboundReceiver {
+    Direct(DirectUdpReceiver),
+    Socks5(Socks5UdpReceiver),
 }
 
 impl DatagramTransport for UdpOutbound {
-    type SendState = UdpOutboundSendState;
+    type Sender = UdpOutboundSender;
+    type Receiver = UdpOutboundReceiver;
 
-    fn poll_send_to(
-        &mut self,
-        cx: &mut Context<'_>,
-        destination: &Address,
-        payload: &[u8],
-        state: &mut Self::SendState,
-    ) -> Poll<io::Result<usize>> {
+    fn split(self) -> (Self::Sender, Self::Receiver) {
         match self {
             Self::Direct(transport) => {
-                transport.poll_send_to(cx, destination, payload, &mut state.direct)
+                let (sender, receiver) = transport.split();
+                (
+                    UdpOutboundSender::Direct(sender),
+                    UdpOutboundReceiver::Direct(receiver),
+                )
             }
             Self::Socks5(transport) => {
-                transport.poll_send_to(cx, destination, payload, &mut state.socks5)
+                let (sender, receiver) = transport.split();
+                (
+                    UdpOutboundSender::Socks5(sender),
+                    UdpOutboundReceiver::Socks5(receiver),
+                )
             }
         }
     }
+}
 
-    fn poll_recv_from(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<ReceivedDatagram>> {
+impl DatagramSender for UdpOutboundSender {
+    async fn send_to(&mut self, destination: Address, payload: Bytes) -> io::Result<usize> {
         match self {
-            Self::Direct(transport) => transport.poll_recv_from(cx),
-            Self::Socks5(transport) => transport.poll_recv_from(cx),
+            Self::Direct(sender) => sender.send_to(destination, payload).await,
+            Self::Socks5(sender) => sender.send_to(destination, payload).await,
+        }
+    }
+}
+
+impl DatagramReceiver for UdpOutboundReceiver {
+    async fn recv_from(&mut self) -> io::Result<ReceivedDatagram> {
+        match self {
+            Self::Direct(receiver) => receiver.recv_from().await,
+            Self::Socks5(receiver) => receiver.recv_from().await,
         }
     }
 }
@@ -124,11 +144,13 @@ async fn connect_direct_udp() -> io::Result<DirectUdpOutbound> {
     let v6 = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
         .await
         .ok();
+    let v4_recv = recv_udp_stream(&v4)?;
+    let v6_recv = v6.as_ref().map(recv_udp_stream).transpose()?;
     Ok(DirectUdpOutbound {
         v4,
         v6,
-        v4_recv_state: UdpRecvState::default(),
-        v6_recv_state: UdpRecvState::default(),
+        v4_recv,
+        v6_recv,
     })
 }
 
@@ -226,12 +248,13 @@ async fn connect_socks5_udp(server: SocketAddr) -> io::Result<Socks5UdpOutbound>
         "socks5 udp associate handshake",
     )
     .await?;
+    let recv = recv_udp_stream(&socket)?;
     Ok(Socks5UdpOutbound {
-        _control: control,
+        control: Rc::new(control),
         socket,
         relay,
-        recv_state: UdpRecvState::default(),
-        control_ttl: ttl_timer(),
+        recv,
+        last_activity: Rc::new(Cell::new(Instant::now())),
     })
 }
 
@@ -319,100 +342,61 @@ async fn socks5_udp_relay_addr(server: SocketAddr, bind: Address) -> io::Result<
 pub(crate) struct DirectUdpOutbound {
     v4: UdpSocket,
     v6: Option<UdpSocket>,
-    v4_recv_state: UdpRecvState,
-    v6_recv_state: UdpRecvState,
+    v4_recv: UdpRecvStream,
+    v6_recv: Option<UdpRecvStream>,
 }
 
-#[derive(Default)]
-enum DirectUdpSendState {
-    #[default]
-    Ready,
-    Resolving(ResolveFuture),
-    Sending {
-        addr: SocketAddr,
-        state: UdpSendState,
-    },
+pub(crate) struct DirectUdpSender {
+    v4: UdpSocket,
+    v6: Option<UdpSocket>,
+}
+
+pub(crate) struct DirectUdpReceiver {
+    v4_recv: UdpRecvStream,
+    v6_recv: Option<UdpRecvStream>,
 }
 
 impl DirectUdpOutbound {
-    fn poll_send_to(
-        &self,
-        cx: &mut Context<'_>,
-        destination: &Address,
-        payload: &[u8],
-        state: &mut DirectUdpSendState,
-    ) -> Poll<io::Result<usize>> {
-        loop {
-            match state {
-                DirectUdpSendState::Ready => match destination {
-                    Address::Ip(addr) => {
-                        *state = DirectUdpSendState::Sending {
-                            addr: *addr,
-                            state: UdpSendState::default(),
-                        };
-                    }
-                    Address::Domain { host, port } => {
-                        let host = host.clone();
-                        let port = *port;
-                        *state = DirectUdpSendState::Resolving(Box::pin(async move {
-                            Ok((host, port).to_socket_addrs_async().await?.collect())
-                        }));
-                    }
-                },
-                DirectUdpSendState::Resolving(future) => {
-                    let mut addrs = ready!(future.as_mut().poll(cx))?;
-                    let addr = addrs.drain(..).next().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "udp destination not found")
-                    })?;
-                    *state = DirectUdpSendState::Sending {
-                        addr,
-                        state: UdpSendState::default(),
-                    };
-                }
-                DirectUdpSendState::Sending { addr, state: send } => {
-                    let payload_len = payload.len();
-                    ready!(poll_udp_send_to(
-                        self.socket_for(*addr)?,
-                        cx,
-                        *addr,
-                        payload,
-                        send,
-                    ))?;
-                    *state = DirectUdpSendState::Ready;
-                    return Poll::Ready(Ok(payload_len));
-                }
-            }
-        }
+    fn split(self) -> (DirectUdpSender, DirectUdpReceiver) {
+        (
+            DirectUdpSender {
+                v4: self.v4.clone(),
+                v6: self.v6.clone(),
+            },
+            DirectUdpReceiver {
+                v4_recv: self.v4_recv,
+                v6_recv: self.v6_recv,
+            },
+        )
     }
+}
 
-    fn poll_recv_from(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<ReceivedDatagram>> {
-        match poll_udp_recv_from(&self.v4, cx, &mut self.v4_recv_state) {
-            Poll::Ready(Ok(packet)) => {
-                return Poll::Ready(Ok(ReceivedDatagram::new(
-                    Address::Ip(packet.source()),
-                    packet,
-                )));
-            }
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Pending => {}
-        }
-
-        if let Some(v6) = &self.v6 {
-            match poll_udp_recv_from(v6, cx, &mut self.v6_recv_state) {
-                Poll::Ready(Ok(packet)) => {
-                    return Poll::Ready(Ok(ReceivedDatagram::new(
-                        Address::Ip(packet.source()),
-                        packet,
-                    )));
-                }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => {}
-            }
-        }
-
-        Poll::Pending
+impl DatagramSender for DirectUdpSender {
+    async fn send_to(&mut self, destination: Address, payload: Bytes) -> io::Result<usize> {
+        let addr = resolve_udp_destination(destination).await?;
+        let len = payload.len();
+        send_udp_bytes_to(self.socket_for(addr)?, addr, payload).await?;
+        Ok(len)
     }
+}
 
+impl DatagramReceiver for DirectUdpReceiver {
+    async fn recv_from(&mut self) -> io::Result<ReceivedDatagram> {
+        let packet = if let Some(v6_recv) = &mut self.v6_recv {
+            let v4_next = recv_udp_packet(&mut self.v4_recv);
+            let v6_next = recv_udp_packet(v6_recv);
+            futures::pin_mut!(v4_next, v6_next);
+            match future::select(v4_next, v6_next).await {
+                Either::Left((result, _)) | Either::Right((result, _)) => result?,
+            }
+        } else {
+            recv_udp_packet(&mut self.v4_recv).await?
+        };
+        Ok(ReceivedDatagram::new(Address::Ip(packet.source()), packet))
+    }
+}
+
+impl DirectUdpSender {
     fn socket_for(&self, destination: SocketAddr) -> io::Result<&UdpSocket> {
         if destination.is_ipv4() {
             Ok(&self.v4)
@@ -427,87 +411,85 @@ impl DirectUdpOutbound {
     }
 }
 
-pub(crate) struct Socks5UdpOutbound {
-    _control: TcpStream,
-    socket: UdpSocket,
-    relay: SocketAddr,
-    recv_state: UdpRecvState,
-    control_ttl: TimerFuture,
+async fn resolve_udp_destination(destination: Address) -> io::Result<SocketAddr> {
+    match destination {
+        Address::Ip(addr) => Ok(addr),
+        Address::Domain { host, port } => (host, port)
+            .to_socket_addrs_async()
+            .await?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "udp destination not found")),
+    }
 }
 
-#[derive(Default)]
-enum Socks5UdpSendState {
-    #[default]
-    Ready,
-    Sending {
-        packet: Option<Bytes>,
-        payload_len: usize,
-        state: UdpSendState,
-    },
+pub(crate) struct Socks5UdpOutbound {
+    control: Rc<TcpStream>,
+    socket: UdpSocket,
+    relay: SocketAddr,
+    recv: UdpRecvStream,
+    last_activity: Rc<Cell<Instant>>,
+}
+
+pub(crate) struct Socks5UdpSender {
+    _control: Rc<TcpStream>,
+    socket: UdpSocket,
+    relay: SocketAddr,
+    last_activity: Rc<Cell<Instant>>,
+}
+
+pub(crate) struct Socks5UdpReceiver {
+    _control: Rc<TcpStream>,
+    relay: SocketAddr,
+    recv: UdpRecvStream,
+    last_activity: Rc<Cell<Instant>>,
 }
 
 impl Socks5UdpOutbound {
-    fn check_control_ttl(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
-        if self.control_ttl.as_mut().poll(cx).is_ready() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "socks5 udp outbound idle timeout",
-            ));
-        }
-        Ok(())
+    fn split(self) -> (Socks5UdpSender, Socks5UdpReceiver) {
+        (
+            Socks5UdpSender {
+                _control: self.control.clone(),
+                socket: self.socket.clone(),
+                relay: self.relay,
+                last_activity: self.last_activity.clone(),
+            },
+            Socks5UdpReceiver {
+                _control: self.control,
+                relay: self.relay,
+                recv: self.recv,
+                last_activity: self.last_activity,
+            },
+        )
     }
+}
 
-    fn refresh_control_ttl(&mut self) {
-        self.control_ttl = ttl_timer();
+impl DatagramSender for Socks5UdpSender {
+    async fn send_to(&mut self, destination: Address, payload: Bytes) -> io::Result<usize> {
+        let destination = destination.as_view();
+        let header_len = socks5::udp_header_len(destination)?;
+        let mut packet = BytesMut::zeroed(header_len + payload.len());
+        socks5::encode_udp_header(&mut packet, 0, destination)?;
+        packet[header_len..].copy_from_slice(&payload);
+        let payload_len = payload.len();
+        let timeout = remaining_udp_ttl(&self.last_activity)?;
+        time::timeout(
+            timeout,
+            send_udp_bytes_to(&self.socket, self.relay, packet.freeze()),
+        )
+        .await
+        .map_err(|_| socks5_udp_idle_timeout())??;
+        self.last_activity.set(Instant::now());
+        Ok(payload_len)
     }
+}
 
-    fn poll_send_to(
-        &mut self,
-        cx: &mut Context<'_>,
-        destination: &Address,
-        payload: &[u8],
-        state: &mut Socks5UdpSendState,
-    ) -> Poll<io::Result<usize>> {
-        self.check_control_ttl(cx)?;
+impl DatagramReceiver for Socks5UdpReceiver {
+    async fn recv_from(&mut self) -> io::Result<ReceivedDatagram> {
         loop {
-            match state {
-                Socks5UdpSendState::Ready => {
-                    let destination = destination.as_view();
-                    let header_len = socks5::udp_header_len(destination)?;
-                    let mut packet = BytesMut::zeroed(header_len + payload.len());
-                    socks5::encode_udp_header(&mut packet, 0, destination)?;
-                    packet[header_len..].copy_from_slice(payload);
-                    *state = Socks5UdpSendState::Sending {
-                        packet: Some(packet.freeze()),
-                        payload_len: payload.len(),
-                        state: UdpSendState::default(),
-                    };
-                }
-                Socks5UdpSendState::Sending {
-                    packet,
-                    payload_len,
-                    state: send_state,
-                } => {
-                    let payload_len = *payload_len;
-                    ready!(poll_udp_send_bytes_to(
-                        &self.socket,
-                        cx,
-                        self.relay,
-                        packet,
-                        send_state,
-                    ))?;
-                    *state = Socks5UdpSendState::Ready;
-                    self.refresh_control_ttl();
-                    return Poll::Ready(Ok(payload_len));
-                }
-            }
-        }
-    }
-
-    fn poll_recv_from(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<ReceivedDatagram>> {
-        self.check_control_ttl(cx)?;
-        loop {
-            let packet = ready!(poll_udp_recv_from(&self.socket, cx, &mut self.recv_state))?;
+            let timeout = remaining_udp_ttl(&self.last_activity)?;
+            let packet = time::timeout(timeout, recv_udp_packet(&mut self.recv))
+                .await
+                .map_err(|_| socks5_udp_idle_timeout())??;
             if packet.source() != self.relay {
                 continue;
             }
@@ -520,16 +502,20 @@ impl Socks5UdpOutbound {
                 }
                 (parsed.destination.into_owned(), parsed.payload_offset)
             };
-            self.refresh_control_ttl();
-            return Poll::Ready(ReceivedDatagram::with_payload_offset(
-                destination,
-                packet,
-                payload_offset,
-            ));
+            self.last_activity.set(Instant::now());
+            return ReceivedDatagram::with_payload_offset(destination, packet, payload_offset);
         }
     }
 }
 
-fn ttl_timer() -> TimerFuture {
-    Box::pin(time::sleep(UDP_ASSOCIATION_TTL))
+fn remaining_udp_ttl(last_activity: &Cell<Instant>) -> io::Result<Duration> {
+    let elapsed = last_activity.get().elapsed();
+    if elapsed >= UDP_ASSOCIATION_TTL {
+        return Err(socks5_udp_idle_timeout());
+    }
+    Ok(UDP_ASSOCIATION_TTL - elapsed)
+}
+
+fn socks5_udp_idle_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "socks5 udp outbound idle timeout")
 }

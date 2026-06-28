@@ -585,7 +585,10 @@ mod tests {
             snell::{V4Mode, V6ShapedMode},
             socks5::{self, Command, METHOD_NO_AUTH, Reply},
         },
-        relay::tcp::client::SnellConnector,
+        relay::{
+            tcp::client::SnellConnector,
+            udp::{recv_udp_packet, recv_udp_stream},
+        },
     };
     use std::io;
 
@@ -872,7 +875,8 @@ mod tests {
             assert_eq!(request.destination, destination);
             assert!(!request.reuse);
 
-            let batch = std::future::poll_fn(|cx| reader.poll_read_frame_batch(cx))
+            let batch = reader
+                .read_frame_batch()
                 .await
                 .unwrap()
                 .expect("coalesced payload");
@@ -1285,7 +1289,9 @@ mod tests {
         transport.writer.write_frame(&packet).await.unwrap();
 
         let response = time::timeout(std::time::Duration::from_secs(2), async {
-            let batch = std::future::poll_fn(|cx| transport.reader.poll_read_frame_batch(cx))
+            let batch = transport
+                .reader
+                .read_frame_batch()
                 .await?
                 .expect("snell udp response frame");
             let mut frames = batch.into_frames();
@@ -1440,13 +1446,17 @@ mod tests {
     }
 
     async fn udp_recv_from(socket: &UdpSocket, dst: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let (result, buf) = socket
-            .recv_from(Vec::with_capacity(dst.len()))
-            .await
-            .into_parts();
-        let (n, peer) = result?;
-        dst[..n].copy_from_slice(&buf[..n]);
-        Ok((n, peer))
+        let mut packets = recv_udp_stream(socket)?;
+        let packet = recv_udp_packet(&mut packets).await?;
+        let payload = packet.payload();
+        if payload.len() > dst.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "udp test buffer is smaller than datagram",
+            ));
+        }
+        dst[..payload.len()].copy_from_slice(payload);
+        Ok((payload.len(), packet.source()))
     }
 
     async fn udp_send_to(socket: &UdpSocket, payload: &[u8], peer: SocketAddr) -> io::Result<()> {
