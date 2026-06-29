@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use super::crypto::GOLDEN_GAMMA;
-use super::crypto::expand::{expand_stream, expand_stream_mapped};
+use super::crypto::expand::expand_stream;
 use super::crypto::kdf::profile_secret;
 use super::crypto::prf::{prf32, prf32_seq};
 use super::crypto::splitmix::splitmix64;
@@ -131,20 +131,6 @@ impl Namespaces {
     #[must_use]
     fn prf_static(self, label: u32, domain: u32) -> u32 {
         prf32(self.for_label(label), label, domain)
-    }
-
-    fn expand_slice_mapped<F>(self, label: u32, seq: u32, out: &mut [u8], map: F)
-    where
-        F: FnMut(usize, u8) -> u8,
-    {
-        expand_stream_mapped(
-            self.for_label(label),
-            label,
-            u64::from(seq),
-            out.len() as u64,
-            out,
-            map,
-        );
     }
 
     fn expand_array<const N: usize>(self, label: u32, seq: u32) -> [u8; N] {
@@ -756,5 +742,192 @@ mod tests {
                 mix_mode
             );
         }
+    }
+
+    #[test]
+    fn split_mixing_matches_contiguous_mixing_for_derived_profiles() {
+        for psk in [TEST_PSK, b"0123456789abcdef", b"another psk value"] {
+            let profile = ShapedProfile::derive(psk);
+            let cipher_len = 1008;
+            let tag_len = 16;
+            let mut split_padding = (0..1024)
+                .map(|value| (value as u8).wrapping_mul(3))
+                .collect::<Vec<_>>();
+            let mut payload_cipher = (0..cipher_len)
+                .map(|value| 0x80u8.wrapping_add(value as u8))
+                .collect::<Vec<_>>();
+            let mut payload_tag = (0..tag_len)
+                .map(|value| 0x20u8.wrapping_add(value as u8))
+                .collect::<Vec<_>>();
+            let mut contiguous_padding = split_padding.clone();
+            let mut contiguous_payload = payload_cipher.clone();
+            contiguous_payload.extend_from_slice(&payload_tag);
+
+            mix_padding_payload_split(
+                &profile,
+                17,
+                &mut split_padding,
+                &mut payload_cipher,
+                &mut payload_tag,
+            );
+            mix_padding_payload(
+                &profile,
+                17,
+                &mut contiguous_padding,
+                &mut contiguous_payload,
+            );
+
+            let mut split_payload = payload_cipher;
+            split_payload.extend_from_slice(&payload_tag);
+            assert_eq!(split_padding, contiguous_padding);
+            assert_eq!(split_payload, contiguous_payload);
+        }
+    }
+
+    #[test]
+    fn folded_stride_mixing_matches_slow_reference() {
+        const SHAPES: [(usize, usize, usize); 5] = [
+            (0, 0, 0),
+            (7, 4, 5),
+            (31, 19, 16),
+            (128, 96, 16),
+            (1024, 1008, 16),
+        ];
+
+        for mix_mode in [0, 2] {
+            for rounds in 1..=3 {
+                for stride in 2..=13 {
+                    for offset_base in [0, 1, 7, 15] {
+                        for seq in [0, 1, 17] {
+                            for (padding_len, cipher_len, tag_len) in SHAPES {
+                                let mut profile = ShapedProfile::derive(TEST_PSK);
+                                profile.mix_mode = mix_mode;
+                                profile.mix_rounds = rounds;
+                                profile.mix_stride = stride;
+                                profile.mix_offset_base = offset_base;
+
+                                let mut fast_padding = test_bytes(padding_len, 3, 0);
+                                let mut fast_payload = test_bytes(cipher_len + tag_len, 5, 0x80);
+                                let mut slow_padding = fast_padding.clone();
+                                let mut slow_payload = fast_payload.clone();
+
+                                mix_padding_payload(
+                                    &profile,
+                                    seq,
+                                    &mut fast_padding,
+                                    &mut fast_payload,
+                                );
+                                slow_mix_contiguous(
+                                    &profile,
+                                    seq,
+                                    &mut slow_padding,
+                                    &mut slow_payload,
+                                );
+                                assert_eq!(
+                                    fast_padding, slow_padding,
+                                    "contiguous padding mismatch: mode={mix_mode}, rounds={rounds}, stride={stride}, offset={offset_base}, seq={seq}, padding_len={padding_len}, cipher_len={cipher_len}, tag_len={tag_len}"
+                                );
+                                assert_eq!(
+                                    fast_payload, slow_payload,
+                                    "contiguous payload mismatch: mode={mix_mode}, rounds={rounds}, stride={stride}, offset={offset_base}, seq={seq}, padding_len={padding_len}, cipher_len={cipher_len}, tag_len={tag_len}"
+                                );
+
+                                let mut fast_padding = test_bytes(padding_len, 3, 0);
+                                let mut fast_cipher = test_bytes(cipher_len, 5, 0x80);
+                                let mut fast_tag = test_bytes(tag_len, 7, 0x20);
+                                let mut slow_padding = fast_padding.clone();
+                                let mut slow_cipher = fast_cipher.clone();
+                                let mut slow_tag = fast_tag.clone();
+
+                                mix_padding_payload_split(
+                                    &profile,
+                                    seq,
+                                    &mut fast_padding,
+                                    &mut fast_cipher,
+                                    &mut fast_tag,
+                                );
+                                slow_mix_split(
+                                    &profile,
+                                    seq,
+                                    &mut slow_padding,
+                                    &mut slow_cipher,
+                                    &mut slow_tag,
+                                );
+                                assert_eq!(
+                                    fast_padding, slow_padding,
+                                    "split padding mismatch: mode={mix_mode}, rounds={rounds}, stride={stride}, offset={offset_base}, seq={seq}, padding_len={padding_len}, cipher_len={cipher_len}, tag_len={tag_len}"
+                                );
+                                assert_eq!(
+                                    fast_cipher, slow_cipher,
+                                    "split cipher mismatch: mode={mix_mode}, rounds={rounds}, stride={stride}, offset={offset_base}, seq={seq}, padding_len={padding_len}, cipher_len={cipher_len}, tag_len={tag_len}"
+                                );
+                                assert_eq!(
+                                    fast_tag, slow_tag,
+                                    "split tag mismatch: mode={mix_mode}, rounds={rounds}, stride={stride}, offset={offset_base}, seq={seq}, padding_len={padding_len}, cipher_len={cipher_len}, tag_len={tag_len}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn slow_mix_contiguous(
+        profile: &ShapedProfile,
+        seq: u32,
+        padding: &mut [u8],
+        payload: &mut [u8],
+    ) {
+        let n = padding.len().min(payload.len());
+        for round in 0..profile.mix_rounds {
+            let (stride, mut off) = slow_stride(profile, seq, round);
+            while off < n {
+                std::mem::swap(&mut padding[off], &mut payload[off]);
+                off += stride;
+            }
+        }
+    }
+
+    fn slow_mix_split(
+        profile: &ShapedProfile,
+        seq: u32,
+        padding: &mut [u8],
+        payload_cipher: &mut [u8],
+        payload_tag: &mut [u8],
+    ) {
+        let n = padding.len().min(payload_cipher.len() + payload_tag.len());
+        for round in 0..profile.mix_rounds {
+            let (stride, mut off) = slow_stride(profile, seq, round);
+            while off < n {
+                if off < payload_cipher.len() {
+                    std::mem::swap(&mut padding[off], &mut payload_cipher[off]);
+                } else {
+                    std::mem::swap(
+                        &mut padding[off],
+                        &mut payload_tag[off - payload_cipher.len()],
+                    );
+                }
+                off += stride;
+            }
+        }
+    }
+
+    fn slow_stride(profile: &ShapedProfile, seq: u32, round: u32) -> (usize, usize) {
+        let stride = (profile.mix_stride + round as usize % 3).max(1);
+        let off = match profile.mix_mode {
+            0 => profile.mix_offset_base % stride,
+            2 => {
+                (profile.prf32(MIX_OFFSET, seq, round) as usize + profile.mix_offset_base) % stride
+            }
+            _ => unreachable!("slow reference only covers stride modes"),
+        };
+        (stride, off)
+    }
+
+    fn test_bytes(len: usize, mul: u8, add: u8) -> Vec<u8> {
+        (0..len)
+            .map(|value| add.wrapping_add((value as u8).wrapping_mul(mul)))
+            .collect()
     }
 }
