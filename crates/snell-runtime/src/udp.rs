@@ -6,7 +6,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,13 +36,13 @@ use crate::session::{
 };
 use crate::socks::write_socks5_reply_bind;
 
-pub const UDP_ASSOCIATION_MAX: usize = 256;
-pub const UDP_CONTROL_MAX: usize = 256;
-pub const UDP_QUEUE_MAX: usize = 16;
-pub const UDP_POOL_MAX_BUFS: usize = 64;
-pub const UDP_POOL_MAX_BYTES: usize = 4 * 1024 * 1024;
-pub const UDP_DNS_CACHE_MAX: usize = 1024;
-pub const UDP_DNS_CACHE_TTL_SECS: u64 = 30;
+const UDP_ASSOCIATION_MAX: usize = 256;
+const UDP_CONTROL_MAX: usize = 256;
+const UDP_QUEUE_MAX: usize = 16;
+const UDP_POOL_MAX_BUFS: usize = 64;
+const UDP_POOL_MAX_BYTES: usize = 4 * 1024 * 1024;
+const UDP_DNS_CACHE_MAX: usize = 1024;
+const UDP_DNS_CACHE_TTL_SECS: u64 = 30;
 
 #[derive(Clone, Copy, Debug)]
 pub struct UdpLimits {
@@ -155,7 +154,7 @@ struct Dial {
 }
 
 #[derive(Clone)]
-pub struct UdpHub {
+pub(crate) struct UdpHub {
     bind: SocketAddr,
     ctrl: mpsc::Sender<Ctrl>,
     next_control: Arc<AtomicU64>,
@@ -233,10 +232,6 @@ impl UdpHub {
         self.control_count.fetch_sub(1, Ordering::Relaxed);
         Ok(())
     }
-}
-
-fn lookup_assoc<'a, K: Eq + Hash, V>(map: &'a HashMap<K, V>, peer: &K) -> Option<&'a V> {
-    map.get(peer)
 }
 
 fn pick_control(controls: &HashMap<ControlId, Control>) -> Option<ControlId> {
@@ -399,7 +394,7 @@ fn handle_datagram(
         buf,
     };
 
-    if let Some(entry) = lookup_assoc(map, &peer) {
+    if let Some(entry) = map.get(&peer) {
         if let Err(buf) = offer(&entry.tx, dgram, metrics) {
             pool.release(buf);
         }
@@ -587,7 +582,7 @@ async fn open_udp<E: TcpEncoder, D: TcpDecoder>(
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
 ) -> Result<(), SessionError> {
-    crate::prepare_session_stream(snell)?;
+    crate::platform::prepare_session_stream(snell)?;
     with_handshake_timeout(async {
         write_udp_setup(encoder, encode, snell).await?;
         let leftover = read_server_tunnel(decoder, recv, snell, kdf, psk).await?;
@@ -881,9 +876,10 @@ mod tests {
         }
 
         let (eq_before, hash_before) = snapshot();
-        assert!(lookup_assoc(&map, &ProbeKey { id: 0 }).is_some());
+        let hit = map.get(&ProbeKey { id: 0 });
         let hit_eqs = EQS.with(Cell::get) - eq_before;
         let hit_hashes = HASHES.with(Cell::get) - hash_before;
+        assert!(hit.is_some());
         assert!(
             hit_hashes >= 1,
             "HashMap::get hashes the key; a table scan would not: hashes={hit_hashes}"
@@ -894,9 +890,10 @@ mod tests {
         );
 
         let (eq_before, hash_before) = snapshot();
-        assert!(lookup_assoc(&map, &ProbeKey { id: 2001 }).is_none());
+        let miss = map.get(&ProbeKey { id: 2001 });
         let miss_eqs = EQS.with(Cell::get) - eq_before;
         let miss_hashes = HASHES.with(Cell::get) - hash_before;
+        assert!(miss.is_none());
         assert!(
             miss_hashes >= 1,
             "missing-key get must hash; a scan would only Eq: hashes={miss_hashes}"

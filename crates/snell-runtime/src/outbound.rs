@@ -8,9 +8,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
+use crate::connect_tcp;
 use crate::dns::DnsResolver;
-use crate::error::{SessionError, TimeoutKind};
-use crate::{connect_tcp, prepare_session_stream};
+use crate::error::SessionError;
+use crate::platform::prepare_session_stream;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outbound {
@@ -219,7 +220,7 @@ async fn connect_direct(destination: &Address) -> Result<TcpStream, SessionError
                     Ok(stream)
                 }
                 Ok(Err(error)) => Err(error.into()),
-                Err(_) => Err(SessionError::from_timeout(TimeoutKind::Connect)),
+                Err(_) => Err(SessionError::ConnectTimeout),
             }
         }
     }

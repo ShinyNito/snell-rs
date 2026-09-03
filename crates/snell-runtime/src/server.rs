@@ -11,18 +11,18 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{Instrument, debug, info, warn};
 
 use crate::auto::{Detected, detect_protocol};
+use crate::bind_listener;
 use crate::codec::{TcpDecoder, TcpEncoder};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
-use crate::platform::{self, AcceptLoop, TcpBrutal};
+use crate::platform::{self, AcceptLoop, TcpBrutal, prepare_session_stream};
 use crate::replay::ReplayCache;
 use crate::session::{
     ServerFirst, ensure_bulk, new_encode, new_recv, read_server_connect, relay, release_bulk,
     server_may_reuse, wait_reuse_idle, with_handshake_timeout, write_reject, write_tunnel,
 };
 use crate::udp::{UdpOptions, run_server_udp};
-use crate::{bind_listener, prepare_session_stream};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -282,7 +282,7 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
 
         recv = ensure_bulk(recv)?;
         encode = new_encode();
-        let ends = relay(
+        relay(
             &mut snell,
             &mut remote,
             &mut encoder,
@@ -297,7 +297,7 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
         if !connect.reuse {
             return Ok(());
         }
-        if !server_may_reuse(ends, &encode, &decoder) {
+        if !server_may_reuse(&encode, &decoder) {
             return Ok(());
         }
         let released = release_bulk(recv, encode)?;

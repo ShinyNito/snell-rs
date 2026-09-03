@@ -40,11 +40,8 @@ pub use outbound::Outbound;
 pub use platform::{PlatformError, TcpBrutal};
 pub use pool::ReusePool;
 pub use server::{ServerConfig, run_server, serve_server};
-pub use snell_protocol as protocol;
 pub use snell_protocol::{ProtocolFlavor, ProtocolSelection};
 pub use udp::{UdpLimits, UdpMetrics, UdpOptions};
-
-use crate::error::TimeoutKind;
 
 pub(crate) fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
     let socket = if addr.is_ipv4() {
@@ -60,10 +57,6 @@ pub(crate) fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
         Err(PlatformError::Io(error)) => return Err(error),
     }
     socket.listen(1024)
-}
-
-pub(crate) fn prepare_session_stream(stream: &TcpStream) -> io::Result<()> {
-    platform::prepare_session_stream(stream)
 }
 
 pub(crate) async fn connect_tcp(addr: SocketAddr) -> Result<TcpStream, SessionError> {
@@ -85,7 +78,7 @@ pub(crate) async fn connect_tcp(addr: SocketAddr) -> Result<TcpStream, SessionEr
     {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => return Err(error.into()),
-        Err(_) => return Err(SessionError::from_timeout(TimeoutKind::Connect)),
+        Err(_) => return Err(SessionError::ConnectTimeout),
     };
     platform::apply_keepalive(&stream)?;
     Ok(stream)

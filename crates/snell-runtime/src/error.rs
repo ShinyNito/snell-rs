@@ -14,8 +14,6 @@ pub enum SessionError {
     Cancelled,
     #[error("udp association limit reached")]
     UdpLimit,
-    #[error("v6-unsafe-raw is not enabled")]
-    UnsafeRawDisabled,
     #[error("reuse idle timed out")]
     ReuseIdleTimeout,
     #[error("early payload exceeds 64 KiB")]
@@ -61,17 +59,18 @@ impl From<ProtocolError> for SessionError {
 }
 
 impl SessionError {
-    pub fn from_timeout(kind: TimeoutKind) -> Self {
-        match kind {
-            TimeoutKind::Handshake => Self::HandshakeTimeout,
-            TimeoutKind::Connect => Self::ConnectTimeout,
-        }
-    }
-
-    pub fn is_stale_pool_error(&self) -> bool {
+    pub(crate) fn is_stale_pool_error(&self) -> bool {
         match self {
             Self::HandshakeTimeout | Self::ConnectTimeout | Self::ReuseIdleTimeout => true,
-            Self::Io(error) => is_stale_io(error.kind()),
+            Self::Io(error) => matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::TimedOut
+            ),
             _ => false,
         }
     }
@@ -79,28 +78,4 @@ impl SessionError {
     pub(crate) fn is_peer_closed(&self) -> bool {
         matches!(self, Self::Cancelled) || self.is_stale_pool_error()
     }
-}
-
-pub(crate) fn is_stale_io(kind: io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::TimedOut
-    )
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TimeoutKind {
-    Handshake,
-    Connect,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DirectionEnd {
-    CleanEof,
-    ProtocolEnd,
 }

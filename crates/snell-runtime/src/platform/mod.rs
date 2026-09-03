@@ -52,14 +52,6 @@ pub struct Keepalive {
     pub interval: Duration,
 }
 
-/// TCP ECN is the kernel/stack default. Linux/macOS/Windows have no portable
-/// per-socket TCP_ECN enable; this phase does not set `IP_TOS`.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EcnPolicy {
-    KernelDefault,
-}
-
 pub(crate) fn prepare_session_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     apply_keepalive(stream)
@@ -199,11 +191,6 @@ pub(crate) fn apply_tcp_brutal(stream: &TcpStream, params: TcpBrutal) -> Result<
         let _ = (stream, params);
         Err(PlatformError::Unsupported("tcp_brutal is Linux-only"))
     }
-}
-
-#[cfg(test)]
-pub(crate) fn tcp_ecn_policy() -> EcnPolicy {
-    EcnPolicy::KernelDefault
 }
 
 #[cfg(test)]
