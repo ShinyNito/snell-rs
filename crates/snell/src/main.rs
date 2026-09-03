@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Version => {
             println!(
-                "snell-rs {} (current phase stops after Phase 8)",
+                "snell-rs {} (current phase stops after Phase 9)",
                 env!("CARGO_PKG_VERSION")
             );
         }

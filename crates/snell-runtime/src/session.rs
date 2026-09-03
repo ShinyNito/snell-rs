@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use snell_protocol::{
     Address, AddressRef, COMMAND_UDP, DecodeStatus, ENCODE_BUFFER_MAX, EncodeBuffer, Error,
-    MAX_CONNECT_REQUEST_LEN, MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk,
+    MAX_CONNECT_REQUEST_LEN, MAX_PACKET_SIZE, MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk,
     REUSE_IDLE_TIMEOUT_SECS, RecordKind, RecvBuffer, SERVER_EARLY_PAYLOAD_MAX, ServerReply,
     TCP_HANDSHAKE_TIMEOUT_SECS, V6_WIRE_CAP, aead_key, encode_connect_request, encode_reject,
     encode_tunnel_reply, encode_udp_request, encode_udp_response, encode_udp_setup,
@@ -22,7 +22,7 @@ use crate::error::{DirectionEnd, SessionError, TimeoutKind};
 use crate::kdf::KdfLimiter;
 use crate::replay::ReplayCache;
 
-const RECORD_HINT: usize = 8 * 1024;
+const RECORD_HINT: usize = MAX_PACKET_SIZE;
 pub(crate) const HANDSHAKE_PLAIN_MAX: usize = MAX_CONNECT_REQUEST_LEN + MAX_PACKET_SIZE_V6;
 
 pub(crate) fn new_recv() -> RecvBuffer {
