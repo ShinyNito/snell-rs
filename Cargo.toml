@@ -1,27 +1,42 @@
-[package]
-name = "snell-rs"
-version = "0.1.0"
+[workspace]
+resolver = "3"
+members = [
+  "crates/snell-protocol",
+  "crates/snell-runtime",
+  "crates/snell-config",
+  "crates/snell",
+  "crates/snell-testkit",
+  "xtask",
+]
+exclude = ["repos"]
+
+[workspace.package]
 edition = "2024"
+rust-version = "1.98.0"
+license = "MIT"
+repository = "https://github.com/ShinyNito/snell-rs"
+version = "0.0.0"
 publish = false
 
-[dependencies]
-# Cryptography
-# ring: AES-128-GCM (record-layer hot path, ring uses optimized ASM).
-#       ring's digest module only supports SHA-1/SHA-2 — BLAKE2 is deliberately
-#       not supported (briansmith/ring#169), so BLAKE2b lives in the `blake2` crate.
+[workspace.dependencies]
+anyhow = "1"
+argon2 = "0.5.3"
+blake2 = "0.10.6"
+clap = { version = "4", features = ["derive"] }
 ring = "0.17"
-argon2 = "0.5" # KDF: Argon2id (unpacked fn 0x39a90; libsodium crypto_pwhash)
-blake2 = "0.10" # BLAKE2b-256 profile secret (unpacked fn 0x39d90)
-rand = "0.8"
+thiserror = "2"
+tokio = { version = "1.53.1", default-features = false }
+zeroize = { version = "1", features = ["derive"] }
 
-# Runtime
-compio = { version = "0.19.1", default-features = false, features = ["bytes", "net", "time", "io-uring", "io-uring-sqe128", "io-uring-cqe32"] }
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+incremental = false
+panic = "abort"
+strip = "symbols"
 
-# Data structures
-bytes = "1.0"
-
-# Error handling
-thiserror = "2.0"
-
-[dev-dependencies]
-hex = "0.4"
+[profile.bench]
+debug = 1
+lto = "fat"
+codegen-units = 1

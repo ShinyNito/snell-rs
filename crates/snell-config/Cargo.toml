@@ -1,0 +1,12 @@
+[package]
+name = "snell-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Raw-to-validated Snell configuration"
+
+[dependencies]
+snell-protocol = { path = "../snell-protocol", version = "0.0.0" }

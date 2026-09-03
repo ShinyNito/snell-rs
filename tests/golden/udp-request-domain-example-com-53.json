@@ -1,0 +1,6 @@
+{
+  "name": "udp-request-domain-example-com-53",
+  "kind": "plaintext-udp-datagram",
+  "notes": "UDP request domain example.com:53 plus payload 'hello'.",
+  "hex": "010b6578616d706c652e636f6d003568656c6c6f"
+}

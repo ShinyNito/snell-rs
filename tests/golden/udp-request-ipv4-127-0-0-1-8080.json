@@ -1,0 +1,6 @@
+{
+  "name": "udp-request-ipv4-127-0-0-1-8080",
+  "kind": "plaintext-udp-datagram",
+  "notes": "One UDP request datagram as a complete plaintext message.",
+  "hex": "0100047f0000011f907061796c6f6164"
+}

@@ -1,0 +1,28 @@
+[package]
+name = "snell-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Synchronous Snell protocol kernel (runtime-free)"
+
+[features]
+default = []
+unsafe-raw = []
+
+[dependencies]
+argon2.workspace = true
+blake2.workspace = true
+ring.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[[bench]]
+name = "v4_record"
+harness = false
+
+[[bench]]
+name = "v6_record"
+harness = false

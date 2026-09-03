@@ -1,0 +1,7 @@
+{
+  "name": "v6-unshaped-hello-salt-07",
+  "kind": "v6-unshaped-record",
+  "notes": "PSK 0123456789abcdef, salt 07 repeated 16, padding 0, payload hello. Same AEAD layout as v4 with no padding.",
+  "psk_utf8": "0123456789abcdef",
+  "hex": "07070707070707070707070707070707c5366a60ea813e1a53f43bacabb9936e9e38bf6df491850327876c199373b01537bcdbe9295174b2b65661bb"
+}

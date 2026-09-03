@@ -1,0 +1,6 @@
+{
+  "name": "connect-example-com-443",
+  "kind": "plaintext-control",
+  "notes": "Client CONNECT without reuse. Empty client id.",
+  "hex": "0101000b6578616d706c652e636f6d01bb"
+}

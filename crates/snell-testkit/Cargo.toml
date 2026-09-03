@@ -1,0 +1,33 @@
+[package]
+name = "snell-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Process tests, golden fixtures, and load helpers"
+
+[dependencies]
+snell-protocol = { path = "../snell-protocol", version = "0.0.0" }
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }

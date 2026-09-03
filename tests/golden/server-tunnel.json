@@ -1,0 +1,6 @@
+{
+  "name": "server-tunnel",
+  "kind": "plaintext-control",
+  "notes": "Server Tunnel reply. Remaining plaintext after this byte is the TCP stream.",
+  "hex": "00"
+}

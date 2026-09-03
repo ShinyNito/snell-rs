@@ -1,0 +1,7 @@
+{
+  "name": "v4-record-hello-salt-07-padding-8",
+  "kind": "v4-record",
+  "notes": "PSK 0123456789abcdef, salt 07 repeated 16, RepeatEntropy 0x3c, initial_padding_len=8, payload hello",
+  "psk_utf8": "0123456789abcdef",
+  "hex": "07070707070707070707070707070707c5366a60e2813e6ee63b822b726e54d05a8627cf2ccff4033c873c193c733c3c273c6c3c933cb01537bcdbe9295174b2b65661bb"
+}

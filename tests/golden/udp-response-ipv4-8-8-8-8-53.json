@@ -1,0 +1,6 @@
+{
+  "name": "udp-response-ipv4-8-8-8-8-53",
+  "kind": "plaintext-udp-datagram",
+  "notes": "UDP response IPv4 8.8.8.8:53 plus payload 'dns'.",
+  "hex": "04080808080035646e73"
+}

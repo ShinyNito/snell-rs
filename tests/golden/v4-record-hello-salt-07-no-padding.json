@@ -1,0 +1,7 @@
+{
+  "name": "v4-record-hello-salt-07-no-padding",
+  "kind": "v4-record",
+  "notes": "PSK 0123456789abcdef, salt 07 repeated 16, padding 0, payload hello",
+  "psk_utf8": "0123456789abcdef",
+  "hex": "07070707070707070707070707070707c5366a60ea813e1a53f43bacabb9936e9e38bf6df491850327876c199373b01537bcdbe9295174b2b65661bb"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "connect-with-client-id",
+  "kind": "plaintext-control",
+  "notes": "CONNECT with a 3-byte client id 'abc' to dns:53. Readers skip the client id.",
+  "hex": "01010361626303646e730035"
+}
