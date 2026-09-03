@@ -11,18 +11,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Task {
-    /// Run the Phase 0/1 workspace gates.
+    /// Run fmt, clippy, nextest, and cargo deny.
     Check,
+    /// Process-level TCP echo soak (`SNELL_SOAK_SECS`, default 15).
+    Soak,
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Task::Check => {
-            if let Err(error) = check() {
-                eprintln!("{error}");
-                return ExitCode::FAILURE;
-            }
-            ExitCode::SUCCESS
+        Task::Check => finish(check()),
+        Task::Soak => finish(soak()),
+    }
+}
+
+fn finish(result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -41,6 +48,19 @@ fn check() -> anyhow::Result<()> {
     run(Command::new("cargo").args(["nextest", "run", "--workspace", "--all-features"]))?;
     run(Command::new("cargo").args(["deny", "check"]))?;
     Ok(())
+}
+
+fn soak() -> anyhow::Result<()> {
+    run(Command::new("cargo").args([
+        "test",
+        "-p",
+        "snell",
+        "--test",
+        "soak",
+        "--",
+        "--ignored",
+        "--nocapture",
+    ]))
 }
 
 fn run(command: &mut Command) -> anyhow::Result<()> {
