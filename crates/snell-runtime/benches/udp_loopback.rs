@@ -1,4 +1,4 @@
-//! UDP loopback on an established SOCKS5 UDP association.
+//! UDP loopback on established v4 and v6 SOCKS5 UDP associations.
 //!
 //! Handshake/KDF is warmed up and excluded from the timed window.
 //! Workload is ping-pong datagrams on the same association.
@@ -30,28 +30,34 @@ fn main() {
 }
 
 async fn run() {
-    let pair = start_pair().await;
-    let echo = spawn_udp_echo().await.expect("echo");
-    let handshake_started = Instant::now();
-    let session = socks5_udp_associate(pair.socks).await.expect("associate");
-    let handshake_elapsed = handshake_started.elapsed();
+    for flavor in [
+        ProtocolFlavor::V4,
+        ProtocolFlavor::V6Shaped,
+        ProtocolFlavor::V6Unshaped,
+    ] {
+        let pair = start_pair(flavor).await;
+        let echo = spawn_udp_echo().await.expect("echo");
+        let handshake_started = Instant::now();
+        let session = socks5_udp_associate(pair.socks).await.expect("associate");
+        let handshake_elapsed = handshake_started.elapsed();
 
-    ping_pong(&session, echo, &PAYLOAD, WARMUP_ROUNDS)
-        .await
-        .expect("warmup");
+        ping_pong(&session, echo, &PAYLOAD, WARMUP_ROUNDS)
+            .await
+            .expect("warmup");
 
-    let ping_started = Instant::now();
-    ping_pong(&session, echo, &PAYLOAD, PING_ROUNDS)
-        .await
-        .expect("ping");
-    let ping_elapsed = ping_started.elapsed();
+        let ping_started = Instant::now();
+        ping_pong(&session, echo, &PAYLOAD, PING_ROUNDS)
+            .await
+            .expect("ping");
+        let ping_elapsed = ping_started.elapsed();
 
-    eprintln!(
-        "v4 udp loopback established association, handshake excluded from ping-pong\n\
-         handshake: elapsed={handshake_elapsed:?}\n\
-         ping: rounds={PING_ROUNDS} size={} elapsed={ping_elapsed:?}",
-        PAYLOAD.len()
-    );
+        eprintln!(
+            "{flavor:?} udp loopback established association, handshake excluded from ping-pong\n\
+             handshake: elapsed={handshake_elapsed:?}\n\
+             ping: rounds={PING_ROUNDS} size={} elapsed={ping_elapsed:?}",
+            PAYLOAD.len()
+        );
+    }
 }
 
 struct Pair {
@@ -66,7 +72,7 @@ struct UdpSession {
     client: UdpSocket,
 }
 
-async fn start_pair() -> Pair {
+async fn start_pair(flavor: ProtocolFlavor) -> Pair {
     let psk = Psk::new(PSK.to_vec()).unwrap();
     let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_listener.local_addr().unwrap();
@@ -77,7 +83,7 @@ async fn start_pair() -> Pair {
     let server_cfg = ServerConfig {
         listen: server_addr,
         psk: psk.clone(),
-        selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
+        selection: ProtocolSelection::Exact(flavor),
         outbound: Outbound::Direct,
         udp: UdpOptions::default(),
         tcp_brutal: None,
@@ -92,7 +98,7 @@ async fn start_pair() -> Pair {
         listen: socks,
         server: server_addr,
         psk,
-        version: ProtocolFlavor::V4,
+        version: flavor,
         reuse: false,
         pool: None,
         udp: UdpOptions::default(),

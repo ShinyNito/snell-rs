@@ -1,4 +1,4 @@
-//! Two SOCKS5 echoes on a reused Snell v4 connection.
+//! Two SOCKS5 echoes on reused Snell v4 and v6 connections.
 //!
 //! Run: `cargo bench -p snell-runtime --bench reuse_loopback`
 
@@ -25,37 +25,43 @@ fn main() {
 }
 
 async fn run() {
-    let pool = ReusePool::new();
-    let pair = start_pair(pool.clone()).await;
-    let echo = spawn_echo().await.expect("echo1");
-    let started = Instant::now();
-    let mut stream = socks5_connect(pair.socks, echo.addr).await.expect("c1");
-    stream.write_all(b"one").await.unwrap();
-    stream.shutdown().await.unwrap();
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.unwrap();
-    assert_eq!(buf, b"one");
-    echo.join.await.unwrap().unwrap();
-    let first = started.elapsed();
+    for flavor in [
+        ProtocolFlavor::V4,
+        ProtocolFlavor::V6Shaped,
+        ProtocolFlavor::V6Unshaped,
+    ] {
+        let pool = ReusePool::new();
+        let pair = start_pair(flavor, pool.clone()).await;
+        let echo = spawn_echo().await.expect("echo1");
+        let started = Instant::now();
+        let mut stream = socks5_connect(pair.socks, echo.addr).await.expect("c1");
+        stream.write_all(b"one").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"one");
+        echo.join.await.unwrap().unwrap();
+        let first = started.elapsed();
 
-    let echo = spawn_echo().await.expect("echo2");
-    let started = Instant::now();
-    let mut stream = socks5_connect(pair.socks, echo.addr).await.expect("c2");
-    stream.write_all(b"two").await.unwrap();
-    stream.shutdown().await.unwrap();
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.unwrap();
-    assert_eq!(buf, b"two");
-    echo.join.await.unwrap().unwrap();
-    let second = started.elapsed();
+        let echo = spawn_echo().await.expect("echo2");
+        let started = Instant::now();
+        let mut stream = socks5_connect(pair.socks, echo.addr).await.expect("c2");
+        stream.write_all(b"two").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"two");
+        echo.join.await.unwrap().unwrap();
+        let second = started.elapsed();
 
-    eprintln!(
-        "v4 reuse two SOCKS5 echoes\n\
-         first (dial+kdf): elapsed={first:?}\n\
-         second (pooled): elapsed={second:?}\n\
-         pool_len={}",
-        pool.len()
-    );
+        eprintln!(
+            "{flavor:?} reuse two SOCKS5 echoes\n\
+             first (dial+kdf): elapsed={first:?}\n\
+             second (pooled): elapsed={second:?}\n\
+             pool_len={}",
+            pool.len()
+        );
+    }
 }
 
 struct Pair {
@@ -69,7 +75,7 @@ struct Echo {
     join: tokio::task::JoinHandle<io::Result<()>>,
 }
 
-async fn start_pair(pool: ReusePool) -> Pair {
+async fn start_pair(flavor: ProtocolFlavor, pool: ReusePool) -> Pair {
     let psk = Psk::new(PSK.to_vec()).unwrap();
     let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_listener.local_addr().unwrap();
@@ -80,7 +86,7 @@ async fn start_pair(pool: ReusePool) -> Pair {
     let server_cfg = ServerConfig {
         listen: server_addr,
         psk: psk.clone(),
-        selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
+        selection: ProtocolSelection::Exact(flavor),
         outbound: Outbound::Direct,
         udp: UdpOptions::default(),
         tcp_brutal: None,
@@ -95,7 +101,7 @@ async fn start_pair(pool: ReusePool) -> Pair {
         listen: socks,
         server: server_addr,
         psk,
-        version: ProtocolFlavor::V4,
+        version: flavor,
         reuse: true,
         pool: Some(pool),
         udp: UdpOptions::default(),
