@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
-use crate::dns::DnsCache;
+use crate::dns::DnsResolver;
 use crate::error::{SessionError, TimeoutKind};
 use crate::{connect_tcp, prepare_session_stream};
 
@@ -26,10 +26,10 @@ impl Outbound {
         }
     }
 
-    pub(crate) async fn open_udp(self) -> Result<UdpFlow, SessionError> {
+    pub(crate) async fn open_udp(self, dns: &DnsResolver) -> Result<UdpFlow, SessionError> {
         match self {
             Self::Direct => UdpFlow::direct().await,
-            Self::Socks5 { server } => UdpFlow::socks5(server).await,
+            Self::Socks5 { server } => UdpFlow::socks5(server, dns).await,
         }
     }
 }
@@ -62,9 +62,9 @@ impl UdpFlow {
         })
     }
 
-    async fn socks5(server: SocketAddr) -> Result<Self, SessionError> {
+    async fn socks5(server: SocketAddr, dns: &DnsResolver) -> Result<Self, SessionError> {
         let mut stream = connect_tcp(server).await?;
-        let bind = socks5_udp_associate(&mut stream).await?;
+        let bind = socks5_udp_associate(&mut stream, dns).await?;
         let relay = rewrite_unspecified(bind, server);
         let local = if relay.is_ipv4() {
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
@@ -85,7 +85,7 @@ impl UdpFlow {
         &mut self,
         dest: AddressRef<'_>,
         payload: &[u8],
-        dns: &DnsCache,
+        dns: &DnsResolver,
     ) -> Result<(), SessionError> {
         match self {
             Self::Direct { socket, .. } => {
@@ -157,7 +157,10 @@ fn rewrite_unspecified(bind: SocketAddr, server: SocketAddr) -> SocketAddr {
     }
 }
 
-async fn socks5_udp_associate(stream: &mut TcpStream) -> Result<SocketAddr, SessionError> {
+async fn socks5_udp_associate(
+    stream: &mut TcpStream,
+    dns: &DnsResolver,
+) -> Result<SocketAddr, SessionError> {
     let mut buf = [0u8; 3 + 1 + 1 + 255 + 2];
     let n = socks5::encode_greeting(&mut buf, &[METHOD_NO_AUTH])?;
     stream.write_all(&buf[..n]).await?;
@@ -198,15 +201,7 @@ async fn socks5_udp_associate(stream: &mut TcpStream) -> Result<SocketAddr, Sess
                 }
                 return match reply.bind {
                     AddressRef::Ip(addr) => Ok(addr),
-                    AddressRef::Domain { host, port } => {
-                        let mut addrs = tokio::net::lookup_host((host, port)).await?;
-                        addrs.next().ok_or_else(|| {
-                            SessionError::Io(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                "socks5 bind host has no addresses",
-                            ))
-                        })
-                    }
+                    AddressRef::Domain { host, port } => dns.resolve(host, port).await,
                 };
             }
         }

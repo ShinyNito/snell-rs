@@ -24,7 +24,7 @@ use tokio::time::Instant;
 
 use crate::client::dial_and_codec;
 use crate::codec::{TcpDecoder, TcpEncoder};
-use crate::dns::DnsCache;
+use crate::dns::DnsResolver;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
@@ -103,22 +103,23 @@ impl fmt::Debug for UdpMetrics {
 pub struct UdpOptions {
     pub limits: UdpLimits,
     pub metrics: Arc<UdpMetrics>,
-    pub dns: Arc<DnsCache>,
+    pub dns: DnsResolver,
 }
 
 impl Default for UdpOptions {
     fn default() -> Self {
-        Self::with_limits(UdpLimits::default())
+        Self::new().expect("system DNS configuration")
     }
 }
 
 impl UdpOptions {
-    pub fn with_limits(limits: UdpLimits) -> Self {
-        Self {
-            dns: Arc::new(DnsCache::new(limits.dns_max, limits.dns_ttl)),
+    pub fn new() -> Result<Self, SessionError> {
+        let limits = UdpLimits::default();
+        Ok(Self {
+            dns: DnsResolver::try_from_system(limits.dns_max, limits.dns_ttl)?,
             metrics: Arc::new(UdpMetrics::default()),
             limits,
-        }
+        })
     }
 }
 
@@ -736,7 +737,7 @@ pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
     let _guard = AssocGuard(&udp.metrics);
     recv = ensure_udp(recv)?;
     encode = new_udp_encode();
-    let mut flow = match outbound.open_udp().await {
+    let mut flow = match outbound.open_udp(&udp.dns).await {
         Ok(flow) => flow,
         Err(error) => {
             let _ = write_reject(&mut encoder, &mut encode, &mut snell, &error.to_string()).await;
