@@ -177,7 +177,7 @@ pub fn encode_tunnel_reply(dst: &mut [u8]) -> Result<usize> {
     Ok(1)
 }
 
-pub fn encode_error_reply(dst: &mut [u8], code: u8, message: &str) -> Result<usize> {
+pub(crate) fn encode_error_reply(dst: &mut [u8], code: u8, message: &str) -> Result<usize> {
     let msg = message.as_bytes();
     let msg_len = msg.len().min(255);
     let needed = 3 + msg_len;

@@ -63,6 +63,7 @@ impl RecordHeader {
             })
     }
 
+    #[cfg(feature = "unsafe-raw")]
     pub fn body_len_v6_raw(self) -> Result<usize> {
         if self.padding_len != 0 {
             return Err(Error::InvalidHeader);

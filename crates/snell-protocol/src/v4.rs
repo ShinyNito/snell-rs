@@ -16,7 +16,7 @@ use crate::{
     V4_INITIAL_PADDING_MIN, V4_INITIAL_PADDING_SPAN,
 };
 
-/// v4 TCP record encoder. v5 TCP uses [`V5Encoder`].
+/// v4 TCP record encoder. v5 TCP uses the same type.
 pub struct V4Encoder<E = OsEntropy, C = UnixClock> {
     aead: Aes128Gcm,
     nonce: Nonce,
@@ -34,46 +34,6 @@ pub struct V4Encoder<E = OsEntropy, C = UnixClock> {
     record_start: usize,
     reserved_budget: usize,
     reserved_at: u64,
-}
-
-/// v5 TCP is the v4 record codec.
-pub type V5Encoder<E = OsEntropy, C = UnixClock> = V4Encoder<E, C>;
-pub type V5Decoder = V4Decoder;
-
-/// Marker for the v4 record codec.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct V4;
-
-/// Marker for the v5 TCP record codec (same wire as v4).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct V5;
-
-impl V4 {
-    pub fn encoder<E: Entropy, C: Clock>(
-        psk: &Psk,
-        entropy: E,
-        clock: C,
-    ) -> Result<V4Encoder<E, C>> {
-        V4Encoder::new(psk, entropy, clock)
-    }
-
-    pub fn decoder(psk: Psk) -> V4Decoder {
-        V4Decoder::new(psk)
-    }
-}
-
-impl V5 {
-    pub fn encoder<E: Entropy, C: Clock>(
-        psk: &Psk,
-        entropy: E,
-        clock: C,
-    ) -> Result<V4Encoder<E, C>> {
-        V4Encoder::new(psk, entropy, clock)
-    }
-
-    pub fn decoder(psk: Psk) -> V4Decoder {
-        V4Decoder::new(psk)
-    }
 }
 
 /// RAII payload slot. Drop without [`V4Reservation::seal`] cancels the record.
@@ -923,25 +883,6 @@ mod tests {
         assert_eq!(rest, wire[3..]);
         out.advance(rest.len()).unwrap();
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn v5_uses_v4_codec() {
-        let mut encoder = V4Encoder::with_salt(
-            &psk(),
-            [9; SALT_LEN],
-            0,
-            RepeatEntropy { byte: 0x3c },
-            FixedClock::new(0),
-        )
-        .unwrap();
-        let mut out = encode_buf();
-        seal_payload(&mut encoder, &mut out, b"v5");
-        let wire = collect_pending(&out);
-        let mut decoder = V5::decoder(psk());
-        let mut buf = RecvBuffer::new(4096);
-        assert_eq!(decode_plain(&mut decoder, &mut buf, &wire), b"v5");
-        let _encoder: V5Encoder<RepeatEntropy, FixedClock> = encoder;
     }
 
     #[test]
