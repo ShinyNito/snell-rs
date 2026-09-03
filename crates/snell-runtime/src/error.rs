@@ -10,8 +10,8 @@ pub enum SessionError {
     ConnectTimeout,
     #[error("cancelled")]
     Cancelled,
-    #[error("udp is not implemented")]
-    UdpNotImplemented,
+    #[error("udp association limit reached")]
+    UdpLimit,
     #[error("v6-unsafe-raw is not enabled")]
     UnsafeRawDisabled,
     #[error("reuse idle timed out")]

@@ -7,7 +7,9 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use snell_protocol::{ProtocolFlavor, ProtocolSelection, Psk};
-use snell_runtime::{ClientConfig, Outbound, ReusePool, ServerConfig, serve_client, serve_server};
+use snell_runtime::{
+    ClientConfig, Outbound, ReusePool, ServerConfig, UdpOptions, serve_client, serve_server,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -80,6 +82,7 @@ async fn start_pair(pool: ReusePool) -> Pair {
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
         outbound: Outbound::Direct,
+        udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
         let _ = serve_server(server_listener, server_cfg, async {
@@ -94,6 +97,7 @@ async fn start_pair(pool: ReusePool) -> Pair {
         version: ProtocolFlavor::V4,
         reuse: true,
         pool: Some(pool),
+        udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
         let _ = serve_client(client_listener, client_cfg, async {

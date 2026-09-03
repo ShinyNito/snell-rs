@@ -15,9 +15,10 @@ use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
 use crate::replay::ReplayCache;
 use crate::session::{
-    ServerConnect, ensure_bulk, new_encode, new_recv, read_server_connect, relay, release_bulk,
+    ServerFirst, ensure_bulk, new_encode, new_recv, read_server_connect, relay, release_bulk,
     server_may_reuse, wait_reuse_idle, with_handshake_timeout, write_reject, write_tunnel,
 };
+use crate::udp::{UdpOptions, run_server_udp};
 use crate::{bind_listener, set_nodelay};
 
 #[derive(Clone, Debug)]
@@ -26,6 +27,7 @@ pub struct ServerConfig {
     pub psk: Psk,
     pub selection: ProtocolSelection,
     pub outbound: Outbound,
+    pub udp: UdpOptions,
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<(), SessionError> {
@@ -83,6 +85,7 @@ pub(crate) async fn handle_server(
                 new_recv(),
                 new_encode(),
                 None,
+                &config.udp,
             )
             .await
         }
@@ -101,6 +104,7 @@ pub(crate) async fn handle_server(
                 new_recv(),
                 new_encode(),
                 None,
+                &config.udp,
             )
             .await
         }
@@ -119,6 +123,7 @@ pub(crate) async fn handle_server(
                 new_recv(),
                 new_encode(),
                 None,
+                &config.udp,
             )
             .await
         }
@@ -129,7 +134,7 @@ pub(crate) async fn handle_server(
                     encoder,
                     decoder,
                     recv,
-                    connect,
+                    first,
                 } => {
                     server_session(
                         snell,
@@ -141,7 +146,8 @@ pub(crate) async fn handle_server(
                         None,
                         recv,
                         new_encode(),
-                        Some(connect),
+                        Some(first),
+                        &config.udp,
                     )
                     .await
                 }
@@ -149,7 +155,7 @@ pub(crate) async fn handle_server(
                     encoder,
                     decoder,
                     recv,
-                    connect,
+                    first,
                 } => {
                     server_session(
                         snell,
@@ -161,7 +167,8 @@ pub(crate) async fn handle_server(
                         None,
                         recv,
                         new_encode(),
-                        Some(connect),
+                        Some(first),
+                        &config.udp,
                     )
                     .await
                 }
@@ -181,12 +188,21 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
     mut replay: Option<&ReplayCache>,
     mut recv: RecvBuffer,
     mut encode: EncodeBuffer,
-    mut pending: Option<ServerConnect>,
+    mut pending: Option<ServerFirst>,
+    udp: &UdpOptions,
 ) -> Result<(), SessionError> {
     let mut first = true;
     loop {
-        let connect = if let Some(connect) = pending.take() {
-            connect
+        let connect = if let Some(first_cmd) = pending.take() {
+            match first_cmd {
+                ServerFirst::Connect(connect) => connect,
+                ServerFirst::Udp => {
+                    return run_server_udp(
+                        snell, encoder, decoder, outbound, kdf, psk, recv, encode, udp,
+                    )
+                    .await;
+                }
+            }
         } else {
             if !first {
                 wait_reuse_idle(&mut snell, &mut recv).await?;
@@ -201,16 +217,12 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
             ))
             .await
             {
-                Ok(connect) => connect,
-                Err(error @ SessionError::UdpNotImplemented) => {
-                    let _ = write_reject(
-                        &mut encoder,
-                        &mut encode,
-                        &mut snell,
-                        "udp is not implemented",
+                Ok(ServerFirst::Connect(connect)) => connect,
+                Ok(ServerFirst::Udp) => {
+                    return run_server_udp(
+                        snell, encoder, decoder, outbound, kdf, psk, recv, encode, udp,
                     )
                     .await;
-                    return Err(error);
                 }
                 Err(error) => return Err(error),
             }

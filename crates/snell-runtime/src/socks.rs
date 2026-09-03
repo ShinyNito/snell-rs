@@ -7,7 +7,12 @@ use tokio::net::TcpStream;
 
 use crate::error::SessionError;
 
-pub(crate) async fn accept_socks5_connect(stream: &mut TcpStream) -> Result<Address, SessionError> {
+pub(crate) enum Socks5Command {
+    Connect(Address),
+    UdpAssociate,
+}
+
+pub(crate) async fn accept_socks5(stream: &mut TcpStream) -> Result<Socks5Command, SessionError> {
     let mut buf = [0u8; 2 + 255];
     let mut filled = 0;
     loop {
@@ -47,11 +52,10 @@ pub(crate) async fn accept_socks5_connect(stream: &mut TcpStream) -> Result<Addr
             }
             ParseState::Done(request) => {
                 return match request.command {
-                    Command::Connect => Ok(request.destination.into_owned()),
-                    Command::UdpAssociate => {
-                        write_socks5_reply(stream, Reply::CommandNotSupported).await?;
-                        Err(SessionError::UdpNotImplemented)
+                    Command::Connect => {
+                        Ok(Socks5Command::Connect(request.destination.into_owned()))
                     }
+                    Command::UdpAssociate => Ok(Socks5Command::UdpAssociate),
                     _ => {
                         write_socks5_reply(stream, Reply::CommandNotSupported).await?;
                         Err(SessionError::CommandNotSupported)
@@ -73,18 +77,23 @@ pub(crate) async fn write_socks5_reply(
     stream: &mut TcpStream,
     reply: Reply,
 ) -> Result<(), SessionError> {
-    let bind = AddressRef::Ip(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
-    let mut buf = [0u8; 10];
-    let n = socks5::encode_reply(&mut buf, reply, bind)?;
+    write_socks5_reply_bind(stream, reply, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await
+}
+
+pub(crate) async fn write_socks5_reply_bind(
+    stream: &mut TcpStream,
+    reply: Reply,
+    bind: SocketAddr,
+) -> Result<(), SessionError> {
+    let mut buf = [0u8; 3 + 1 + 1 + 255 + 2];
+    let n = socks5::encode_reply(&mut buf, reply, AddressRef::Ip(bind))?;
     stream.write_all(&buf[..n]).await?;
     Ok(())
 }
 
 pub(crate) fn socks5_reply_from_error(error: &SessionError) -> Reply {
     match error {
-        SessionError::CommandNotSupported | SessionError::UdpNotImplemented => {
-            Reply::CommandNotSupported
-        }
+        SessionError::CommandNotSupported => Reply::CommandNotSupported,
         SessionError::ConnectTimeout | SessionError::HandshakeTimeout => Reply::TtlExpired,
         SessionError::Io(io) => Reply::from_io_error(io),
         _ => Reply::GeneralFailure,

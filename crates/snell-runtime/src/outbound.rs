@@ -1,12 +1,14 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use snell_protocol::socks5::{self, Command, METHOD_NO_AUTH, Reply};
-use snell_protocol::{Address, AddressRef, ParseState, TCP_CONNECT_TIMEOUT_SECS};
+use snell_protocol::{Address, AddressRef, ParseState, TCP_CONNECT_TIMEOUT_SECS, UDP_DATAGRAM_MAX};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
+use crate::dns::DnsCache;
 use crate::error::{SessionError, TimeoutKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +22,202 @@ impl Outbound {
         match self {
             Self::Direct => connect_direct(destination).await,
             Self::Socks5 { server } => connect_socks5(server, destination).await,
+        }
+    }
+
+    pub(crate) async fn open_udp(self) -> Result<UdpFlow, SessionError> {
+        match self {
+            Self::Direct => UdpFlow::direct().await,
+            Self::Socks5 { server } => UdpFlow::socks5(server).await,
+        }
+    }
+}
+
+pub(crate) struct UdpRecv<'a> {
+    pub addr: Address,
+    pub payload: &'a [u8],
+}
+
+pub(crate) enum UdpFlow {
+    Direct {
+        socket: UdpSocket,
+        recv: Vec<u8>,
+    },
+    Socks5 {
+        _control: TcpStream,
+        socket: UdpSocket,
+        relay: SocketAddr,
+        send: Vec<u8>,
+        recv: Vec<u8>,
+    },
+}
+
+impl UdpFlow {
+    async fn direct() -> Result<Self, SessionError> {
+        let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
+        Ok(Self::Direct {
+            socket,
+            recv: vec![0; UDP_DATAGRAM_MAX],
+        })
+    }
+
+    async fn socks5(server: SocketAddr) -> Result<Self, SessionError> {
+        let mut stream = match timeout(
+            Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
+            TcpStream::connect(server),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err(SessionError::from_timeout(TimeoutKind::Connect)),
+        };
+        stream.set_nodelay(true)?;
+        let bind = socks5_udp_associate(&mut stream).await?;
+        let relay = rewrite_unspecified(bind, server);
+        let local = if relay.is_ipv4() {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        } else {
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+        };
+        let socket = UdpSocket::bind(local).await?;
+        Ok(Self::Socks5 {
+            _control: stream,
+            socket,
+            relay,
+            send: vec![0; UDP_DATAGRAM_MAX],
+            recv: vec![0; UDP_DATAGRAM_MAX],
+        })
+    }
+
+    pub(crate) async fn send(
+        &mut self,
+        dest: AddressRef<'_>,
+        payload: &[u8],
+        dns: &DnsCache,
+    ) -> Result<(), SessionError> {
+        match self {
+            Self::Direct { socket, .. } => {
+                let addr = match dest {
+                    AddressRef::Ip(addr) => addr,
+                    AddressRef::Domain { host, port } => dns.resolve(host, port).await?,
+                };
+                socket.send_to(payload, addr).await?;
+                Ok(())
+            }
+            Self::Socks5 {
+                socket,
+                relay,
+                send,
+                ..
+            } => {
+                let n = socks5::encode_udp_packet(send, 0, dest, payload)?;
+                socket.send_to(&send[..n], *relay).await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) async fn recv(
+        &mut self,
+        frag_dropped: &AtomicU64,
+        invalid: &AtomicU64,
+    ) -> Result<UdpRecv<'_>, SessionError> {
+        match self {
+            Self::Direct { socket, recv } => {
+                let (n, from) = socket.recv_from(recv).await?;
+                Ok(UdpRecv {
+                    addr: Address::Ip(from),
+                    payload: &recv[..n],
+                })
+            }
+            Self::Socks5 { socket, recv, .. } => loop {
+                let n = socket.recv_from(recv).await?.0;
+                let packet = match socks5::parse_udp_packet(&recv[..n]) {
+                    Ok(packet) => packet,
+                    Err(_) => {
+                        invalid.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                if packet.frag != 0 {
+                    frag_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let header_len = packet.header_len;
+                let addr = packet.destination.into_owned();
+                return Ok(UdpRecv {
+                    addr,
+                    payload: &recv[header_len..n],
+                });
+            },
+        }
+    }
+}
+
+fn rewrite_unspecified(bind: SocketAddr, server: SocketAddr) -> SocketAddr {
+    if match bind.ip() {
+        IpAddr::V4(ip) => ip.is_unspecified(),
+        IpAddr::V6(ip) => ip.is_unspecified(),
+    } {
+        SocketAddr::new(server.ip(), bind.port())
+    } else {
+        bind
+    }
+}
+
+async fn socks5_udp_associate(stream: &mut TcpStream) -> Result<SocketAddr, SessionError> {
+    let mut buf = [0u8; 3 + 1 + 1 + 255 + 2];
+    let n = socks5::encode_greeting(&mut buf, &[METHOD_NO_AUTH])?;
+    stream.write_all(&buf[..n]).await?;
+    stream.read_exact(&mut buf[..2]).await?;
+    match socks5::method_selection_need(&buf[..2])? {
+        ParseState::Need(_) => {
+            return Err(SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "socks5 method selection truncated",
+            )));
+        }
+        ParseState::Done(method) if method == METHOD_NO_AUTH => {}
+        ParseState::Done(_) => return Err(SessionError::NoAcceptableMethod),
+    }
+
+    let dest = AddressRef::Ip(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
+    let n = socks5::encode_request(&mut buf, Command::UdpAssociate, dest)?;
+    stream.write_all(&buf[..n]).await?;
+
+    let mut filled = 0;
+    loop {
+        match socks5::reply_need(&buf[..filled])? {
+            ParseState::Need(total) => {
+                if total > buf.len() {
+                    return Err(SessionError::Protocol(snell_protocol::Error::Malformed(
+                        "oversized socks5 udp associate reply",
+                    )));
+                }
+                stream.read_exact(&mut buf[filled..total]).await?;
+                filled = total;
+            }
+            ParseState::Done(reply) => {
+                if reply.reply != Reply::Succeeded {
+                    return Err(SessionError::Io(std::io::Error::other(format!(
+                        "socks5 outbound udp associate failed: {:?}",
+                        reply.reply
+                    ))));
+                }
+                return match reply.bind {
+                    AddressRef::Ip(addr) => Ok(addr),
+                    AddressRef::Domain { host, port } => {
+                        let mut addrs = tokio::net::lookup_host((host, port)).await?;
+                        addrs.next().ok_or_else(|| {
+                            SessionError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "socks5 bind host has no addresses",
+                            ))
+                        })
+                    }
+                };
+            }
         }
     }
 }

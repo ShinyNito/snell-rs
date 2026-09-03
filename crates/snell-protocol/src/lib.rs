@@ -45,6 +45,7 @@ pub use control::{
     decode_connect_request_prefix, decode_server_reply, decode_udp_request, decode_udp_response,
     decode_udp_setup_prefix, encode_connect_request, encode_error_reply, encode_reject,
     encode_tunnel_reply, encode_udp_request, encode_udp_response, encode_udp_setup,
+    udp_request_len, udp_response_len,
 };
 pub use entropy::{Entropy, OsEntropy, RepeatEntropy, SequenceEntropy};
 pub use error::{Error, Result};
@@ -230,6 +231,9 @@ pub const CLIENT_POOL_MAX_IDLE_SECS: u64 = 300;
 /// UDP association idle timeout.
 pub const UDP_ASSOCIATION_IDLE_SECS: u64 = 300;
 
+/// Socket datagram cap. The encoded Snell datagram must still fit one record.
+pub const UDP_DATAGRAM_MAX: usize = 65535;
+
 /// Auto-detect deadline.
 pub const AUTO_DETECT_TIMEOUT_SECS: u64 = 5;
 
@@ -303,6 +307,8 @@ mod tests {
         assert_eq!(REUSE_IDLE_TIMEOUT_SECS, 3600);
         assert_eq!(CLIENT_POOL_MAX_SIZE, 10);
         assert_eq!(CLIENT_POOL_MAX_IDLE_SECS, 300);
+        assert_eq!(UDP_ASSOCIATION_IDLE_SECS, 300);
+        assert_eq!(UDP_DATAGRAM_MAX, 65535);
         assert_eq!(AUTO_DETECT_TIMEOUT_SECS, 5);
         assert_eq!(AUTO_DETECT_PREFIX_MAX, 4096);
         assert_eq!(AUTO_DETECT_MAX_CANDIDATES, 2);

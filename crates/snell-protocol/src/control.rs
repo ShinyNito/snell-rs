@@ -339,6 +339,14 @@ pub fn decode_udp_response(src: &[u8]) -> Result<UdpPacket<'_>> {
     }
 }
 
+pub fn udp_request_len(address: AddressRef<'_>, payload_len: usize) -> Result<usize> {
+    Ok(udp_request_header_len(address)? + payload_len)
+}
+
+pub fn udp_response_len(address: AddressRef<'_>, payload_len: usize) -> Result<usize> {
+    Ok(udp_response_header_len(address)? + payload_len)
+}
+
 fn udp_request_header_len(address: AddressRef<'_>) -> Result<usize> {
     match address {
         AddressRef::Domain { host, .. } => {
