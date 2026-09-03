@@ -32,7 +32,7 @@ struct Pair {
 }
 
 async fn start_pair(version: ProtocolFlavor, outbound: Outbound) -> Pair {
-    start_pair_reuse(version, outbound, false, None).await
+    start_pair_reuse(version, outbound, false, None, None).await
 }
 
 async fn start_pair_reuse(
@@ -40,6 +40,7 @@ async fn start_pair_reuse(
     outbound: Outbound,
     reuse: bool,
     pool: Option<ReusePool>,
+    tcp_brutal: Option<crate::TcpBrutal>,
 ) -> Pair {
     let psk = Psk::new(PSK.to_vec()).unwrap();
     let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -56,7 +57,7 @@ async fn start_pair_reuse(
         selection: ProtocolSelection::Exact(version),
         outbound,
         udp: UdpOptions::default(),
-        tcp_brutal: None,
+        tcp_brutal,
     };
     tokio::spawn(async move {
         let _ = serve_server(server_listener, server_cfg, async {
@@ -549,6 +550,7 @@ async fn error_connections_are_not_returned_to_pool() {
         Outbound::Direct,
         true,
         Some(pool.clone()),
+        None,
     )
     .await;
     let mut client = TcpStream::connect(pair.socks).await.unwrap();
@@ -694,31 +696,22 @@ async fn early_payload_over_64kib_is_rejected() {
 }
 
 #[tokio::test]
-async fn tcp_brutal_requested_does_not_start_when_unsupported() {
+async fn unavailable_tcp_brutal_does_not_break_connections() {
     let params = crate::TcpBrutal {
         send_mbps: 100,
         cwnd_gain: 15,
     };
-    if crate::platform::require_tcp_brutal(params).is_ok() {
-        return;
-    }
-    let psk = Psk::new(PSK.to_vec()).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let cfg = ServerConfig {
-        listen: listener.local_addr().unwrap(),
-        psk,
-        selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
-        outbound: Outbound::Direct,
-        udp: UdpOptions::default(),
-        tcp_brutal: Some(params),
-    };
-    let err = serve_server(listener, cfg, std::future::pending::<()>())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, SessionError::Unsupported(_)),
-        "requested tcp_brutal must not start a server: {err:?}"
-    );
+    let pair = start_pair_reuse(
+        ProtocolFlavor::V4,
+        Outbound::Direct,
+        false,
+        None,
+        Some(params),
+    )
+    .await;
+    let payload = b"tcp-brutal-fallback";
+    let echoed = socks5_echo(pair.socks, payload).await.unwrap();
+    assert_eq!(echoed, payload);
 }
 
 struct UdpPair {

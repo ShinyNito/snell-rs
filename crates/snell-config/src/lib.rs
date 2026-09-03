@@ -1,10 +1,10 @@
 //! Two-stage configuration: raw text → validated config.
 //!
-//! Unknown keys, unimplemented unsafe-raw, and missing required fields fail
-//! closed. `tcp_brutal` is parsed and fail-closed if requested with invalid
-//! parameters. `reuse = true` is allowed. Omitting server `version` selects
-//! auto-detect. PSK is stored as [`Psk`] so `Debug` does not print the secret.
-//! UDP ASSOCIATE is handled in `snell-runtime`.
+//! Unimplemented unsafe-raw and missing required fields fail closed.
+//! `tcp_brutal` is parsed and fail-closed if requested with invalid parameters.
+//! `reuse = true` is allowed. Omitting server `version` selects auto-detect.
+//! PSK is stored as [`Psk`] so `Debug` does not print the secret. UDP ASSOCIATE
+//! is handled in `snell-runtime`.
 
 #![deny(unsafe_code)]
 
@@ -23,17 +23,6 @@ const SERVER_SECTION: &str = "snell-server";
 const TCP_BRUTAL_CWND_GAIN_MIN: u32 = 5;
 const TCP_BRUTAL_CWND_GAIN_MAX: u32 = 80;
 const TCP_BRUTAL_SEND_MBPS_MAX: u32 = 100_000;
-const CLIENT_KEYS: &[&str] = &["listen", "server", "psk", "version", "reuse"];
-const SERVER_KEYS: &[&str] = &[
-    "listen",
-    "psk",
-    "version",
-    "mode",
-    "upstream_socks5",
-    "tcp_brutal",
-    "tcp_brutal_send_mbps",
-    "tcp_brutal_cwnd_gain",
-];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -58,8 +47,6 @@ pub enum ConfigError {
         key: &'static str,
         msg: String,
     },
-    #[error("unknown {section} key `{key}`")]
-    UnknownKey { section: &'static str, key: String },
     #[error("{0}")]
     Unsupported(&'static str),
 }
@@ -110,8 +97,6 @@ impl ClientConfig {
         let section = file
             .section(CLIENT_SECTION)
             .ok_or(ConfigError::MissingSection(CLIENT_SECTION))?;
-        reject_unknown(CLIENT_SECTION, section, CLIENT_KEYS)?;
-
         let reuse = optional_bool(CLIENT_SECTION, section, "reuse")?.unwrap_or(false);
         let version = parse_client_version(required(CLIENT_SECTION, section, "version")?)?;
         Ok(Self {
@@ -147,8 +132,6 @@ impl ServerConfig {
         let section = file
             .section(SERVER_SECTION)
             .ok_or(ConfigError::MissingSection(SERVER_SECTION))?;
-        reject_unknown(SERVER_SECTION, section, SERVER_KEYS)?;
-
         let tcp_brutal = parse_tcp_brutal(section)?;
 
         let selection = match section.get("version") {
@@ -193,14 +176,6 @@ fn parse_tcp_brutal(section: &Section) -> Result<Option<TcpBrutal>, ConfigError>
     let send = section.get("tcp_brutal_send_mbps");
     let gain = section.get("tcp_brutal_cwnd_gain");
     if !enabled {
-        if send.is_some() || gain.is_some() {
-            return Err(ConfigError::Invalid {
-                section: SERVER_SECTION,
-                key: "tcp_brutal",
-                msg: "tcp_brutal_send_mbps/tcp_brutal_cwnd_gain require tcp_brutal = true"
-                    .to_owned(),
-            });
-        }
         return Ok(None);
     }
     let send_mbps = parse_u32(
@@ -366,22 +341,6 @@ fn optional_bool(
             msg: format!("expected a boolean, got `{value}`"),
         }),
     }
-}
-
-fn reject_unknown(
-    section: &'static str,
-    keys: &Section,
-    known: &[&str],
-) -> Result<(), ConfigError> {
-    for (key, _) in &keys.pairs {
-        if !known.iter().any(|item| item.eq_ignore_ascii_case(key)) {
-            return Err(ConfigError::UnknownKey {
-                section,
-                key: key.clone(),
-            });
-        }
-    }
-    Ok(())
 }
 
 struct IniFile {
@@ -582,18 +541,12 @@ mod tests {
     }
 
     #[test]
-    fn server_tcp_brutal_params_without_enable_fail() {
-        let err = ServerConfig::parse(&format!(
+    fn server_tcp_brutal_params_without_enable_are_ignored() {
+        let cfg = ServerConfig::parse(&format!(
             "[snell-server]\nlisten = 127.0.0.1:8388\npsk = {PSK}\nversion = 4\ntcp_brutal_send_mbps = 100\n"
         ))
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Invalid {
-                key: "tcp_brutal",
-                ..
-            }
-        ));
+        .unwrap();
+        assert_eq!(cfg.tcp_brutal, None);
     }
 
     #[test]
@@ -612,12 +565,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_is_rejected() {
-        let err = ClientConfig::parse(&format!(
+    fn unknown_keys_are_ignored() {
+        ClientConfig::parse(&format!(
             "[snell-client]\nlisten = 127.0.0.1:1080\nserver = 127.0.0.1:8388\npsk = {PSK}\nversion = v4\nobfs = http\n"
         ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::UnknownKey { .. }));
+        .unwrap();
+        ServerConfig::parse(&format!(
+            "[snell-server]\nlisten = 127.0.0.1:8388\npsk = {PSK}\ntcp_fast_open = true\n"
+        ))
+        .unwrap();
     }
 
     #[test]

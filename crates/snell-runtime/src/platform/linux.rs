@@ -1,7 +1,7 @@
 use rustix::fd::{AsFd, AsRawFd};
 use rustix::io::Errno;
 use rustix::net::sockopt;
-use socket2::{Domain, Protocol, SockRef, Socket, Type};
+use socket2::SockRef;
 use tokio::net::{TcpSocket, TcpStream};
 
 use super::{PlatformError, TcpBrutal};
@@ -36,18 +36,6 @@ fn tfo_error(error: Errno) -> PlatformError {
         }
         _ => PlatformError::Io(error.into()),
     }
-}
-
-pub(super) fn require_tcp_brutal(params: TcpBrutal) -> Result<(), PlatformError> {
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    apply_brutal(&socket, params)?;
-    let name = sockopt::get_tcp_congestion(&socket).map_err(brutal_error)?;
-    if name.trim_end_matches('\0') != "brutal" {
-        return Err(PlatformError::Unsupported(
-            "tcp_brutal requested but congestion control is not brutal",
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn apply_tcp_brutal(stream: &TcpStream, params: TcpBrutal) -> Result<(), PlatformError> {
