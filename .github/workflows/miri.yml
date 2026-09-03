@@ -20,10 +20,10 @@ jobs:
         with:
           components: miri
       - name: Miri protocol buffers
-        run: cargo miri test -p snell-protocol --lib --all-features buffer::
+        run: "cargo miri test -p snell-protocol --lib --all-features buffer::"
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
       - name: Miri accept backoff
-        run: cargo miri test -p snell-runtime --lib --all-features platform::accept
+        run: "cargo miri test -p snell-runtime --lib --all-features platform::accept"
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
