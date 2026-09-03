@@ -1,13 +1,39 @@
 use crate::{Entropy, Result};
 
+#[inline]
+fn count_ones(bytes: &[u8]) -> usize {
+    let slice = &bytes[..bytes.len() & !3];
+    let (chunks, remainder) = slice.as_chunks::<8>();
+    let mut total = chunks
+        .iter()
+        .map(|chunk| u64::from_ne_bytes(*chunk).count_ones() as usize)
+        .sum::<usize>();
+    for &byte in remainder {
+        total += byte.count_ones() as usize;
+    }
+    total
+}
+
 /// Swap even-indexed bytes across the padding / payload-cipher boundary.
 ///
 /// Applied after sealing so the on-wire split is not a clean padding|cipher cut.
 /// The same function undoes the swap before opening.
 pub fn swap_even_indices(padding: &mut [u8], payload_cipher: &mut [u8]) {
+    const MASK: u64 = u64::from_ne_bytes([0xff, 0, 0xff, 0, 0xff, 0, 0xff, 0]);
     let limit = padding.len().min(payload_cipher.len());
-    for i in (0..limit).step_by(2) {
-        core::mem::swap(&mut padding[i], &mut payload_cipher[i]);
+    let padding = &mut padding[..limit];
+    let payload_cipher = &mut payload_cipher[..limit];
+    let (p_chunks, p_tail) = padding.as_chunks_mut::<8>();
+    let (c_chunks, c_tail) = payload_cipher.as_chunks_mut::<8>();
+    for (p, c) in p_chunks.iter_mut().zip(c_chunks) {
+        let a = u64::from_ne_bytes(*p);
+        let b = u64::from_ne_bytes(*c);
+        let diff = (a ^ b) & MASK;
+        *p = (a ^ diff).to_ne_bytes();
+        *c = (b ^ diff).to_ne_bytes();
+    }
+    for i in (0..p_tail.len()).step_by(2) {
+        core::mem::swap(&mut p_tail[i], &mut c_tail[i]);
     }
 }
 
@@ -24,10 +50,7 @@ pub fn fill_v4_padding<E: Entropy>(
         return Ok(());
     }
 
-    let ones = payload_cipher[..payload_cipher.len() & !3]
-        .iter()
-        .map(|byte| byte.count_ones() as usize)
-        .sum::<usize>();
+    let ones = count_ones(payload_cipher);
     let zeros = payload_cipher.len() * u8::BITS as usize - ones;
     if zeros == 0 {
         return entropy.fill(padding);
@@ -119,6 +142,45 @@ mod tests {
     use super::*;
     use crate::RepeatEntropy;
 
+    const LENGTHS: &[usize] = &[
+        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 256, 257, 1023, 1024,
+        1025, 4095, 4096, 4097, 16379, 16380, 16381, 16382, 16383,
+    ];
+
+    fn count_ones_scalar(bytes: &[u8]) -> usize {
+        bytes[..bytes.len() & !3]
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum()
+    }
+
+    fn swap_even_indices_scalar(padding: &mut [u8], payload_cipher: &mut [u8]) {
+        let limit = padding.len().min(payload_cipher.len());
+        for i in (0..limit).step_by(2) {
+            core::mem::swap(&mut padding[i], &mut payload_cipher[i]);
+        }
+    }
+
+    #[test]
+    fn count_ones_matches_scalar_truncated() {
+        let known = [0xFFu8, 0x00, 0x0F, 0xF0, 0x01];
+        assert_eq!(count_ones_scalar(&known), 16);
+        assert_eq!(count_ones(&known), 16);
+        assert_eq!(
+            known
+                .iter()
+                .map(|byte| byte.count_ones() as usize)
+                .sum::<usize>(),
+            17
+        );
+        for &len in LENGTHS {
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            assert_eq!(count_ones(&bytes), count_ones_scalar(&bytes), "len={len}");
+        }
+    }
+
     #[test]
     fn swap_is_an_involution() {
         let mut padding = [1, 2, 3, 4, 5];
@@ -130,6 +192,23 @@ mod tests {
         swap_even_indices(&mut padding, &mut payload);
         assert_eq!(padding, before_p);
         assert_eq!(payload, before_c);
+    }
+
+    #[test]
+    fn swap_even_indices_matches_scalar_loop() {
+        for &plen in LENGTHS {
+            for clen in [plen.saturating_sub(1), plen, plen.saturating_add(1)] {
+                let mut p_scalar: Vec<u8> = (0..plen).map(|i| (i as u8).wrapping_add(1)).collect();
+                let mut c_scalar: Vec<u8> =
+                    (0..clen).map(|i| (i as u8).wrapping_add(100)).collect();
+                let mut p_got = p_scalar.clone();
+                let mut c_got = c_scalar.clone();
+                swap_even_indices_scalar(&mut p_scalar, &mut c_scalar);
+                swap_even_indices(&mut p_got, &mut c_got);
+                assert_eq!(p_got, p_scalar, "padding plen={plen} clen={clen}");
+                assert_eq!(c_got, c_scalar, "cipher plen={plen} clen={clen}");
+            }
+        }
     }
 
     #[test]
