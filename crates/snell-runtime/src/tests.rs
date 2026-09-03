@@ -1,22 +1,27 @@
 use std::io;
-use std::net::SocketAddr;
-use std::time::{Duration, Instant};
-
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use snell_protocol::{ProtocolFlavor, ProtocolSelection, Psk, V4Decoder, V4Encoder};
+use snell_protocol::socks5;
+use snell_protocol::{
+    Address, AddressRef, Error, MAX_PACKET_SIZE, ProtocolFlavor, ProtocolSelection, Psk, V4Decoder,
+    V4Encoder, udp_request_len,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
 use crate::pool::{PooledCodec, PooledConn, ReusePool};
 use crate::replay::ReplayCache;
 use crate::server::handle_server;
-use crate::{ClientConfig, ServerConfig, serve_client, serve_server};
+use crate::session::{new_udp_encode, write_tunnel, write_udp_request, write_udp_setup};
+use crate::{ClientConfig, ServerConfig, UdpLimits, UdpOptions, serve_client, serve_server};
 
 const PSK: &[u8] = b"0123456789abcdef";
 
@@ -50,6 +55,7 @@ async fn start_pair_reuse(
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(version),
         outbound,
+        udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
         let _ = serve_server(server_listener, server_cfg, async {
@@ -65,6 +71,7 @@ async fn start_pair_reuse(
         version,
         reuse,
         pool,
+        udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
         let _ = serve_client(client_listener, client_cfg, async {
@@ -230,6 +237,7 @@ async fn handshake_timeout() {
         psk,
         selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
         outbound: Outbound::Direct,
+        udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
         let _ = serve_server(server_listener, cfg, async {
@@ -280,6 +288,7 @@ async fn socks5_reply_when_snell_closes_after_dial() {
         version: ProtocolFlavor::V4,
         reuse: false,
         pool: None,
+        udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
         let _ = serve_client(client_listener, cfg, async {
@@ -409,6 +418,7 @@ async fn start_counted(
         psk: psk.clone(),
         selection,
         outbound: Outbound::Direct,
+        udp: UdpOptions::default(),
     };
     let kdf = Arc::new(KdfLimiter::new());
     let replay = Arc::new(ReplayCache::new());
@@ -435,6 +445,7 @@ async fn start_counted(
         version,
         reuse,
         pool,
+        udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
         let _ = serve_client(client_listener, client_cfg, async {
@@ -633,6 +644,7 @@ async fn early_payload_over_64kib_is_rejected() {
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
         outbound: Outbound::Direct,
+        udp: UdpOptions::default(),
     };
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
@@ -675,4 +687,390 @@ async fn early_payload_over_64kib_is_rejected() {
         matches!(result, Err(crate::SessionError::EarlyPayloadTooLarge)),
         "{result:?}"
     );
+}
+
+struct UdpPair {
+    socks: SocketAddr,
+    client_udp: UdpOptions,
+    _server_udp: UdpOptions,
+    _stop_client: oneshot::Sender<()>,
+    _stop_server: oneshot::Sender<()>,
+}
+
+async fn start_pair_udp(
+    version: ProtocolFlavor,
+    outbound: Outbound,
+    client_udp: UdpOptions,
+    server_udp: UdpOptions,
+) -> UdpPair {
+    let psk = Psk::new(PSK.to_vec()).unwrap();
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks = client_listener.local_addr().unwrap();
+    let (stop_server, server_rx) = oneshot::channel();
+    let (stop_client, client_rx) = oneshot::channel();
+    let server_cfg = ServerConfig {
+        listen: server_addr,
+        psk: psk.clone(),
+        selection: ProtocolSelection::Exact(version),
+        outbound,
+        udp: server_udp.clone(),
+    };
+    tokio::spawn(async move {
+        let _ = serve_server(server_listener, server_cfg, async {
+            let _ = server_rx.await;
+        })
+        .await;
+    });
+    let client_cfg = ClientConfig {
+        listen: socks,
+        server: server_addr,
+        psk,
+        version,
+        reuse: false,
+        pool: None,
+        udp: client_udp.clone(),
+    };
+    tokio::spawn(async move {
+        let _ = serve_client(client_listener, client_cfg, async {
+            let _ = client_rx.await;
+        })
+        .await;
+    });
+    UdpPair {
+        socks,
+        client_udp,
+        _server_udp: server_udp,
+        _stop_client: stop_client,
+        _stop_server: stop_server,
+    }
+}
+
+async fn spawn_udp_echo() -> io::Result<SocketAddr> {
+    let echo = UdpSocket::bind("127.0.0.1:0").await?;
+    let addr = echo.local_addr()?;
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65535];
+        loop {
+            let Ok((n, peer)) = echo.recv_from(&mut buf).await else {
+                break;
+            };
+            let _ = echo.send_to(&buf[..n], peer).await;
+        }
+    });
+    Ok(addr)
+}
+
+async fn socks5_udp_associate(socks: SocketAddr) -> io::Result<(TcpStream, SocketAddr, UdpSocket)> {
+    let mut tcp = TcpStream::connect(socks).await?;
+    tcp.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut method = [0u8; 2];
+    tcp.read_exact(&mut method).await?;
+    assert_eq!(method, [0x05, 0x00]);
+    tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+    let mut reply_head = [0u8; 4];
+    tcp.read_exact(&mut reply_head).await?;
+    assert_eq!(reply_head[0], 0x05);
+    if reply_head[1] != 0x00 {
+        return Err(io::Error::other(format!(
+            "udp associate failed: {}",
+            reply_head[1]
+        )));
+    }
+    assert_eq!(reply_head[3], 0x01);
+    let mut rest = [0u8; 6];
+    tcp.read_exact(&mut rest).await?;
+    let ip = Ipv4Addr::new(rest[0], rest[1], rest[2], rest[3]);
+    let port = u16::from_be_bytes([rest[4], rest[5]]);
+    let relay = SocketAddr::from((ip, port));
+    let udp = UdpSocket::bind("127.0.0.1:0").await?;
+    Ok((tcp, relay, udp))
+}
+
+fn encode_socks_udp(dest: SocketAddr, frag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0u8; 32 + payload.len()];
+    let n = socks5::encode_udp_packet(&mut buf, frag, AddressRef::Ip(dest), payload).unwrap();
+    buf.truncate(n);
+    buf
+}
+
+async fn socks5_udp_roundtrip(
+    socks: SocketAddr,
+    echo: SocketAddr,
+    payload: &[u8],
+) -> io::Result<Vec<u8>> {
+    let (_tcp, relay, client) = socks5_udp_associate(socks).await?;
+    let packet = encode_socks_udp(echo, 0, payload);
+    client.send_to(&packet, relay).await?;
+    let mut buf = [0u8; 65535];
+    let (n, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "udp echo timed out"))??;
+    let parsed = socks5::parse_udp_packet(&buf[..n]).unwrap();
+    assert_eq!(parsed.frag, 0);
+    Ok(parsed.payload.to_vec())
+}
+
+async fn udp_echo_version(version: ProtocolFlavor, payload: &[u8]) {
+    let pair = start_pair_udp(
+        version,
+        Outbound::Direct,
+        UdpOptions::default(),
+        UdpOptions::default(),
+    )
+    .await;
+    let echo = spawn_udp_echo().await.unwrap();
+    let got = socks5_udp_roundtrip(pair.socks, echo, payload)
+        .await
+        .unwrap();
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn v4_udp_echo_roundtrip() {
+    udp_echo_version(ProtocolFlavor::V4, b"phase-7-v4").await;
+}
+
+#[tokio::test]
+async fn v5_udp_echo_roundtrip() {
+    udp_echo_version(ProtocolFlavor::V5, b"phase-7-v5").await;
+}
+
+#[tokio::test]
+async fn v6_shaped_udp_echo_roundtrip() {
+    udp_echo_version(ProtocolFlavor::V6Shaped, b"phase-7-v6-shaped").await;
+}
+
+#[tokio::test]
+async fn v6_unshaped_udp_echo_roundtrip() {
+    udp_echo_version(ProtocolFlavor::V6Unshaped, b"phase-7-v6-unshaped").await;
+}
+
+#[test]
+fn v4_udp_request_with_max_packet_payload_exceeds_slot() {
+    let dest = AddressRef::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
+    let needed = udp_request_len(dest, MAX_PACKET_SIZE).unwrap();
+    assert!(
+        needed > MAX_PACKET_SIZE,
+        "payload {MAX_PACKET_SIZE} plus UDP request header must miss the v4 slot ({needed} > {MAX_PACKET_SIZE})"
+    );
+}
+
+#[tokio::test]
+async fn write_udp_request_rejects_payload_that_misses_v4_slot() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let (mut server, _) = listener.accept().await.unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65536];
+        loop {
+            match server.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let psk = Psk::new(PSK.to_vec()).unwrap();
+    let mut encoder = V4Encoder::os(&psk).unwrap();
+    let mut encode = new_udp_encode();
+    write_udp_setup(&mut encoder, &mut encode, &mut client)
+        .await
+        .unwrap();
+    write_tunnel(&mut encoder, &mut encode, &mut client)
+        .await
+        .unwrap();
+    let dest = Address::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
+    let payload = vec![0xab; MAX_PACKET_SIZE];
+    let error = write_udp_request(
+        &mut encoder,
+        &mut encode,
+        &mut client,
+        dest.as_view(),
+        &payload,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, SessionError::Protocol(Error::PayloadTooLarge)),
+        "expected PayloadTooLarge, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn udp_frag_nonzero_is_dropped() {
+    let pair = start_pair_udp(
+        ProtocolFlavor::V4,
+        Outbound::Direct,
+        UdpOptions::default(),
+        UdpOptions::default(),
+    )
+    .await;
+    let echo = spawn_udp_echo().await.unwrap();
+    let (_tcp, relay, client) = socks5_udp_associate(pair.socks).await.unwrap();
+    let packet = encode_socks_udp(echo, 1, b"frag");
+    client.send_to(&packet, relay).await.unwrap();
+    let mut buf = [0u8; 64];
+    let result = timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await;
+    assert!(result.is_err(), "FRAG != 0 must not be forwarded");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(pair.client_udp.metrics.frag_dropped.load(Ordering::Relaxed) >= 1);
+}
+
+#[tokio::test]
+async fn udp_idle_expires_association() {
+    let limits = UdpLimits {
+        idle: Duration::from_millis(80),
+        ..UdpLimits::default()
+    };
+    let pair = start_pair_udp(
+        ProtocolFlavor::V4,
+        Outbound::Direct,
+        UdpOptions::with_limits(limits),
+        UdpOptions::with_limits(limits),
+    )
+    .await;
+    let echo = spawn_udp_echo().await.unwrap();
+    let (_tcp, relay, client) = socks5_udp_associate(pair.socks).await.unwrap();
+    let packet = encode_socks_udp(echo, 0, b"idle");
+    client.send_to(&packet, relay).await.unwrap();
+    let mut buf = [0u8; 65535];
+    let (n, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let parsed = socks5::parse_udp_packet(&buf[..n]).unwrap();
+    assert_eq!(parsed.payload, b"idle");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(pair.client_udp.metrics.idle_expired.load(Ordering::Relaxed) >= 1);
+    assert_eq!(
+        pair.client_udp.metrics.associations.load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn udp_associations_stay_capped() {
+    let limits = UdpLimits {
+        max_associations: 4,
+        ..UdpLimits::default()
+    };
+    let pair = start_pair_udp(
+        ProtocolFlavor::V4,
+        Outbound::Direct,
+        UdpOptions::with_limits(limits),
+        UdpOptions::default(),
+    )
+    .await;
+    let echo = spawn_udp_echo().await.unwrap();
+    let (_tcp, relay, _) = socks5_udp_associate(pair.socks).await.unwrap();
+    let packet = encode_socks_udp(echo, 0, b"cap");
+    for _ in 0..16 {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&packet, relay).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let live = pair.client_udp.metrics.associations.load(Ordering::Relaxed);
+    assert!(live <= 4, "associations={live}");
+    assert!(pair.client_udp.metrics.map_full.load(Ordering::Relaxed) >= 1);
+}
+
+#[tokio::test]
+async fn udp_socks5_outbound_echo() {
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = proxy.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let _ = socks5_udp_proxy_once(stream).await;
+            });
+        }
+    });
+    let pair = start_pair_udp(
+        ProtocolFlavor::V4,
+        Outbound::Socks5 { server: proxy_addr },
+        UdpOptions::default(),
+        UdpOptions::default(),
+    )
+    .await;
+    let echo = spawn_udp_echo().await.unwrap();
+    let got = socks5_udp_roundtrip(pair.socks, echo, b"via-socks5-udp")
+        .await
+        .unwrap();
+    assert_eq!(got, b"via-socks5-udp");
+}
+
+async fn socks5_udp_proxy_once(mut stream: TcpStream) -> io::Result<()> {
+    let mut head = [0u8; 2];
+    stream.read_exact(&mut head).await?;
+    let mut methods = vec![0u8; usize::from(head[1])];
+    stream.read_exact(&mut methods).await?;
+    stream.write_all(&[0x05, 0x00]).await?;
+    let mut req = [0u8; 4];
+    stream.read_exact(&mut req).await?;
+    match req[3] {
+        0x01 => {
+            let mut dest = [0u8; 6];
+            stream.read_exact(&mut dest).await?;
+        }
+        0x04 => {
+            let mut dest = [0u8; 18];
+            stream.read_exact(&mut dest).await?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            let mut rest = vec![0u8; usize::from(len[0]) + 2];
+            stream.read_exact(&mut rest).await?;
+        }
+        _ => {}
+    }
+    let udp = UdpSocket::bind("127.0.0.1:0").await?;
+    let bind = udp.local_addr()?;
+    let std::net::SocketAddr::V4(v4) = bind else {
+        panic!("proxy bind ipv4");
+    };
+    let mut reply = vec![0x05, 0x00, 0x00, 0x01];
+    reply.extend_from_slice(&v4.ip().octets());
+    reply.extend_from_slice(&v4.port().to_be_bytes());
+    stream.write_all(&reply).await?;
+    let mut buf = [0u8; 65535];
+    let mut out = [0u8; 65535];
+    let mut ctrl = [0u8; 1];
+    loop {
+        tokio::select! {
+            result = udp.recv_from(&mut buf) => {
+                let (n, peer) = result?;
+                let packet = match socks5::parse_udp_packet(&buf[..n]) {
+                    Ok(packet) if packet.frag == 0 => packet,
+                    _ => continue,
+                };
+                let AddressRef::Ip(dest) = packet.destination else {
+                    continue;
+                };
+                let payload = packet.payload.to_vec();
+                udp.send_to(&payload, dest).await?;
+                let (rn, from) = udp.recv_from(&mut buf).await?;
+                let n = socks5::encode_udp_packet(
+                    &mut out,
+                    0,
+                    AddressRef::Ip(from),
+                    &buf[..rn],
+                )
+                .unwrap();
+                udp.send_to(&out[..n], peer).await?;
+            }
+            n = stream.read(&mut ctrl) => {
+                if n? == 0 {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }

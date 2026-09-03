@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use snell_config::{ClientConfig as FileClientConfig, ServerConfig as FileServerConfig};
 use snell_runtime::{
-    ClientConfig, Outbound, ProtocolSelection, ServerConfig, run_client, run_server,
+    ClientConfig, Outbound, ProtocolSelection, ServerConfig, UdpOptions, run_client, run_server,
 };
 
 #[derive(Parser)]
@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Version => {
             println!(
-                "snell-rs {} (current phase stops after Phase 6)",
+                "snell-rs {} (current phase stops after Phase 7)",
                 env!("CARGO_PKG_VERSION")
             );
         }
@@ -94,6 +94,7 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
             version: cfg.version,
             reuse: cfg.reuse,
             pool: None,
+            udp: UdpOptions::default(),
         });
     }
     Ok(ClientConfig {
@@ -103,6 +104,7 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
         version: snell_config::parse_client_version(&args.version.expect("required by clap"))?,
         reuse: args.reuse,
         pool: None,
+        udp: UdpOptions::default(),
     })
 }
 
@@ -114,6 +116,7 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
             psk: cfg.psk,
             selection: cfg.selection,
             outbound: map_outbound(cfg.outbound),
+            udp: UdpOptions::default(),
         });
     }
     if args.version.is_none() && args.mode.is_some() {
@@ -134,6 +137,7 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
             Some(server) => Outbound::Socks5 { server },
             None => Outbound::Direct,
         },
+        udp: UdpOptions::default(),
     })
 }
 

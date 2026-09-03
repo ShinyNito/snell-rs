@@ -1,9 +1,9 @@
 //! Two-stage configuration: raw text → validated config.
 //!
-//! Unknown keys, unimplemented UDP/unsafe-raw/tcp-brutal, and missing
-//! required fields fail closed. `reuse = true` is allowed. Omitting server
-//! `version` selects auto-detect. PSK is stored as [`Psk`] so `Debug` does
-//! not print the secret.
+//! Unknown keys, unimplemented unsafe-raw/tcp-brutal, and missing required
+//! fields fail closed. `reuse = true` is allowed. Omitting server `version`
+//! selects auto-detect. PSK is stored as [`Psk`] so `Debug` does not print
+//! the secret. UDP ASSOCIATE is handled in `snell-runtime`.
 
 #![deny(unsafe_code)]
 

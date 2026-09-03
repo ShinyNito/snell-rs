@@ -9,7 +9,8 @@ use snell_protocol::{
     MAX_CONNECT_REQUEST_LEN, MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk,
     REUSE_IDLE_TIMEOUT_SECS, RecordKind, RecvBuffer, SERVER_EARLY_PAYLOAD_MAX, ServerReply,
     TCP_HANDSHAKE_TIMEOUT_SECS, V6_WIRE_CAP, aead_key, encode_connect_request, encode_reject,
-    encode_tunnel_reply,
+    encode_tunnel_reply, encode_udp_request, encode_udp_response, encode_udp_setup,
+    udp_request_len, udp_response_len,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -32,6 +33,22 @@ pub(crate) fn new_encode() -> EncodeBuffer {
     EncodeBuffer::new(ENCODE_BUFFER_MAX)
 }
 
+pub(crate) fn new_udp_recv() -> RecvBuffer {
+    RecvBuffer::new(V6_WIRE_CAP)
+}
+
+pub(crate) fn new_udp_encode() -> EncodeBuffer {
+    EncodeBuffer::new(V6_WIRE_CAP)
+}
+
+pub(crate) fn ensure_udp(recv: RecvBuffer) -> Result<RecvBuffer, SessionError> {
+    let live = recv.filled().to_vec();
+    drop(recv);
+    let mut next = RecvBuffer::new(V6_WIRE_CAP);
+    next.extend_from_slice(&live)?;
+    Ok(next)
+}
+
 pub(crate) async fn with_handshake_timeout<F, T>(fut: F) -> Result<T, SessionError>
 where
     F: Future<Output = Result<T, SessionError>>,
@@ -50,6 +67,72 @@ where
         Ok(result) => result,
         Err(_) => Err(SessionError::ReuseIdleTimeout),
     }
+}
+
+pub(crate) async fn write_udp_setup<E: TcpEncoder, W: AsyncWrite + Unpin>(
+    encoder: &mut E,
+    encode: &mut EncodeBuffer,
+    writer: &mut W,
+) -> Result<(), SessionError> {
+    let mut req = [0u8; 3];
+    let n = encode_udp_setup(&mut req)?;
+    write_plain_records(encoder, encode, writer, &req[..n]).await
+}
+
+pub(crate) async fn write_udp_request<E: TcpEncoder, W: AsyncWrite + Unpin>(
+    encoder: &mut E,
+    encode: &mut EncodeBuffer,
+    writer: &mut W,
+    address: AddressRef<'_>,
+    payload: &[u8],
+) -> Result<(), SessionError> {
+    let needed = udp_request_len(address, payload.len())?;
+    write_udp_plain(encoder, encode, writer, needed, |dst| {
+        encode_udp_request(dst, address, payload)
+    })
+    .await
+}
+
+pub(crate) async fn write_udp_response<E: TcpEncoder, W: AsyncWrite + Unpin>(
+    encoder: &mut E,
+    encode: &mut EncodeBuffer,
+    writer: &mut W,
+    address: AddressRef<'_>,
+    payload: &[u8],
+) -> Result<(), SessionError> {
+    let needed = udp_response_len(address, payload.len())?;
+    write_udp_plain(encoder, encode, writer, needed, |dst| {
+        encode_udp_response(dst, address, payload)
+    })
+    .await
+}
+
+async fn write_udp_plain<E, W, F>(
+    encoder: &mut E,
+    encode: &mut EncodeBuffer,
+    writer: &mut W,
+    needed: usize,
+    fill: F,
+) -> Result<(), SessionError>
+where
+    E: TcpEncoder,
+    W: AsyncWrite + Unpin,
+    F: FnOnce(&mut [u8]) -> snell_protocol::Result<usize>,
+{
+    drain_encode(writer, encode).await?;
+    let mut reservation = match encoder.reserve(encode, &[], needed) {
+        Ok(reservation) => reservation,
+        Err(Error::PayloadTooLarge) => return Err(SessionError::Protocol(Error::PayloadTooLarge)),
+        Err(error) => return Err(error.into()),
+    };
+    if reservation.capacity() < needed {
+        drop(reservation);
+        return Err(SessionError::Protocol(Error::PayloadTooLarge));
+    }
+    let n = fill(reservation.payload_mut())?;
+    reservation.seal(n)?;
+    drain_encode(writer, encode).await?;
+    Ok(())
 }
 
 pub(crate) async fn write_connect<E: TcpEncoder, W: AsyncWrite + Unpin>(
@@ -145,6 +228,11 @@ pub(crate) struct ServerConnect {
     pub reuse: bool,
 }
 
+pub(crate) enum ServerFirst {
+    Connect(ServerConnect),
+    Udp,
+}
+
 pub(crate) async fn read_server_connect<D: TcpDecoder, R: AsyncRead + Unpin>(
     decoder: &mut D,
     recv: &mut RecvBuffer,
@@ -152,7 +240,7 @@ pub(crate) async fn read_server_connect<D: TcpDecoder, R: AsyncRead + Unpin>(
     kdf: &KdfLimiter,
     psk: &Psk,
     replay: Option<&ReplayCache>,
-) -> Result<ServerConnect, SessionError> {
+) -> Result<ServerFirst, SessionError> {
     let mut plain = PlainStream::new(HANDSHAKE_PLAIN_MAX);
     let mut replay_checked = replay.is_none();
     loop {
@@ -179,15 +267,22 @@ pub(crate) async fn read_server_connect<D: TcpDecoder, R: AsyncRead + Unpin>(
                         if leftover.len() > SERVER_EARLY_PAYLOAD_MAX {
                             return Err(SessionError::EarlyPayloadTooLarge);
                         }
-                        return Ok(ServerConnect {
+                        return Ok(ServerFirst::Connect(ServerConnect {
                             destination: request.destination,
                             leftover,
                             reuse: request.reuse,
-                        });
+                        }));
                     }
                     Err(Error::UnknownCommand(COMMAND_UDP)) => match plain.udp_setup()? {
                         ParseState::Need(_) => {}
-                        ParseState::Done(_) => return Err(SessionError::UdpNotImplemented),
+                        ParseState::Done(n) => {
+                            if plain.filled().len() != n {
+                                return Err(SessionError::Protocol(Error::Malformed(
+                                    "udp setup must occupy the whole record",
+                                )));
+                            }
+                            return Ok(ServerFirst::Udp);
+                        }
                     },
                     Err(error) => return Err(error.into()),
                 }
@@ -196,7 +291,7 @@ pub(crate) async fn read_server_connect<D: TcpDecoder, R: AsyncRead + Unpin>(
     }
 }
 
-enum HandshakeRecord {
+pub(crate) enum HandshakeRecord {
     Zero,
     Data(Vec<u8>),
 }
@@ -228,7 +323,7 @@ async fn drain_early_payload<D: TcpDecoder>(
     }
 }
 
-async fn decode_once<D: TcpDecoder, R: AsyncRead + Unpin>(
+pub(crate) async fn decode_once<D: TcpDecoder, R: AsyncRead + Unpin>(
     decoder: &mut D,
     recv: &mut RecvBuffer,
     reader: &mut R,

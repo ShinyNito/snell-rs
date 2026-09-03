@@ -11,11 +11,11 @@ use crate::codec::TcpDecoder;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::replay::ReplayCache;
-use crate::session::{HANDSHAKE_PLAIN_MAX, ServerConnect, maybe_install_kdf};
+use crate::session::{HANDSHAKE_PLAIN_MAX, ServerConnect, ServerFirst, maybe_install_kdf};
 
 enum Cand {
     NeedMore,
-    Match(ServerConnect),
+    Match(ServerFirst),
     Invalid,
 }
 
@@ -26,13 +26,13 @@ pub(crate) enum Detected {
         encoder: V4Encoder,
         decoder: V4Decoder,
         recv: RecvBuffer,
-        connect: ServerConnect,
+        first: ServerFirst,
     },
     V6Shaped {
         encoder: V6ShapedEncoder,
         decoder: V6ShapedDecoder,
         recv: RecvBuffer,
-        connect: ServerConnect,
+        first: ServerFirst,
     },
 }
 
@@ -99,7 +99,7 @@ async fn detect_inner(
         match (&v4_state, &v6_state) {
             (Cand::Match(_), Cand::Match(_)) => return Err(SessionError::AmbiguousProtocol),
             (Cand::Match(_), _) => {
-                let Cand::Match(connect) = std::mem::replace(&mut v4_state, Cand::Invalid) else {
+                let Cand::Match(first) = std::mem::replace(&mut v4_state, Cand::Invalid) else {
                     unreachable!();
                 };
                 let psk_enc = psk.clone();
@@ -108,11 +108,11 @@ async fn detect_inner(
                     encoder,
                     decoder: v4,
                     recv: v4_recv,
-                    connect,
+                    first,
                 });
             }
             (_, Cand::Match(_)) => {
-                let Cand::Match(connect) = std::mem::replace(&mut v6_state, Cand::Invalid) else {
+                let Cand::Match(first) = std::mem::replace(&mut v6_state, Cand::Invalid) else {
                     unreachable!();
                 };
                 if let Some(id) = v6.replay_identity() {
@@ -124,7 +124,7 @@ async fn detect_inner(
                     encoder,
                     decoder: v6,
                     recv: v6_recv,
-                    connect,
+                    first,
                 });
             }
             (Cand::Invalid, Cand::Invalid) => return Err(SessionError::Aead),
@@ -187,15 +187,14 @@ async fn advance<D: TcpDecoder>(
                 }
                 match interpret_plain(plain) {
                     Interpret::Need => {}
-                    Interpret::Match(connect) => {
-                        *state = Cand::Match(connect);
+                    Interpret::Match(first) => {
+                        *state = Cand::Match(first);
                         return Ok(());
                     }
                     Interpret::Invalid => {
                         *state = Cand::Invalid;
                         return Ok(());
                     }
-                    Interpret::Udp => return Err(SessionError::UdpNotImplemented),
                     Interpret::EarlyPayload => return Err(SessionError::EarlyPayloadTooLarge),
                 }
             }
@@ -209,9 +208,8 @@ async fn advance<D: TcpDecoder>(
 
 enum Interpret {
     Need,
-    Match(ServerConnect),
+    Match(ServerFirst),
     Invalid,
-    Udp,
     EarlyPayload,
 }
 
@@ -223,15 +221,21 @@ fn interpret_plain(plain: &PlainStream) -> Interpret {
             if leftover.len() > SERVER_EARLY_PAYLOAD_MAX {
                 return Interpret::EarlyPayload;
             }
-            Interpret::Match(ServerConnect {
+            Interpret::Match(ServerFirst::Connect(ServerConnect {
                 destination: request.destination,
                 leftover,
                 reuse: request.reuse,
-            })
+            }))
         }
         Err(Error::UnknownCommand(COMMAND_UDP)) => match plain.udp_setup() {
             Ok(ParseState::Need(_)) => Interpret::Need,
-            Ok(ParseState::Done(_)) => Interpret::Udp,
+            Ok(ParseState::Done(n)) => {
+                if plain.filled().len() != n {
+                    Interpret::Invalid
+                } else {
+                    Interpret::Match(ServerFirst::Udp)
+                }
+            }
             Err(_) => Interpret::Invalid,
         },
         Err(_) => Interpret::Invalid,

@@ -243,6 +243,19 @@ pub fn encode_udp_header(dst: &mut [u8], frag: u8, destination: AddressRef<'_>) 
     Ok(needed)
 }
 
+pub fn encode_udp_packet(
+    dst: &mut [u8],
+    frag: u8,
+    destination: AddressRef<'_>,
+    payload: &[u8],
+) -> Result<usize> {
+    let header_len = encode_udp_header(dst, frag, destination)?;
+    let needed = header_len + payload.len();
+    ensure_capacity(dst, needed)?;
+    dst[header_len..needed].copy_from_slice(payload);
+    Ok(needed)
+}
+
 fn parse_cmd_addr<'a, T>(
     buf: &'a [u8],
     build: impl FnOnce(u8, AddressRef<'a>, usize) -> T,
