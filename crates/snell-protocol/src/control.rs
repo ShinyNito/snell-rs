@@ -1,4 +1,7 @@
+use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::address::{Address, AddressRef, validate_domain};
 use crate::{
@@ -6,6 +9,36 @@ use crate::{
     COMMAND_TUNNEL, COMMAND_UDP, COMMAND_UDP_FORWARD, ERROR_REJECT, Error, PROTOCOL_VERSION,
     ParseState, Result, UDP_REQUEST_IP_LEN,
 };
+
+/// First three bytes of CONNECT / UDP setup: `VERSION CMD CLIENT_ID_LEN`.
+///
+/// Host/payload bytes after this prefix are variable-length and stay slice-based.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(C, packed)]
+struct WireControlHead {
+    version: u8,
+    command: u8,
+    client_id_len: u8,
+}
+
+/// CONNECT prefix when `CLIENT_ID_LEN` is 0 (this project's encode path).
+///
+/// Layout: `VERSION CMD CLIENT_ID_LEN HOST_LEN`. UDP setup has no `HOST_LEN`.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(C, packed)]
+pub struct WireControlPrefix {
+    pub version: u8,
+    pub command: u8,
+    pub client_id_len: u8,
+    pub host_len: u8,
+}
+
+const _: () = assert!(size_of::<WireControlHead>() == 3);
+const _: () = assert!(size_of::<WireControlPrefix>() == 4);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectRequest {
@@ -42,16 +75,19 @@ pub fn encode_connect_request(
     }
     let host = destination.host();
     let host = host.as_bytes();
-    dst[0] = PROTOCOL_VERSION;
-    dst[1] = if reuse {
+    let available = dst.len();
+    let (wire, rest) = WireControlPrefix::mut_from_prefix(dst)
+        .map_err(|_| Error::BufferTooSmall { needed, available })?;
+    wire.version = PROTOCOL_VERSION;
+    wire.command = if reuse {
         COMMAND_CONNECT_V2
     } else {
         COMMAND_CONNECT
     };
-    dst[2] = 0;
-    dst[3] = host.len() as u8;
-    dst[4..4 + host.len()].copy_from_slice(host);
-    dst[4 + host.len()..needed].copy_from_slice(&destination.port().to_be_bytes());
+    wire.client_id_len = 0;
+    wire.host_len = host.len() as u8;
+    rest[..host.len()].copy_from_slice(host);
+    rest[host.len()..host.len() + 2].copy_from_slice(&destination.port().to_be_bytes());
     Ok(needed)
 }
 
@@ -64,70 +100,70 @@ pub fn decode_connect_request(src: &[u8]) -> Result<ConnectRequest> {
 }
 
 pub fn decode_connect_request_prefix(src: &[u8]) -> Result<(ConnectRequest, usize)> {
-    if src.len() < 3 {
-        return Err(Error::Truncated);
+    let (head, after) = WireControlHead::ref_from_prefix(src).map_err(|_| Error::Truncated)?;
+    if head.version != PROTOCOL_VERSION {
+        return Err(Error::InvalidVersion(head.version));
     }
-    if src[0] != PROTOCOL_VERSION {
-        return Err(Error::InvalidVersion(src[0]));
-    }
-    let reuse = match src[1] {
+    let reuse = match head.command {
         COMMAND_CONNECT => false,
         COMMAND_CONNECT_V2 => true,
         other => return Err(Error::UnknownCommand(other)),
     };
-    let client_id_len = src[2] as usize;
-    let host_len_offset = 3 + client_id_len;
-    if src.len() <= host_len_offset {
+    let client_id_len = head.client_id_len as usize;
+    if after.len() <= client_id_len {
         return Err(Error::Truncated);
     }
-    let host_len = src[host_len_offset] as usize;
+    let host_len = after[client_id_len] as usize;
     if host_len == 0 {
         return Err(Error::EmptyHost);
     }
-    let host_offset = host_len_offset + 1;
-    let needed = host_offset + host_len + 2;
-    if src.len() < needed {
+    let host_offset = client_id_len + 1;
+    let needed_after = host_offset + host_len + 2;
+    if after.len() < needed_after {
         return Err(Error::Truncated);
     }
-    let host = std::str::from_utf8(&src[host_offset..host_offset + host_len])
+    let host = std::str::from_utf8(&after[host_offset..host_offset + host_len])
         .map_err(|_| Error::InvalidHostUtf8)?;
-    let port = u16::from_be_bytes([src[host_offset + host_len], src[host_offset + host_len + 1]]);
+    let port = u16::from_be_bytes([
+        after[host_offset + host_len],
+        after[host_offset + host_len + 1],
+    ]);
     let destination = if let Ok(ip) = host.parse::<IpAddr>() {
         Address::Ip(SocketAddr::new(ip, port))
     } else {
         Address::domain(host, port)?
     };
-    Ok((ConnectRequest { destination, reuse }, needed))
+    Ok((
+        ConnectRequest { destination, reuse },
+        size_of::<WireControlHead>() + needed_after,
+    ))
 }
 
 pub fn encode_udp_setup(dst: &mut [u8]) -> Result<usize> {
-    if dst.len() < 3 {
-        return Err(Error::BufferTooSmall {
-            needed: 3,
-            available: dst.len(),
-        });
-    }
-    dst[0] = PROTOCOL_VERSION;
-    dst[1] = COMMAND_UDP;
-    dst[2] = 0;
-    Ok(3)
+    let available = dst.len();
+    let (wire, _) = WireControlHead::mut_from_prefix(dst).map_err(|_| Error::BufferTooSmall {
+        needed: size_of::<WireControlHead>(),
+        available,
+    })?;
+    wire.version = PROTOCOL_VERSION;
+    wire.command = COMMAND_UDP;
+    wire.client_id_len = 0;
+    Ok(size_of::<WireControlHead>())
 }
 
 pub fn decode_udp_setup_prefix(src: &[u8]) -> Result<usize> {
-    if src.len() < 3 {
+    let (wire, after) = WireControlHead::ref_from_prefix(src).map_err(|_| Error::Truncated)?;
+    if wire.version != PROTOCOL_VERSION {
+        return Err(Error::InvalidVersion(wire.version));
+    }
+    if wire.command != COMMAND_UDP {
+        return Err(Error::UnknownCommand(wire.command));
+    }
+    let client_id_len = wire.client_id_len as usize;
+    if after.len() < client_id_len {
         return Err(Error::Truncated);
     }
-    if src[0] != PROTOCOL_VERSION {
-        return Err(Error::InvalidVersion(src[0]));
-    }
-    if src[1] != COMMAND_UDP {
-        return Err(Error::UnknownCommand(src[1]));
-    }
-    let needed = 3 + src[2] as usize;
-    if src.len() < needed {
-        return Err(Error::Truncated);
-    }
-    Ok(needed)
+    Ok(size_of::<WireControlHead>() + client_id_len)
 }
 
 pub fn encode_tunnel_reply(dst: &mut [u8]) -> Result<usize> {

@@ -18,6 +18,7 @@ blake2.workspace = true
 ring.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+zerocopy = { workspace = true }
 
 [[bench]]
 name = "v4_record"
