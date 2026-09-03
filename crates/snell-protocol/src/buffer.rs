@@ -97,6 +97,16 @@ impl RecvBuffer {
         Ok(())
     }
 
+    /// Commit `n` bytes previously initialized in the spare tail.
+    ///
+    /// Callers must have filled `storage[old_len..old_len + n]` through
+    /// [`Self::spare_capacity_mut`] (for example Tokio `ReadBuf::uninit`).
+    /// The `unsafe` stays in this buffer module.
+    pub fn commit_init(&mut self, n: usize) -> Result<()> {
+        // SAFETY: caller initialized `n` bytes of the spare tail.
+        unsafe { self.commit(n) }
+    }
+
     pub fn consume(&mut self, n: usize) -> Result<()> {
         if n > self.len() {
             return Err(Error::BufferTooSmall {
@@ -353,6 +363,15 @@ mod tests {
         buf.range_mut(buf.filled_len() - 6, buf.filled_len())
             .copy_from_slice(b"ghijkl");
         assert_eq!(buf.pending(), b"efghijkl");
+    }
+
+    #[test]
+    fn commit_init_advances_filled() {
+        let mut buf = RecvBuffer::new(8);
+        let spare = buf.spare_capacity_mut(2).unwrap();
+        spare[..2].write_copy_of_slice(b"ab");
+        buf.commit_init(2).unwrap();
+        assert_eq!(buf.filled(), b"ab");
     }
 
     #[test]

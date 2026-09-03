@@ -98,9 +98,39 @@ impl ProcessPair {
         server_version: Option<&str>,
         client: ClientOptions,
     ) -> Result<Self, OracleError> {
+        Self::spawn_with_mode(binary, psk, server_version, None, client).await
+    }
+
+    pub async fn spawn_with_mode(
+        binary: &SnellBinary,
+        psk: &str,
+        server_version: Option<&str>,
+        server_mode: Option<&str>,
+        client: ClientOptions,
+    ) -> Result<Self, OracleError> {
+        Self::spawn_binaries(binary, binary, psk, server_version, server_mode, client).await
+    }
+
+    pub async fn spawn_binaries(
+        server_bin: &SnellBinary,
+        client_bin: &SnellBinary,
+        psk: &str,
+        server_version: Option<&str>,
+        server_mode: Option<&str>,
+        client: ClientOptions,
+    ) -> Result<Self, OracleError> {
         let mut last_error = None;
         for _ in 0..8 {
-            match spawn_once(binary, psk, server_version, client).await {
+            match spawn_once(
+                server_bin,
+                client_bin,
+                psk,
+                server_version,
+                server_mode,
+                client,
+            )
+            .await
+            {
                 Ok(pair) => return Ok(pair),
                 Err(error @ (OracleError::ExitedEarly { .. } | OracleError::ReadyTimeout(_))) => {
                     last_error = Some(error);
@@ -113,9 +143,11 @@ impl ProcessPair {
 }
 
 async fn spawn_once(
-    binary: &SnellBinary,
+    server_bin: &SnellBinary,
+    client_bin: &SnellBinary,
     psk: &str,
     server_version: Option<&str>,
+    server_mode: Option<&str>,
     client: ClientOptions,
 ) -> Result<ProcessPair, OracleError> {
     let dir = tempfile_dir::TempDir::new()?;
@@ -124,13 +156,16 @@ async fn spawn_once(
 
     let server_conf = dir.path().join("snell-server.conf");
     let client_conf = dir.path().join("snell-client.conf");
-    std::fs::write(&server_conf, server_ini(snell, psk, server_version))?;
+    std::fs::write(
+        &server_conf,
+        server_ini(snell, psk, server_version, server_mode),
+    )?;
     std::fs::write(&client_conf, client_ini(socks, snell, psk, client))?;
 
-    let mut server = spawn_role(binary, "server", &server_conf)?;
+    let mut server = spawn_role(server_bin, "server", &server_conf)?;
     wait_listening(&mut server, snell, "server").await?;
 
-    let mut client_proc = spawn_role(binary, "client", &client_conf)?;
+    let mut client_proc = spawn_role(client_bin, "client", &client_conf)?;
     wait_listening(&mut client_proc, socks, "client").await?;
 
     Ok(ProcessPair {
@@ -161,12 +196,15 @@ async fn free_listen_addr() -> Result<SocketAddr, OracleError> {
     Ok(addr)
 }
 
-fn server_ini(listen: SocketAddr, psk: &str, version: Option<&str>) -> String {
-    match version {
-        Some(version) => {
+fn server_ini(listen: SocketAddr, psk: &str, version: Option<&str>, mode: Option<&str>) -> String {
+    match (version, mode) {
+        (Some(version), Some(mode)) => format!(
+            "[snell-server]\nlisten = {listen}\npsk = {psk}\nversion = {version}\nmode = {mode}\n"
+        ),
+        (Some(version), None) => {
             format!("[snell-server]\nlisten = {listen}\npsk = {psk}\nversion = {version}\n")
         }
-        None => format!("[snell-server]\nlisten = {listen}\npsk = {psk}\n"),
+        (None, _) => format!("[snell-server]\nlisten = {listen}\npsk = {psk}\n"),
     }
 }
 

@@ -8,6 +8,34 @@ repository.workspace = true
 publish.workspace = true
 description = "Tokio runtime for Snell client and server sessions"
 
+[features]
+default = []
+unsafe-raw = ["snell-protocol/unsafe-raw"]
+
 [dependencies]
 snell-protocol = { path = "../snell-protocol", version = "0.0.0" }
-tokio = { workspace = true, features = ["rt"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "signal",
+  "sync",
+  "time",
+] }
+
+[dev-dependencies]
+snell-testkit = { path = "../snell-testkit", version = "0.0.0" }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+
+[[bench]]
+name = "tcp_loopback"
+harness = false

@@ -343,6 +343,8 @@ dependencies = [
  "clap",
  "snell-config",
  "snell-runtime",
+ "snell-testkit",
+ "tokio",
 ]
 
 [[package]]
@@ -350,6 +352,7 @@ name = "snell-config"
 version = "0.0.0"
 dependencies = [
  "snell-protocol",
+ "thiserror",
 ]
 
 [[package]]
@@ -368,6 +371,8 @@ name = "snell-runtime"
 version = "0.0.0"
 dependencies = [
  "snell-protocol",
+ "snell-testkit",
+ "thiserror",
  "tokio",
 ]
 

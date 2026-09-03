@@ -12,8 +12,32 @@ description = "Snell client/server binary"
 name = "snell-rs"
 path = "src/main.rs"
 
+[features]
+default = []
+unsafe-raw = ["snell-runtime/unsafe-raw"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 snell-config = { path = "../snell-config", version = "0.0.0" }
 snell-runtime = { path = "../snell-runtime", version = "0.0.0" }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "time",
+] }
+
+[dev-dependencies]
+snell-testkit = { path = "../snell-testkit", version = "0.0.0" }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }

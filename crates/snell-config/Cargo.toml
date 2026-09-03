@@ -10,3 +10,4 @@ description = "Raw-to-validated Snell configuration"
 
 [dependencies]
 snell-protocol = { path = "../snell-protocol", version = "0.0.0" }
+thiserror.workspace = true
