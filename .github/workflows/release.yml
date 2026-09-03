@@ -10,6 +10,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
 
 jobs:
   validate:
@@ -30,3 +32,196 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  sbom:
+    name: SBOM
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: snell-rs-${{ github.ref_name }}-sbom.cdx.json
+          output-file: snell-rs-${{ github.ref_name }}-sbom.cdx.json
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: snell-rs-${{ github.ref_name }}-sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: snell-rs-${{ github.ref_name }}-sbom.cdx.json
+
+  build:
+    name: Build ${{ matrix.artifact }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cpu: x86-64-v2
+            artifact: x86_64-unknown-linux-gnu-v2
+            archive: tar.gz
+            binary: snell-rs
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cpu: x86-64-v3
+            artifact: x86_64-unknown-linux-gnu-v3
+            archive: tar.gz
+            binary: snell-rs
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cpu: x86-64-v4
+            artifact: x86_64-unknown-linux-gnu-v4
+            archive: tar.gz
+            binary: snell-rs
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cpu: generic
+            artifact: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            binary: snell-rs
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cpu: x86-64-v2
+            artifact: x86_64-unknown-linux-musl-v2
+            musl: true
+            archive: tar.gz
+            binary: snell-rs
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cpu: x86-64-v3
+            artifact: x86_64-unknown-linux-musl-v3
+            musl: true
+            archive: tar.gz
+            binary: snell-rs
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cpu: x86-64-v4
+            artifact: x86_64-unknown-linux-musl-v4
+            musl: true
+            archive: tar.gz
+            binary: snell-rs
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            cpu: generic
+            artifact: aarch64-unknown-linux-musl
+            musl: true
+            archive: tar.gz
+            binary: snell-rs
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cpu: apple-m1
+            artifact: aarch64-apple-darwin
+            archive: tar.gz
+            binary: snell-rs
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cpu: x86-64-v2
+            artifact: x86_64-apple-darwin-v2
+            archive: tar.gz
+            binary: snell-rs
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cpu: x86-64-v3
+            artifact: x86_64-apple-darwin-v3
+            archive: tar.gz
+            binary: snell-rs
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cpu: x86-64-v4
+            artifact: x86_64-apple-darwin-v4
+            archive: tar.gz
+            binary: snell-rs
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cpu: x86-64-v2
+            artifact: x86_64-pc-windows-msvc-v2
+            archive: zip
+            binary: snell-rs.exe
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cpu: x86-64-v3
+            artifact: x86_64-pc-windows-msvc-v3
+            archive: zip
+            binary: snell-rs.exe
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cpu: x86-64-v4
+            artifact: x86_64-pc-windows-msvc-v4
+            archive: zip
+            binary: snell-rs.exe
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+          components: llvm-tools-preview
+      - name: Install musl-tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: PGO release build
+        shell: bash
+        env:
+          SNELL_SOAK_SECS: "30"
+        run: bash .github/scripts/pgo-release-build.sh "${{ matrix.target }}" "${{ matrix.cpu }}" "${{ matrix.binary }}"
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          stage="snell-rs-${{ github.ref_name }}-${{ matrix.artifact }}"
+          mkdir -p "${stage}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${stage}/"
+          cp LICENSE README.md "${stage}/"
+          if [ -f pgo-data/status ]; then cp pgo-data/status "${stage}/PGO"; fi
+          tar -czf "${stage}.tar.gz" "${stage}"
+          shasum -a 256 "${stage}.tar.gz" | tee "${stage}.tar.gz.sha256"
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $stage = "snell-rs-${{ github.ref_name }}-${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" $stage
+          Copy-Item LICENSE, README.md $stage
+          if (Test-Path pgo-data/status) { Copy-Item pgo-data/status "$stage/PGO" }
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "$stage.zip").Hash.ToLower()
+          "$hash  $stage.zip" | Out-File -Encoding ascii "$stage.zip.sha256"
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: snell-rs-${{ github.ref_name }}-${{ matrix.artifact }}.${{ matrix.archive }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            snell-rs-${{ github.ref_name }}-${{ matrix.artifact }}.${{ matrix.archive }}
+            snell-rs-${{ github.ref_name }}-${{ matrix.artifact }}.${{ matrix.archive }}.sha256
+
+  publish:
+    name: GitHub Release
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

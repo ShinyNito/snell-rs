@@ -1,4 +1,1 @@
-```bash
-rustup show
-cargo xtask check
-```
+快跑 💨

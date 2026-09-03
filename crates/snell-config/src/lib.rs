@@ -619,4 +619,14 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ConfigError::UnknownKey { .. }));
     }
+
+    #[test]
+    fn workspace_examples_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        ClientConfig::load(root.join("client.ini")).unwrap();
+        ClientConfig::load(root.join("client-reuse.ini")).unwrap();
+        ServerConfig::load(root.join("server.ini")).unwrap();
+        ServerConfig::load(root.join("server-socks5.ini")).unwrap();
+        ServerConfig::load(root.join("server-tcp-brutal.ini")).unwrap();
+    }
 }

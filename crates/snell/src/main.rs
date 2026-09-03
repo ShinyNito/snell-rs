@@ -23,7 +23,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print toolchain and phase status.
+    /// Print the snell-rs version.
     Version,
     /// SOCKS5 inbound that proxies through a Snell server.
     Client(ClientArgs),
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Version => {
-            println!("snell-rs {} ", env!("CARGO_PKG_VERSION"));
+            println!("snell-rs {}", env!("CARGO_PKG_VERSION"));
         }
         Command::Client(args) => {
             init_logging(cli.log_level.as_deref());
