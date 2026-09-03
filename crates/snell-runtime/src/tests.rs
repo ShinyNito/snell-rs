@@ -56,6 +56,7 @@ async fn start_pair_reuse(
         selection: ProtocolSelection::Exact(version),
         outbound,
         udp: UdpOptions::default(),
+        tcp_brutal: None,
     };
     tokio::spawn(async move {
         let _ = serve_server(server_listener, server_cfg, async {
@@ -238,6 +239,7 @@ async fn handshake_timeout() {
         selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
         outbound: Outbound::Direct,
         udp: UdpOptions::default(),
+        tcp_brutal: None,
     };
     tokio::spawn(async move {
         let _ = serve_server(server_listener, cfg, async {
@@ -419,6 +421,7 @@ async fn start_counted(
         selection,
         outbound: Outbound::Direct,
         udp: UdpOptions::default(),
+        tcp_brutal: None,
     };
     let kdf = Arc::new(KdfLimiter::new());
     let replay = Arc::new(ReplayCache::new());
@@ -645,6 +648,7 @@ async fn early_payload_over_64kib_is_rejected() {
         selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
         outbound: Outbound::Direct,
         udp: UdpOptions::default(),
+        tcp_brutal: None,
     };
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
@@ -689,6 +693,34 @@ async fn early_payload_over_64kib_is_rejected() {
     );
 }
 
+#[tokio::test]
+async fn tcp_brutal_requested_does_not_start_when_unsupported() {
+    let params = crate::TcpBrutal {
+        send_mbps: 100,
+        cwnd_gain: 15,
+    };
+    if crate::platform::require_tcp_brutal(params).is_ok() {
+        return;
+    }
+    let psk = Psk::new(PSK.to_vec()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cfg = ServerConfig {
+        listen: listener.local_addr().unwrap(),
+        psk,
+        selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
+        outbound: Outbound::Direct,
+        udp: UdpOptions::default(),
+        tcp_brutal: Some(params),
+    };
+    let err = serve_server(listener, cfg, std::future::pending::<()>())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SessionError::Unsupported(_)),
+        "requested tcp_brutal must not start a server: {err:?}"
+    );
+}
+
 struct UdpPair {
     socks: SocketAddr,
     client_udp: UdpOptions,
@@ -716,6 +748,7 @@ async fn start_pair_udp(
         selection: ProtocolSelection::Exact(version),
         outbound,
         udp: server_udp.clone(),
+        tcp_brutal: None,
     };
     tokio::spawn(async move {
         let _ = serve_server(server_listener, server_cfg, async {

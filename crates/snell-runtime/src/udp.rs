@@ -584,7 +584,7 @@ async fn open_udp<E: TcpEncoder, D: TcpDecoder>(
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
 ) -> Result<(), SessionError> {
-    crate::set_nodelay(snell)?;
+    crate::prepare_session_stream(snell)?;
     with_handshake_timeout(async {
         write_udp_setup(encoder, encode, snell).await?;
         let leftover = read_server_tunnel(decoder, recv, snell, kdf, psk).await?;

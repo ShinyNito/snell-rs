@@ -24,6 +24,7 @@ argon2 = "0.5.3"
 blake2 = "0.10.6"
 clap = { version = "4", features = ["derive"] }
 ring = "0.17"
+rustix = { version = "0.38", default-features = false, features = ["net", "std"] }
 thiserror = "2"
 tokio = { version = "1.53.1", default-features = false }
 zeroize = { version = "1", features = ["derive"] }

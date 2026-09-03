@@ -2,6 +2,8 @@ use std::io;
 
 use snell_protocol::Error as ProtocolError;
 
+use crate::platform::PlatformError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("handshake timed out")]
@@ -24,6 +26,8 @@ pub enum SessionError {
     AmbiguousProtocol,
     #[error("kdf queue is full")]
     KdfQueueFull,
+    #[error("{0}")]
+    Unsupported(&'static str),
     #[error("aead authentication failed")]
     Aead,
     #[error("socks5 has no acceptable method")]
@@ -36,6 +40,15 @@ pub enum SessionError {
     Protocol(ProtocolError),
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+impl From<PlatformError> for SessionError {
+    fn from(error: PlatformError) -> Self {
+        match error {
+            PlatformError::Unsupported(msg) => Self::Unsupported(msg),
+            PlatformError::Io(error) => Self::Io(error),
+        }
+    }
 }
 
 impl From<ProtocolError> for SessionError {
