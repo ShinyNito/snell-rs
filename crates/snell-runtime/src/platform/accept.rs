@@ -193,11 +193,10 @@ fn resource_codes() -> [i32; 4] {
 }
 
 #[cfg(windows)]
-fn resource_codes() -> [i32; 3] {
+fn resource_codes() -> [i32; 2] {
     [
         rustix::io::Errno::MFILE.raw_os_error(),
         rustix::io::Errno::NOBUFS.raw_os_error(),
-        rustix::io::Errno::NOMEM.raw_os_error(),
     ]
 }
 

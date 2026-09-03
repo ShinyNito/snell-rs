@@ -1,8 +1,6 @@
-use rustix::net::sockopt;
-use socket2::SockRef;
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpSocket;
 
-use super::{Keepalive, PlatformError};
+use super::PlatformError;
 
 pub(super) fn set_tcp_fastopen_listener(_socket: &TcpSocket) -> Result<(), PlatformError> {
     // rustix 0.38 and socket2 0.6 have no Windows TCP_FASTOPEN sockopt.
@@ -19,13 +17,17 @@ pub(super) fn read_tcp_fastopen_listener(_socket: &TcpSocket) -> Result<i32, Pla
 }
 
 #[cfg(test)]
-pub(super) fn read_keepalive(stream: &TcpStream) -> Result<Keepalive, PlatformError> {
-    let sock = SockRef::from(stream);
+pub(super) fn read_keepalive(
+    stream: &tokio::net::TcpStream,
+) -> Result<super::Keepalive, PlatformError> {
+    use rustix::net::sockopt;
+    use socket2::SockRef;
+
     // socket2 0.6 does not expose tcp_keepalive_time/interval on Windows.
     // rustix 0.38 does (TCP_KEEPIDLE / TCP_KEEPINTVL).
-    Ok(Keepalive {
-        enabled: sock.keepalive()?,
-        idle: sockopt::get_tcp_keepidle(&*sock)?,
-        interval: sockopt::get_tcp_keepintvl(&*sock)?,
+    Ok(super::Keepalive {
+        enabled: SockRef::from(stream).keepalive()?,
+        idle: sockopt::get_tcp_keepidle(stream)?,
+        interval: sockopt::get_tcp_keepintvl(stream)?,
     })
 }
