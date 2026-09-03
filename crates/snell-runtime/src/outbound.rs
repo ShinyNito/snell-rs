@@ -10,6 +10,7 @@ use tokio::time::timeout;
 
 use crate::dns::DnsCache;
 use crate::error::{SessionError, TimeoutKind};
+use crate::{connect_tcp, prepare_session_stream};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outbound {
@@ -62,17 +63,7 @@ impl UdpFlow {
     }
 
     async fn socks5(server: SocketAddr) -> Result<Self, SessionError> {
-        let mut stream = match timeout(
-            Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
-            TcpStream::connect(server),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => return Err(error.into()),
-            Err(_) => return Err(SessionError::from_timeout(TimeoutKind::Connect)),
-        };
-        stream.set_nodelay(true)?;
+        let mut stream = connect_tcp(server).await?;
         let bind = socks5_udp_associate(&mut stream).await?;
         let relay = rewrite_unspecified(bind, server);
         let local = if relay.is_ipv4() {
@@ -223,19 +214,19 @@ async fn socks5_udp_associate(stream: &mut TcpStream) -> Result<SocketAddr, Sess
 }
 
 async fn connect_direct(destination: &Address) -> Result<TcpStream, SessionError> {
-    let connect = async {
-        match destination {
-            Address::Ip(addr) => TcpStream::connect(*addr).await,
-            Address::Domain { host, port } => TcpStream::connect((host.as_str(), *port)).await,
+    match destination {
+        Address::Ip(addr) => connect_tcp(*addr).await,
+        Address::Domain { host, port } => {
+            let connect = TcpStream::connect((host.as_str(), *port));
+            match timeout(Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS), connect).await {
+                Ok(Ok(stream)) => {
+                    prepare_session_stream(&stream)?;
+                    Ok(stream)
+                }
+                Ok(Err(error)) => Err(error.into()),
+                Err(_) => Err(SessionError::from_timeout(TimeoutKind::Connect)),
+            }
         }
-    };
-    match timeout(Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS), connect).await {
-        Ok(Ok(stream)) => {
-            stream.set_nodelay(true)?;
-            Ok(stream)
-        }
-        Ok(Err(error)) => Err(error.into()),
-        Err(_) => Err(SessionError::from_timeout(TimeoutKind::Connect)),
     }
 }
 
@@ -243,17 +234,7 @@ async fn connect_socks5(
     server: SocketAddr,
     destination: &Address,
 ) -> Result<TcpStream, SessionError> {
-    let stream = match timeout(
-        Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
-        TcpStream::connect(server),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return Err(error.into()),
-        Err(_) => return Err(SessionError::from_timeout(TimeoutKind::Connect)),
-    };
-    stream.set_nodelay(true)?;
+    let stream = connect_tcp(server).await?;
     socks5_connect_handshake(stream, destination.as_view()).await
 }
 

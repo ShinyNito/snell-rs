@@ -20,7 +20,7 @@ All crates stay unpublished (`publish = false`).
 # Architecture boundaries
 
 - snell-protocol is synchronous and runtime-free.
-- snell-runtime owns Tokio, sockets, tasks, timeouts, UDP, reuse, and outbound.
+- snell-runtime owns Tokio, sockets, tasks, timeouts, UDP, reuse, outbound, and platform socket options.
 - snell-config converts raw text into validated runtime configuration.
 - snell is the binary composition root.
 - snell-testkit and xtask are development-only.

@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use snell_config::{ClientConfig as FileClientConfig, ServerConfig as FileServerConfig};
 use snell_runtime::{
-    ClientConfig, Outbound, ProtocolSelection, ServerConfig, UdpOptions, run_client, run_server,
+    ClientConfig, Outbound, ProtocolSelection, ServerConfig, TcpBrutal, UdpOptions, run_client,
+    run_server,
 };
 
 #[derive(Parser)]
@@ -70,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Version => {
             println!(
-                "snell-rs {} (current phase stops after Phase 7)",
+                "snell-rs {} (current phase stops after Phase 8)",
                 env!("CARGO_PKG_VERSION")
             );
         }
@@ -117,6 +118,10 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
             selection: cfg.selection,
             outbound: map_outbound(cfg.outbound),
             udp: UdpOptions::default(),
+            tcp_brutal: cfg.tcp_brutal.map(|brutal| TcpBrutal {
+                send_mbps: brutal.send_mbps,
+                cwnd_gain: brutal.cwnd_gain,
+            }),
         });
     }
     if args.version.is_none() && args.mode.is_some() {
@@ -138,6 +143,7 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
             None => Outbound::Direct,
         },
         udp: UdpOptions::default(),
+        tcp_brutal: None,
     })
 }
 

@@ -13,13 +13,14 @@ use crate::codec::{TcpDecoder, TcpEncoder};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
+use crate::platform::{self, AcceptLoop, TcpBrutal};
 use crate::replay::ReplayCache;
 use crate::session::{
     ServerFirst, ensure_bulk, new_encode, new_recv, read_server_connect, relay, release_bulk,
     server_may_reuse, wait_reuse_idle, with_handshake_timeout, write_reject, write_tunnel,
 };
 use crate::udp::{UdpOptions, run_server_udp};
-use crate::{bind_listener, set_nodelay};
+use crate::{bind_listener, prepare_session_stream};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -28,6 +29,7 @@ pub struct ServerConfig {
     pub selection: ProtocolSelection,
     pub outbound: Outbound,
     pub udp: UdpOptions,
+    pub tcp_brutal: Option<TcpBrutal>,
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<(), SessionError> {
@@ -43,13 +45,17 @@ pub async fn serve_server(
     config: ServerConfig,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SessionError> {
+    if let Some(params) = config.tcp_brutal {
+        platform::require_tcp_brutal(params)?;
+    }
     tokio::pin!(shutdown);
     let kdf = Arc::new(KdfLimiter::new());
     let replay = Arc::new(ReplayCache::new());
+    let mut accept = AcceptLoop::new(&listener);
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            accepted = listener.accept() => {
+            accepted = accept.next() => {
                 let (stream, _) = accepted?;
                 let config = config.clone();
                 let kdf = kdf.clone();
@@ -68,7 +74,10 @@ pub(crate) async fn handle_server(
     kdf: Arc<KdfLimiter>,
     replay: Arc<ReplayCache>,
 ) -> Result<(), SessionError> {
-    set_nodelay(&snell)?;
+    prepare_session_stream(&snell)?;
+    if let Some(params) = config.tcp_brutal {
+        platform::apply_tcp_brutal(&snell, params)?;
+    }
     match config.selection {
         ProtocolSelection::Exact(ProtocolFlavor::V4 | ProtocolFlavor::V5) => {
             let psk = config.psk.clone();

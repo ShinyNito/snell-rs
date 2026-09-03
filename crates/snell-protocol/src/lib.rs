@@ -317,6 +317,8 @@ mod tests {
         assert_eq!(REPLAY_CACHE_TTL_SECS, 3600);
         assert_eq!(KDF_MAX_INFLIGHT, 8);
         assert_eq!(KDF_MAX_QUEUED, 32);
+        assert_eq!(TCP_KEEPALIVE_IDLE_SECS, 300);
+        assert_eq!(TCP_KEEPALIVE_INTERVAL_SECS, 75);
         assert_eq!(ProtocolSelection::Auto, ProtocolSelection::Auto);
         assert_eq!(
             ProtocolSelection::Exact(ProtocolFlavor::V4),

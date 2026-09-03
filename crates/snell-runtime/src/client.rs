@@ -1,19 +1,18 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use snell_protocol::socks5::Reply;
 use snell_protocol::{
-    Address, EncodeBuffer, ProtocolFlavor, Psk, RecvBuffer, TCP_CONNECT_TIMEOUT_SECS, V4Decoder,
-    V4Encoder, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
+    Address, EncodeBuffer, ProtocolFlavor, Psk, RecvBuffer, V4Decoder, V4Encoder, V6ShapedDecoder,
+    V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
 
 use crate::codec::{TcpDecoder, TcpEncoder};
-use crate::error::{SessionError, TimeoutKind};
+use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
+use crate::platform::AcceptLoop;
 use crate::pool::{PooledCodec, PooledConn, ReusePool};
 use crate::session::{
     client_may_pool, new_encode, new_recv, read_server_tunnel, relay, with_handshake_timeout,
@@ -21,7 +20,7 @@ use crate::session::{
 };
 use crate::socks::{Socks5Command, accept_socks5, socks5_reply_from_error, write_socks5_reply};
 use crate::udp::{UdpHub, UdpOptions};
-use crate::{bind_listener, set_nodelay};
+use crate::{bind_listener, connect_tcp, prepare_session_stream};
 
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -69,10 +68,11 @@ pub async fn serve_client(
         None
     };
     let hub = UdpHub::start(listener.local_addr()?, config.clone(), kdf.clone()).await?;
+    let mut accept = AcceptLoop::new(&listener);
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            accepted = listener.accept() => {
+            accepted = accept.next() => {
                 let (stream, _) = accepted?;
                 let config = config.clone();
                 let kdf = kdf.clone();
@@ -93,7 +93,7 @@ async fn handle_client(
     pool: Option<ReusePool>,
     hub: UdpHub,
 ) -> Result<(), SessionError> {
-    set_nodelay(&local)?;
+    prepare_session_stream(&local)?;
     match with_handshake_timeout(accept_socks5(&mut local)).await? {
         Socks5Command::Connect(destination) => {
             client_handshake_and_relay(&mut local, config, &destination, &kdf, pool.as_ref()).await
@@ -161,17 +161,7 @@ pub(crate) async fn dial_and_codec(
     version: ProtocolFlavor,
     kdf: &KdfLimiter,
 ) -> Result<(TcpStream, PooledCodec), SessionError> {
-    let stream = match timeout(
-        Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
-        TcpStream::connect(server),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return Err(error.into()),
-        Err(_) => return Err(SessionError::from_timeout(TimeoutKind::Connect)),
-    };
-    set_nodelay(&stream)?;
+    let stream = connect_tcp(server).await?;
     let codec = new_codec(psk, version, kdf).await?;
     Ok((stream, codec))
 }
@@ -390,7 +380,7 @@ async fn open_tunnel<E: TcpEncoder, D: TcpDecoder>(
     kdf: &KdfLimiter,
     psk: &Psk,
 ) -> Result<Vec<u8>, SessionError> {
-    set_nodelay(snell)?;
+    prepare_session_stream(snell)?;
     with_handshake_timeout(async {
         write_connect(encoder, encode, snell, destination.as_view(), reuse).await?;
         read_server_tunnel(decoder, recv, snell, kdf, psk).await
