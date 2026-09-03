@@ -10,14 +10,20 @@ pub enum SessionError {
     ConnectTimeout,
     #[error("cancelled")]
     Cancelled,
-    #[error("reuse is not implemented")]
-    ReuseNotImplemented,
     #[error("udp is not implemented")]
     UdpNotImplemented,
-    #[error("auto-detect is not implemented")]
-    AutoNotImplemented,
     #[error("v6-unsafe-raw is not enabled")]
     UnsafeRawDisabled,
+    #[error("reuse idle timed out")]
+    ReuseIdleTimeout,
+    #[error("early payload exceeds 64 KiB")]
+    EarlyPayloadTooLarge,
+    #[error("duplicate v6 salt")]
+    ReplayDuplicate,
+    #[error("auto-detect matched more than one candidate")]
+    AmbiguousProtocol,
+    #[error("kdf queue is full")]
+    KdfQueueFull,
     #[error("aead authentication failed")]
     Aead,
     #[error("socks5 has no acceptable method")]
@@ -48,6 +54,26 @@ impl SessionError {
             TimeoutKind::Connect => Self::ConnectTimeout,
         }
     }
+
+    pub fn is_stale_pool_error(&self) -> bool {
+        match self {
+            Self::HandshakeTimeout | Self::ConnectTimeout | Self::ReuseIdleTimeout => true,
+            Self::Io(error) => is_stale_io(error.kind()),
+            _ => false,
+        }
+    }
+}
+
+pub(crate) fn is_stale_io(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

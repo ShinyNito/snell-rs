@@ -1,7 +1,7 @@
 use snell_protocol::{
-    DecodeStatus, DecodedRecord, EncodeBuffer, RecvBuffer, Result, V4Decoder, V4Encoder,
-    V4Reservation, V6ShapedDecoder, V6ShapedEncoder, V6ShapedReservation, V6UnshapedDecoder,
-    V6UnshapedEncoder, V6UnshapedReservation,
+    AES_128_KEY_LEN, DecodeStatus, DecodedRecord, EncodeBuffer, RecvBuffer, Result, SALT_LEN,
+    V4Decoder, V4Encoder, V4Reservation, V6ShapedDecoder, V6ShapedEncoder, V6ShapedReservation,
+    V6UnshapedDecoder, V6UnshapedEncoder, V6UnshapedReservation,
 };
 
 pub(crate) trait TcpReservation {
@@ -22,6 +22,11 @@ pub(crate) trait TcpEncoder {
 pub(crate) trait TcpDecoder {
     fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus>;
     fn consume(&mut self, buf: &mut RecvBuffer, record: &DecodedRecord) -> Result<()>;
+    fn replay_identity(&self) -> Option<[u8; SALT_LEN]>;
+    fn has_unconsumed_plaintext(&self) -> bool;
+    fn kdf_need(&self) -> usize;
+    fn kdf_salt(&self, buf: &RecvBuffer) -> Result<[u8; SALT_LEN]>;
+    fn install_aead(&mut self, salt: [u8; SALT_LEN], key: [u8; AES_128_KEY_LEN]) -> Result<()>;
 }
 
 impl TcpReservation for V4Reservation<'_> {
@@ -56,6 +61,26 @@ impl TcpDecoder for V4Decoder {
 
     fn consume(&mut self, buf: &mut RecvBuffer, record: &DecodedRecord) -> Result<()> {
         V4Decoder::consume(self, buf, record)
+    }
+
+    fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
+        V4Decoder::replay_identity(self)
+    }
+
+    fn has_unconsumed_plaintext(&self) -> bool {
+        V4Decoder::has_unconsumed_plaintext(self)
+    }
+
+    fn kdf_need(&self) -> usize {
+        V4Decoder::kdf_need(self)
+    }
+
+    fn kdf_salt(&self, buf: &RecvBuffer) -> Result<[u8; SALT_LEN]> {
+        V4Decoder::kdf_salt(self, buf)
+    }
+
+    fn install_aead(&mut self, _salt: [u8; SALT_LEN], key: [u8; AES_128_KEY_LEN]) -> Result<()> {
+        V4Decoder::install_aead(self, key)
     }
 }
 
@@ -92,6 +117,26 @@ impl TcpDecoder for V6ShapedDecoder {
     fn consume(&mut self, buf: &mut RecvBuffer, record: &DecodedRecord) -> Result<()> {
         V6ShapedDecoder::consume(self, buf, record)
     }
+
+    fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
+        V6ShapedDecoder::replay_identity(self)
+    }
+
+    fn has_unconsumed_plaintext(&self) -> bool {
+        V6ShapedDecoder::has_unconsumed_plaintext(self)
+    }
+
+    fn kdf_need(&self) -> usize {
+        V6ShapedDecoder::kdf_need(self)
+    }
+
+    fn kdf_salt(&self, buf: &RecvBuffer) -> Result<[u8; SALT_LEN]> {
+        V6ShapedDecoder::kdf_salt(self, buf)
+    }
+
+    fn install_aead(&mut self, salt: [u8; SALT_LEN], key: [u8; AES_128_KEY_LEN]) -> Result<()> {
+        V6ShapedDecoder::install_aead(self, salt, key)
+    }
 }
 
 impl TcpReservation for V6UnshapedReservation<'_> {
@@ -126,5 +171,25 @@ impl TcpDecoder for V6UnshapedDecoder {
 
     fn consume(&mut self, buf: &mut RecvBuffer, record: &DecodedRecord) -> Result<()> {
         V6UnshapedDecoder::consume(self, buf, record)
+    }
+
+    fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
+        V6UnshapedDecoder::replay_identity(self)
+    }
+
+    fn has_unconsumed_plaintext(&self) -> bool {
+        V6UnshapedDecoder::has_unconsumed_plaintext(self)
+    }
+
+    fn kdf_need(&self) -> usize {
+        V6UnshapedDecoder::kdf_need(self)
+    }
+
+    fn kdf_salt(&self, buf: &RecvBuffer) -> Result<[u8; SALT_LEN]> {
+        V6UnshapedDecoder::kdf_salt(self, buf)
+    }
+
+    fn install_aead(&mut self, salt: [u8; SALT_LEN], key: [u8; AES_128_KEY_LEN]) -> Result<()> {
+        V6UnshapedDecoder::install_aead(self, salt, key)
     }
 }

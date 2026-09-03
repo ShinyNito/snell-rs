@@ -1,8 +1,9 @@
 //! Two-stage configuration: raw text → validated config.
 //!
-//! Unknown keys, unimplemented reuse/auto/UDP/unsafe-raw/tcp-brutal, and
-//! missing required fields fail closed. PSK is stored as [`Psk`] so `Debug`
-//! does not print the secret.
+//! Unknown keys, unimplemented UDP/unsafe-raw/tcp-brutal, and missing
+//! required fields fail closed. `reuse = true` is allowed. Omitting server
+//! `version` selects auto-detect. PSK is stored as [`Psk`] so `Debug` does
+//! not print the secret.
 
 #![deny(unsafe_code)]
 
@@ -14,7 +15,7 @@ use std::path::Path;
 use snell_protocol::{PSK_MAX_LEN, PSK_MIN_LEN, Psk};
 
 pub use snell_protocol as protocol;
-pub use snell_protocol::ProtocolFlavor;
+pub use snell_protocol::{ProtocolFlavor, ProtocolSelection};
 
 const CLIENT_SECTION: &str = "snell-client";
 const SERVER_SECTION: &str = "snell-server";
@@ -65,6 +66,7 @@ pub struct ClientConfig {
     pub server: SocketAddr,
     pub psk: Psk,
     pub version: ProtocolFlavor,
+    pub reuse: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,7 +79,7 @@ pub enum Outbound {
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub psk: Psk,
-    pub version: ProtocolFlavor,
+    pub selection: ProtocolSelection,
     pub outbound: Outbound,
 }
 
@@ -99,12 +101,6 @@ impl ClientConfig {
         reject_unknown(CLIENT_SECTION, section, CLIENT_KEYS)?;
 
         let reuse = optional_bool(CLIENT_SECTION, section, "reuse")?.unwrap_or(false);
-        if reuse {
-            return Err(ConfigError::Unsupported(
-                "client reuse is not implemented in this phase",
-            ));
-        }
-
         let version = parse_client_version(required(CLIENT_SECTION, section, "version")?)?;
         Ok(Self {
             listen: parse_socket(
@@ -119,6 +115,7 @@ impl ClientConfig {
             )?,
             psk: parse_psk(CLIENT_SECTION, required(CLIENT_SECTION, section, "psk")?)?,
             version,
+            reuse,
         })
     }
 }
@@ -153,13 +150,20 @@ impl ServerConfig {
             ));
         }
 
-        let version = match section.get("version") {
+        let selection = match section.get("version") {
             None => {
-                return Err(ConfigError::Unsupported(
-                    "server auto-detect is not implemented in this phase",
-                ));
+                if section.get("mode").is_some() {
+                    return Err(ConfigError::Invalid {
+                        section: SERVER_SECTION,
+                        key: "mode",
+                        msg: "mode is only valid when version = 6".to_owned(),
+                    });
+                }
+                ProtocolSelection::Auto
             }
-            Some(version) => parse_server_version(version, section.get("mode"))?,
+            Some(version) => {
+                ProtocolSelection::Exact(parse_server_version(version, section.get("mode"))?)
+            }
         };
 
         let outbound = match section.get("upstream_socks5") {
@@ -176,7 +180,7 @@ impl ServerConfig {
                 required(SERVER_SECTION, section, "listen")?,
             )?,
             psk: parse_psk(SERVER_SECTION, required(SERVER_SECTION, section, "psk")?)?,
-            version,
+            selection,
             outbound,
         })
     }
@@ -405,16 +409,18 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.listen, "127.0.0.1:1080".parse().unwrap());
         assert_eq!(cfg.version, ProtocolFlavor::V4);
+        assert!(!cfg.reuse);
         assert_eq!(format!("{:?}", cfg.psk), "Psk(redacted)");
     }
 
     #[test]
-    fn client_reuse_fails_closed() {
-        let err = ClientConfig::parse(&format!(
+    fn client_reuse_true_parses() {
+        let cfg = ClientConfig::parse(&format!(
             "[snell-client]\nlisten = 127.0.0.1:1080\nserver = 127.0.0.1:8388\npsk = {PSK}\nversion = v4\nreuse = true\n"
         ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported(_)));
+        .unwrap();
+        assert!(cfg.reuse);
+        assert_eq!(cfg.version, ProtocolFlavor::V4);
     }
 
     #[test]
@@ -427,12 +433,12 @@ mod tests {
     }
 
     #[test]
-    fn server_missing_version_fails_closed() {
-        let err = ServerConfig::parse(&format!(
+    fn server_missing_version_is_auto() {
+        let cfg = ServerConfig::parse(&format!(
             "[snell-server]\nlisten = 127.0.0.1:8388\npsk = {PSK}\n"
         ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported(_)));
+        .unwrap();
+        assert_eq!(cfg.selection, ProtocolSelection::Auto);
     }
 
     #[test]
@@ -441,7 +447,10 @@ mod tests {
             "[snell-server]\nlisten = 127.0.0.1:8388\npsk = {PSK}\nversion = 6\nmode = unshaped\n"
         ))
         .unwrap();
-        assert_eq!(cfg.version, ProtocolFlavor::V6Unshaped);
+        assert_eq!(
+            cfg.selection,
+            ProtocolSelection::Exact(ProtocolFlavor::V6Unshaped)
+        );
         assert_eq!(cfg.outbound, Outbound::Direct);
     }
 
@@ -451,12 +460,18 @@ mod tests {
             "[snell-server]\nlisten = 127.0.0.1:8388\npsk = {PSK}\nversion = 6\nmode = Unshaped\n"
         ))
         .unwrap();
-        assert_eq!(cfg.version, ProtocolFlavor::V6Unshaped);
+        assert_eq!(
+            cfg.selection,
+            ProtocolSelection::Exact(ProtocolFlavor::V6Unshaped)
+        );
         let cfg = ServerConfig::parse(&format!(
             "[snell-server]\nlisten = 127.0.0.1:8388\npsk = {PSK}\nversion = 6\nmode = DEFAULT\n"
         ))
         .unwrap();
-        assert_eq!(cfg.version, ProtocolFlavor::V6Shaped);
+        assert_eq!(
+            cfg.selection,
+            ProtocolSelection::Exact(ProtocolFlavor::V6Shaped)
+        );
     }
 
     #[test]

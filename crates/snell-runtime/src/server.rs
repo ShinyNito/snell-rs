@@ -1,18 +1,22 @@
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use snell_protocol::{
-    ProtocolFlavor, Psk, V4Decoder, V4Encoder, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder,
-    V6UnshapedEncoder,
+    EncodeBuffer, ProtocolFlavor, ProtocolSelection, Psk, RecvBuffer, V4Decoder, V4Encoder,
+    V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::auto::{Detected, detect_protocol};
 use crate::codec::{TcpDecoder, TcpEncoder};
 use crate::error::SessionError;
+use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
+use crate::replay::ReplayCache;
 use crate::session::{
-    new_encode, new_recv, read_server_connect, relay, with_handshake_timeout, write_reject,
-    write_tunnel,
+    ServerConnect, ensure_bulk, new_encode, new_recv, read_server_connect, relay, release_bulk,
+    server_may_reuse, wait_reuse_idle, with_handshake_timeout, write_reject, write_tunnel,
 };
 use crate::{bind_listener, set_nodelay};
 
@@ -20,7 +24,7 @@ use crate::{bind_listener, set_nodelay};
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub psk: Psk,
-    pub version: ProtocolFlavor,
+    pub selection: ProtocolSelection,
     pub outbound: Outbound,
 }
 
@@ -38,91 +42,219 @@ pub async fn serve_server(
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SessionError> {
     tokio::pin!(shutdown);
+    let kdf = Arc::new(KdfLimiter::new());
+    let replay = Arc::new(ReplayCache::new());
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let config = config.clone();
+                let kdf = kdf.clone();
+                let replay = replay.clone();
                 tokio::spawn(async move {
-                    let _ = handle_server(stream, config).await;
+                    let _ = handle_server(stream, config, kdf, replay).await;
                 });
             }
         }
     }
 }
 
-async fn handle_server(snell: TcpStream, config: ServerConfig) -> Result<(), SessionError> {
+pub(crate) async fn handle_server(
+    snell: TcpStream,
+    config: ServerConfig,
+    kdf: Arc<KdfLimiter>,
+    replay: Arc<ReplayCache>,
+) -> Result<(), SessionError> {
     set_nodelay(&snell)?;
-    match config.version {
-        ProtocolFlavor::V4 | ProtocolFlavor::V5 => {
-            let encoder = V4Encoder::os(&config.psk)?;
+    match config.selection {
+        ProtocolSelection::Exact(ProtocolFlavor::V4 | ProtocolFlavor::V5) => {
+            let psk = config.psk.clone();
+            let encoder = kdf.run(move || V4Encoder::os(&psk)).await??;
             let decoder = V4Decoder::new(config.psk.clone());
-            server_session(snell, encoder, decoder, config.outbound).await
+            server_session(
+                snell,
+                encoder,
+                decoder,
+                config.outbound,
+                &kdf,
+                &config.psk,
+                None,
+                new_recv(),
+                new_encode(),
+                None,
+            )
+            .await
         }
-        ProtocolFlavor::V6Shaped => {
-            let encoder = V6ShapedEncoder::os(&config.psk)?;
+        ProtocolSelection::Exact(ProtocolFlavor::V6Shaped) => {
+            let psk = config.psk.clone();
+            let encoder = kdf.run(move || V6ShapedEncoder::os(&psk)).await??;
             let decoder = V6ShapedDecoder::new(config.psk.clone())?;
-            server_session(snell, encoder, decoder, config.outbound).await
+            server_session(
+                snell,
+                encoder,
+                decoder,
+                config.outbound,
+                &kdf,
+                &config.psk,
+                Some(replay.as_ref()),
+                new_recv(),
+                new_encode(),
+                None,
+            )
+            .await
         }
-        ProtocolFlavor::V6Unshaped => {
-            let encoder = V6UnshapedEncoder::os(&config.psk)?;
+        ProtocolSelection::Exact(ProtocolFlavor::V6Unshaped) => {
+            let psk = config.psk.clone();
+            let encoder = kdf.run(move || V6UnshapedEncoder::os(&psk)).await??;
             let decoder = V6UnshapedDecoder::new(config.psk.clone());
-            server_session(snell, encoder, decoder, config.outbound).await
+            server_session(
+                snell,
+                encoder,
+                decoder,
+                config.outbound,
+                &kdf,
+                &config.psk,
+                Some(replay.as_ref()),
+                new_recv(),
+                new_encode(),
+                None,
+            )
+            .await
+        }
+        ProtocolSelection::Auto => {
+            let mut snell = snell;
+            match detect_protocol(&mut snell, config.psk.clone(), &kdf, &replay).await? {
+                Detected::V4 {
+                    encoder,
+                    decoder,
+                    recv,
+                    connect,
+                } => {
+                    server_session(
+                        snell,
+                        encoder,
+                        decoder,
+                        config.outbound,
+                        &kdf,
+                        &config.psk,
+                        None,
+                        recv,
+                        new_encode(),
+                        Some(connect),
+                    )
+                    .await
+                }
+                Detected::V6Shaped {
+                    encoder,
+                    decoder,
+                    recv,
+                    connect,
+                } => {
+                    server_session(
+                        snell,
+                        encoder,
+                        decoder,
+                        config.outbound,
+                        &kdf,
+                        &config.psk,
+                        None,
+                        recv,
+                        new_encode(),
+                        Some(connect),
+                    )
+                    .await
+                }
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn server_session<E: TcpEncoder, D: TcpDecoder>(
     mut snell: TcpStream,
     mut encoder: E,
     mut decoder: D,
     outbound: Outbound,
+    kdf: &KdfLimiter,
+    psk: &Psk,
+    mut replay: Option<&ReplayCache>,
+    mut recv: RecvBuffer,
+    mut encode: EncodeBuffer,
+    mut pending: Option<ServerConnect>,
 ) -> Result<(), SessionError> {
-    let mut encode = new_encode();
-    let mut recv = new_recv();
-    let connect = match with_handshake_timeout(read_server_connect(
-        &mut decoder,
-        &mut recv,
-        &mut snell,
-    ))
-    .await
-    {
-        Ok(connect) => connect,
-        Err(error @ (SessionError::ReuseNotImplemented | SessionError::UdpNotImplemented)) => {
-            let message = match error {
-                SessionError::ReuseNotImplemented => "reuse is not implemented",
-                _ => "udp is not implemented",
-            };
-            let _ = write_reject(&mut encoder, &mut encode, &mut snell, message).await;
-            return Err(error);
-        }
-        Err(error) => return Err(error),
-    };
+    let mut first = true;
+    loop {
+        let connect = if let Some(connect) = pending.take() {
+            connect
+        } else {
+            if !first {
+                wait_reuse_idle(&mut snell, &mut recv).await?;
+            }
+            match with_handshake_timeout(read_server_connect(
+                &mut decoder,
+                &mut recv,
+                &mut snell,
+                kdf,
+                psk,
+                replay,
+            ))
+            .await
+            {
+                Ok(connect) => connect,
+                Err(error @ SessionError::UdpNotImplemented) => {
+                    let _ = write_reject(
+                        &mut encoder,
+                        &mut encode,
+                        &mut snell,
+                        "udp is not implemented",
+                    )
+                    .await;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        first = false;
+        replay = None;
 
-    let mut remote = match with_handshake_timeout(async {
-        let remote = outbound.connect(&connect.destination).await?;
-        write_tunnel(&mut encoder, &mut encode, &mut snell).await?;
-        Ok(remote)
-    })
-    .await
-    {
-        Ok(remote) => remote,
-        Err(error) => {
-            let _ = write_reject(&mut encoder, &mut encode, &mut snell, &error.to_string()).await;
-            return Err(error);
+        let mut remote = match with_handshake_timeout(async {
+            let remote = outbound.connect(&connect.destination).await?;
+            write_tunnel(&mut encoder, &mut encode, &mut snell).await?;
+            Ok(remote)
+        })
+        .await
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                let _ =
+                    write_reject(&mut encoder, &mut encode, &mut snell, &error.to_string()).await;
+                return Err(error);
+            }
+        };
+
+        recv = ensure_bulk(recv)?;
+        encode = new_encode();
+        let ends = relay(
+            &mut snell,
+            &mut remote,
+            &mut encoder,
+            &mut decoder,
+            &mut recv,
+            &mut encode,
+            &connect.leftover,
+            &[],
+            connect.reuse,
+        )
+        .await?;
+        if !connect.reuse {
+            return Ok(());
         }
-    };
-    relay(
-        &mut snell,
-        &mut remote,
-        &mut encoder,
-        &mut decoder,
-        &mut recv,
-        &mut encode,
-        &connect.leftover,
-        &[],
-    )
-    .await?;
-    Ok(())
+        if !server_may_reuse(ends, &encode, &decoder) {
+            return Ok(());
+        }
+        let released = release_bulk(recv, encode)?;
+        recv = released.0;
+        encode = released.1;
+    }
 }

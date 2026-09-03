@@ -356,6 +356,36 @@ impl V6ShapedDecoder {
         self.replay
     }
 
+    pub fn has_unconsumed_plaintext(&self) -> bool {
+        self.busy
+    }
+
+    pub fn kdf_need(&self) -> usize {
+        if self.aead.is_none() && matches!(self.step, ReadStep::Salt) {
+            self.profile.salt_block_len()
+        } else {
+            0
+        }
+    }
+
+    pub fn kdf_salt(&self, buf: &RecvBuffer) -> Result<[u8; SALT_LEN]> {
+        let salt_len = self.profile.salt_block_len();
+        if buf.len() < salt_len {
+            return Err(Error::Truncated);
+        }
+        self.profile.extract_salt(&buf.filled()[..salt_len])
+    }
+
+    pub fn install_aead(
+        &mut self,
+        salt: [u8; SALT_LEN],
+        key: [u8; crate::AES_128_KEY_LEN],
+    ) -> Result<()> {
+        self.aead = Some(Aes128Gcm::new(&key)?);
+        self.replay = Some(salt);
+        Ok(())
+    }
+
     pub fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus> {
         if self.busy {
             return Err(Error::PlaintextNotDrained);
@@ -367,11 +397,13 @@ impl V6ShapedDecoder {
                     if let Some(need) = Self::decode_need(buf, salt_len)? {
                         return Ok(need);
                     }
-                    let salt = self.profile.extract_salt(&buf.filled()[..salt_len])?;
-                    let mut key = aead_key(self.psk.as_bytes(), &salt)?;
-                    self.aead = Some(Aes128Gcm::new(&key)?);
-                    key.zeroize();
-                    self.replay = Some(salt);
+                    if self.aead.is_none() {
+                        let salt = self.profile.extract_salt(&buf.filled()[..salt_len])?;
+                        let mut key = aead_key(self.psk.as_bytes(), &salt)?;
+                        self.aead = Some(Aes128Gcm::new(&key)?);
+                        key.zeroize();
+                        self.replay = Some(salt);
+                    }
                     self.step = ReadStep::Header {
                         prefix_len: self.profile.record_prefix_len(self.seq),
                     };
