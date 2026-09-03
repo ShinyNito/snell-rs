@@ -13,14 +13,11 @@ struct Cli {
 enum Task {
     /// Run fmt, clippy, nextest, and cargo deny.
     Check,
-    /// Process-level TCP echo soak (`SNELL_SOAK_SECS`, default 15).
-    Soak,
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
         Task::Check => finish(check()),
-        Task::Soak => finish(soak()),
     }
 }
 
@@ -48,19 +45,6 @@ fn check() -> anyhow::Result<()> {
     run(Command::new("cargo").args(["nextest", "run", "--workspace", "--all-features"]))?;
     run(Command::new("cargo").args(["deny", "check"]))?;
     Ok(())
-}
-
-fn soak() -> anyhow::Result<()> {
-    run(Command::new("cargo").args([
-        "test",
-        "-p",
-        "snell",
-        "--test",
-        "soak",
-        "--",
-        "--ignored",
-        "--nocapture",
-    ]))
 }
 
 fn run(command: &mut Command) -> anyhow::Result<()> {

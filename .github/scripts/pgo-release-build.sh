@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Two-pass LLVM PGO for snell-rs. Training load is crates/snell/tests/soak.rs.
+# Two-pass LLVM PGO for snell-rs. Training uses the runtime loopback benchmarks.
 # target-cpu=native is forbidden: artifacts must run on machines other than the builder.
 set -euo pipefail
 
@@ -55,10 +55,10 @@ if ! "${bin}" version >/dev/null 2>&1; then
 fi
 
 export LLVM_PROFILE_FILE="${pgo}/snell-%p-%m.profraw"
-export SNELL_RS_TEST_BIN="${bin}"
-export SNELL_SOAK_SECS="${SNELL_SOAK_SECS:-30}"
 
-cargo test --release --locked --target "${target}" -p snell --test soak -- --ignored --nocapture
+cargo test --release --locked --target "${target}" -p snell-runtime --bench tcp_loopback -- --nocapture
+cargo test --release --locked --target "${target}" -p snell-runtime --bench reuse_loopback -- --nocapture
+cargo test --release --locked --target "${target}" -p snell-runtime --bench udp_loopback -- --nocapture
 
 shopt -s nullglob
 raws=("${pgo}"/*.profraw)
@@ -67,9 +67,13 @@ if [[ ${#raws[@]} -eq 0 ]]; then
   exit 1
 fi
 "${profdata}" merge -o "${pgo}/merged.profdata" "${raws[@]}"
+if ! "${profdata}" show --covered "${pgo}/merged.profdata" | awk '/snell_runtime/{found=1} END{exit !found}'; then
+  echo "PGO profile does not cover snell-runtime" >&2
+  exit 1
+fi
 
 unset CARGO_PROFILE_RELEASE_STRIP
-export RUSTFLAGS="-Ctarget-cpu=${cpu} -Cprofile-use=${pgo}/merged.profdata -Cllvm-args=-pgo-warn-mismatch"
+export RUSTFLAGS="-Ctarget-cpu=${cpu} -Cprofile-use=${pgo}/merged.profdata"
 cargo build --release --locked --target "${target}" -p snell
 echo trained >"${status_file}"
 

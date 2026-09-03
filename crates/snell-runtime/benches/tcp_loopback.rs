@@ -1,4 +1,4 @@
-//! TCP one-shot loopback on an established session.
+//! TCP one-shot loopback on established v4 and v6 sessions.
 //!
 //! Handshake/KDF is warmed up and excluded from the timed window.
 //! Large stream is pipelined echo (write and read concurrently).
@@ -32,40 +32,46 @@ fn main() {
 }
 
 async fn run() {
-    let pair = start_pair().await;
-    let echo = spawn_echo().await.expect("echo");
-    let handshake_started = Instant::now();
-    let mut stream = socks5_connect(pair.socks, echo.addr)
-        .await
-        .expect("socks5 connect");
-    stream.set_nodelay(true).expect("nodelay");
-    let handshake_elapsed = handshake_started.elapsed();
+    for flavor in [
+        ProtocolFlavor::V4,
+        ProtocolFlavor::V6Shaped,
+        ProtocolFlavor::V6Unshaped,
+    ] {
+        let pair = start_pair(flavor).await;
+        let echo = spawn_echo().await.expect("echo");
+        let handshake_started = Instant::now();
+        let mut stream = socks5_connect(pair.socks, echo.addr)
+            .await
+            .expect("socks5 connect");
+        stream.set_nodelay(true).expect("nodelay");
+        let handshake_elapsed = handshake_started.elapsed();
 
-    let warmup = vec![0xA5u8; WARMUP_BYTES];
-    sequential_echo(&mut stream, &warmup).await.expect("warmup");
+        let warmup = vec![0xA5u8; WARMUP_BYTES];
+        sequential_echo(&mut stream, &warmup).await.expect("warmup");
 
-    let large_started = Instant::now();
-    pipelined_echo(&mut stream, LARGE_BYTES, LARGE_CHUNK, 0xA5)
-        .await
-        .expect("large");
-    let large_elapsed = large_started.elapsed();
+        let large_started = Instant::now();
+        pipelined_echo(&mut stream, LARGE_BYTES, LARGE_CHUNK, 0xA5)
+            .await
+            .expect("large");
+        let large_elapsed = large_started.elapsed();
 
-    let small = [0x5Au8; SMALL_SIZE];
-    let small_started = Instant::now();
-    ping_pong(&mut stream, &small, SMALL_ROUNDS)
-        .await
-        .expect("small");
-    let small_elapsed = small_started.elapsed();
+        let small = [0x5Au8; SMALL_SIZE];
+        let small_started = Instant::now();
+        ping_pong(&mut stream, &small, SMALL_ROUNDS)
+            .await
+            .expect("small");
+        let small_elapsed = small_started.elapsed();
 
-    stream.shutdown().await.expect("shutdown");
-    echo.join.await.expect("echo join").expect("echo copy");
+        stream.shutdown().await.expect("shutdown");
+        echo.join.await.expect("echo join").expect("echo copy");
 
-    eprintln!(
-        "v4 tcp loopback established session, handshake excluded from large/small\n\
-         handshake: elapsed={handshake_elapsed:?}\n\
-         large: bytes={LARGE_BYTES} chunk={LARGE_CHUNK} elapsed={large_elapsed:?}\n\
-         small: rounds={SMALL_ROUNDS} size={SMALL_SIZE} elapsed={small_elapsed:?}"
-    );
+        eprintln!(
+            "{flavor:?} tcp loopback established session, handshake excluded from large/small\n\
+             handshake: elapsed={handshake_elapsed:?}\n\
+             large: bytes={LARGE_BYTES} chunk={LARGE_CHUNK} elapsed={large_elapsed:?}\n\
+             small: rounds={SMALL_ROUNDS} size={SMALL_SIZE} elapsed={small_elapsed:?}"
+        );
+    }
 }
 
 struct Pair {
@@ -79,7 +85,7 @@ struct Echo {
     join: tokio::task::JoinHandle<io::Result<()>>,
 }
 
-async fn start_pair() -> Pair {
+async fn start_pair(flavor: ProtocolFlavor) -> Pair {
     let psk = Psk::new(PSK.to_vec()).unwrap();
     let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_listener.local_addr().unwrap();
@@ -91,7 +97,7 @@ async fn start_pair() -> Pair {
     let server_cfg = ServerConfig {
         listen: server_addr,
         psk: psk.clone(),
-        selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
+        selection: ProtocolSelection::Exact(flavor),
         outbound: Outbound::Direct,
         udp: UdpOptions::default(),
         tcp_brutal: None,
@@ -106,7 +112,7 @@ async fn start_pair() -> Pair {
         listen: socks,
         server: server_addr,
         psk,
-        version: ProtocolFlavor::V4,
+        version: flavor,
         reuse: false,
         pool: None,
         udp: UdpOptions::default(),

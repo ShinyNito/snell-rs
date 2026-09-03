@@ -174,8 +174,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: PGO release build
         shell: bash
-        env:
-          SNELL_SOAK_SECS: "30"
         run: bash .github/scripts/pgo-release-build.sh "${{ matrix.target }}" "${{ matrix.cpu }}" "${{ matrix.binary }}"
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
