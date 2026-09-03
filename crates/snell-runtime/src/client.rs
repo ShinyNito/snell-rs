@@ -50,13 +50,9 @@ impl std::fmt::Debug for ClientConfig {
 }
 
 pub async fn run_client(config: ClientConfig) -> Result<(), SessionError> {
-    let listener = match bind_listener(config.listen) {
-        Ok(listener) => listener,
-        Err(error) => {
-            tracing::error!(error = %error, listen = %config.listen, "bind failed");
-            return Err(error.into());
-        }
-    };
+    let listener = bind_listener(config.listen).inspect_err(|error| {
+        tracing::error!(error = %error, listen = %config.listen, "bind failed");
+    })?;
     serve_client(listener, config, async {
         let _ = tokio::signal::ctrl_c().await;
     })

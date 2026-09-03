@@ -101,7 +101,6 @@ fn init_logging(log_level: Option<&str>) {
                 .with_writer(std::io::stderr)
                 .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
                 .with_target(false)
-                .with_level(true)
                 .compact(),
         )
         .init();

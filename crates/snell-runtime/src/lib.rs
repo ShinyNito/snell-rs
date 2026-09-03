@@ -35,7 +35,7 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::time::timeout;
 
 pub use client::{ClientConfig, run_client, serve_client};
-pub use error::{DirectionEnd, SessionError};
+pub use error::SessionError;
 pub use outbound::Outbound;
 pub use platform::{PlatformError, TcpBrutal};
 pub use pool::ReusePool;
