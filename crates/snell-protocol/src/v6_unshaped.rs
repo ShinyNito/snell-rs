@@ -252,6 +252,37 @@ impl V6UnshapedDecoder {
         self.replay
     }
 
+    pub fn has_unconsumed_plaintext(&self) -> bool {
+        self.busy
+    }
+
+    pub fn kdf_need(&self) -> usize {
+        if self.aead.is_none() && matches!(self.step, ReadStep::Salt) {
+            SALT_LEN
+        } else {
+            0
+        }
+    }
+
+    pub fn kdf_salt(&self, buf: &RecvBuffer) -> Result<[u8; SALT_LEN]> {
+        if buf.len() < SALT_LEN {
+            return Err(Error::Truncated);
+        }
+        let mut salt = [0u8; SALT_LEN];
+        salt.copy_from_slice(&buf.filled()[..SALT_LEN]);
+        Ok(salt)
+    }
+
+    pub fn install_aead(
+        &mut self,
+        salt: [u8; SALT_LEN],
+        key: [u8; crate::AES_128_KEY_LEN],
+    ) -> Result<()> {
+        self.aead = Some(Aes128Gcm::new(&key)?);
+        self.replay = Some(salt);
+        Ok(())
+    }
+
     pub fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus> {
         if self.busy {
             return Err(Error::PlaintextNotDrained);
@@ -262,12 +293,14 @@ impl V6UnshapedDecoder {
                     if let Some(need) = Self::decode_need(buf, SALT_LEN)? {
                         return Ok(need);
                     }
-                    let mut salt = [0u8; SALT_LEN];
-                    salt.copy_from_slice(&buf.filled()[..SALT_LEN]);
-                    let mut key = aead_key(self.psk.as_bytes(), &salt)?;
-                    self.aead = Some(Aes128Gcm::new(&key)?);
-                    key.zeroize();
-                    self.replay = Some(salt);
+                    if self.aead.is_none() {
+                        let mut salt = [0u8; SALT_LEN];
+                        salt.copy_from_slice(&buf.filled()[..SALT_LEN]);
+                        let mut key = aead_key(self.psk.as_bytes(), &salt)?;
+                        self.aead = Some(Aes128Gcm::new(&key)?);
+                        key.zeroize();
+                        self.replay = Some(salt);
+                    }
                     self.step = ReadStep::Header;
                 }
                 ReadStep::Header => {

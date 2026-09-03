@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use snell_config::{ClientConfig as FileClientConfig, ServerConfig as FileServerConfig};
-use snell_runtime::{ClientConfig, Outbound, ServerConfig, run_client, run_server};
+use snell_runtime::{
+    ClientConfig, Outbound, ProtocolSelection, ServerConfig, run_client, run_server,
+};
 
 #[derive(Parser)]
 #[command(name = "snell-rs", version, about = "Snell client/server")]
@@ -30,7 +32,7 @@ enum Command {
 ))]
 struct ClientArgs {
     /// Path to an INI config file.
-    #[arg(long, value_name = "FILE", conflicts_with_all = ["listen", "server", "psk", "version"])]
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["listen", "server", "psk", "version", "reuse"])]
     config: Option<PathBuf>,
     /// SOCKS5 listen address.
     #[arg(requires_all = ["server", "psk", "version"])]
@@ -38,6 +40,9 @@ struct ClientArgs {
     server: Option<SocketAddr>,
     psk: Option<String>,
     version: Option<String>,
+    /// Enable CONNECT_V2 client reuse.
+    #[arg(long)]
+    reuse: bool,
 }
 
 #[derive(Args)]
@@ -65,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Version => {
             println!(
-                "snell-rs {} (current phase stops after Phase 5)",
+                "snell-rs {} (current phase stops after Phase 6)",
                 env!("CARGO_PKG_VERSION")
             );
         }
@@ -87,6 +92,8 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
             server: cfg.server,
             psk: cfg.psk,
             version: cfg.version,
+            reuse: cfg.reuse,
+            pool: None,
         });
     }
     Ok(ClientConfig {
@@ -94,6 +101,8 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
         server: args.server.expect("required by clap"),
         psk: snell_config::parse_psk_str(&args.psk.expect("required by clap"))?,
         version: snell_config::parse_client_version(&args.version.expect("required by clap"))?,
+        reuse: args.reuse,
+        pool: None,
     })
 }
 
@@ -103,18 +112,24 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
         return Ok(ServerConfig {
             listen: cfg.listen,
             psk: cfg.psk,
-            version: cfg.version,
+            selection: cfg.selection,
             outbound: map_outbound(cfg.outbound),
         });
     }
-    let version = args
-        .version
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("server auto-detect is not implemented in this phase"))?;
+    if args.version.is_none() && args.mode.is_some() {
+        anyhow::bail!("mode is only valid when version = 6");
+    }
+    let selection = match args.version.as_deref() {
+        None => ProtocolSelection::Auto,
+        Some(version) => ProtocolSelection::Exact(snell_config::parse_server_version(
+            version,
+            args.mode.as_deref(),
+        )?),
+    };
     Ok(ServerConfig {
         listen: args.listen.expect("required by clap"),
         psk: snell_config::parse_psk_str(&args.psk.expect("required by clap"))?,
-        version: snell_config::parse_server_version(version, args.mode.as_deref())?,
+        selection,
         outbound: match args.socks5_outbound {
             Some(server) => Outbound::Socks5 { server },
             None => Outbound::Direct,

@@ -2,13 +2,20 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use snell_protocol::{ProtocolFlavor, Psk};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use snell_protocol::{ProtocolFlavor, ProtocolSelection, Psk, V4Decoder, V4Encoder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
+use crate::pool::{PooledCodec, PooledConn, ReusePool};
+use crate::replay::ReplayCache;
+use crate::server::handle_server;
 use crate::{ClientConfig, ServerConfig, serve_client, serve_server};
 
 const PSK: &[u8] = b"0123456789abcdef";
@@ -20,6 +27,15 @@ struct Pair {
 }
 
 async fn start_pair(version: ProtocolFlavor, outbound: Outbound) -> Pair {
+    start_pair_reuse(version, outbound, false, None).await
+}
+
+async fn start_pair_reuse(
+    version: ProtocolFlavor,
+    outbound: Outbound,
+    reuse: bool,
+    pool: Option<ReusePool>,
+) -> Pair {
     let psk = Psk::new(PSK.to_vec()).unwrap();
     let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_listener.local_addr().unwrap();
@@ -32,7 +48,7 @@ async fn start_pair(version: ProtocolFlavor, outbound: Outbound) -> Pair {
     let server_cfg = ServerConfig {
         listen: server_addr,
         psk: psk.clone(),
-        version,
+        selection: ProtocolSelection::Exact(version),
         outbound,
     };
     tokio::spawn(async move {
@@ -47,6 +63,8 @@ async fn start_pair(version: ProtocolFlavor, outbound: Outbound) -> Pair {
         server: server_addr,
         psk,
         version,
+        reuse,
+        pool,
     };
     tokio::spawn(async move {
         let _ = serve_client(client_listener, client_cfg, async {
@@ -210,7 +228,7 @@ async fn handshake_timeout() {
     let cfg = ServerConfig {
         listen: server_addr,
         psk,
-        version: ProtocolFlavor::V4,
+        selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
         outbound: Outbound::Direct,
     };
     tokio::spawn(async move {
@@ -260,6 +278,8 @@ async fn socks5_reply_when_snell_closes_after_dial() {
         server: snell_addr,
         psk,
         version: ProtocolFlavor::V4,
+        reuse: false,
+        pool: None,
     };
     tokio::spawn(async move {
         let _ = serve_client(client_listener, cfg, async {
@@ -344,6 +364,8 @@ fn tcp_hot_path_has_no_channel_or_flush() {
         include_str!("server.rs"),
         include_str!("bufio.rs"),
         include_str!("outbound.rs"),
+        include_str!("auto.rs"),
+        include_str!("pool.rs"),
     ];
     for src in sources {
         assert!(!src.contains("mpsc"), "TCP path must not use mpsc");
@@ -360,4 +382,297 @@ fn tcp_hot_path_has_no_channel_or_flush() {
             "TCP path must not allocate per record"
         );
     }
+}
+
+struct Counted {
+    socks: SocketAddr,
+    accepts: Arc<AtomicUsize>,
+    _stop_client: oneshot::Sender<()>,
+}
+
+async fn start_counted(
+    version: ProtocolFlavor,
+    selection: ProtocolSelection,
+    reuse: bool,
+    pool: Option<ReusePool>,
+) -> Counted {
+    let psk = Psk::new(PSK.to_vec()).unwrap();
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks = client_listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let (stop_client, client_rx) = oneshot::channel();
+
+    let server_cfg = ServerConfig {
+        listen: server_addr,
+        psk: psk.clone(),
+        selection,
+        outbound: Outbound::Direct,
+    };
+    let kdf = Arc::new(KdfLimiter::new());
+    let replay = Arc::new(ReplayCache::new());
+    let accepts_server = accepts.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = server_listener.accept().await else {
+                break;
+            };
+            accepts_server.fetch_add(1, Ordering::SeqCst);
+            let server_cfg = server_cfg.clone();
+            let kdf = kdf.clone();
+            let replay = replay.clone();
+            tokio::spawn(async move {
+                let _ = handle_server(stream, server_cfg, kdf, replay).await;
+            });
+        }
+    });
+
+    let client_cfg = ClientConfig {
+        listen: socks,
+        server: server_addr,
+        psk,
+        version,
+        reuse,
+        pool,
+    };
+    tokio::spawn(async move {
+        let _ = serve_client(client_listener, client_cfg, async {
+            let _ = client_rx.await;
+        })
+        .await;
+    });
+
+    Counted {
+        socks,
+        accepts,
+        _stop_client: stop_client,
+    }
+}
+
+async fn reuse_two_echoes(version: ProtocolFlavor) {
+    let counted = start_counted(version, ProtocolSelection::Exact(version), true, None).await;
+    for i in 0..2 {
+        let payload = format!("reuse-{version:?}-{i}").into_bytes();
+        let echoed = socks5_echo(counted.socks, &payload).await.unwrap();
+        assert_eq!(echoed, payload);
+    }
+    assert_eq!(counted.accepts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn v4_reuse_two_echoes_one_snell_conn() {
+    reuse_two_echoes(ProtocolFlavor::V4).await;
+}
+
+#[tokio::test]
+async fn v5_reuse_two_echoes_one_snell_conn() {
+    reuse_two_echoes(ProtocolFlavor::V5).await;
+}
+
+#[tokio::test]
+async fn v6_shaped_reuse_two_echoes_one_snell_conn() {
+    reuse_two_echoes(ProtocolFlavor::V6Shaped).await;
+}
+
+#[tokio::test]
+async fn v6_unshaped_reuse_two_echoes_one_snell_conn() {
+    reuse_two_echoes(ProtocolFlavor::V6Unshaped).await;
+}
+
+#[tokio::test]
+async fn reuse_false_opens_two_snell_conns() {
+    let counted = start_counted(
+        ProtocolFlavor::V4,
+        ProtocolSelection::Exact(ProtocolFlavor::V4),
+        false,
+        None,
+    )
+    .await;
+    for i in 0..2 {
+        let payload = format!("oneshot-{i}").into_bytes();
+        let echoed = socks5_echo(counted.socks, &payload).await.unwrap();
+        assert_eq!(echoed, payload);
+    }
+    assert_eq!(counted.accepts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn stale_pool_retries_once() {
+    let pool = ReusePool::new();
+    let dummy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dummy_addr = dummy.local_addr().unwrap();
+    let stream = TcpStream::connect(dummy_addr).await.unwrap();
+    let peer = dummy.accept().await.unwrap().0;
+    drop(peer);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let psk = Psk::new(PSK.to_vec()).unwrap();
+    let encoder = V4Encoder::os(&psk).unwrap();
+    let decoder = V4Decoder::new(psk);
+    let _ = pool.put(PooledConn {
+        stream,
+        codec: PooledCodec::V4 { encoder, decoder },
+    });
+
+    let counted = start_counted(
+        ProtocolFlavor::V4,
+        ProtocolSelection::Exact(ProtocolFlavor::V4),
+        true,
+        Some(pool),
+    )
+    .await;
+    let payload = b"stale-retry";
+    let echoed = socks5_echo(counted.socks, payload).await.unwrap();
+    assert_eq!(echoed, payload);
+    assert_eq!(counted.accepts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn error_connections_are_not_returned_to_pool() {
+    let pool = ReusePool::new();
+    let pair = start_pair_reuse(
+        ProtocolFlavor::V4,
+        Outbound::Direct,
+        true,
+        Some(pool.clone()),
+    )
+    .await;
+    let mut client = TcpStream::connect(pair.socks).await.unwrap();
+    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method = [0u8; 2];
+    client.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [0x05, 0x00]);
+    client
+        .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 1])
+        .await
+        .unwrap();
+    let mut reply_head = [0u8; 4];
+    timeout(Duration::from_secs(5), client.read_exact(&mut reply_head))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply_head[0], 0x05);
+    assert_ne!(reply_head[1], 0x00);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(pool.len(), 0);
+}
+
+#[tokio::test]
+async fn auto_server_accepts_v4() {
+    let counted = start_counted(ProtocolFlavor::V4, ProtocolSelection::Auto, false, None).await;
+    let payload = b"auto-v4";
+    let echoed = socks5_echo(counted.socks, payload).await.unwrap();
+    assert_eq!(echoed, payload);
+}
+
+#[tokio::test]
+async fn auto_server_accepts_v6_shaped() {
+    let counted = start_counted(
+        ProtocolFlavor::V6Shaped,
+        ProtocolSelection::Auto,
+        false,
+        None,
+    )
+    .await;
+    let payload = b"auto-v6-shaped";
+    let echoed = socks5_echo(counted.socks, payload).await.unwrap();
+    assert_eq!(echoed, payload);
+}
+
+#[tokio::test]
+async fn exact_v4_does_not_accept_v6_shaped() {
+    let counted = start_counted(
+        ProtocolFlavor::V6Shaped,
+        ProtocolSelection::Exact(ProtocolFlavor::V4),
+        false,
+        None,
+    )
+    .await;
+    let mut client = TcpStream::connect(counted.socks).await.unwrap();
+    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method = [0u8; 2];
+    client.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [0x05, 0x00]);
+    client
+        .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 9])
+        .await
+        .unwrap();
+    let mut reply_head = [0u8; 4];
+    timeout(Duration::from_secs(5), client.read_exact(&mut reply_head))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply_head[0], 0x05);
+    assert_ne!(reply_head[1], 0x00);
+}
+
+#[test]
+fn exact_mode_does_not_probe() {
+    let src = include_str!("server.rs");
+    let calls = src.matches("detect_protocol(").count();
+    assert_eq!(calls, 1, "detect_protocol must be called once, from Auto");
+    let auto_idx = src.find("ProtocolSelection::Auto").expect("auto arm");
+    assert!(
+        src[auto_idx..].contains("detect_protocol("),
+        "auto arm must probe"
+    );
+}
+
+#[tokio::test]
+async fn early_payload_over_64kib_is_rejected() {
+    use snell_protocol::{
+        Address, EncodeBuffer, MAX_CONNECT_REQUEST_LEN, SERVER_EARLY_PAYLOAD_MAX,
+        encode_connect_request,
+    };
+
+    let psk = Psk::new(PSK.to_vec()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cfg = ServerConfig {
+        listen: addr,
+        psk: psk.clone(),
+        selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
+        outbound: Outbound::Direct,
+    };
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        handle_server(
+            stream,
+            cfg,
+            Arc::new(KdfLimiter::new()),
+            Arc::new(ReplayCache::new()),
+        )
+        .await
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut encoder = V4Encoder::os(&psk).unwrap();
+    let mut encode = EncodeBuffer::new(snell_protocol::ENCODE_BUFFER_MAX);
+    let dest = Address::from("127.0.0.1:9".parse::<SocketAddr>().unwrap());
+    let mut req = [0u8; MAX_CONNECT_REQUEST_LEN];
+    let n = encode_connect_request(&mut req, dest.as_view(), false).unwrap();
+    let mut plain = req[..n].to_vec();
+    plain.extend(std::iter::repeat_n(b'x', SERVER_EARLY_PAYLOAD_MAX + 1));
+    let mut offset = 0;
+    while offset < plain.len() {
+        let mut reservation = encoder
+            .reserve(&mut encode, &[], plain.len() - offset)
+            .unwrap();
+        let take = reservation.capacity().min(plain.len() - offset);
+        reservation.payload_mut()[..take].copy_from_slice(&plain[offset..offset + take]);
+        reservation.seal(take).unwrap();
+        offset += take;
+    }
+    tokio::io::AsyncWriteExt::write_all(&mut client, encode.pending())
+        .await
+        .unwrap();
+
+    let result = timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result, Err(crate::SessionError::EarlyPayloadTooLarge)),
+        "{result:?}"
+    );
 }

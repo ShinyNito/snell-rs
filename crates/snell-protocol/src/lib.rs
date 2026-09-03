@@ -64,13 +64,20 @@ pub use v6::{
     V6UnshapedEncoder, V6UnshapedReservation,
 };
 
-/// Exact record-codec selection. Auto-detect is a later phase.
+/// Exact record-codec selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolFlavor {
     V4,
     V5,
     V6Shaped,
     V6Unshaped,
+}
+
+/// Server protocol selection. Exact never probes. Auto is v4 and v6-shaped only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtocolSelection {
+    Exact(ProtocolFlavor),
+    Auto,
 }
 
 #[cfg(feature = "unsafe-raw")]
@@ -229,6 +236,24 @@ pub const AUTO_DETECT_TIMEOUT_SECS: u64 = 5;
 /// Auto-detect prefix cap in bytes.
 pub const AUTO_DETECT_PREFIX_MAX: usize = 4096;
 
+/// Auto-detect candidate cap (v4 and v6-shaped).
+pub const AUTO_DETECT_MAX_CANDIDATES: usize = 2;
+
+/// Server early TCP payload after CONNECT, hard cap.
+pub const SERVER_EARLY_PAYLOAD_MAX: usize = 64 * 1024;
+
+/// v6 salt replay cache capacity.
+pub const REPLAY_CACHE_CAPACITY: usize = 4096;
+
+/// v6 salt replay cache entry TTL.
+pub const REPLAY_CACHE_TTL_SECS: u64 = 3600;
+
+/// Max concurrent Argon2id KDFs.
+pub const KDF_MAX_INFLIGHT: usize = 8;
+
+/// Max waiters for a KDF permit. Further attempts fail closed.
+pub const KDF_MAX_QUEUED: usize = 32;
+
 /// TCP keepalive idle.
 pub const TCP_KEEPALIVE_IDLE_SECS: u64 = 300;
 
@@ -278,6 +303,19 @@ mod tests {
         assert_eq!(REUSE_IDLE_TIMEOUT_SECS, 3600);
         assert_eq!(CLIENT_POOL_MAX_SIZE, 10);
         assert_eq!(CLIENT_POOL_MAX_IDLE_SECS, 300);
+        assert_eq!(AUTO_DETECT_TIMEOUT_SECS, 5);
+        assert_eq!(AUTO_DETECT_PREFIX_MAX, 4096);
+        assert_eq!(AUTO_DETECT_MAX_CANDIDATES, 2);
+        assert_eq!(SERVER_EARLY_PAYLOAD_MAX, 64 * 1024);
+        assert_eq!(REPLAY_CACHE_CAPACITY, 4096);
+        assert_eq!(REPLAY_CACHE_TTL_SECS, 3600);
+        assert_eq!(KDF_MAX_INFLIGHT, 8);
+        assert_eq!(KDF_MAX_QUEUED, 32);
+        assert_eq!(ProtocolSelection::Auto, ProtocolSelection::Auto);
+        assert_eq!(
+            ProtocolSelection::Exact(ProtocolFlavor::V4),
+            ProtocolSelection::Exact(ProtocolFlavor::V4)
+        );
         assert_eq!(
             PROFILE_SEED_24,
             [

@@ -11,8 +11,8 @@ use crate::kdf::aead_key;
 use crate::padding::{fill_v4_padding, swap_even_indices};
 use crate::record::{DecodeStatus, DecodedRecord, RecordKind};
 use crate::{
-    Clock, EncodeBuffer, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE,
-    Nonce, OsEntropy, Psk, RecvBuffer, Result, SALT_LEN, TAG_LEN, UnixClock,
+    AES_128_KEY_LEN, Clock, EncodeBuffer, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN,
+    MAX_PACKET_SIZE, Nonce, OsEntropy, Psk, RecvBuffer, Result, SALT_LEN, TAG_LEN, UnixClock,
     V4_INITIAL_PADDING_MIN, V4_INITIAL_PADDING_SPAN,
 };
 
@@ -346,6 +346,38 @@ impl V4Decoder {
         }
     }
 
+    pub fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
+        None
+    }
+
+    pub fn has_unconsumed_plaintext(&self) -> bool {
+        self.busy
+    }
+
+    /// Bytes of salt required before Argon2id. Zero after the key is installed.
+    pub fn kdf_need(&self) -> usize {
+        if self.aead.is_none() && matches!(self.step, ReadStep::Salt) {
+            SALT_LEN
+        } else {
+            0
+        }
+    }
+
+    pub fn kdf_salt(&self, buf: &RecvBuffer) -> Result<[u8; SALT_LEN]> {
+        if buf.len() < SALT_LEN {
+            return Err(Error::Truncated);
+        }
+        let mut salt = [0u8; SALT_LEN];
+        salt.copy_from_slice(&buf.filled()[..SALT_LEN]);
+        Ok(salt)
+    }
+
+    /// Skip inline KDF in [`Self::decode`] after the runtime derived the key.
+    pub fn install_aead(&mut self, key: [u8; AES_128_KEY_LEN]) -> Result<()> {
+        self.aead = Some(Aes128Gcm::new(&key)?);
+        Ok(())
+    }
+
     pub fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus> {
         if self.busy {
             return Err(Error::PlaintextNotDrained);
@@ -356,11 +388,13 @@ impl V4Decoder {
                     if let Some(need) = Self::decode_need(buf, SALT_LEN)? {
                         return Ok(need);
                     }
-                    let mut salt = [0u8; SALT_LEN];
-                    salt.copy_from_slice(&buf.filled()[..SALT_LEN]);
-                    let mut key = aead_key(self.psk.as_bytes(), &salt)?;
-                    self.aead = Some(Aes128Gcm::new(&key)?);
-                    key.zeroize();
+                    if self.aead.is_none() {
+                        let mut salt = [0u8; SALT_LEN];
+                        salt.copy_from_slice(&buf.filled()[..SALT_LEN]);
+                        let mut key = aead_key(self.psk.as_bytes(), &salt)?;
+                        self.aead = Some(Aes128Gcm::new(&key)?);
+                        key.zeroize();
+                    }
                     self.step = ReadStep::Header;
                 }
                 ReadStep::Header => {

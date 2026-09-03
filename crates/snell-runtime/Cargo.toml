@@ -39,3 +39,11 @@ tokio = { workspace = true, features = [
 [[bench]]
 name = "tcp_loopback"
 harness = false
+
+[[bench]]
+name = "kdf_bound"
+harness = false
+
+[[bench]]
+name = "reuse_loopback"
+harness = false
