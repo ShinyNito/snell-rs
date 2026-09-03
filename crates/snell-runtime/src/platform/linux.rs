@@ -31,7 +31,7 @@ pub(super) fn read_tcp_fastopen_connect(socket: &TcpSocket) -> Result<i32, Platf
 
 fn tfo_error(error: Errno) -> PlatformError {
     match error {
-        Errno::NOPROTOOPT | Errno::OPNOTSUPP | Errno::NOTSUP | Errno::INVAL => {
+        Errno::NOPROTOOPT | Errno::OPNOTSUPP | Errno::INVAL => {
             PlatformError::Unsupported("tcp fast open")
         }
         _ => PlatformError::Io(error.into()),
