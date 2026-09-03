@@ -1,12 +1,14 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use snell_protocol::{
     EncodeBuffer, ProtocolFlavor, ProtocolSelection, Psk, RecvBuffer, V4Decoder, V4Encoder,
     V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::auto::{Detected, detect_protocol};
 use crate::codec::{TcpDecoder, TcpEncoder};
@@ -33,7 +35,13 @@ pub struct ServerConfig {
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<(), SessionError> {
-    let listener = bind_listener(config.listen)?;
+    let listener = match bind_listener(config.listen) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(error = %error, listen = %config.listen, "bind failed");
+            return Err(error.into());
+        }
+    };
     serve_server(listener, config, async {
         let _ = tokio::signal::ctrl_c().await;
     })
@@ -52,17 +60,33 @@ pub async fn serve_server(
     let kdf = Arc::new(KdfLimiter::new());
     let replay = Arc::new(ReplayCache::new());
     let mut accept = AcceptLoop::new(&listener);
+    let session_ids = AtomicU64::new(1);
+    info!(listen = %listener.local_addr()?, "server started");
     loop {
         tokio::select! {
-            _ = &mut shutdown => return Ok(()),
+            _ = &mut shutdown => {
+                info!("server shutting down");
+                return Ok(());
+            }
             accepted = accept.next() => {
-                let (stream, _) = accepted?;
+                let (stream, peer) = accepted?;
                 let config = config.clone();
                 let kdf = kdf.clone();
                 let replay = replay.clone();
+                let id = session_ids.fetch_add(1, Ordering::Relaxed);
+                let span = tracing::info_span!("session", id, peer = %peer);
                 tokio::spawn(async move {
-                    let _ = handle_server(stream, config, kdf, replay).await;
-                });
+                    debug!("accepted");
+                    match handle_server(stream, config, kdf, replay).await {
+                        Ok(()) => debug!("session finished"),
+                        Err(error) if error.is_peer_closed() => {
+                            debug!(error = %error, "session closed by peer");
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "session terminated with unexpected error");
+                        }
+                    }
+                }.instrument(span));
             }
         }
     }
@@ -236,6 +260,7 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
                 Err(error) => return Err(error),
             }
         };
+        let reused = !first;
         first = false;
         replay = None;
 
@@ -253,6 +278,11 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
                 return Err(error);
             }
         };
+        info!(
+            target = %connect.destination,
+            reused,
+            "handshake completed, tunnel established"
+        );
 
         recv = ensure_bulk(recv)?;
         encode = new_encode();

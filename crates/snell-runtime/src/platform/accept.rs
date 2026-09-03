@@ -64,7 +64,16 @@ pub(crate) fn on_accept_result(
             Ok(OnAccept::Ready(stream, addr))
         }
         Err(error) => match classify_accept_error(&error) {
-            AcceptClass::Resource => Ok(OnAccept::RetryAfter(backoff.next_delay())),
+            AcceptClass::Resource => {
+                let delay = backoff.next_delay();
+                if backoff.consecutive == 1 {
+                    tracing::warn!(
+                        delay_ms = delay.as_millis(),
+                        "accept backing off (file descriptors exhausted)"
+                    );
+                }
+                Ok(OnAccept::RetryAfter(delay))
+            }
             AcceptClass::Ignore => Ok(OnAccept::RetryAfter(Duration::ZERO)),
             AcceptClass::Fatal => Err(error),
         },

@@ -21,6 +21,8 @@ anyhow.workspace = true
 clap.workspace = true
 snell-config = { path = "../snell-config", version = "0.0.0" }
 snell-runtime = { path = "../snell-runtime", version = "0.0.0" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = [
   "io-util",
   "macros",

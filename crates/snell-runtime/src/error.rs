@@ -75,6 +75,17 @@ impl SessionError {
             _ => false,
         }
     }
+
+    pub(crate) fn is_peer_closed(&self) -> bool {
+        match self {
+            Self::HandshakeTimeout
+            | Self::ConnectTimeout
+            | Self::Cancelled
+            | Self::ReuseIdleTimeout => true,
+            Self::Io(error) => is_stale_io(error.kind()),
+            _ => false,
+        }
+    }
 }
 
 pub(crate) fn is_stale_io(kind: io::ErrorKind) -> bool {

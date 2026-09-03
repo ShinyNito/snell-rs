@@ -17,6 +17,7 @@ snell-protocol = { path = "../snell-protocol", version = "0.0.0" }
 hickory-resolver.workspace = true
 socket2 = { version = "0.6", features = ["all"] }
 thiserror.workspace = true
+tracing.workspace = true
 tokio = { workspace = true, features = [
   "io-util",
   "macros",

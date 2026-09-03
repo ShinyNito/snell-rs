@@ -430,6 +430,7 @@ fn handle_datagram(
         slot.peers.insert(peer);
     }
     metrics.associations.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(client = %peer, "udp association created");
     tokio::spawn(client_assoc(
         rx,
         peer,
@@ -461,6 +462,7 @@ async fn client_assoc(
     let end = client_assoc_inner(rx, peer, socks_udp, dial, &metrics, idle, &pool).await;
     if matches!(end, Ok(AssocEnd::Idle)) {
         metrics.idle_expired.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(client = %peer, "udp association expired after idle timeout");
     }
     let _ = ctrl.send(Ctrl::Closed(peer)).await;
 }
@@ -782,6 +784,7 @@ where
         tokio::select! {
             _ = &mut sleep => {
                 udp.metrics.idle_expired.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("udp association expired after idle timeout");
                 return Ok(());
             }
             record = decode_once(decoder, recv, &mut snell_r, kdf, psk) => {
