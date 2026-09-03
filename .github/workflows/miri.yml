@@ -11,13 +11,16 @@ permissions:
 jobs:
   miri:
     runs-on: ubuntu-latest
+    env:
+      # rust-toolchain.toml pins 1.98.0, which has no miri component.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - name: Miri protocol buffers
-        run: "cargo miri test -p snell-protocol --lib --all-features buffer::"
+        run: cargo miri test -p snell-protocol --lib --all-features buffer::
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
       - name: Miri accept backoff
