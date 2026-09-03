@@ -27,7 +27,3 @@ harness = false
 [[bench]]
 name = "v6_record"
 harness = false
-
-[[bench]]
-name = "padding_kernel"
-harness = false
