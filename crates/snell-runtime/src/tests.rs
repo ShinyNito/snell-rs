@@ -21,7 +21,7 @@ use crate::pool::{PooledCodec, PooledConn, ReusePool};
 use crate::replay::ReplayCache;
 use crate::server::handle_server;
 use crate::session::{new_udp_encode, write_tunnel, write_udp_request, write_udp_setup};
-use crate::{ClientConfig, ServerConfig, UdpLimits, UdpOptions, serve_client, serve_server};
+use crate::{ClientConfig, ServerConfig, UdpOptions, serve_client, serve_server};
 
 const PSK: &[u8] = b"0123456789abcdef";
 
@@ -955,17 +955,11 @@ async fn udp_frag_nonzero_is_dropped() {
 
 #[tokio::test]
 async fn udp_idle_expires_association() {
-    let limits = UdpLimits {
-        idle: Duration::from_millis(80),
-        ..UdpLimits::default()
-    };
-    let pair = start_pair_udp(
-        ProtocolFlavor::V4,
-        Outbound::Direct,
-        UdpOptions::with_limits(limits),
-        UdpOptions::with_limits(limits),
-    )
-    .await;
+    let mut client_udp = UdpOptions::default();
+    client_udp.limits.idle = Duration::from_millis(80);
+    let mut server_udp = UdpOptions::default();
+    server_udp.limits.idle = Duration::from_millis(80);
+    let pair = start_pair_udp(ProtocolFlavor::V4, Outbound::Direct, client_udp, server_udp).await;
     let echo = spawn_udp_echo().await.unwrap();
     let (_tcp, relay, client) = socks5_udp_associate(pair.socks).await.unwrap();
     let packet = encode_socks_udp(echo, 0, b"idle");
@@ -987,14 +981,12 @@ async fn udp_idle_expires_association() {
 
 #[tokio::test]
 async fn udp_associations_stay_capped() {
-    let limits = UdpLimits {
-        max_associations: 4,
-        ..UdpLimits::default()
-    };
+    let mut client_udp = UdpOptions::default();
+    client_udp.limits.max_associations = 4;
     let pair = start_pair_udp(
         ProtocolFlavor::V4,
         Outbound::Direct,
-        UdpOptions::with_limits(limits),
+        client_udp,
         UdpOptions::default(),
     )
     .await;

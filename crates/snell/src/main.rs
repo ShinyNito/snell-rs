@@ -70,10 +70,7 @@ struct ServerArgs {
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Version => {
-            println!(
-                "snell-rs {} (current phase stops after Phase 9)",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("snell-rs {} ", env!("CARGO_PKG_VERSION"));
         }
         Command::Client(args) => {
             run_client(client_config(args)?).await?;
@@ -95,7 +92,7 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
             version: cfg.version,
             reuse: cfg.reuse,
             pool: None,
-            udp: UdpOptions::default(),
+            udp: UdpOptions::new()?,
         });
     }
     Ok(ClientConfig {
@@ -105,7 +102,7 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
         version: snell_config::parse_client_version(&args.version.expect("required by clap"))?,
         reuse: args.reuse,
         pool: None,
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new()?,
     })
 }
 
@@ -117,7 +114,7 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
             psk: cfg.psk,
             selection: cfg.selection,
             outbound: map_outbound(cfg.outbound),
-            udp: UdpOptions::default(),
+            udp: UdpOptions::new()?,
             tcp_brutal: cfg.tcp_brutal.map(|brutal| TcpBrutal {
                 send_mbps: brutal.send_mbps,
                 cwnd_gain: brutal.cwnd_gain,
@@ -142,7 +139,7 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
             Some(server) => Outbound::Socks5 { server },
             None => Outbound::Direct,
         },
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new()?,
         tcp_brutal: None,
     })
 }
