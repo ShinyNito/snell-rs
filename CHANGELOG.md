@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 1.0.0-rc.2
+
+### Changed
+- Unknown INI keys are ignored instead of rejecting the config.
+- `tcp_brutal_send_mbps` / `tcp_brutal_cwnd_gain` without `tcp_brutal = true` are ignored.
+- Linux TCP Brutal is applied per accepted connection. If the kernel module or sockopt is unusable, the server logs a warning and continues without Brutal instead of refusing to start.
+
 ## 1.0.0-rc.1
 
 First release candidate of `snell-rs`. All crates remain unpublished (`publish = false`). The distributed product is the `snell-rs` binary.
