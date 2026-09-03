@@ -18,7 +18,7 @@ use tokio::time::timeout;
 
 use crate::bufio::{drain_encode, read_into_recv};
 use crate::codec::{TcpDecoder, TcpEncoder, TcpReservation};
-use crate::error::{DirectionEnd, SessionError, TimeoutKind};
+use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::replay::ReplayCache;
 
@@ -55,7 +55,7 @@ where
 {
     match timeout(Duration::from_secs(TCP_HANDSHAKE_TIMEOUT_SECS), fut).await {
         Ok(result) => result,
-        Err(_) => Err(SessionError::from_timeout(TimeoutKind::Handshake)),
+        Err(_) => Err(SessionError::HandshakeTimeout),
     }
 }
 
@@ -391,27 +391,15 @@ pub(crate) async fn wait_reuse_idle<R: AsyncRead + Unpin>(
 }
 
 pub(crate) fn client_may_pool<D: TcpDecoder>(
-    ends: (DirectionEnd, DirectionEnd),
     encode: &EncodeBuffer,
     recv: &RecvBuffer,
     decoder: &D,
 ) -> bool {
-    clean_ends(ends) && encode.is_empty() && recv.is_empty() && !decoder.has_unconsumed_plaintext()
+    encode.is_empty() && recv.is_empty() && !decoder.has_unconsumed_plaintext()
 }
 
-pub(crate) fn server_may_reuse<D: TcpDecoder>(
-    ends: (DirectionEnd, DirectionEnd),
-    encode: &EncodeBuffer,
-    decoder: &D,
-) -> bool {
-    clean_ends(ends) && encode.is_empty() && !decoder.has_unconsumed_plaintext()
-}
-
-fn clean_ends(ends: (DirectionEnd, DirectionEnd)) -> bool {
-    fn one(end: DirectionEnd) -> bool {
-        matches!(end, DirectionEnd::CleanEof | DirectionEnd::ProtocolEnd)
-    }
-    one(ends.0) && one(ends.1)
+pub(crate) fn server_may_reuse<D: TcpDecoder>(encode: &EncodeBuffer, decoder: &D) -> bool {
+    encode.is_empty() && !decoder.has_unconsumed_plaintext()
 }
 
 pub(crate) fn release_bulk(
@@ -465,7 +453,7 @@ pub(crate) async fn relay<E: TcpEncoder, D: TcpDecoder>(
     initial_to_plain: &[u8],
     initial_to_snell: &[u8],
     keep_snell_open: bool,
-) -> Result<(DirectionEnd, DirectionEnd), SessionError> {
+) -> Result<(), SessionError> {
     if !initial_to_plain.is_empty() {
         tokio::io::AsyncWriteExt::write_all(plain, initial_to_plain).await?;
     }
@@ -478,7 +466,8 @@ pub(crate) async fn relay<E: TcpEncoder, D: TcpDecoder>(
     tokio::try_join!(
         pump_plain_to_snell(&mut plain_r, &mut snell_w, encoder, encode, keep_snell_open,),
         pump_snell_to_plain(&mut snell_r, &mut plain_w, decoder, recv),
-    )
+    )?;
+    Ok(())
 }
 
 async fn pump_plain_to_snell<R, W, E>(
@@ -487,7 +476,7 @@ async fn pump_plain_to_snell<R, W, E>(
     encoder: &mut E,
     encode: &mut EncodeBuffer,
     keep_snell_open: bool,
-) -> Result<DirectionEnd, SessionError>
+) -> Result<(), SessionError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -500,11 +489,7 @@ where
         loop {
             if shutting_down {
                 return match Pin::new(&mut *writer).poll_shutdown(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(if zero_sent {
-                        DirectionEnd::ProtocolEnd
-                    } else {
-                        DirectionEnd::CleanEof
-                    })),
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
                     Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
                     Poll::Pending => Poll::Pending,
                 };
@@ -592,7 +577,7 @@ where
 
             if local_eof && zero_sent {
                 if keep_snell_open {
-                    return Poll::Ready(Ok(DirectionEnd::ProtocolEnd));
+                    return Poll::Ready(Ok(()));
                 }
                 shutting_down = true;
                 continue;
@@ -609,7 +594,7 @@ async fn pump_snell_to_plain<R, W, D>(
     writer: &mut W,
     decoder: &mut D,
     recv: &mut RecvBuffer,
-) -> Result<DirectionEnd, SessionError>
+) -> Result<(), SessionError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -623,11 +608,7 @@ where
         loop {
             if shutting_down {
                 return match Pin::new(&mut *writer).poll_shutdown(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(if protocol_end {
-                        DirectionEnd::ProtocolEnd
-                    } else {
-                        DirectionEnd::CleanEof
-                    })),
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
                     Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
                     Poll::Pending => Poll::Pending,
                 };

@@ -5,7 +5,7 @@
 
 use std::sync::Mutex;
 
-pub struct PacketBuf {
+pub(crate) struct PacketBuf {
     data: Vec<u8>,
 }
 
@@ -45,7 +45,7 @@ struct Inner {
     bytes: usize,
 }
 
-pub struct PacketPool {
+pub(crate) struct PacketPool {
     inner: Mutex<Inner>,
     max_bufs: usize,
     max_bytes: usize,

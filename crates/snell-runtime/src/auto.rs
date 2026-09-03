@@ -49,9 +49,7 @@ pub(crate) async fn detect_protocol(
     .await
     {
         Ok(result) => result,
-        Err(_) => Err(SessionError::from_timeout(
-            crate::error::TimeoutKind::Handshake,
-        )),
+        Err(_) => Err(SessionError::HandshakeTimeout),
     }
 }
 

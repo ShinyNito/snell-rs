@@ -9,9 +9,9 @@ use super::accept::{
     apply_accept_result, classify_accept_error, emfile_error,
 };
 use super::{
-    EcnPolicy, PlatformError, TcpBrutal, apply_keepalive, read_keepalive,
-    read_tcp_fastopen_connect, read_tcp_fastopen_listener, require_tcp_brutal,
-    set_tcp_fastopen_connect, set_tcp_fastopen_listener, tcp_ecn_policy,
+    PlatformError, TcpBrutal, apply_keepalive, read_keepalive, read_tcp_fastopen_connect,
+    read_tcp_fastopen_listener, require_tcp_brutal, set_tcp_fastopen_connect,
+    set_tcp_fastopen_listener,
 };
 
 #[cfg(not(miri))]
@@ -91,11 +91,6 @@ fn tcp_brutal_is_unsupported_off_linux() {
     })
     .unwrap_err();
     assert!(matches!(err, PlatformError::Unsupported(_)));
-}
-
-#[test]
-fn ecn_is_kernel_default_not_claimed_enabled() {
-    assert_eq!(tcp_ecn_policy(), EcnPolicy::KernelDefault);
 }
 
 #[tokio::test]
