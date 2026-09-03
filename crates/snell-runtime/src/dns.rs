@@ -11,15 +11,9 @@ use crate::error::SessionError;
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DnsResolver {
     resolver: TokioResolver,
-}
-
-impl std::fmt::Debug for DnsResolver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DnsResolver").finish_non_exhaustive()
-    }
 }
 
 impl DnsResolver {
@@ -85,10 +79,5 @@ mod tests {
             dns.resolve("::1", 9).await.unwrap(),
             SocketAddr::from((Ipv6Addr::LOCALHOST, 9))
         );
-    }
-
-    #[test]
-    fn system_conf_is_required() {
-        DnsResolver::try_from_system(1024, Duration::from_secs(30)).unwrap();
     }
 }

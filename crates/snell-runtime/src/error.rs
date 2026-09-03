@@ -77,14 +77,7 @@ impl SessionError {
     }
 
     pub(crate) fn is_peer_closed(&self) -> bool {
-        match self {
-            Self::HandshakeTimeout
-            | Self::ConnectTimeout
-            | Self::Cancelled
-            | Self::ReuseIdleTimeout => true,
-            Self::Io(error) => is_stale_io(error.kind()),
-            _ => false,
-        }
+        matches!(self, Self::Cancelled) || self.is_stale_pool_error()
     }
 }
 
@@ -107,9 +100,7 @@ pub enum TimeoutKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DirectionEnd {
+pub(crate) enum DirectionEnd {
     CleanEof,
     ProtocolEnd,
-    Cancelled,
-    Failed,
 }

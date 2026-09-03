@@ -31,10 +31,7 @@ ring = "0.17"
 rustix = { version = "0.38", default-features = false, features = ["net", "std"] }
 thiserror = "2"
 tokio = { version = "1.53.1", default-features = false }
-tracing = { version = "0.1.41", default-features = false, features = [
-  "std",
-  "attributes",
-] }
+tracing = { version = "0.1.41", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.19", default-features = false, features = [
   "env-filter",
   "fmt",
