@@ -1,0 +1,20 @@
+name: Miri
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Skip until unsafe buffer backend exists
+        run: echo "Miri coverage is required when buffer::uninit or FFI lands."

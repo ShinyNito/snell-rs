@@ -1,0 +1,6 @@
+{
+  "name": "connect-v2-example-com-443",
+  "kind": "plaintext-control",
+  "notes": "Client CONNECT_V2 reuse header.",
+  "hex": "0105000b6578616d706c652e636f6d01bb"
+}

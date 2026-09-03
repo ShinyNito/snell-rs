@@ -1,0 +1,6 @@
+{
+  "name": "udp-setup",
+  "kind": "plaintext-control",
+  "notes": "UDP association setup.",
+  "hex": "010600"
+}

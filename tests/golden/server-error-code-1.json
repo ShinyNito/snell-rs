@@ -1,0 +1,6 @@
+{
+  "name": "server-error-code-1",
+  "kind": "plaintext-control",
+  "notes": "Server reject uses code 1. Example message 'connect failed' is 14 bytes.",
+  "hex": "02010e636f6e6e656374206661696c6564"
+}

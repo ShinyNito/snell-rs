@@ -1,4 +1,11 @@
 /target
+**/*.rs.bk
+.DS_Store
 CLAUDE.local.md
 research/
 cargo-flamegraph.trace/
+/.agent/plan
+/repos/
+/tmp-legacy-build/
+docs/
+.zvec-grep
