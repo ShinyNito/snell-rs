@@ -1,7 +1,28 @@
+use std::mem::size_of;
+
+use zerocopy::byteorder::big_endian::U16;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+
 use crate::{
     Error, HEADER_PLAIN_LEN, HEADER_VERSION_MARKER, MAX_PACKET_SIZE, MAX_PACKET_SIZE_V6, Result,
     TAG_LEN,
 };
+
+/// Snell 7-byte plaintext record header.
+///
+/// Layout: `marker(1) reserved(2) padding_len(2 BE) payload_len(2 BE)`.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(C, packed)]
+pub struct WirePlainHeader {
+    pub marker: u8,
+    pub reserved: [u8; 2],
+    pub padding_len: U16,
+    pub payload_len: U16,
+}
+
+const _: () = assert!(size_of::<WirePlainHeader>() == HEADER_PLAIN_LEN);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecordHeader {
@@ -51,14 +72,12 @@ impl RecordHeader {
 }
 
 pub fn parse_v4_plain_header(header: &[u8]) -> Result<RecordHeader> {
-    if header.len() < HEADER_PLAIN_LEN {
-        return Err(Error::Truncated);
-    }
-    if header[0] != HEADER_VERSION_MARKER {
+    let (wire, _) = WirePlainHeader::ref_from_prefix(header).map_err(|_| Error::Truncated)?;
+    if wire.marker != HEADER_VERSION_MARKER {
         return Err(Error::InvalidHeader);
     }
-    let padding_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-    let payload_len = u16::from_be_bytes([header[5], header[6]]) as usize;
+    let padding_len = wire.padding_len.get() as usize;
+    let payload_len = wire.payload_len.get() as usize;
     if padding_len > MAX_PACKET_SIZE || payload_len > MAX_PACKET_SIZE {
         return Err(Error::PayloadTooLarge);
     }
@@ -69,18 +88,17 @@ pub fn parse_v4_plain_header(header: &[u8]) -> Result<RecordHeader> {
 }
 
 pub fn parse_v6_plain_header(header: &[u8]) -> Result<RecordHeader> {
-    if header.len() < HEADER_PLAIN_LEN {
-        return Err(Error::Truncated);
-    }
-    if header[0] != HEADER_VERSION_MARKER {
+    let (wire, _) = WirePlainHeader::ref_from_prefix(header).map_err(|_| Error::Truncated)?;
+    if wire.marker != HEADER_VERSION_MARKER {
         return Err(Error::InvalidHeader);
     }
-    if header[1] != 0 || header[2] != 0 {
-        return Err(Error::InvalidReserved(header[1] | header[2]));
+    let reserved = wire.reserved;
+    if reserved != [0, 0] {
+        return Err(Error::InvalidReserved(reserved[0] | reserved[1]));
     }
     Ok(RecordHeader {
-        padding_len: u16::from_be_bytes([header[3], header[4]]) as usize,
-        payload_len: u16::from_be_bytes([header[5], header[6]]) as usize,
+        padding_len: wire.padding_len.get() as usize,
+        payload_len: wire.payload_len.get() as usize,
     })
 }
 
@@ -106,12 +124,12 @@ fn write_plain_header(
     payload_len: usize,
     reserved_zero: bool,
 ) -> Result<()> {
-    if header.len() < HEADER_PLAIN_LEN {
-        return Err(Error::BufferTooSmall {
+    let available = header.len();
+    let (wire, _) =
+        WirePlainHeader::mut_from_prefix(header).map_err(|_| Error::BufferTooSmall {
             needed: HEADER_PLAIN_LEN,
-            available: header.len(),
-        });
-    }
+            available,
+        })?;
     let max = if reserved_zero {
         MAX_PACKET_SIZE_V6
     } else {
@@ -120,11 +138,10 @@ fn write_plain_header(
     if padding_len > max || payload_len > max {
         return Err(Error::PayloadTooLarge);
     }
-    header[0] = HEADER_VERSION_MARKER;
-    header[1] = 0;
-    header[2] = 0;
-    header[3..5].copy_from_slice(&(padding_len as u16).to_be_bytes());
-    header[5..7].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    wire.marker = HEADER_VERSION_MARKER;
+    wire.reserved = [0, 0];
+    wire.padding_len.set(padding_len as u16);
+    wire.payload_len.set(payload_len as u16);
     Ok(())
 }
 
@@ -156,5 +173,26 @@ mod tests {
         assert_eq!(parsed.padding_len, 8);
         assert_eq!(parsed.payload_len, 16);
         assert_eq!(parsed.body_len_v4().unwrap(), 8 + 16 + TAG_LEN);
+    }
+
+    #[test]
+    fn truncated_header_is_truncated() {
+        assert!(matches!(
+            parse_v4_plain_header(&[4, 0, 0, 0, 0, 0]),
+            Err(Error::Truncated)
+        ));
+        assert!(matches!(parse_v6_plain_header(&[]), Err(Error::Truncated)));
+    }
+
+    #[test]
+    fn write_buffer_too_small() {
+        let mut header = [0; 6];
+        assert!(matches!(
+            write_v4_plain_header(&mut header, 0, 1),
+            Err(Error::BufferTooSmall {
+                needed: HEADER_PLAIN_LEN,
+                available: 6
+            })
+        ));
     }
 }
