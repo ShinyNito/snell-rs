@@ -1,11 +1,48 @@
-//! Tokio runtime for Snell sessions.
+//! Tokio runtime for Snell TCP one-shot sessions.
 //!
-//! Owns sockets, tasks, timeouts, reuse, UDP, and outbound. Session, TCP
-//! relay, reuse, and UDP implementations start in later phases. This crate
-//! currently exists to lock the workspace dependency direction:
-//!
-//! ```text
-//! snell -> snell-config + snell-runtime -> snell-protocol
-//! ```
+//! Owns sockets, tasks, timeouts, and outbound. Reuse, auto-detect, and UDP
+//! fail closed. The TCP hot path uses borrowed split, `try_join!`, and a
+//! single `write(pending())` of [`EncodeBuffer`] — no `mpsc`, no per-record
+//! `Vec`, no unconditional `flush`.
 
+#![deny(unsafe_code)]
+
+mod bufio;
+mod client;
+mod codec;
+mod error;
+mod outbound;
+mod server;
+mod session;
+mod socks;
+
+use std::io;
+use std::net::SocketAddr;
+
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+
+pub use client::{ClientConfig, run_client, serve_client};
+pub use error::{DirectionEnd, SessionError};
+pub use outbound::Outbound;
+pub use server::{ServerConfig, run_server, serve_server};
 pub use snell_protocol as protocol;
+pub use snell_protocol::ProtocolFlavor;
+
+pub(crate) fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.set_nodelay(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
+}
+
+pub(crate) fn set_nodelay(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)
+}
+
+#[cfg(test)]
+mod tests;

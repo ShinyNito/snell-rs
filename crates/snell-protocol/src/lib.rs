@@ -64,6 +64,15 @@ pub use v6::{
     V6UnshapedEncoder, V6UnshapedReservation,
 };
 
+/// Exact record-codec selection. Auto-detect is a later phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtocolFlavor {
+    V4,
+    V5,
+    V6Shaped,
+    V6Unshaped,
+}
+
 #[cfg(feature = "unsafe-raw")]
 pub use v6::{V6UnsafeRaw, V6UnsafeRawDecoder, V6UnsafeRawEncoder, V6UnsafeRawReservation};
 
@@ -276,5 +285,7 @@ mod tests {
                 0xc0, 0x6e, 0x4a, 0x91, 0x25, 0xfd, 0xb8, 0x03, 0x77, 0xac
             ]
         );
+        assert_ne!(ProtocolFlavor::V4, ProtocolFlavor::V5);
+        assert_ne!(ProtocolFlavor::V6Shaped, ProtocolFlavor::V6Unshaped);
     }
 }
