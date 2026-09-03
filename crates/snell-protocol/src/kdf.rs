@@ -8,7 +8,7 @@ use crate::{
     PROFILE_SEED_24, PSK_MAX_LEN, PSK_MIN_LEN, Result, SALT_LEN,
 };
 
-pub fn profile_secret(psk: &[u8]) -> Result<[u8; 32]> {
+pub(crate) fn profile_secret(psk: &[u8]) -> Result<[u8; 32]> {
     check_psk(psk)?;
     let mut hasher = Blake2bVar::new(32).map_err(|_| Error::Kdf)?;
     Update::update(&mut hasher, &PROFILE_SEED_24);
@@ -18,7 +18,7 @@ pub fn profile_secret(psk: &[u8]) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-pub fn aead_key_raw(psk: &[u8], salt: &[u8; SALT_LEN]) -> Result<[u8; ARGON2_OUTPUT_LEN]> {
+pub(crate) fn aead_key_raw(psk: &[u8], salt: &[u8; SALT_LEN]) -> Result<[u8; ARGON2_OUTPUT_LEN]> {
     check_psk(psk)?;
     let params = Params::new(
         ARGON2_M_COST_KIB,
@@ -68,10 +68,5 @@ mod tests {
         let raw = aead_key_raw(psk, &salt).unwrap();
         let key = aead_key(psk, &salt).unwrap();
         assert_eq!(raw[..16], key);
-    }
-
-    #[test]
-    fn seed24_matches_documented_bytes() {
-        assert_eq!(PROFILE_SEED_24[0..4], [0x8d, 0x41, 0xa7, 0x13]);
     }
 }

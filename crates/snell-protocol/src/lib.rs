@@ -43,26 +43,22 @@ pub use clock::{Clock, FixedClock, UnixClock};
 pub use control::{
     ConnectRequest, ServerReply, UdpPacket, connect_request_len, decode_connect_request,
     decode_connect_request_prefix, decode_server_reply, decode_udp_request, decode_udp_response,
-    decode_udp_setup_prefix, encode_connect_request, encode_error_reply, encode_reject,
-    encode_tunnel_reply, encode_udp_request, encode_udp_response, encode_udp_setup,
-    udp_request_len, udp_response_len,
+    decode_udp_setup_prefix, encode_connect_request, encode_reject, encode_tunnel_reply,
+    encode_udp_request, encode_udp_response, encode_udp_setup, udp_request_len, udp_response_len,
 };
 pub use entropy::{Entropy, OsEntropy, RepeatEntropy, SequenceEntropy};
 pub use error::{Error, Result};
-pub use header::{
-    RecordHeader, parse_v4_plain_header, parse_v6_plain_header, write_v4_plain_header,
-    write_v6_plain_header,
-};
-pub use kdf::{aead_key, aead_key_raw, profile_secret};
-pub use nonce::Nonce;
+pub(crate) use header::RecordHeader;
+pub use kdf::aead_key;
+pub(crate) use nonce::Nonce;
 pub use parse::ParseState;
 pub use record::{DecodeStatus, DecodedRecord, RecordKind};
 pub use secret::Psk;
 pub use stream::PlainStream;
-pub use v4::{V4, V4Decoder, V4Encoder, V4Reservation, V5, V5Decoder, V5Encoder};
+pub use v4::{V4Decoder, V4Encoder, V4Reservation};
 pub use v6::{
-    V6Shaped, V6ShapedDecoder, V6ShapedEncoder, V6ShapedReservation, V6Unshaped, V6UnshapedDecoder,
-    V6UnshapedEncoder, V6UnshapedReservation,
+    V6ShapedDecoder, V6ShapedEncoder, V6ShapedReservation, V6UnshapedDecoder, V6UnshapedEncoder,
+    V6UnshapedReservation,
 };
 
 /// Exact record-codec selection.
@@ -82,7 +78,7 @@ pub enum ProtocolSelection {
 }
 
 #[cfg(feature = "unsafe-raw")]
-pub use v6::{V6UnsafeRaw, V6UnsafeRawDecoder, V6UnsafeRawEncoder, V6UnsafeRawReservation};
+pub use v6::{V6UnsafeRawDecoder, V6UnsafeRawEncoder, V6UnsafeRawReservation};
 
 /// Snell CONNECT / UDP-setup version byte. Distinct from the AEAD header marker.
 pub const PROTOCOL_VERSION: u8 = 0x01;
@@ -319,11 +315,6 @@ mod tests {
         assert_eq!(KDF_MAX_QUEUED, 32);
         assert_eq!(TCP_KEEPALIVE_IDLE_SECS, 300);
         assert_eq!(TCP_KEEPALIVE_INTERVAL_SECS, 75);
-        assert_eq!(ProtocolSelection::Auto, ProtocolSelection::Auto);
-        assert_eq!(
-            ProtocolSelection::Exact(ProtocolFlavor::V4),
-            ProtocolSelection::Exact(ProtocolFlavor::V4)
-        );
         assert_eq!(
             PROFILE_SEED_24,
             [
