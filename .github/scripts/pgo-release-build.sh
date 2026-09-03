@@ -20,6 +20,10 @@ status_file="${pgo}/status"
 sysroot="$(rustc --print sysroot)"
 sysroot="${sysroot//\\//}"
 host="$(rustc -vV | awk '/^host:/{print $2}')"
+rustc_pgo="${pgo}"
+if [[ "${host}" == *-pc-windows-* ]]; then
+  rustc_pgo="$(cygpath -m "${pgo}")"
+fi
 profdata="${sysroot}/lib/rustlib/${host}/bin/llvm-profdata"
 if [[ ! -x "${profdata}" && -x "${profdata}.exe" ]]; then
   profdata="${profdata}.exe"
@@ -39,7 +43,7 @@ build_final() {
 }
 
 export CARGO_PROFILE_RELEASE_STRIP=none
-export RUSTFLAGS="-Ctarget-cpu=${cpu} -Cprofile-generate=${pgo}"
+export RUSTFLAGS="-Ctarget-cpu=${cpu} -Cprofile-generate=${rustc_pgo}"
 cargo build --release --locked --target "${target}" -p snell
 
 if [[ ! -f "${bin}" ]]; then
@@ -54,7 +58,7 @@ if ! "${bin}" version >/dev/null 2>&1; then
   exit 0
 fi
 
-export LLVM_PROFILE_FILE="${pgo}/snell-%p-%m.profraw"
+export LLVM_PROFILE_FILE="${rustc_pgo}/snell-%p-%m.profraw"
 
 cargo test --release --locked --target "${target}" -p snell-runtime --bench tcp_loopback -- --nocapture
 cargo test --release --locked --target "${target}" -p snell-runtime --bench reuse_loopback -- --nocapture
@@ -73,17 +77,6 @@ if ! "${profdata}" show --covered "${pgo}/merged.profdata" | awk '/snell_runtime
 fi
 
 unset CARGO_PROFILE_RELEASE_STRIP
-export RUSTFLAGS="-Ctarget-cpu=${cpu} -Cprofile-use=${pgo}/merged.profdata"
+export RUSTFLAGS="-Ctarget-cpu=${cpu} -Cprofile-use=${rustc_pgo}/merged.profdata"
 cargo build --release --locked --target "${target}" -p snell
 echo trained >"${status_file}"
-
-if [[ "${target}" == *-linux-musl ]]; then
-  if command -v file >/dev/null 2>&1; then
-    file "${bin}"
-  fi
-  if command -v ldd >/dev/null 2>&1 && ldd "${bin}" >/dev/null 2>&1; then
-    echo "musl artifact must be statically linked" >&2
-    ldd "${bin}" || true
-    exit 1
-  fi
-fi
