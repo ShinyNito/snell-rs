@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use snell_protocol::socks5::Reply;
 use snell_protocol::{
@@ -8,6 +9,7 @@ use snell_protocol::{
     V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::codec::{TcpDecoder, TcpEncoder};
 use crate::error::SessionError;
@@ -48,7 +50,13 @@ impl std::fmt::Debug for ClientConfig {
 }
 
 pub async fn run_client(config: ClientConfig) -> Result<(), SessionError> {
-    let listener = bind_listener(config.listen)?;
+    let listener = match bind_listener(config.listen) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(error = %error, listen = %config.listen, "bind failed");
+            return Err(error.into());
+        }
+    };
     serve_client(listener, config, async {
         let _ = tokio::signal::ctrl_c().await;
     })
@@ -69,18 +77,34 @@ pub async fn serve_client(
     };
     let hub = UdpHub::start(listener.local_addr()?, config.clone(), kdf.clone()).await?;
     let mut accept = AcceptLoop::new(&listener);
+    let session_ids = AtomicU64::new(1);
+    info!(listen = %listener.local_addr()?, "client started");
     loop {
         tokio::select! {
-            _ = &mut shutdown => return Ok(()),
+            _ = &mut shutdown => {
+                info!("client shutting down");
+                return Ok(());
+            }
             accepted = accept.next() => {
-                let (stream, _) = accepted?;
+                let (stream, peer) = accepted?;
                 let config = config.clone();
                 let kdf = kdf.clone();
                 let pool = pool.clone();
                 let hub = hub.clone();
+                let id = session_ids.fetch_add(1, Ordering::Relaxed);
+                let span = tracing::info_span!("session", id, peer = %peer);
                 tokio::spawn(async move {
-                    let _ = handle_client(stream, config, kdf, pool, hub).await;
-                });
+                    debug!("accepted");
+                    match handle_client(stream, config, kdf, pool, hub).await {
+                        Ok(()) => debug!("session finished"),
+                        Err(error) if error.is_peer_closed() => {
+                            debug!(error = %error, "session closed by peer");
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "session terminated with unexpected error");
+                        }
+                    }
+                }.instrument(span));
             }
         }
     }
@@ -114,6 +138,10 @@ async fn client_handshake_and_relay(
     let (snell, codec) = if let Some(pool) = pool {
         if let Some(conn) = pool.take() {
             from_pool = true;
+            debug!(
+                pool_len = pool.len(),
+                "checked out connection from reuse pool"
+            );
             (conn.stream, conn.codec)
         } else {
             match dial_and_codec(config.server, &config.psk, config.version, kdf).await {
@@ -138,6 +166,7 @@ async fn client_handshake_and_relay(
     } = match opened {
         Ok(opened) => opened,
         Err(error) if from_pool && error.is_stale_pool_error() => {
+            from_pool = false;
             let (snell, codec) =
                 match dial_and_codec(config.server, &config.psk, config.version, kdf).await {
                     Ok(pair) => pair,
@@ -152,6 +181,12 @@ async fn client_handshake_and_relay(
     };
 
     write_socks5_reply(local, Reply::Succeeded).await?;
+    info!(
+        target = %destination,
+        version = ?config.version,
+        reused = from_pool,
+        "handshake completed, tunnel established"
+    );
     finish_session(local, snell, codec, leftover, encode, recv, reuse, pool).await
 }
 
@@ -362,8 +397,10 @@ async fn finish_session(
             }
         }
     };
-    if let (Some(pool), Some(conn)) = (pool, back) {
-        let _ = pool.put(conn);
+    if let (Some(pool), Some(conn)) = (pool, back)
+        && pool.put(conn)
+    {
+        debug!(pool_len = pool.len(), "returned connection to reuse pool");
     }
     Ok(())
 }

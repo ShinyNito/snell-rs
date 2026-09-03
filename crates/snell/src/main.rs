@@ -7,10 +7,16 @@ use snell_runtime::{
     ClientConfig, Outbound, ProtocolSelection, ServerConfig, TcpBrutal, UdpOptions, run_client,
     run_server,
 };
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Parser)]
 #[command(name = "snell-rs", version, about = "Snell client/server")]
 struct Cli {
+    /// Log filter (`info`, `debug`, `snell_runtime=debug`). `RUST_LOG` wins if set.
+    #[arg(long = "log-level", global = true, value_name = "FILTER")]
+    log_level: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -68,18 +74,37 @@ struct ServerArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    match cli.command {
         Command::Version => {
             println!("snell-rs {} ", env!("CARGO_PKG_VERSION"));
         }
         Command::Client(args) => {
+            init_logging(cli.log_level.as_deref());
             run_client(client_config(args)?).await?;
         }
         Command::Server(args) => {
+            init_logging(cli.log_level.as_deref());
             run_server(server_config(args)?).await?;
         }
     }
     Ok(())
+}
+
+fn init_logging(log_level: Option<&str>) {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(log_level.unwrap_or("info")));
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+                .with_target(false)
+                .with_level(true)
+                .compact(),
+        )
+        .init();
 }
 
 fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
