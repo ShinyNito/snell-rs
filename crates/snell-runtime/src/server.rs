@@ -49,9 +49,6 @@ pub async fn serve_server(
     config: ServerConfig,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SessionError> {
-    if let Some(params) = config.tcp_brutal {
-        platform::require_tcp_brutal(params)?;
-    }
     tokio::pin!(shutdown);
     let kdf = Arc::new(KdfLimiter::new());
     let replay = Arc::new(ReplayCache::new());
@@ -95,8 +92,10 @@ pub(crate) async fn handle_server(
     replay: Arc<ReplayCache>,
 ) -> Result<(), SessionError> {
     prepare_session_stream(&snell)?;
-    if let Some(params) = config.tcp_brutal {
-        platform::apply_tcp_brutal(&snell, params)?;
+    if let Some(params) = config.tcp_brutal
+        && let Err(error) = platform::apply_tcp_brutal(&snell, params)
+    {
+        warn!(error = %error, "tcp_brutal unavailable; continuing without it");
     }
     match config.selection {
         ProtocolSelection::Exact(ProtocolFlavor::V4 | ProtocolFlavor::V5) => {

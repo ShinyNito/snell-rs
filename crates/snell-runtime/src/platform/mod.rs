@@ -169,18 +169,6 @@ pub(crate) fn read_tcp_fastopen_listener(socket: &TcpSocket) -> Result<i32, Plat
     }
 }
 
-pub(crate) fn require_tcp_brutal(params: TcpBrutal) -> Result<(), PlatformError> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::require_tcp_brutal(params)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = params;
-        Err(PlatformError::Unsupported("tcp_brutal is Linux-only"))
-    }
-}
-
 pub(crate) fn apply_tcp_brutal(stream: &TcpStream, params: TcpBrutal) -> Result<(), PlatformError> {
     #[cfg(target_os = "linux")]
     {

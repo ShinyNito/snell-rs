@@ -9,9 +9,8 @@ use super::accept::{
     apply_accept_result, classify_accept_error, emfile_error,
 };
 use super::{
-    PlatformError, TcpBrutal, apply_keepalive, read_keepalive, read_tcp_fastopen_connect,
-    read_tcp_fastopen_listener, require_tcp_brutal, set_tcp_fastopen_connect,
-    set_tcp_fastopen_listener,
+    PlatformError, apply_keepalive, read_keepalive, read_tcp_fastopen_connect,
+    read_tcp_fastopen_listener, set_tcp_fastopen_connect, set_tcp_fastopen_listener,
 };
 
 #[cfg(not(miri))]
@@ -64,33 +63,6 @@ fn tfo_connect_supported_path_sets_option_or_unsupported() {
         Err(PlatformError::Unsupported(_)) => {}
         Err(error) => panic!("TFO connect must set the option or return Unsupported, got {error}"),
     }
-}
-
-#[test]
-fn tcp_brutal_requested_is_unsupported_or_really_brutal() {
-    let params = TcpBrutal {
-        send_mbps: 16,
-        cwnd_gain: 15,
-    };
-    match require_tcp_brutal(params) {
-        Ok(()) => {
-            #[cfg(not(target_os = "linux"))]
-            panic!("tcp_brutal must not succeed off Linux");
-        }
-        Err(PlatformError::Unsupported(_)) => {}
-        Err(error) => panic!("tcp_brutal must fail closed, got {error}"),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-#[test]
-fn tcp_brutal_is_unsupported_off_linux() {
-    let err = require_tcp_brutal(TcpBrutal {
-        send_mbps: 16,
-        cwnd_gain: 15,
-    })
-    .unwrap_err();
-    assert!(matches!(err, PlatformError::Unsupported(_)));
 }
 
 #[tokio::test]
