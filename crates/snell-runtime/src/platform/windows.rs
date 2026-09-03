@@ -27,7 +27,7 @@ pub(super) fn read_keepalive(
     // rustix 0.38 does (TCP_KEEPIDLE / TCP_KEEPINTVL).
     Ok(super::Keepalive {
         enabled: SockRef::from(stream).keepalive()?,
-        idle: sockopt::get_tcp_keepidle(stream)?,
-        interval: sockopt::get_tcp_keepintvl(stream)?,
+        idle: sockopt::get_tcp_keepidle(stream).map_err(std::io::Error::from)?,
+        interval: sockopt::get_tcp_keepintvl(stream).map_err(std::io::Error::from)?,
     })
 }
