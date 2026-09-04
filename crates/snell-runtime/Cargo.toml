@@ -62,3 +62,7 @@ harness = false
 [[bench]]
 name = "udp_loopback"
 harness = false
+
+[[bench]]
+name = "pgo_train"
+harness = false
