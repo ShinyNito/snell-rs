@@ -20,7 +20,7 @@ use crate::outbound::Outbound;
 use crate::pool::{PooledCodec, PooledConn, ReusePool};
 use crate::replay::ReplayCache;
 use crate::server::handle_server;
-use crate::session::{new_udp_encode, write_tunnel, write_udp_request, write_udp_setup};
+use crate::session::{new_encode, write_tunnel, write_udp_request, write_udp_setup};
 use crate::{ClientConfig, ServerConfig, UdpOptions, serve_client, serve_server};
 
 const PSK: &[u8] = b"0123456789abcdef";
@@ -369,6 +369,14 @@ async fn socks5_outbound_slow_handshake_cannot_delay_tunnel_past_15s() {
 }
 
 #[test]
+fn bulk_buffers_hold_one_max_v6_wire_record() {
+    // The decoder needs one maximum shaped record contiguous in the receive
+    // buffer; anything smaller would reject legal peer traffic.
+    assert!(crate::session::new_recv().max() >= snell_protocol::V6_WIRE_CAP);
+    assert!(crate::session::new_encode().max() >= snell_protocol::V6_WIRE_CAP);
+}
+
+#[test]
 fn tcp_hot_path_has_no_channel_or_flush() {
     let sources = [
         include_str!("session.rs"),
@@ -389,8 +397,12 @@ fn tcp_hot_path_has_no_channel_or_flush() {
             !src.contains(".flush("),
             "TCP path must not unconditionally flush"
         );
+    }
+    // outbound.rs (index 4) is exempt: `UdpFlow` allocates capacity-only
+    // datagram buffers once per UDP association, never per record.
+    for (i, src) in sources.iter().enumerate() {
         assert!(
-            !src.contains("Vec::with_capacity"),
+            i == 4 || !src.contains("Vec::with_capacity"),
             "TCP path must not allocate per record"
         );
     }
@@ -665,7 +677,7 @@ async fn early_payload_over_64kib_is_rejected() {
 
     let mut client = TcpStream::connect(addr).await.unwrap();
     let mut encoder = V4Encoder::os(&psk).unwrap();
-    let mut encode = EncodeBuffer::new(snell_protocol::ENCODE_BUFFER_MAX);
+    let mut encode = EncodeBuffer::new(256 * 1024);
     let dest = Address::from("127.0.0.1:9".parse::<SocketAddr>().unwrap());
     let mut req = [0u8; MAX_CONNECT_REQUEST_LEN];
     let n = encode_connect_request(&mut req, dest.as_view(), false).unwrap();
@@ -902,7 +914,7 @@ async fn write_udp_request_rejects_payload_that_misses_v4_slot() {
 
     let psk = Psk::new(PSK.to_vec()).unwrap();
     let mut encoder = V4Encoder::os(&psk).unwrap();
-    let mut encode = new_udp_encode();
+    let mut encode = new_encode();
     write_udp_setup(&mut encoder, &mut encode, &mut client)
         .await
         .unwrap();

@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use snell_protocol::socks5::{self, Command, METHOD_NO_AUTH, Reply};
-use snell_protocol::{Address, AddressRef, ParseState, TCP_CONNECT_TIMEOUT_SECS, UDP_DATAGRAM_MAX};
+use snell_protocol::{
+    Address, AddressRef, Error, MAX_UDP_PACKET_ADDR_LEN, ParseState, TCP_CONNECT_TIMEOUT_SECS,
+    UDP_DATAGRAM_MAX,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -40,6 +43,9 @@ pub(crate) struct UdpRecv<'a> {
     pub payload: &'a [u8],
 }
 
+/// Per-association UDP buffers hold capacity only; datagrams are received
+/// with `recv_buf_from` (uninit append) and sends are built with
+/// `extend_from_slice`, so only bytes actually carried are ever dirtied.
 pub(crate) enum UdpFlow {
     Direct {
         socket: UdpSocket,
@@ -59,7 +65,7 @@ impl UdpFlow {
         let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
         Ok(Self::Direct {
             socket,
-            recv: vec![0; UDP_DATAGRAM_MAX],
+            recv: Vec::with_capacity(UDP_DATAGRAM_MAX),
         })
     }
 
@@ -77,8 +83,8 @@ impl UdpFlow {
             _control: stream,
             socket,
             relay,
-            send: vec![0; UDP_DATAGRAM_MAX],
-            recv: vec![0; UDP_DATAGRAM_MAX],
+            send: Vec::with_capacity(UDP_DATAGRAM_MAX),
+            recv: Vec::with_capacity(UDP_DATAGRAM_MAX),
         })
     }
 
@@ -103,8 +109,15 @@ impl UdpFlow {
                 send,
                 ..
             } => {
-                let n = socks5::encode_udp_packet(send, 0, dest, payload)?;
-                socket.send_to(&send[..n], *relay).await?;
+                let mut hdr = [0u8; 3 + MAX_UDP_PACKET_ADDR_LEN];
+                let hdr_len = socks5::encode_udp_header(&mut hdr, 0, dest)?;
+                if hdr_len.saturating_add(payload.len()) > UDP_DATAGRAM_MAX {
+                    return Err(Error::PayloadTooLarge.into());
+                }
+                send.clear();
+                send.extend_from_slice(&hdr[..hdr_len]);
+                send.extend_from_slice(payload);
+                socket.send_to(send, *relay).await?;
                 Ok(())
             }
         }
@@ -117,15 +130,17 @@ impl UdpFlow {
     ) -> Result<UdpRecv<'_>, SessionError> {
         match self {
             Self::Direct { socket, recv } => {
-                let (n, from) = socket.recv_from(recv).await?;
+                recv.clear();
+                let (_, from) = socket.recv_buf_from(recv).await?;
                 Ok(UdpRecv {
                     addr: Address::Ip(from),
-                    payload: &recv[..n],
+                    payload: recv.as_slice(),
                 })
             }
             Self::Socks5 { socket, recv, .. } => loop {
-                let n = socket.recv_from(recv).await?.0;
-                let packet = match socks5::parse_udp_packet(&recv[..n]) {
+                recv.clear();
+                socket.recv_buf_from(recv).await?;
+                let packet = match socks5::parse_udp_packet(recv) {
                     Ok(packet) => packet,
                     Err(_) => {
                         invalid.fetch_add(1, Ordering::Relaxed);
@@ -140,7 +155,7 @@ impl UdpFlow {
                 let addr = packet.destination.into_owned();
                 return Ok(UdpRecv {
                     addr,
-                    payload: &recv[header_len..n],
+                    payload: &recv[header_len..],
                 });
             },
         }

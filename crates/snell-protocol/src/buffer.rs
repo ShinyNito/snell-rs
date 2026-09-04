@@ -5,9 +5,6 @@ use std::mem::MaybeUninit;
 
 use crate::{Error, Result};
 
-/// Default encode-buffer cap: several max v4 records, one allocation per connection.
-pub const ENCODE_BUFFER_MAX: usize = 256 * 1024;
-
 /// Contiguous receive allocation: `consumed | live | uninitialized cap`.
 ///
 /// Fixed capacity: `new(max)` does `Vec::with_capacity(max)` and never reallocates.

@@ -6,32 +6,27 @@
 use std::sync::Mutex;
 
 pub(crate) struct PacketBuf {
-    /// Initialized storage. Never shrinks: `truncate` moves `len`, not `data.len()`,
-    /// so reusing a pooled buffer does not re-zero the tail on every datagram.
+    /// `data.len()` is the datagram length. Fills go through [`Self::storage_mut`]
+    /// (uninit append, e.g. `recv_buf_from` / `extend_from_slice`), so pooled
+    /// reuse never memsets storage and only bytes actually written are dirtied.
     data: Vec<u8>,
-    /// Logical datagram length; always `<= data.len()`.
-    len: usize,
 }
 
 impl PacketBuf {
     pub fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len]
+        &self.data
     }
 
-    pub fn spare(&mut self, min: usize) -> &mut [u8] {
-        if self.data.len() < min {
-            self.data.resize(min, 0);
-        }
-        self.len = min;
-        &mut self.data[..min]
-    }
-
-    pub fn truncate(&mut self, n: usize) {
-        self.len = self.len.min(n);
+    /// Cleared backing storage for an append-style fill. Callers must not
+    /// write past the existing capacity ([`PacketPool::acquire`] sized it);
+    /// growth would escape the pool's byte accounting.
+    pub fn storage_mut(&mut self) -> &mut Vec<u8> {
+        self.data.clear();
+        &mut self.data
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.data.len()
     }
 
     fn capacity(&self) -> usize {
@@ -40,8 +35,7 @@ impl PacketBuf {
 
     #[cfg(test)]
     pub fn from_test(data: Vec<u8>) -> Self {
-        let len = data.len();
-        Self { data, len }
+        Self { data }
     }
 }
 
@@ -72,10 +66,7 @@ impl PacketPool {
 
     pub fn acquire(&self, min_cap: usize) -> Option<PacketBuf> {
         if min_cap == 0 {
-            return Some(PacketBuf {
-                data: Vec::new(),
-                len: 0,
-            });
+            return Some(PacketBuf { data: Vec::new() });
         }
         let mut inner = self.lock();
         if let Some(idx) = inner.free.iter().rposition(|buf| buf.capacity() >= min_cap) {
@@ -93,7 +84,6 @@ impl PacketPool {
         }
         let buf = PacketBuf {
             data: Vec::with_capacity(min_cap),
-            len: 0,
         };
         inner.bytes += buf.capacity();
         inner.live += 1;
@@ -139,15 +129,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truncate_then_spare_does_not_rezero_storage() {
+    fn storage_mut_clears_len_and_keeps_capacity() {
         let pool = PacketPool::new(1, 1024);
         let mut buf = pool.acquire(8).unwrap();
-        buf.spare(8).copy_from_slice(&[0xAA; 8]);
-        buf.truncate(2);
-        assert_eq!(buf.as_slice(), &[0xAA, 0xAA]);
-        // The tail keeps its prior contents: reuse must not memset per datagram.
-        assert_eq!(buf.spare(8), &[0xAA; 8]);
-        assert_eq!(buf.len(), 8);
+        buf.storage_mut().extend_from_slice(&[0xAA; 8]);
+        assert_eq!(buf.as_slice(), &[0xAA; 8]);
+        let cap = buf.storage_mut().capacity();
+        assert!(cap >= 8);
+        assert_eq!(buf.len(), 0, "storage_mut starts a fresh datagram");
+        buf.storage_mut().extend_from_slice(&[0x55; 2]);
+        assert_eq!(buf.as_slice(), &[0x55, 0x55]);
         pool.release(buf);
     }
 
