@@ -30,7 +30,7 @@ use crate::outbound::Outbound;
 use crate::packet::{PacketBuf, PacketPool};
 use crate::pool::PooledCodec;
 use crate::session::{
-    HandshakeRecord, decode_once, ensure_udp, new_udp_encode, new_udp_recv, read_server_tunnel,
+    RecordEvent, decode_once, ensure_udp, new_udp_encode, new_udp_recv, read_server_tunnel,
     with_handshake_timeout, write_reject, write_tunnel, write_udp_request, write_udp_response,
     write_udp_setup,
 };
@@ -648,9 +648,11 @@ where
             record = decode_once(decoder, recv, &mut snell_r, kdf, psk) => {
                 sleep.as_mut().reset(Instant::now() + idle);
                 match record? {
-                    HandshakeRecord::Zero => return Ok(AssocEnd::Closed),
-                    HandshakeRecord::Data(plain) => {
-                        send_socks_response(socks_udp, peer, &plain, metrics, pool).await?;
+                    RecordEvent::Zero => return Ok(AssocEnd::Closed),
+                    RecordEvent::Data(record) => {
+                        let plain = record.plaintext(recv.filled());
+                        send_socks_response(socks_udp, peer, plain, metrics, pool).await?;
+                        decoder.consume(recv, &record)?;
                     }
                 }
             }
@@ -785,22 +787,24 @@ where
             record = decode_once(decoder, recv, &mut snell_r, kdf, psk) => {
                 sleep.as_mut().reset(Instant::now() + udp.limits.idle);
                 match record? {
-                    HandshakeRecord::Zero => return Ok(()),
-                    HandshakeRecord::Data(plain) => {
-                        let pkt = match decode_udp_request(&plain) {
-                            Ok(pkt) => pkt,
+                    RecordEvent::Zero => return Ok(()),
+                    RecordEvent::Data(record) => {
+                        let plain = record.plaintext(recv.filled());
+                        match decode_udp_request(plain) {
+                            Ok(pkt) => {
+                                if flow
+                                    .send(pkt.address, pkt.payload, &udp.dns)
+                                    .await
+                                    .is_err()
+                                {
+                                    udp.metrics.invalid.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                             Err(_) => {
                                 udp.metrics.invalid.fetch_add(1, Ordering::Relaxed);
-                                continue;
                             }
-                        };
-                        if flow
-                            .send(pkt.address, pkt.payload, &udp.dns)
-                            .await
-                            .is_err()
-                        {
-                            udp.metrics.invalid.fetch_add(1, Ordering::Relaxed);
                         }
+                        decoder.consume(recv, &record)?;
                     }
                 }
             }

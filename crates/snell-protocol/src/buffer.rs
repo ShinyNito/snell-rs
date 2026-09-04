@@ -196,6 +196,60 @@ impl EncodeBuffer {
         Ok(&mut spare[..writable])
     }
 
+    /// Absolute end index of committed storage. Record bookkeeping only;
+    /// indices are invalid across compact.
+    pub(crate) fn end(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// Reserve capacity for a whole record of `total` bytes (may compact once),
+    /// then zero-fill and commit only the first `fixed` bytes. Returns the
+    /// record start index.
+    ///
+    /// Until `total - fixed` further bytes are committed, subsequent
+    /// [`Self::reserve_zeroed`], [`Self::extend_from_slice`], and
+    /// [`Self::commit_init`] calls within the record cannot compact or fail
+    /// for capacity, so absolute indices stay valid.
+    pub(crate) fn reserve_record(&mut self, total: usize, fixed: usize) -> Result<usize> {
+        debug_assert!(fixed <= total);
+        let spare = self.spare_capacity_mut(total)?;
+        spare[..fixed].fill(MaybeUninit::new(0));
+        // SAFETY: `fill` initialized `fixed` bytes of the tail.
+        unsafe {
+            self.commit(fixed)?;
+        }
+        Ok(self.storage.len() - fixed)
+    }
+
+    /// Copy `bytes` into the uninitialized tail and commit them.
+    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let spare = self.spare_capacity_mut(bytes.len())?;
+        spare[..bytes.len()].write_copy_of_slice(bytes);
+        // SAFETY: `write_copy_of_slice` initialized `bytes.len()` bytes of the tail.
+        unsafe { self.commit(bytes.len()) }
+    }
+
+    /// Entire uninitialized tail without compaction. The caller may initialize
+    /// a prefix of it (for example through Tokio `ReadBuf::uninit`) and then
+    /// commit with [`Self::commit_init`].
+    pub(crate) fn spare_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
+        let writable = self.max - self.storage.len();
+        let spare = self.storage.spare_capacity_mut();
+        &mut spare[..writable]
+    }
+
+    /// Commit `n` bytes previously initialized in the spare tail.
+    ///
+    /// Callers must have filled `storage[old_len..old_len + n]` through
+    /// [`Self::spare_uninit`]. The `unsafe` stays in this buffer module.
+    pub(crate) fn commit_init(&mut self, n: usize) -> Result<()> {
+        // SAFETY: caller initialized `n` bytes of the spare tail.
+        unsafe { self.commit(n) }
+    }
+
     /// Zero-fill `n` bytes of spare and commit them. Returns the start index after compact.
     pub fn reserve_zeroed(&mut self, n: usize) -> Result<usize> {
         if n == 0 {
@@ -274,6 +328,29 @@ impl EncodeBuffer {
         self.storage.truncate(live);
         self.sent = 0;
     }
+}
+
+/// Shared reservation `seal_init` bookkeeping: validate the payload slot is
+/// still uninitialized spare, then commit `written` caller-initialized bytes.
+/// Returns the total payload length including the prefix.
+pub(crate) fn commit_init_payload(
+    buf: &mut EncodeBuffer,
+    payload_start: usize,
+    prefix_len: usize,
+    max_payload: usize,
+    written: usize,
+) -> Result<usize> {
+    let total = prefix_len
+        .checked_add(written)
+        .ok_or(Error::PayloadTooLarge)?;
+    if total > max_payload {
+        return Err(Error::PayloadTooLarge);
+    }
+    if buf.end() != payload_start + prefix_len {
+        return Err(Error::PendingWire);
+    }
+    buf.commit_init(written)?;
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -372,6 +449,35 @@ mod tests {
         spare[..2].write_copy_of_slice(b"ab");
         buf.commit_init(2).unwrap();
         assert_eq!(buf.filled(), b"ab");
+    }
+
+    #[test]
+    fn reserve_record_commits_only_fixed_part() {
+        let mut buf = EncodeBuffer::new(64);
+        let start = buf.reserve_record(16, 4).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(buf.end(), 4);
+        assert_eq!(buf.range_mut(0, 4), &[0u8; 4]);
+        // Remaining record bytes commit without compaction or capacity errors.
+        buf.extend_from_slice(b"abcd").unwrap();
+        let spare = buf.spare_uninit();
+        spare[..4].write_copy_of_slice(b"efgh");
+        buf.commit_init(4).unwrap();
+        buf.reserve_zeroed(4).unwrap();
+        assert_eq!(buf.end(), 16);
+        assert_eq!(buf.pending(), b"\0\0\0\0abcdefgh\0\0\0\0");
+    }
+
+    #[test]
+    fn reserve_record_compacts_once_and_rejects_oversize() {
+        let mut buf = EncodeBuffer::new(8);
+        buf.reserve_zeroed(6).unwrap();
+        buf.range_mut(0, 6).copy_from_slice(b"abcdef");
+        buf.advance(4).unwrap();
+        let start = buf.reserve_record(6, 2).unwrap();
+        assert_eq!(start, 2, "compacted so the record fits the tail");
+        assert_eq!(buf.pending(), b"ef\0\0");
+        assert_eq!(buf.reserve_record(64, 0), Err(Error::PayloadTooLarge));
     }
 
     #[test]
