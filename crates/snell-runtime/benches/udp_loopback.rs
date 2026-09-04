@@ -1,7 +1,9 @@
 //! UDP loopback on established v4 and v6 SOCKS5 UDP associations.
 //!
 //! Handshake/KDF is warmed up and excluded from the timed window.
-//! Workload is ping-pong datagrams on the same association.
+//! Workloads are ping-pong datagrams and windowed bursts on the same
+//! association; the burst window keeps several datagrams queued so the
+//! association's encode/flush batching is exercised.
 //!
 //! Run: `cargo bench -p snell-runtime --bench udp_loopback`
 
@@ -19,6 +21,8 @@ use tokio::sync::oneshot;
 const PSK: &[u8] = b"0123456789abcdef";
 const WARMUP_ROUNDS: usize = 100;
 const PING_ROUNDS: usize = 5_000;
+const BURST_ROUNDS: usize = 2_000;
+const BURST_WINDOW: usize = 8;
 const PAYLOAD: [u8; 64] = [0x5A; 64];
 
 fn main() {
@@ -51,10 +55,22 @@ async fn run() {
             .expect("ping");
         let ping_elapsed = ping_started.elapsed();
 
+        burst(&session, echo, &PAYLOAD, WARMUP_ROUNDS, BURST_WINDOW)
+            .await
+            .expect("burst warmup");
+
+        let burst_started = Instant::now();
+        burst(&session, echo, &PAYLOAD, BURST_ROUNDS, BURST_WINDOW)
+            .await
+            .expect("burst");
+        let burst_elapsed = burst_started.elapsed();
+
         eprintln!(
             "{flavor:?} udp loopback established association, handshake excluded from ping-pong\n\
              handshake: elapsed={handshake_elapsed:?}\n\
-             ping: rounds={PING_ROUNDS} size={} elapsed={ping_elapsed:?}",
+             ping: rounds={PING_ROUNDS} size={} elapsed={ping_elapsed:?}\n\
+             burst: rounds={BURST_ROUNDS} window={BURST_WINDOW} size={} elapsed={burst_elapsed:?}",
+            PAYLOAD.len(),
             PAYLOAD.len()
         );
     }
@@ -170,6 +186,36 @@ async fn ping_pong(
         let parsed = socks5::parse_udp_packet(&buf[..got]).map_err(io::Error::other)?;
         if parsed.payload != payload {
             return Err(io::Error::other("udp payload mismatch"));
+        }
+    }
+    Ok(())
+}
+
+async fn burst(
+    session: &UdpSession,
+    echo: SocketAddr,
+    payload: &[u8],
+    rounds: usize,
+    window: usize,
+) -> io::Result<()> {
+    let mut packet = vec![0u8; 32 + payload.len()];
+    let n = socks5::encode_udp_packet(&mut packet, 0, AddressRef::Ip(echo), payload)
+        .map_err(io::Error::other)?;
+    packet.truncate(n);
+    let mut buf = [0u8; 2048];
+    for _ in 0..rounds {
+        for _ in 0..window {
+            session.client.send_to(&packet, session.relay).await?;
+        }
+        for _ in 0..window {
+            let recv = session.client.recv_from(&mut buf);
+            let (got, _) = tokio::time::timeout(std::time::Duration::from_secs(5), recv)
+                .await
+                .map_err(|_| io::Error::other("udp burst response timed out"))??;
+            let parsed = socks5::parse_udp_packet(&buf[..got]).map_err(io::Error::other)?;
+            if parsed.payload != payload {
+                return Err(io::Error::other("udp payload mismatch"));
+            }
         }
     }
     Ok(())

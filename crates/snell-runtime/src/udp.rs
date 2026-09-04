@@ -448,7 +448,7 @@ enum AssocEnd {
 
 #[allow(clippy::too_many_arguments)]
 async fn client_assoc(
-    rx: mpsc::Receiver<InboundDgram>,
+    mut rx: mpsc::Receiver<InboundDgram>,
     peer: SocketAddr,
     socks_udp: Arc<UdpSocket>,
     dial: Dial,
@@ -457,17 +457,23 @@ async fn client_assoc(
     idle: Duration,
     pool: Arc<PacketPool>,
 ) {
-    let end = client_assoc_inner(rx, peer, socks_udp, dial, &metrics, idle, &pool).await;
+    let end = client_assoc_inner(&mut rx, peer, socks_udp, dial, &metrics, idle, &pool).await;
     if matches!(end, Ok(AssocEnd::Idle)) {
         metrics.idle_expired.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(client = %peer, "udp association expired after idle timeout");
+    }
+    // Datagrams still queued when the association dies (dial failure, TCP
+    // error, idle race) must return to the pool, or its live count leaks.
+    rx.close();
+    while let Ok(dgram) = rx.try_recv() {
+        pool.release(dgram.buf);
     }
     let _ = ctrl.send(Ctrl::Closed(peer)).await;
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn client_assoc_inner(
-    rx: mpsc::Receiver<InboundDgram>,
+    rx: &mut mpsc::Receiver<InboundDgram>,
     peer: SocketAddr,
     socks_udp: Arc<UdpSocket>,
     dial: Dial,
@@ -608,7 +614,7 @@ async fn pump_client<E, D>(
     recv: &mut RecvBuffer,
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
-    mut rx: mpsc::Receiver<InboundDgram>,
+    rx: &mut mpsc::Receiver<InboundDgram>,
     peer: SocketAddr,
     socks_udp: &UdpSocket,
     metrics: &UdpMetrics,
@@ -911,6 +917,55 @@ mod tests {
         assert!(
             miss_eqs < 32,
             "missing-key scan would Eq all 2000 entries: eqs={miss_eqs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assoc_dial_failure_releases_queued_buffers() {
+        let pool = Arc::new(PacketPool::new(4, 1024 * 1024));
+        let (tx, rx) = mpsc::channel(4);
+        for _ in 0..2 {
+            let mut buf = pool.acquire(64).unwrap();
+            buf.spare(4).copy_from_slice(b"ping");
+            buf.truncate(4);
+            tx.try_send(InboundDgram {
+                dest: Address::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+                header_len: 0,
+                buf,
+            })
+            .unwrap();
+        }
+        assert_eq!(pool.live(), 2);
+        // Bind then drop: dialing this port fails fast with connection refused.
+        let dead = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let socks_udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
+        let metrics = Arc::new(UdpMetrics::default());
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 3456));
+        client_assoc(
+            rx,
+            peer,
+            socks_udp,
+            Dial {
+                server: dead,
+                psk: Psk::new(b"0123456789abcdef".to_vec()).unwrap(),
+                version: ProtocolFlavor::V4,
+                kdf: Arc::new(KdfLimiter::new()),
+            },
+            ctrl_tx,
+            metrics,
+            Duration::from_secs(5),
+            pool.clone(),
+        )
+        .await;
+        assert!(matches!(ctrl_rx.recv().await, Some(Ctrl::Closed(_))));
+        assert_eq!(
+            pool.live(),
+            0,
+            "queued datagram buffers must return to the pool when the association dies"
         );
     }
 
