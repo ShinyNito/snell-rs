@@ -595,6 +595,11 @@ where
     .await
 }
 
+/// Vectored-write fan-in limit: at most this many decoded records are
+/// flushed per `writev`. Sized so max-size v4 records can fill the batch
+/// without exceeding the receive buffer.
+const WRITE_BATCH_MAX: usize = 16;
+
 async fn pump_snell_to_plain<R, W, D>(
     reader: &mut R,
     writer: &mut W,
@@ -606,8 +611,16 @@ where
     W: AsyncWrite + Unpin,
     D: TcpDecoder,
 {
+    // Decoded-ahead records not yet written: their plaintext ranges stay
+    // valid against the unmoved `filled()` view until any is consumed, so
+    // the batch is flushed with one vectored write, then consumed FIFO.
+    // Fixed-size slots: the TCP path allocates nothing per record.
+    let mut batch: [Option<snell_protocol::DecodedRecord>; WRITE_BATCH_MAX] = Default::default();
+    let mut batch_count = 0usize;
+    let mut batch_len = 0usize;
     let mut write_off = 0usize;
-    let mut current: Option<snell_protocol::DecodedRecord> = None;
+    let mut end_after_batch = false;
+    let mut deferred: Option<SessionError> = None;
     let mut protocol_end = false;
     let mut shutting_down = false;
     poll_fn(|cx| {
@@ -620,10 +633,23 @@ where
                 };
             }
 
-            if let Some(record) = current.as_ref() {
-                let plain = record.plaintext(recv.filled());
-                if write_off < plain.len() {
-                    match Pin::new(&mut *writer).poll_write(cx, &plain[write_off..]) {
+            if batch_count > 0 {
+                if write_off < batch_len {
+                    let filled = recv.filled();
+                    let mut slices = [io::IoSlice::new(&[]); WRITE_BATCH_MAX];
+                    let mut count = 0usize;
+                    let mut skip = write_off;
+                    for record in batch[..batch_count].iter().flatten() {
+                        let plain = record.plaintext(filled);
+                        if skip >= plain.len() {
+                            skip -= plain.len();
+                            continue;
+                        }
+                        slices[count] = io::IoSlice::new(&plain[skip..]);
+                        skip = 0;
+                        count += 1;
+                    }
+                    match Pin::new(&mut *writer).poll_write_vectored(cx, &slices[..count]) {
                         Poll::Ready(Ok(0)) => {
                             return Poll::Ready(Err(SessionError::Io(io::Error::new(
                                 io::ErrorKind::WriteZero,
@@ -636,11 +662,22 @@ where
                     }
                     continue;
                 }
-                if let Err(error) = decoder.consume(recv, record) {
-                    return Poll::Ready(Err(error.into()));
+                for slot in batch[..batch_count].iter_mut() {
+                    if let Some(record) = slot.take()
+                        && let Err(error) = decoder.consume(recv, &record)
+                    {
+                        return Poll::Ready(Err(error.into()));
+                    }
                 }
-                current = None;
+                batch_count = 0;
+                batch_len = 0;
                 write_off = 0;
+                if let Some(error) = deferred.take() {
+                    return Poll::Ready(Err(error));
+                }
+                if end_after_batch {
+                    protocol_end = true;
+                }
                 continue;
             }
 
@@ -649,53 +686,81 @@ where
                 continue;
             }
 
-            match decoder.decode(recv) {
-                Ok(DecodeStatus::NeedMore { minimum }) => {
-                    if recv.len() >= minimum {
-                        return Poll::Ready(Err(SessionError::Protocol(Error::Malformed(
-                            "decoder need exceeds filled",
-                        ))));
-                    }
-                    let n = {
-                        let spare = match recv.spare_capacity_mut(1) {
-                            Ok(spare) => spare,
-                            Err(error) => return Poll::Ready(Err(error.into())),
-                        };
-                        let mut buf = ReadBuf::uninit(spare);
-                        match Pin::new(&mut *reader).poll_read(cx, &mut buf) {
-                            Poll::Ready(Ok(())) => buf.filled().len(),
-                            Poll::Ready(Err(error)) => {
-                                return Poll::Ready(Err(error.into()));
+            // Fill a batch by decode-ahead. No reads happen mid-batch, so no
+            // compaction can move the plaintext under the collected ranges.
+            loop {
+                match decoder.decode(recv) {
+                    Ok(DecodeStatus::NeedMore { minimum }) => {
+                        if batch_count > 0 {
+                            // Flush what is ready before reading more.
+                            break;
+                        }
+                        if recv.len() >= minimum {
+                            return Poll::Ready(Err(SessionError::Protocol(Error::Malformed(
+                                "decoder need exceeds filled",
+                            ))));
+                        }
+                        let n = {
+                            let spare = match recv.spare_capacity_mut(1) {
+                                Ok(spare) => spare,
+                                Err(error) => return Poll::Ready(Err(error.into())),
+                            };
+                            let mut buf = ReadBuf::uninit(spare);
+                            match Pin::new(&mut *reader).poll_read(cx, &mut buf) {
+                                Poll::Ready(Ok(())) => buf.filled().len(),
+                                Poll::Ready(Err(error)) => {
+                                    return Poll::Ready(Err(error.into()));
+                                }
+                                Poll::Pending => return Poll::Pending,
                             }
-                            Poll::Pending => return Poll::Pending,
+                        };
+                        if n == 0 {
+                            if recv.is_empty() {
+                                protocol_end = false;
+                                shutting_down = true;
+                                break;
+                            }
+                            return Poll::Ready(Err(SessionError::Io(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "eof mid-record",
+                            ))));
                         }
-                    };
-                    if n == 0 {
-                        if recv.is_empty() {
-                            protocol_end = false;
-                            shutting_down = true;
-                            continue;
-                        }
-                        return Poll::Ready(Err(SessionError::Io(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "eof mid-record",
-                        ))));
-                    }
-                    if let Err(error) = recv.commit_init(n) {
-                        return Poll::Ready(Err(error.into()));
-                    }
-                }
-                Ok(DecodeStatus::Record(record)) => {
-                    if record.kind == RecordKind::ZeroChunk {
-                        if let Err(error) = decoder.consume(recv, &record) {
+                        if let Err(error) = recv.commit_init(n) {
                             return Poll::Ready(Err(error.into()));
                         }
-                        protocol_end = true;
-                        continue;
                     }
-                    current = Some(record);
+                    Ok(DecodeStatus::Record(record)) => {
+                        if record.kind == RecordKind::ZeroChunk {
+                            if batch_count == 0 {
+                                if let Err(error) = decoder.consume(recv, &record) {
+                                    return Poll::Ready(Err(error.into()));
+                                }
+                                protocol_end = true;
+                            } else {
+                                // Consumed FIFO with the batch, then end.
+                                batch[batch_count] = Some(record);
+                                batch_count += 1;
+                                end_after_batch = true;
+                            }
+                            break;
+                        }
+                        batch_len += record.plaintext.len();
+                        batch[batch_count] = Some(record);
+                        batch_count += 1;
+                        if batch_count == WRITE_BATCH_MAX {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        if batch_count == 0 {
+                            return Poll::Ready(Err(error.into()));
+                        }
+                        // Flush decoded records before surfacing the error,
+                        // matching the former write-per-record order.
+                        deferred = Some(error.into());
+                        break;
+                    }
                 }
-                Err(error) => return Poll::Ready(Err(error.into())),
             }
         }
     })
