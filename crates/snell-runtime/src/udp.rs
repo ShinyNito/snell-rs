@@ -926,8 +926,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         for _ in 0..2 {
             let mut buf = pool.acquire(64).unwrap();
-            buf.spare(4).copy_from_slice(b"ping");
-            buf.truncate(4);
+            buf.storage_mut().extend_from_slice(b"ping");
             tx.try_send(InboundDgram {
                 dest: Address::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
                 header_len: 0,
