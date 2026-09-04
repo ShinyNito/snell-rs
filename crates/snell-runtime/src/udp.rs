@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use snell_protocol::socks5::{self, Reply};
 use snell_protocol::{
-    Address, EncodeBuffer, Error, ProtocolFlavor, Psk, RecvBuffer, UDP_ASSOCIATION_IDLE_SECS,
-    UDP_DATAGRAM_MAX, decode_udp_request, decode_udp_response,
+    Address, EncodeBuffer, Error, MAX_UDP_PACKET_ADDR_LEN, ProtocolFlavor, Psk, RecvBuffer,
+    UDP_ASSOCIATION_IDLE_SECS, UDP_DATAGRAM_MAX, decode_udp_request, decode_udp_response,
 };
+
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -30,7 +31,7 @@ use crate::outbound::Outbound;
 use crate::packet::{PacketBuf, PacketPool};
 use crate::pool::PooledCodec;
 use crate::session::{
-    RecordEvent, decode_once, ensure_udp, new_udp_encode, new_udp_recv, read_server_tunnel,
+    RecordEvent, decode_once, ensure_bulk, new_encode, new_recv, read_server_tunnel,
     with_handshake_timeout, write_reject, write_tunnel, write_udp_request, write_udp_response,
     write_udp_setup,
 };
@@ -271,15 +272,17 @@ async fn dispatcher(
 ) {
     let mut map: HashMap<SocketAddr, AssocEntry> = HashMap::new();
     let mut controls: HashMap<ControlId, Control> = HashMap::new();
-    let mut drop_scratch = vec![0u8; UDP_DATAGRAM_MAX];
+    // Uninit-append receives: the kernel writes the datagram, so neither the
+    // scratch sink nor pooled buffers are ever zero-filled up front.
+    let mut drop_scratch: Vec<u8> = Vec::with_capacity(UDP_DATAGRAM_MAX);
     let mut held = pool.acquire(UDP_DATAGRAM_MAX);
     loop {
         if let Some(mut buf) = held.take() {
             let result = {
-                let spare = buf.spare(UDP_DATAGRAM_MAX);
+                let storage = buf.storage_mut();
                 tokio::select! {
                     ctrl = ctrl_rx.recv() => Err(ctrl),
-                    result = socket.recv_from(spare) => Ok(result),
+                    result = socket.recv_buf_from(storage) => Ok(result),
                 }
             };
             match result {
@@ -288,8 +291,7 @@ async fn dispatcher(
                     held = Some(buf);
                     apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
                 }
-                Ok(Ok((n, peer))) => {
-                    buf.truncate(n);
+                Ok(Ok((_, peer))) => {
                     handle_datagram(
                         peer,
                         buf,
@@ -314,7 +316,8 @@ async fn dispatcher(
                     let Some(ctrl) = ctrl else { return; };
                     apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
                 }
-                result = socket.recv_from(&mut drop_scratch) => {
+                result = socket.recv_buf_from(&mut drop_scratch) => {
+                    drop_scratch.clear();
                     if result.is_ok() {
                         metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
                     }
@@ -474,8 +477,8 @@ async fn client_assoc_inner(
 ) -> Result<AssocEnd, SessionError> {
     let (mut snell, codec) =
         dial_and_codec(dial.server, &dial.psk, dial.version, &dial.kdf).await?;
-    let mut encode = new_udp_encode();
-    let mut recv = new_udp_recv();
+    let mut encode = new_encode();
+    let mut recv = new_recv();
     match codec {
         PooledCodec::V4 {
             mut encoder,
@@ -674,6 +677,21 @@ async fn send_socks_response(
             return Ok(());
         }
     };
+    // Encode the SOCKS5 header on the stack, then append header and payload
+    // into the pooled buffer: only the bytes actually sent are dirtied.
+    let mut hdr = [0u8; 3 + MAX_UDP_PACKET_ADDR_LEN];
+    let hdr_len = match socks5::encode_udp_header(&mut hdr, 0, pkt.address) {
+        Ok(n) => n,
+        Err(_) => {
+            metrics.invalid.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+    };
+    let needed = hdr_len.saturating_add(pkt.payload.len());
+    if needed > UDP_DATAGRAM_MAX {
+        metrics.oversize.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
     let mut out = match pool.acquire(UDP_DATAGRAM_MAX) {
         Some(buf) => buf,
         None => {
@@ -681,20 +699,9 @@ async fn send_socks_response(
             return Ok(());
         }
     };
-    let n =
-        match socks5::encode_udp_packet(out.spare(UDP_DATAGRAM_MAX), 0, pkt.address, pkt.payload) {
-            Ok(n) => n,
-            Err(Error::BufferTooSmall { .. } | Error::PayloadTooLarge) => {
-                metrics.oversize.fetch_add(1, Ordering::Relaxed);
-                pool.release(out);
-                return Ok(());
-            }
-            Err(error) => {
-                pool.release(out);
-                return Err(error.into());
-            }
-        };
-    out.truncate(n);
+    let storage = out.storage_mut();
+    storage.extend_from_slice(&hdr[..hdr_len]);
+    storage.extend_from_slice(pkt.payload);
     socks_udp.send_to(out.as_slice(), peer).await?;
     pool.release(out);
     Ok(())
@@ -734,8 +741,7 @@ pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
         return Err(SessionError::UdpLimit);
     }
     let _guard = AssocGuard(&udp.metrics);
-    recv = ensure_udp(recv)?;
-    encode = new_udp_encode();
+    recv = ensure_bulk(recv)?;
     let mut flow = match outbound.open_udp(&udp.dns).await {
         Ok(flow) => flow,
         Err(error) => {

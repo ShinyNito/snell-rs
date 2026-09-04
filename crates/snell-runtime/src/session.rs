@@ -5,12 +5,11 @@ use std::task::Poll;
 use std::time::Duration;
 
 use snell_protocol::{
-    Address, AddressRef, COMMAND_UDP, DecodeStatus, ENCODE_BUFFER_MAX, EncodeBuffer, Error,
-    MAX_CONNECT_REQUEST_LEN, MAX_PACKET_SIZE, MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk,
-    REUSE_IDLE_TIMEOUT_SECS, RecordKind, RecvBuffer, SERVER_EARLY_PAYLOAD_MAX, ServerReply,
-    TCP_HANDSHAKE_TIMEOUT_SECS, V6_WIRE_CAP, aead_key, encode_connect_request, encode_reject,
-    encode_tunnel_reply, encode_udp_request, encode_udp_response, encode_udp_setup,
-    udp_request_len, udp_response_len,
+    Address, AddressRef, COMMAND_UDP, DecodeStatus, EncodeBuffer, Error, MAX_CONNECT_REQUEST_LEN,
+    MAX_PACKET_SIZE, MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk, REUSE_IDLE_TIMEOUT_SECS,
+    RecordKind, RecvBuffer, SERVER_EARLY_PAYLOAD_MAX, ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS,
+    V6_WIRE_CAP, aead_key, encode_connect_request, encode_reject, encode_tunnel_reply,
+    encode_udp_request, encode_udp_response, encode_udp_setup, udp_request_len, udp_response_len,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -25,28 +24,17 @@ use crate::replay::ReplayCache;
 const RECORD_HINT: usize = MAX_PACKET_SIZE;
 pub(crate) const HANDSHAKE_PLAIN_MAX: usize = MAX_CONNECT_REQUEST_LEN + MAX_PACKET_SIZE_V6;
 
+/// Per-connection buffer cap for both TCP and UDP-over-TCP sessions:
+/// exactly one maximum v6 wire record. The receive side needs this much
+/// contiguous space to decode a max-size shaped record; the encode side
+/// flushes through pump backpressure, so a larger cap only raises the
+/// retained per-connection high-water mark without helping throughput.
 pub(crate) fn new_recv() -> RecvBuffer {
-    RecvBuffer::new(ENCODE_BUFFER_MAX)
-}
-
-pub(crate) fn new_encode() -> EncodeBuffer {
-    EncodeBuffer::new(ENCODE_BUFFER_MAX)
-}
-
-pub(crate) fn new_udp_recv() -> RecvBuffer {
     RecvBuffer::new(V6_WIRE_CAP)
 }
 
-pub(crate) fn new_udp_encode() -> EncodeBuffer {
+pub(crate) fn new_encode() -> EncodeBuffer {
     EncodeBuffer::new(V6_WIRE_CAP)
-}
-
-pub(crate) fn ensure_udp(recv: RecvBuffer) -> Result<RecvBuffer, SessionError> {
-    let live = recv.filled().to_vec();
-    drop(recv);
-    let mut next = RecvBuffer::new(V6_WIRE_CAP);
-    next.extend_from_slice(&live)?;
-    Ok(next)
 }
 
 pub(crate) async fn with_handshake_timeout<F, T>(fut: F) -> Result<T, SessionError>
@@ -406,6 +394,8 @@ pub(crate) fn server_may_reuse<D: TcpDecoder>(encode: &EncodeBuffer, decoder: &D
     encode.is_empty() && !decoder.has_unconsumed_plaintext()
 }
 
+/// Drop the session's touched buffer pages while a reuse connection sits
+/// idle: reallocate fresh (untouched) capacity, preserving live bytes.
 pub(crate) fn release_bulk(
     recv: RecvBuffer,
     encode: EncodeBuffer,
@@ -413,18 +403,18 @@ pub(crate) fn release_bulk(
     let live = recv.filled().to_vec();
     drop(recv);
     drop(encode);
-    let cap = live.len().clamp(V6_WIRE_CAP, ENCODE_BUFFER_MAX);
-    let mut next = RecvBuffer::new(cap);
+    let mut next = new_recv();
     next.extend_from_slice(&live)?;
-    Ok((next, EncodeBuffer::new(V6_WIRE_CAP)))
+    Ok((next, new_encode()))
 }
 
+/// Upgrade an auto-detect prefix buffer to full bulk capacity.
 pub(crate) fn ensure_bulk(recv: RecvBuffer) -> Result<RecvBuffer, SessionError> {
-    if recv.max() >= ENCODE_BUFFER_MAX {
+    if recv.max() >= V6_WIRE_CAP {
         return Ok(recv);
     }
     let live = recv.filled().to_vec();
-    let mut next = RecvBuffer::new(ENCODE_BUFFER_MAX);
+    let mut next = new_recv();
     next.extend_from_slice(&live)?;
     Ok(next)
 }

@@ -37,7 +37,7 @@ mod v6_raw;
 mod fragment;
 
 pub use address::{Address, AddressRef};
-pub use buffer::{ENCODE_BUFFER_MAX, EncodeBuffer, RecvBuffer};
+pub use buffer::{EncodeBuffer, RecvBuffer};
 pub use chunk::next_v4_chunk_limit;
 pub use clock::{Clock, FixedClock, UnixClock};
 pub use control::{
