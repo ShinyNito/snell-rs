@@ -886,6 +886,45 @@ async fn v6_unshaped_udp_echo_roundtrip() {
     udp_echo_version(ProtocolFlavor::V6Unshaped, b"phase-7-v6-unshaped").await;
 }
 
+/// A burst of datagrams queued on one association must all be relayed:
+/// batching the encode/flush must not drop, merge, or reorder records.
+#[tokio::test]
+async fn udp_burst_all_datagrams_roundtrip() {
+    let pair = start_pair_udp(
+        ProtocolFlavor::V4,
+        Outbound::Direct,
+        UdpOptions::default(),
+        UdpOptions::default(),
+    )
+    .await;
+    let echo = spawn_udp_echo().await.unwrap();
+    let (_tcp, relay, client) = socks5_udp_associate(pair.socks).await.unwrap();
+    let count = 8usize;
+    for i in 0..count {
+        let payload = format!("burst-{i}");
+        let packet = encode_socks_udp(echo, 0, payload.as_bytes());
+        client.send_to(&packet, relay).await.unwrap();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut buf = vec![0u8; 2048];
+    while seen.len() < count {
+        let (n, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("burst response timed out")
+            .unwrap();
+        let parsed = socks5::parse_udp_packet(&buf[..n]).unwrap();
+        assert_eq!(parsed.frag, 0);
+        seen.insert(parsed.payload.to_vec());
+    }
+    for i in 0..count {
+        let payload = format!("burst-{i}");
+        assert!(
+            seen.contains(payload.as_bytes()),
+            "missing burst payload {payload}"
+        );
+    }
+}
+
 #[test]
 fn v4_udp_request_with_max_packet_payload_exceeds_slot() {
     let dest = AddressRef::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));

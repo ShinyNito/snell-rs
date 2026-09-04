@@ -268,7 +268,10 @@ pub struct V6UnshapedDecoder {
     include_salt: bool,
     replay: Option<[u8; SALT_LEN]>,
     step: ReadStep,
-    busy: bool,
+    /// Bytes of returned-but-unconsumed records at the front of `filled()`.
+    /// Decode-ahead parses the next record at this offset; [`Self::consume`]
+    /// drains records FIFO.
+    pending: usize,
 }
 
 impl V6UnshapedDecoder {
@@ -280,7 +283,7 @@ impl V6UnshapedDecoder {
             include_salt: true,
             replay: None,
             step: ReadStep::Salt,
-            busy: false,
+            pending: 0,
         }
     }
 
@@ -290,7 +293,7 @@ impl V6UnshapedDecoder {
     }
 
     pub fn has_unconsumed_plaintext(&self) -> bool {
-        self.busy
+        self.pending != 0
     }
 
     pub fn kdf_need(&self) -> usize {
@@ -321,13 +324,10 @@ impl V6UnshapedDecoder {
     }
 
     pub fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus> {
-        if self.busy {
-            return Err(Error::PlaintextNotDrained);
-        }
         loop {
             match self.step {
                 ReadStep::Salt => {
-                    if let Some(need) = Self::decode_need(buf, SALT_LEN)? {
+                    if let Some(need) = self.decode_need(buf, SALT_LEN)? {
                         return Ok(need);
                     }
                     if self.aead.is_none() {
@@ -343,7 +343,7 @@ impl V6UnshapedDecoder {
                 ReadStep::Header => {
                     let off = self.header_offset();
                     let header_end = off + HEADER_CIPHER_LEN;
-                    if let Some(need) = Self::decode_need(buf, header_end)? {
+                    if let Some(need) = self.decode_need(buf, header_end)? {
                         return Ok(need);
                     }
                     let mut hdr = [0u8; HEADER_CIPHER_LEN];
@@ -364,9 +364,10 @@ impl V6UnshapedDecoder {
                     if body_len == 0 {
                         self.include_salt = false;
                         self.step = ReadStep::Header;
-                        self.busy = true;
+                        let consumed = header_end - self.pending;
+                        self.pending = header_end;
                         return Ok(DecodeStatus::Record(DecodedRecord {
-                            consumed: header_end,
+                            consumed,
                             plaintext: 0..0,
                             kind: RecordKind::ZeroChunk,
                         }));
@@ -378,7 +379,7 @@ impl V6UnshapedDecoder {
                     let body_off = off + HEADER_CIPHER_LEN;
                     let body_len = header.body_len_v6_unshaped()?;
                     let needed = body_off + body_len;
-                    if let Some(need) = Self::decode_need(buf, needed)? {
+                    if let Some(need) = self.decode_need(buf, needed)? {
                         return Ok(need);
                     }
                     let body = &mut buf.filled_mut()[body_off..needed];
@@ -392,9 +393,10 @@ impl V6UnshapedDecoder {
                     self.nonce.increment();
                     self.include_salt = false;
                     self.step = ReadStep::Header;
-                    self.busy = true;
+                    let consumed = needed - self.pending;
+                    self.pending = needed;
                     return Ok(DecodeStatus::Record(DecodedRecord {
-                        consumed: needed,
+                        consumed,
                         plaintext: body_off..body_off + header.payload_len,
                         kind: RecordKind::Data,
                     }));
@@ -404,17 +406,23 @@ impl V6UnshapedDecoder {
     }
 
     pub fn consume(&mut self, buf: &mut RecvBuffer, record: &DecodedRecord) -> Result<()> {
+        self.pending = self
+            .pending
+            .checked_sub(record.consumed)
+            .ok_or(Error::PlaintextNotDrained)?;
         buf.consume(record.consumed)?;
-        self.busy = false;
         Ok(())
     }
 
     fn header_offset(&self) -> usize {
-        if self.include_salt { SALT_LEN } else { 0 }
+        self.pending + if self.include_salt { SALT_LEN } else { 0 }
     }
 
-    fn decode_need(buf: &RecvBuffer, minimum: usize) -> Result<Option<DecodeStatus>> {
-        if minimum > buf.max() {
+    /// `minimum` is measured from the start of `filled()` and includes
+    /// `pending`. A record must fit the buffer on its own; when outstanding
+    /// records crowd it out, report `NeedMore` so the caller drains first.
+    fn decode_need(&self, buf: &RecvBuffer, minimum: usize) -> Result<Option<DecodeStatus>> {
+        if minimum - self.pending > buf.max() {
             Err(Error::PayloadTooLarge)
         } else if buf.len() < minimum {
             Ok(Some(DecodeStatus::NeedMore { minimum }))
@@ -428,7 +436,7 @@ impl fmt::Debug for V6UnshapedDecoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("V6UnshapedDecoder")
             .field("include_salt", &self.include_salt)
-            .field("busy", &self.busy)
+            .field("pending", &self.pending)
             .finish_non_exhaustive()
     }
 }
@@ -557,6 +565,39 @@ mod tests {
         assert_eq!(
             decode_plain(&mut decoder, &mut buf, &pending),
             b"helloworld"
+        );
+    }
+
+    #[test]
+    fn decode_ahead_batches_records_before_consume() {
+        let mut enc = encoder();
+        let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+        for msg in [&b"hello"[..], b"world"] {
+            let mut rec = enc.reserve(&mut out, &[], msg.len()).unwrap();
+            rec.payload_mut()[..msg.len()].copy_from_slice(msg);
+            rec.seal(msg.len()).unwrap();
+        }
+        let wire = collect(&out);
+        let mut decoder = V6UnshapedDecoder::new(psk());
+        let mut buf = RecvBuffer::new(4096);
+        buf.extend_from_slice(&wire).unwrap();
+        let DecodeStatus::Record(first) = decoder.decode(&mut buf).unwrap() else {
+            panic!("first record not ready");
+        };
+        let DecodeStatus::Record(second) = decoder.decode(&mut buf).unwrap() else {
+            panic!("second record not ready");
+        };
+        assert!(decoder.has_unconsumed_plaintext());
+        assert_eq!(first.plaintext(buf.filled()), b"hello");
+        assert_eq!(second.plaintext(buf.filled()), b"world");
+        assert_eq!(first.consumed + second.consumed, wire.len());
+        decoder.consume(&mut buf, &first).unwrap();
+        decoder.consume(&mut buf, &second).unwrap();
+        assert!(buf.is_empty());
+        assert!(!decoder.has_unconsumed_plaintext());
+        assert_eq!(
+            decoder.consume(&mut buf, &second),
+            Err(Error::PlaintextNotDrained)
         );
     }
 

@@ -328,7 +328,10 @@ pub struct V4Decoder {
     nonce: Nonce,
     include_salt: bool,
     step: ReadStep,
-    busy: bool,
+    /// Bytes of returned-but-unconsumed records at the front of `filled()`.
+    /// Decode-ahead parses the next record at this offset; [`Self::consume`]
+    /// drains records FIFO.
+    pending: usize,
 }
 
 impl V4Decoder {
@@ -339,7 +342,7 @@ impl V4Decoder {
             nonce: Nonce::new(),
             include_salt: true,
             step: ReadStep::Salt,
-            busy: false,
+            pending: 0,
         }
     }
 
@@ -348,7 +351,7 @@ impl V4Decoder {
     }
 
     pub fn has_unconsumed_plaintext(&self) -> bool {
-        self.busy
+        self.pending != 0
     }
 
     /// Bytes of salt required before Argon2id. Zero after the key is installed.
@@ -376,13 +379,10 @@ impl V4Decoder {
     }
 
     pub fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus> {
-        if self.busy {
-            return Err(Error::PlaintextNotDrained);
-        }
         loop {
             match self.step {
                 ReadStep::Salt => {
-                    if let Some(need) = Self::decode_need(buf, SALT_LEN)? {
+                    if let Some(need) = self.decode_need(buf, SALT_LEN)? {
                         return Ok(need);
                     }
                     if self.aead.is_none() {
@@ -397,7 +397,7 @@ impl V4Decoder {
                 ReadStep::Header => {
                     let off = self.header_offset();
                     let header_end = off + HEADER_CIPHER_LEN;
-                    if let Some(need) = Self::decode_need(buf, header_end)? {
+                    if let Some(need) = self.decode_need(buf, header_end)? {
                         return Ok(need);
                     }
                     let mut hdr = [0u8; HEADER_CIPHER_LEN];
@@ -415,9 +415,10 @@ impl V4Decoder {
                     if body_len == 0 {
                         self.include_salt = false;
                         self.step = ReadStep::Header;
-                        self.busy = true;
+                        let consumed = header_end - self.pending;
+                        self.pending = header_end;
                         return Ok(DecodeStatus::Record(DecodedRecord {
-                            consumed: header_end,
+                            consumed,
                             plaintext: 0..0,
                             kind: RecordKind::ZeroChunk,
                         }));
@@ -429,7 +430,7 @@ impl V4Decoder {
                     let body_off = off + HEADER_CIPHER_LEN;
                     let body_len = header.body_len_v4()?;
                     let needed = body_off + body_len;
-                    if let Some(need) = Self::decode_need(buf, needed)? {
+                    if let Some(need) = self.decode_need(buf, needed)? {
                         return Ok(need);
                     }
                     let body = &mut buf.filled_mut()[body_off..needed];
@@ -446,9 +447,10 @@ impl V4Decoder {
                     let start = body_off + header.padding_len;
                     self.include_salt = false;
                     self.step = ReadStep::Header;
-                    self.busy = true;
+                    let consumed = needed - self.pending;
+                    self.pending = needed;
                     return Ok(DecodeStatus::Record(DecodedRecord {
-                        consumed: needed,
+                        consumed,
                         plaintext: start..start + header.payload_len,
                         kind: RecordKind::Data,
                     }));
@@ -458,17 +460,23 @@ impl V4Decoder {
     }
 
     pub fn consume(&mut self, buf: &mut RecvBuffer, record: &DecodedRecord) -> Result<()> {
+        self.pending = self
+            .pending
+            .checked_sub(record.consumed)
+            .ok_or(Error::PlaintextNotDrained)?;
         buf.consume(record.consumed)?;
-        self.busy = false;
         Ok(())
     }
 
     fn header_offset(&self) -> usize {
-        if self.include_salt { SALT_LEN } else { 0 }
+        self.pending + if self.include_salt { SALT_LEN } else { 0 }
     }
 
-    fn decode_need(buf: &RecvBuffer, minimum: usize) -> Result<Option<DecodeStatus>> {
-        if minimum > buf.max() {
+    /// `minimum` is measured from the start of `filled()` and includes
+    /// `pending`. A record must fit the buffer on its own; when outstanding
+    /// records crowd it out, report `NeedMore` so the caller drains first.
+    fn decode_need(&self, buf: &RecvBuffer, minimum: usize) -> Result<Option<DecodeStatus>> {
+        if minimum - self.pending > buf.max() {
             Err(Error::PayloadTooLarge)
         } else if buf.len() < minimum {
             Ok(Some(DecodeStatus::NeedMore { minimum }))
@@ -482,7 +490,7 @@ impl fmt::Debug for V4Decoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("V4Decoder")
             .field("include_salt", &self.include_salt)
-            .field("busy", &self.busy)
+            .field("pending", &self.pending)
             .finish_non_exhaustive()
     }
 }
@@ -883,16 +891,40 @@ mod tests {
     }
 
     #[test]
-    fn drain_required_before_next_decode() {
+    fn decode_ahead_batches_records_before_consume() {
         let mut encoder = encoder_no_padding();
         let mut out = encode_buf();
         seal_payload(&mut encoder, &mut out, b"hello");
+        seal_payload(&mut encoder, &mut out, b"world");
         let wire = collect_pending(&out);
         let mut decoder = V4Decoder::new(psk());
         let mut buf = RecvBuffer::new(4096);
         push(&mut buf, &wire);
-        let _ = decoder.decode(&mut buf).unwrap();
-        assert_eq!(decoder.decode(&mut buf), Err(Error::PlaintextNotDrained));
+        let DecodeStatus::Record(first) = decoder.decode(&mut buf).unwrap() else {
+            panic!("first record not ready");
+        };
+        let DecodeStatus::Record(second) = decoder.decode(&mut buf).unwrap() else {
+            panic!("second record not ready");
+        };
+        assert!(decoder.has_unconsumed_plaintext());
+        // Both plaintexts stay valid against the same unmoved filled() view.
+        assert_eq!(first.plaintext(buf.filled()), b"hello");
+        assert_eq!(second.plaintext(buf.filled()), b"world");
+        assert_eq!(first.consumed + second.consumed, wire.len());
+        // Records drain FIFO; the buffer advances per record.
+        decoder.consume(&mut buf, &first).unwrap();
+        decoder.consume(&mut buf, &second).unwrap();
+        assert!(buf.is_empty());
+        assert!(!decoder.has_unconsumed_plaintext());
+        // Over-consuming past the outstanding records fails closed.
+        assert_eq!(
+            decoder.consume(&mut buf, &second),
+            Err(Error::PlaintextNotDrained)
+        );
+        assert!(matches!(
+            decoder.decode(&mut buf).unwrap(),
+            DecodeStatus::NeedMore { .. }
+        ));
     }
 
     #[test]
