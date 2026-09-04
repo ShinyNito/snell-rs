@@ -13,7 +13,7 @@ default = []
 unsafe-raw = ["snell-protocol/unsafe-raw"]
 
 [dependencies]
-snell-protocol = { path = "../snell-protocol", version = "1.0.0-rc.3" }
+snell-protocol = { path = "../snell-protocol", version = "1.0.0-rc.4" }
 bytes.workspace = true
 hickory-resolver.workspace = true
 socket2 = { version = "0.6", features = ["all"] }
@@ -37,7 +37,7 @@ rustix = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
-snell-testkit = { path = "../snell-testkit", version = "1.0.0-rc.3" }
+snell-testkit = { path = "../snell-testkit", version = "1.0.0-rc.4" }
 tokio = { workspace = true, features = [
   "io-util",
   "macros",

@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 1.0.0-rc.4
+
+### Changed
+- TCP sessions decode consecutive records ahead and flush them with one vectored
+  write, while keeping record order and wire behavior unchanged.
+- TCP and UDP buffer sizing avoids unnecessary high-water memory and zeroing.
+- Release PGO training uses a dedicated mixed-traffic workload at a portable CPU
+  level and reuses one profile across the target's CPU variants.
+
+### Fixed
+- Queued UDP buffers are returned to the bounded pool whenever an association
+  exits.
+
 ## 1.0.0-rc.3
 
 ### Changed

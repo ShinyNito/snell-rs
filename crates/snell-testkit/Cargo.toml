@@ -9,7 +9,7 @@ publish.workspace = true
 description = "Process tests, golden fixtures, and load helpers"
 
 [dependencies]
-snell-protocol = { path = "../snell-protocol", version = "1.0.0-rc.3" }
+snell-protocol = { path = "../snell-protocol", version = "1.0.0-rc.4" }
 thiserror.workspace = true
 tokio = { workspace = true, features = [
   "io-util",
