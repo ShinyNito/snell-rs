@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Two-pass LLVM PGO for snell-rs. Training uses the runtime loopback benchmarks.
+# Two-pass LLVM PGO for snell-rs. Training runs the pgo_train workload.
 # target-cpu=native is forbidden: artifacts must run on machines other than the builder.
+#
+# The instrumented pass is built at a portable target-cpu for the target's
+# architecture so the training workload can always run on the builder, even
+# when the artifact cpu is newer than the builder (x86-64-v3/v4 artifacts on
+# baseline runners, x86_64 macOS artifacts trained under Rosetta 2). LLVM
+# profiles are keyed by function, not by target-cpu, so the final
+# profile-use build applies them at the artifact cpu.
 set -euo pipefail
 
 target="${1:?target}"
@@ -11,6 +18,12 @@ if [[ "${cpu}" == "native" ]]; then
   echo "target-cpu=native is forbidden for release artifacts" >&2
   exit 1
 fi
+
+case "${target}" in
+  x86_64-*) train_cpu="x86-64" ;;
+  aarch64-apple-*) train_cpu="apple-m1" ;;
+  *) train_cpu="generic" ;;
+esac
 
 pgo="${PWD}/pgo-data"
 rm -rf "${pgo}"
@@ -43,7 +56,7 @@ build_final() {
 }
 
 export CARGO_PROFILE_RELEASE_STRIP=none
-export RUSTFLAGS="-Ctarget-cpu=${cpu} -Cprofile-generate=${rustc_pgo}"
+export RUSTFLAGS="-Ctarget-cpu=${train_cpu} -Cprofile-generate=${rustc_pgo}"
 cargo build --release --locked --target "${target}" -p snell
 
 if [[ ! -f "${bin}" ]]; then
@@ -60,9 +73,7 @@ fi
 
 export LLVM_PROFILE_FILE="${rustc_pgo}/snell-%p-%m.profraw"
 
-cargo test --release --locked --target "${target}" -p snell-runtime --bench tcp_loopback -- --nocapture
-cargo test --release --locked --target "${target}" -p snell-runtime --bench reuse_loopback -- --nocapture
-cargo test --release --locked --target "${target}" -p snell-runtime --bench udp_loopback -- --nocapture
+cargo test --release --locked --target "${target}" -p snell-runtime --bench pgo_train
 
 shopt -s nullglob
 raws=("${pgo}"/*.profraw)
@@ -71,12 +82,15 @@ if [[ ${#raws[@]} -eq 0 ]]; then
   exit 1
 fi
 "${profdata}" merge -o "${pgo}/merged.profdata" "${raws[@]}"
-if ! "${profdata}" show --covered "${pgo}/merged.profdata" | awk '/snell_runtime/{found=1} END{exit !found}'; then
-  echo "PGO profile does not cover snell-runtime" >&2
-  exit 1
-fi
+covered="$("${profdata}" show --covered "${pgo}/merged.profdata")"
+for crate in snell_runtime snell_protocol; do
+  if ! grep -q "${crate}" <<<"${covered}"; then
+    echo "PGO profile does not cover ${crate}" >&2
+    exit 1
+  fi
+done
 
 unset CARGO_PROFILE_RELEASE_STRIP
 export RUSTFLAGS="-Ctarget-cpu=${cpu} -Cprofile-use=${rustc_pgo}/merged.profdata"
 cargo build --release --locked --target "${target}" -p snell
-echo trained >"${status_file}"
+echo "trained: pgo_train at target-cpu=${train_cpu}, applied at target-cpu=${cpu}" >"${status_file}"
