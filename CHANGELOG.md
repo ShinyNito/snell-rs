@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 1.0.0-rc.3
+
+### Changed
+- TCP record payload slots remain uninitialized until filled, avoiding redundant
+  zeroing while preserving wire bytes.
+- UDP packet buffers are reused and processed in place, avoiding per-datagram
+  copies and repeated buffer initialization.
+
 ## 1.0.0-rc.2
 
 ### Changed
