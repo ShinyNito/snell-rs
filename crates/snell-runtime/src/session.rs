@@ -200,14 +200,15 @@ pub(crate) async fn read_server_tunnel<D: TcpDecoder, R: AsyncRead + Unpin>(
     let mut plain = PlainStream::new(HANDSHAKE_PLAIN_MAX);
     loop {
         match decode_once(decoder, recv, reader, kdf, psk).await? {
-            HandshakeRecord::Zero => {
+            RecordEvent::Zero => {
                 return Err(SessionError::Io(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "zero chunk before tunnel",
                 )));
             }
-            HandshakeRecord::Data(plain_bytes) => {
-                plain.push(&plain_bytes)?;
+            RecordEvent::Data(record) => {
+                plain.push(record.plaintext(recv.filled()))?;
+                decoder.consume(recv, &record)?;
                 match plain.server_reply()? {
                     ParseState::Need(_) => {}
                     ParseState::Done((ServerReply::Tunnel, n)) => {
@@ -245,20 +246,21 @@ pub(crate) async fn read_server_connect<D: TcpDecoder, R: AsyncRead + Unpin>(
     let mut replay_checked = replay.is_none();
     loop {
         match decode_once(decoder, recv, reader, kdf, psk).await? {
-            HandshakeRecord::Zero => {
+            RecordEvent::Zero => {
                 return Err(SessionError::Io(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "zero chunk before CONNECT",
                 )));
             }
-            HandshakeRecord::Data(plain_bytes) => {
+            RecordEvent::Data(record) => {
                 if !replay_checked {
                     replay_checked = true;
                     if let (Some(cache), Some(id)) = (replay, decoder.replay_identity()) {
                         cache.insert(id)?;
                     }
                 }
-                plain.push(&plain_bytes)?;
+                plain.push(record.plaintext(recv.filled()))?;
+                decoder.consume(recv, &record)?;
                 match plain.connect() {
                     Ok(ParseState::Need(_)) => {}
                     Ok(ParseState::Done((request, n))) => {
@@ -291,9 +293,13 @@ pub(crate) async fn read_server_connect<D: TcpDecoder, R: AsyncRead + Unpin>(
     }
 }
 
-pub(crate) enum HandshakeRecord {
+/// One decoded record. `Data` borrows from the receive buffer: the caller
+/// processes `record.plaintext(recv.filled())` and then calls
+/// `decoder.consume(recv, &record)` exactly once before the next decode.
+/// `Zero` is already consumed. No owned copy in steady state.
+pub(crate) enum RecordEvent {
     Zero,
-    Data(Vec<u8>),
+    Data(snell_protocol::DecodedRecord),
 }
 
 async fn drain_early_payload<D: TcpDecoder>(
@@ -329,7 +335,7 @@ pub(crate) async fn decode_once<D: TcpDecoder, R: AsyncRead + Unpin>(
     reader: &mut R,
     kdf: &KdfLimiter,
     psk: &Psk,
-) -> Result<HandshakeRecord, SessionError> {
+) -> Result<RecordEvent, SessionError> {
     loop {
         maybe_install_kdf(decoder, recv, kdf, psk).await?;
         match decoder.decode(recv)? {
@@ -339,11 +345,9 @@ pub(crate) async fn decode_once<D: TcpDecoder, R: AsyncRead + Unpin>(
             DecodeStatus::Record(record) => {
                 if record.kind == RecordKind::ZeroChunk {
                     decoder.consume(recv, &record)?;
-                    return Ok(HandshakeRecord::Zero);
+                    return Ok(RecordEvent::Zero);
                 }
-                let plain = record.plaintext(recv.filled()).to_vec();
-                decoder.consume(recv, &record)?;
-                return Ok(HandshakeRecord::Data(plain));
+                return Ok(RecordEvent::Data(record));
             }
         }
     }
@@ -511,7 +515,9 @@ where
                                 break;
                             }
                             let read = {
-                                let mut read_buf = ReadBuf::new(reservation.payload_mut());
+                                // Uninit payload slot: the kernel writes it, so the
+                                // reserve path never zero-fills the payload region.
+                                let mut read_buf = ReadBuf::uninit(reservation.payload_uninit());
                                 match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
                                     Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
                                     Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
@@ -524,7 +530,7 @@ where
                                     break;
                                 }
                                 Poll::Ready(Ok(n)) => {
-                                    if let Err(error) = reservation.seal(n) {
+                                    if let Err(error) = reservation.seal_init(n) {
                                         return Poll::Ready(Err(error.into()));
                                     }
                                 }

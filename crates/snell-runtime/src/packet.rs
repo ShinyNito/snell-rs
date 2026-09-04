@@ -6,27 +6,32 @@
 use std::sync::Mutex;
 
 pub(crate) struct PacketBuf {
+    /// Initialized storage. Never shrinks: `truncate` moves `len`, not `data.len()`,
+    /// so reusing a pooled buffer does not re-zero the tail on every datagram.
     data: Vec<u8>,
+    /// Logical datagram length; always `<= data.len()`.
+    len: usize,
 }
 
 impl PacketBuf {
     pub fn as_slice(&self) -> &[u8] {
-        &self.data
+        &self.data[..self.len]
     }
 
     pub fn spare(&mut self, min: usize) -> &mut [u8] {
         if self.data.len() < min {
             self.data.resize(min, 0);
         }
+        self.len = min;
         &mut self.data[..min]
     }
 
     pub fn truncate(&mut self, n: usize) {
-        self.data.truncate(n);
+        self.len = self.len.min(n);
     }
 
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.len
     }
 
     fn capacity(&self) -> usize {
@@ -35,7 +40,8 @@ impl PacketBuf {
 
     #[cfg(test)]
     pub fn from_test(data: Vec<u8>) -> Self {
-        Self { data }
+        let len = data.len();
+        Self { data, len }
     }
 }
 
@@ -66,7 +72,10 @@ impl PacketPool {
 
     pub fn acquire(&self, min_cap: usize) -> Option<PacketBuf> {
         if min_cap == 0 {
-            return Some(PacketBuf { data: Vec::new() });
+            return Some(PacketBuf {
+                data: Vec::new(),
+                len: 0,
+            });
         }
         let mut inner = self.lock();
         if let Some(idx) = inner.free.iter().rposition(|buf| buf.capacity() >= min_cap) {
@@ -84,6 +93,7 @@ impl PacketPool {
         }
         let buf = PacketBuf {
             data: Vec::with_capacity(min_cap),
+            len: 0,
         };
         inner.bytes += buf.capacity();
         inner.live += 1;
@@ -127,6 +137,19 @@ impl PacketPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_then_spare_does_not_rezero_storage() {
+        let pool = PacketPool::new(1, 1024);
+        let mut buf = pool.acquire(8).unwrap();
+        buf.spare(8).copy_from_slice(&[0xAA; 8]);
+        buf.truncate(2);
+        assert_eq!(buf.as_slice(), &[0xAA, 0xAA]);
+        // The tail keeps its prior contents: reuse must not memset per datagram.
+        assert_eq!(buf.spare(8), &[0xAA; 8]);
+        assert_eq!(buf.len(), 8);
+        pool.release(buf);
+    }
 
     #[test]
     fn acquire_fails_at_count_cap() {

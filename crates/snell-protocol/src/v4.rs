@@ -116,18 +116,16 @@ impl<E: Entropy, C: Clock> V4Encoder<E, C> {
             0
         };
         let salt_len = usize::from(first) * SALT_LEN;
-        let record_cap = salt_len + HEADER_CIPHER_LEN + padding_len + max_payload + TAG_LEN;
-        let record_start = buf.reserve_zeroed(record_cap)?;
+        let fixed = salt_len + HEADER_CIPHER_LEN + padding_len;
+        let record_cap = fixed + max_payload + TAG_LEN;
+        let record_start = buf.reserve_record(record_cap, fixed)?;
         if first {
             buf.range_mut(record_start, record_start + SALT_LEN)
                 .copy_from_slice(&self.salt);
         }
         let header_start = record_start + salt_len;
         let payload_start = header_start + HEADER_CIPHER_LEN + padding_len;
-        if !prefix.is_empty() {
-            buf.range_mut(payload_start, payload_start + prefix.len())
-                .copy_from_slice(prefix);
-        }
+        buf.extend_from_slice(prefix)?;
         self.prefix_len = prefix.len();
         self.max_payload = max_payload;
         self.padding_len = padding_len;
@@ -158,7 +156,13 @@ impl<E: Entropy, C: Clock> V4Encoder<E, C> {
         if payload_len == 0 {
             buf.truncate(self.header_start + HEADER_CIPHER_LEN)?;
         } else {
-            buf.truncate(self.payload_start + payload_len + TAG_LEN)?;
+            let body_end = self.payload_start + payload_len + TAG_LEN;
+            if buf.end() < body_end {
+                // Zero-commit through the tag slot; never touches committed payload.
+                buf.reserve_zeroed(body_end - buf.end())?;
+            } else {
+                buf.truncate(body_end)?;
+            }
         }
 
         let nonce_before = self.nonce;
@@ -234,7 +238,26 @@ impl<E: Entropy, C: Clock> V4Reservation<'_, E, C> {
     pub fn payload_mut(&mut self) -> &mut [u8] {
         let start = self.encoder.payload_start + self.encoder.prefix_len;
         let end = self.encoder.payload_start + self.encoder.max_payload;
+        let record_end = end + TAG_LEN;
+        if self.buf.end() < record_end {
+            // Materialize the rest of the record for in-place writers.
+            // Capacity was reserved by `reserve_record`; this cannot fail.
+            self.buf
+                .reserve_zeroed(record_end - self.buf.end())
+                .expect("record capacity reserved");
+        }
         self.buf.range_mut(start, end)
+    }
+
+    /// Uninitialized payload slot after the prefix. Fill a prefix of it (for
+    /// example through Tokio `ReadBuf::uninit`), then call [`Self::seal_init`].
+    /// Do not mix with [`Self::payload_mut`]. Empty once materialized.
+    pub fn payload_uninit(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
+        let cap = self.encoder.max_payload - self.encoder.prefix_len;
+        if self.buf.end() != self.encoder.payload_start + self.encoder.prefix_len {
+            return &mut [];
+        }
+        &mut self.buf.spare_uninit()[..cap]
     }
 
     pub fn capacity(&self) -> usize {
@@ -254,6 +277,20 @@ impl<E: Entropy, C: Clock> V4Reservation<'_, E, C> {
         if total > self.encoder.max_payload {
             return Err(Error::PayloadTooLarge);
         }
+        self.sealed = true;
+        self.encoder.finish(self.buf, total)
+    }
+
+    /// Seal after the caller initialized `written` bytes of
+    /// [`Self::payload_uninit`]. Commits them without zero-filling first.
+    pub fn seal_init(mut self, written: usize) -> Result<()> {
+        let total = crate::buffer::commit_init_payload(
+            self.buf,
+            self.encoder.payload_start,
+            self.encoder.prefix_len,
+            self.encoder.max_payload,
+            written,
+        )?;
         self.sealed = true;
         self.encoder.finish(self.buf, total)
     }
@@ -1002,6 +1039,69 @@ mod tests {
         assert_eq!(wire, expected);
         let hex: String = wire.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, PADDED_HELLO_HEX);
+    }
+
+    #[test]
+    fn seal_init_wire_matches_payload_mut() {
+        let mk = || {
+            V4Encoder::with_salt(
+                &psk(),
+                [7; SALT_LEN],
+                32,
+                RepeatEntropy { byte: 0x3c },
+                FixedClock::new(0),
+            )
+            .unwrap()
+        };
+        let mut a_enc = mk();
+        let mut a = encode_buf();
+        let mut b_enc = mk();
+        let mut b = encode_buf();
+        // Padded first record, steady second record, short write under the hint.
+        for (msg, hint) in [(&b"hello"[..], 5), (b"steady", 6), (b"abc", 8)] {
+            let mut rec = a_enc.reserve(&mut a, &[], hint).unwrap();
+            rec.payload_mut()[..msg.len()].copy_from_slice(msg);
+            rec.seal(msg.len()).unwrap();
+
+            let mut rec = b_enc.reserve(&mut b, &[], hint).unwrap();
+            rec.payload_uninit()[..msg.len()].write_copy_of_slice(msg);
+            rec.seal_init(msg.len()).unwrap();
+        }
+        assert_eq!(a.pending(), b.pending());
+    }
+
+    #[test]
+    fn seal_init_wire_matches_payload_mut_with_prefix() {
+        let mut a_enc = encoder_no_padding();
+        let mut a = encode_buf();
+        let mut b_enc = encoder_no_padding();
+        let mut b = encode_buf();
+
+        let mut rec = a_enc.reserve(&mut a, b"pfx", 5).unwrap();
+        rec.payload_mut()[..5].copy_from_slice(b"hello");
+        rec.seal(5).unwrap();
+
+        let mut rec = b_enc.reserve(&mut b, b"pfx", 5).unwrap();
+        rec.payload_uninit()[..5].write_copy_of_slice(b"hello");
+        rec.seal_init(5).unwrap();
+
+        assert_eq!(a.pending(), b.pending());
+    }
+
+    #[test]
+    fn seal_init_after_payload_mut_fails_closed() {
+        let mut encoder = encoder_no_padding();
+        let mut out = encode_buf();
+        let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
+        rec.payload_mut()[..5].copy_from_slice(b"hello");
+        assert!(rec.payload_uninit().is_empty());
+        assert_eq!(rec.seal_init(5), Err(Error::PendingWire));
+        assert!(out.is_empty(), "failed seal cancels the record");
+        // The encoder recovers: the next reservation seals normally.
+        let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
+        rec.payload_mut()[..5].copy_from_slice(b"hello");
+        rec.seal(5).unwrap();
+        assert!(!out.is_empty());
     }
 
     const PADDED_HELLO_HEX: &str = "07070707070707070707070707070707c5366a60e2813e6ee63b822b726e54d05a8627cf2ccff4033c873c193c733c3c273c6c3c933cb01537bcdbe9295174b2b65661bb";
