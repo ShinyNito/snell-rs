@@ -42,7 +42,9 @@ impl Drop for PacketBuf {
         let Some(pool) = self.pool.take() else {
             return;
         };
-        let mut inner = pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.live -= 1;
         let mut data = std::mem::take(&mut self.data);
         data.clear();
