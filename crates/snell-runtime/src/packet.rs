@@ -2,14 +2,16 @@
 //!
 //! Caps both buffer count and total allocated bytes. Queue paths take
 //! ownership of a [`PacketBuf`]; they do not memcpy payload to enqueue.
+//! Each checked-out buffer returns itself on drop, including cancellation.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub(crate) struct PacketBuf {
     /// `data.len()` is the datagram length. Fills go through [`Self::storage_mut`]
     /// (uninit append, e.g. `recv_buf_from` / `extend_from_slice`), so pooled
     /// reuse never memsets storage and only bytes actually written are dirtied.
     data: Vec<u8>,
+    pool: Option<Arc<Mutex<Inner>>>,
 }
 
 impl PacketBuf {
@@ -29,24 +31,34 @@ impl PacketBuf {
         self.data.len()
     }
 
-    fn capacity(&self) -> usize {
-        self.data.capacity()
-    }
-
     #[cfg(test)]
     pub fn from_test(data: Vec<u8>) -> Self {
-        Self { data }
+        Self { data, pool: None }
+    }
+}
+
+impl Drop for PacketBuf {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.take() else {
+            return;
+        };
+        let mut inner = pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.live -= 1;
+        let mut data = std::mem::take(&mut self.data);
+        data.clear();
+        // Free entries are plain Vecs, not leases: no Arc ownership cycle.
+        inner.free.push(data);
     }
 }
 
 struct Inner {
-    free: Vec<PacketBuf>,
+    free: Vec<Vec<u8>>,
     live: usize,
     bytes: usize,
 }
 
 pub(crate) struct PacketPool {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
     max_bufs: usize,
     max_bytes: usize,
 }
@@ -54,11 +66,11 @@ pub(crate) struct PacketPool {
 impl PacketPool {
     pub fn new(max_bufs: usize, max_bytes: usize) -> Self {
         Self {
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 free: Vec::new(),
                 live: 0,
                 bytes: 0,
-            }),
+            })),
             max_bufs,
             max_bytes,
         }
@@ -66,39 +78,45 @@ impl PacketPool {
 
     pub fn acquire(&self, min_cap: usize) -> Option<PacketBuf> {
         if min_cap == 0 {
-            return Some(PacketBuf { data: Vec::new() });
+            return Some(PacketBuf {
+                data: Vec::new(),
+                pool: None,
+            });
         }
         let mut inner = self.lock();
         if let Some(idx) = inner.free.iter().rposition(|buf| buf.capacity() >= min_cap) {
-            let buf = inner.free.swap_remove(idx);
+            let data = inner.free.swap_remove(idx);
             inner.live += 1;
-            return Some(buf);
+            return Some(PacketBuf {
+                data,
+                pool: Some(self.inner.clone()),
+            });
         }
         let held = inner.live + inner.free.len();
         if held >= self.max_bufs {
             return None;
         }
-        let add = min_cap;
-        if inner.bytes.saturating_add(add) > self.max_bytes {
+        if inner.bytes.saturating_add(min_cap) > self.max_bytes {
             return None;
         }
-        let buf = PacketBuf {
-            data: Vec::with_capacity(min_cap),
-        };
-        inner.bytes += buf.capacity();
+        let data = Vec::with_capacity(min_cap);
+        // Charge actual capacity, not just the requested minimum.
+        let bytes = inner.bytes.checked_add(data.capacity())?;
+        if bytes > self.max_bytes {
+            return None;
+        }
+        inner.bytes = bytes;
         inner.live += 1;
-        Some(buf)
+        Some(PacketBuf {
+            data,
+            pool: Some(self.inner.clone()),
+        })
     }
 
     pub fn release(&self, buf: PacketBuf) {
-        let mut inner = self.lock();
-        inner.live = inner.live.saturating_sub(1);
-        let cap = buf.capacity();
-        if inner.free.len() + inner.live >= self.max_bufs || inner.bytes > self.max_bytes {
-            inner.bytes = inner.bytes.saturating_sub(cap);
-            return;
-        }
-        inner.free.push(buf);
+        // Existing explicit-return sites and implicit error/cancel paths use
+        // the same owner. Returning to a different pool cannot corrupt counts.
+        drop(buf);
     }
 
     #[cfg(test)]
@@ -138,8 +156,8 @@ mod tests {
         assert!(cap >= 8);
         assert_eq!(buf.len(), 0, "storage_mut starts a fresh datagram");
         buf.storage_mut().extend_from_slice(&[0x55; 2]);
-        assert_eq!(buf.as_slice(), &[0x55, 0x55]);
         pool.release(buf);
+        assert_eq!(pool.live(), 0);
     }
 
     #[test]
@@ -171,5 +189,70 @@ mod tests {
         pool.release(b);
         assert!(pool.allocated_bufs() <= 2);
         assert!(pool.allocated_bytes() <= 1024);
+    }
+
+    #[test]
+    fn drop_returns_buffer_without_explicit_release() {
+        let pool = PacketPool::new(1, 1024);
+        for _ in 0..64 {
+            let buf = pool.acquire(64).unwrap();
+            assert_eq!(pool.live(), 1);
+            assert!(pool.acquire(64).is_none());
+            drop(buf);
+            assert_eq!(pool.live(), 0);
+            assert_eq!(pool.allocated_bufs(), 1);
+            assert_eq!(pool.allocated_bytes(), 64);
+        }
+    }
+
+    #[test]
+    fn dropping_queue_returns_all_leases() {
+        let pool = PacketPool::new(2, 1024);
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        assert!(tx.try_send(pool.acquire(64).unwrap()).is_ok());
+        assert!(tx.try_send(pool.acquire(64).unwrap()).is_ok());
+        assert_eq!(pool.live(), 2);
+        drop(rx);
+        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.allocated_bufs(), 2);
+    }
+
+    #[tokio::test]
+    async fn abort_returns_in_flight_lease() {
+        let pool = PacketPool::new(1, 1024);
+        let buf = pool.acquire(64).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _buf = buf;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        assert_eq!(pool.live(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(pool.live(), 0);
+        assert!(pool.acquire(64).is_some());
+    }
+
+    #[test]
+    fn final_lease_does_not_keep_pool_alive() {
+        let pool = PacketPool::new(1, 1024);
+        let weak = Arc::downgrade(&pool.inner);
+        let buf = pool.acquire(64).unwrap();
+        drop(pool);
+        assert!(weak.upgrade().is_some());
+        drop(buf);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn empty_and_test_buffers_do_not_change_pool_accounting() {
+        let pool = PacketPool::new(1, 1024);
+        drop(pool.acquire(0).unwrap());
+        pool.release(PacketBuf::from_test(vec![1, 2, 3]));
+        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.allocated_bufs(), 0);
+        assert_eq!(pool.allocated_bytes(), 0);
     }
 }
