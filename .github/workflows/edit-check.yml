@@ -14,36 +14,22 @@ jobs:
           ref: ec020bc3edc05f7c53d31be6b286915ec795b0b5
           path: source
           persist-credentials: false
-      - name: Archive pinned source without executing repository code
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Download dependencies without compiling repository code
+        run: cargo fetch --manifest-path source/fuzz/Cargo.toml
+      - name: Prepare dependency audit executable and advisory database
         run: |
-          mkdir export
-          git -C source archive HEAD | gzip > export/source.tar.gz
-          git -C source rev-parse HEAD > export/COMMIT
-      - uses: actions/upload-artifact@v4
-        with:
-          name: current-source
-          path: export/
-          retention-days: 2
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri, rust-src
-      - name: Prepare independent offline verification tools
-        run: |
-          set -euo pipefail
           cd "$RUNNER_TEMP"
-          cargo +nightly miri setup
-          cargo +nightly install cargo-fuzz --locked
-          mkdir -p "$GITHUB_WORKSPACE/tools"
-          sysroot=$(rustc +nightly --print sysroot)
-          tar -czf "$GITHUB_WORKSPACE/tools/nightly.tar.gz" -C "$sysroot" bin lib libexec
-          tar -czf "$GITHUB_WORKSPACE/tools/registry.tar.gz" -C "$HOME/.cargo" registry
-          cp "$HOME/.cargo/bin/cargo-fuzz" "$GITHUB_WORKSPACE/tools/"
-          if [ -d "$HOME/.cache/miri" ]; then
-            tar -czf "$GITHUB_WORKSPACE/tools/miri-sysroot.tar.gz" -C "$HOME/.cache/miri" .
-          fi
+          cargo +1.98.0 install cargo-deny --locked
+          mkdir -p "$GITHUB_WORKSPACE/export"
+          cp "$HOME/.cargo/bin/cargo-deny" "$GITHUB_WORKSPACE/export/"
+          git clone --depth 1 https://github.com/RustSec/advisory-db.git advisory-db
+          git -C advisory-db rev-parse HEAD > "$GITHUB_WORKSPACE/export/ADVISORY_COMMIT"
+          tar -czf "$GITHUB_WORKSPACE/export/advisories.tar.gz" advisory-db
+          tar -czf "$GITHUB_WORKSPACE/export/registry.tar.gz" -C "$HOME/.cargo" registry
       - uses: actions/upload-artifact@v4
         with:
-          name: offline-verification-tools
-          path: tools/
+          name: offline-fuzz-and-audit-inputs
+          path: export/
           compression-level: 0
           retention-days: 2
