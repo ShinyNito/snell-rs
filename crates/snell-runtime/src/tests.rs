@@ -660,66 +660,54 @@ fn exact_mode_does_not_probe() {
 }
 
 #[tokio::test]
-async fn early_payload_over_64kib_is_rejected() {
+async fn early_payload_limit_is_independent_of_socket_readiness() {
     use snell_protocol::{
-        Address, EncodeBuffer, MAX_CONNECT_REQUEST_LEN, SERVER_EARLY_PAYLOAD_MAX,
-        encode_connect_request,
+        EncodeBuffer, MAX_CONNECT_REQUEST_LEN, SERVER_EARLY_PAYLOAD_MAX, encode_connect_request,
     };
 
-    let psk = Psk::new(PSK.to_vec()).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let cfg = ServerConfig {
-        limits: Default::default(),
-        listen: addr,
-        psk: psk.clone(),
-        selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
-        outbound: Outbound::Direct,
-        udp: UdpOptions::default(),
-        tcp_brutal: None,
-    };
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        handle_server(
-            stream,
-            Arc::new(cfg),
-            Arc::new(KdfLimiter::new()),
-            Arc::new(ReplayCache::new()),
-            crate::admission::Handshake::new(None),
+    let psk = Psk::new(PSK).unwrap();
+    let destination = Address::from("127.0.0.1:9".parse::<SocketAddr>().unwrap());
+    let kdf = KdfLimiter::new();
+    for payload_len in [SERVER_EARLY_PAYLOAD_MAX, SERVER_EARLY_PAYLOAD_MAX + 1] {
+        let mut encoder = V4Encoder::os(&psk).unwrap();
+        let mut encode = EncodeBuffer::new(256 * 1024);
+        let mut req = [0u8; MAX_CONNECT_REQUEST_LEN];
+        let n = encode_connect_request(&mut req, destination.as_view(), false).unwrap();
+        let mut plain = req[..n].to_vec();
+        plain.resize(n + payload_len, b'x');
+        let mut offset = 0;
+        while offset < plain.len() {
+            let mut reservation = encoder
+                .reserve(&mut encode, &[], plain.len() - offset)
+                .unwrap();
+            let take = reservation.capacity().min(plain.len() - offset);
+            reservation.payload_mut()[..take].copy_from_slice(&plain[offset..offset + take]);
+            reservation.seal(take).unwrap();
+            offset += take;
+        }
+        // All input is ready: a real socket may return Pending between segments,
+        // at which point later bytes belong to steady relay, not early prefetch.
+        let mut wire = encode.pending();
+        let mut decoder = V4Decoder::new(psk.clone());
+        let mut recv = crate::session::new_recv();
+        let result = crate::session::read_server_connect(
+            &mut decoder,
+            &mut recv,
+            &mut wire,
+            &kdf,
+            &psk,
+            None,
         )
-        .await
-    });
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    let mut encoder = V4Encoder::os(&psk).unwrap();
-    let mut encode = EncodeBuffer::new(256 * 1024);
-    let dest = Address::from("127.0.0.1:9".parse::<SocketAddr>().unwrap());
-    let mut req = [0u8; MAX_CONNECT_REQUEST_LEN];
-    let n = encode_connect_request(&mut req, dest.as_view(), false).unwrap();
-    let mut plain = req[..n].to_vec();
-    plain.extend(std::iter::repeat_n(b'x', SERVER_EARLY_PAYLOAD_MAX + 1));
-    let mut offset = 0;
-    while offset < plain.len() {
-        let mut reservation = encoder
-            .reserve(&mut encode, &[], plain.len() - offset)
-            .unwrap();
-        let take = reservation.capacity().min(plain.len() - offset);
-        reservation.payload_mut()[..take].copy_from_slice(&plain[offset..offset + take]);
-        reservation.seal(take).unwrap();
-        offset += take;
+        .await;
+        if payload_len > SERVER_EARLY_PAYLOAD_MAX {
+            assert!(matches!(result, Err(SessionError::EarlyPayloadTooLarge)));
+        } else {
+            let crate::session::ServerFirst::Connect(connect) = result.unwrap() else {
+                panic!("expected CONNECT");
+            };
+            assert_eq!(connect.leftover, vec![b'x'; payload_len]);
+        }
     }
-    tokio::io::AsyncWriteExt::write_all(&mut client, encode.pending())
-        .await
-        .unwrap();
-
-    let result = timeout(Duration::from_secs(5), server)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        matches!(result, Err(crate::SessionError::EarlyPayloadTooLarge)),
-        "{result:?}"
-    );
 }
 
 #[tokio::test]

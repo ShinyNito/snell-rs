@@ -356,11 +356,15 @@ impl EncodeBuffer {
 /// Shared bounded growth; length remains the initialized prefix.
 fn grow(storage: &mut Vec<u8>, needed: usize, max: usize) {
     if needed > storage.capacity() {
-        let target = needed
+        let mut target = needed
             .checked_next_power_of_two()
             .unwrap_or(max)
             .max(4096)
             .min(max);
+        // Skip a near-identical final reallocation, e.g. 64 KiB -> 67 KiB.
+        if target > max / 2 {
+            target = max;
+        }
         storage.reserve_exact(target - storage.len());
     }
 }
@@ -593,6 +597,23 @@ mod tests {
         assert_eq!(recv.filled(), b"prefix");
         recv.put_slice(&vec![1; 32_000]);
         assert_eq!(&recv.filled()[..6], b"prefix");
+    }
+
+    #[test]
+    fn final_growth_step_keeps_bulk_allocation_stable() {
+        let max = crate::V6_WIRE_CAP;
+        let mut recv = RecvBuffer::new(max);
+        let mut encode = EncodeBuffer::new(max);
+        recv.extend_from_slice(&vec![1; 40_000]).unwrap();
+        encode.reserve_zeroed(40_000).unwrap();
+        let recv_ptr = recv.filled().as_ptr();
+        let encode_ptr = encode.pending().as_ptr();
+        recv.extend_from_slice(&vec![2; max - 40_000]).unwrap();
+        encode.reserve_zeroed(max - 40_000).unwrap();
+        assert_eq!(recv.filled().as_ptr(), recv_ptr);
+        assert_eq!(encode.pending().as_ptr(), encode_ptr);
+        assert_eq!(recv.len(), max);
+        assert_eq!(encode.len(), max);
     }
 
     #[test]
