@@ -1,0 +1,48 @@
+name: Validate isolated candidate
+on:
+  push:
+    branches: [codex/verify-memory-throughput]
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: control
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          shared-key: memory-throughput-validation
+      - name: Apply source changes in isolated worktree
+        id: apply
+        run: |
+          git -C control worktree add --detach ../work 5c3c4312189c4b10fd462df47fe67babaa1f8981
+          cd work
+          python3 ../control/.ci/apply.py
+          cargo fmt --all
+      - name: Save candidate commit
+        if: always() && steps.apply.outcome == 'success'
+        working-directory: work
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates Cargo.lock
+          git diff --cached --check
+          git commit -m 'perf: reclaim idle buffers and use bounded initialized payload writers'
+          git push origin HEAD:refs/heads/codex/verified-perf-${GITHUB_RUN_ID}
+          echo CANDIDATE_SHA=$(git rev-parse HEAD)
+      - name: Clippy
+        if: always() && steps.apply.outcome == 'success'
+        working-directory: work
+        run: cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+      - name: Tests
+        if: always() && steps.apply.outcome == 'success'
+        working-directory: work
+        run: cargo test --workspace --locked --all-features
