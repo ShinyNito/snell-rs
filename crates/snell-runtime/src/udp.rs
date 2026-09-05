@@ -31,9 +31,8 @@ use crate::outbound::Outbound;
 use crate::packet::{PacketBuf, PacketPool};
 use crate::pool::PooledCodec;
 use crate::session::{
-    RecordEvent, decode_once, ensure_bulk, new_encode, new_recv, read_server_tunnel,
-    with_handshake_timeout, write_reject, write_tunnel, write_udp_request, write_udp_response,
-    write_udp_setup,
+    RecordEvent, decode_once, new_encode, new_recv, read_server_tunnel, with_handshake_timeout,
+    write_reject, write_tunnel, write_udp_request, write_udp_response, write_udp_setup,
 };
 use crate::socks::write_socks5_reply_bind;
 
@@ -747,7 +746,7 @@ pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
         return Err(SessionError::UdpLimit);
     }
     let _guard = AssocGuard(&udp.metrics);
-    recv = ensure_bulk(recv)?;
+    recv.set_max(snell_protocol::V6_WIRE_CAP)?;
     let mut flow = match outbound.open_udp(&udp.dns).await {
         Ok(flow) => flow,
         Err(error) => {

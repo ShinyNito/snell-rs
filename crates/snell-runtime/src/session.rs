@@ -6,22 +6,22 @@ use std::time::Duration;
 
 use snell_protocol::{
     Address, AddressRef, COMMAND_UDP, DecodeStatus, EncodeBuffer, Error, MAX_CONNECT_REQUEST_LEN,
-    MAX_PACKET_SIZE, MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk, REUSE_IDLE_TIMEOUT_SECS,
-    RecordKind, RecvBuffer, SERVER_EARLY_PAYLOAD_MAX, ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS,
-    V6_WIRE_CAP, aead_key, encode_connect_request, encode_reject, encode_tunnel_reply,
-    encode_udp_request, encode_udp_response, encode_udp_setup, udp_request_len, udp_response_len,
+    MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk, REUSE_IDLE_TIMEOUT_SECS, RecordKind,
+    RecvBuffer, SERVER_EARLY_PAYLOAD_MAX, ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS, V6_WIRE_CAP,
+    aead_key, encode_connect_request, encode_reject, encode_tunnel_reply, encode_udp_request,
+    encode_udp_response, encode_udp_setup, udp_request_len, udp_response_len,
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::bufio::{drain_encode, read_into_recv};
+use crate::bufio::{drain_encode, poll_read_buf, poll_recv, read_into_recv};
 use crate::codec::{TcpDecoder, TcpEncoder, TcpReservation};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::replay::ReplayCache;
 
-const RECORD_HINT: usize = MAX_PACKET_SIZE;
+const RECORD_HINT: usize = MAX_PACKET_SIZE_V6;
 pub(crate) const HANDSHAKE_PLAIN_MAX: usize = MAX_CONNECT_REQUEST_LEN + MAX_PACKET_SIZE_V6;
 
 /// Per-connection buffer cap for both TCP and UDP-over-TCP sessions:
@@ -352,8 +352,8 @@ pub(crate) async fn maybe_install_kdf<D: TcpDecoder>(
         return Ok(());
     }
     let salt = decoder.kdf_salt(recv)?;
-    let psk_bytes = psk.as_bytes().to_vec();
-    let key = kdf.run(move || aead_key(&psk_bytes, &salt)).await??;
+    let psk = psk.clone();
+    let key = kdf.run(move || aead_key(psk.as_bytes(), &salt)).await??;
     decoder.install_aead(salt, key)?;
     Ok(())
 }
@@ -394,37 +394,13 @@ pub(crate) fn server_may_reuse<D: TcpDecoder>(encode: &EncodeBuffer, decoder: &D
     encode.is_empty() && !decoder.has_unconsumed_plaintext()
 }
 
-/// Drop the session's touched buffer pages while a reuse connection sits
-/// idle: reallocate fresh (untouched) capacity, preserving live bytes.
-pub(crate) fn release_bulk(
-    recv: RecvBuffer,
-    encode: EncodeBuffer,
-) -> Result<(RecvBuffer, EncodeBuffer), SessionError> {
-    let live = recv.filled().to_vec();
-    drop(recv);
-    drop(encode);
-    let mut next = new_recv();
-    next.extend_from_slice(&live)?;
-    Ok((next, new_encode()))
-}
-
-/// Upgrade an auto-detect prefix buffer to full bulk capacity.
-pub(crate) fn ensure_bulk(recv: RecvBuffer) -> Result<RecvBuffer, SessionError> {
-    if recv.max() >= V6_WIRE_CAP {
-        return Ok(recv);
-    }
-    let live = recv.filled().to_vec();
-    let mut next = new_recv();
-    next.extend_from_slice(&live)?;
-    Ok(next)
-}
-
 async fn fill_until<R: AsyncRead + Unpin>(
     reader: &mut R,
     recv: &mut RecvBuffer,
     minimum: usize,
 ) -> Result<(), SessionError> {
     while recv.len() < minimum {
+        recv.spare_capacity_mut(minimum - recv.len())?;
         let n = read_into_recv(reader, recv).await?;
         if n == 0 {
             return Err(SessionError::Io(io::Error::new(
@@ -444,16 +420,13 @@ pub(crate) async fn relay<E: TcpEncoder, D: TcpDecoder>(
     decoder: &mut D,
     recv: &mut RecvBuffer,
     encode: &mut EncodeBuffer,
-    initial_to_plain: &[u8],
-    initial_to_snell: &[u8],
+    initial_to_plain: Vec<u8>,
     keep_snell_open: bool,
 ) -> Result<(), SessionError> {
     if !initial_to_plain.is_empty() {
-        tokio::io::AsyncWriteExt::write_all(plain, initial_to_plain).await?;
+        tokio::io::AsyncWriteExt::write_all(plain, &initial_to_plain).await?;
     }
-    if !initial_to_snell.is_empty() {
-        write_plain_records(encoder, encode, snell, initial_to_snell).await?;
-    }
+    drop(initial_to_plain);
 
     let (mut snell_r, mut snell_w) = snell.split();
     let (mut plain_r, mut plain_w) = plain.split();
@@ -504,23 +477,14 @@ where
                             if reservation.capacity() == 0 {
                                 break;
                             }
-                            let read = {
-                                // Uninit payload slot: the kernel writes it, so the
-                                // reserve path never zero-fills the payload region.
-                                let mut read_buf = ReadBuf::uninit(reservation.payload_uninit());
-                                match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
-                                    Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-                                    Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                                    Poll::Pending => Poll::Pending,
-                                }
-                            };
+                            let read = poll_read_buf(cx, reader, &mut reservation.payload_buf());
                             match read {
                                 Poll::Ready(Ok(0)) => {
                                     local_eof = true;
                                     break;
                                 }
                                 Poll::Ready(Ok(n)) => {
-                                    if let Err(error) = reservation.seal_init(n) {
+                                    if let Err(error) = reservation.seal(n) {
                                         return Poll::Ready(Err(error.into()));
                                     }
                                 }
@@ -690,19 +654,10 @@ where
                                 "decoder need exceeds filled",
                             ))));
                         }
-                        let n = {
-                            let spare = match recv.spare_capacity_mut(1) {
-                                Ok(spare) => spare,
-                                Err(error) => return Poll::Ready(Err(error.into())),
-                            };
-                            let mut buf = ReadBuf::uninit(spare);
-                            match Pin::new(&mut *reader).poll_read(cx, &mut buf) {
-                                Poll::Ready(Ok(())) => buf.filled().len(),
-                                Poll::Ready(Err(error)) => {
-                                    return Poll::Ready(Err(error.into()));
-                                }
-                                Poll::Pending => return Poll::Pending,
-                            }
+                        let n = match poll_recv(cx, reader, recv, minimum) {
+                            Poll::Ready(Ok(n)) => n,
+                            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                            Poll::Pending => return Poll::Pending,
                         };
                         if n == 0 {
                             if recv.is_empty() {
@@ -714,9 +669,6 @@ where
                                 io::ErrorKind::UnexpectedEof,
                                 "eof mid-record",
                             ))));
-                        }
-                        if let Err(error) = recv.commit_init(n) {
-                            return Poll::Ready(Err(error.into()));
                         }
                     }
                     Ok(DecodeStatus::Record(record)) => {

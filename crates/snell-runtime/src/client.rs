@@ -323,8 +323,7 @@ async fn finish_session(
                 &mut decoder,
                 &mut recv,
                 &mut encode,
-                &leftover,
-                &[],
+                leftover,
                 reuse,
             )
             .await?;
@@ -348,8 +347,7 @@ async fn finish_session(
                 &mut decoder,
                 &mut recv,
                 &mut encode,
-                &leftover,
-                &[],
+                leftover,
                 reuse,
             )
             .await?;
@@ -373,8 +371,7 @@ async fn finish_session(
                 &mut decoder,
                 &mut recv,
                 &mut encode,
-                &leftover,
-                &[],
+                leftover,
                 reuse,
             )
             .await?;
