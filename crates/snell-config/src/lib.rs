@@ -53,6 +53,8 @@ pub enum ConfigError {
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    pub max_connections: Option<usize>,
+    pub max_handshakes: Option<usize>,
     pub listen: SocketAddr,
     pub server: SocketAddr,
     pub psk: Psk,
@@ -75,6 +77,8 @@ pub struct TcpBrutal {
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    pub max_connections: Option<usize>,
+    pub max_handshakes: Option<usize>,
     pub listen: SocketAddr,
     pub psk: Psk,
     pub selection: ProtocolSelection,
@@ -100,6 +104,8 @@ impl ClientConfig {
         let reuse = optional_bool(CLIENT_SECTION, section, "reuse")?.unwrap_or(false);
         let version = parse_client_version(required(CLIENT_SECTION, section, "version")?)?;
         Ok(Self {
+            max_connections: optional_limit(CLIENT_SECTION, section, "max_connections")?,
+            max_handshakes: optional_limit(CLIENT_SECTION, section, "max_handshakes")?,
             listen: parse_socket(
                 CLIENT_SECTION,
                 "listen",
@@ -158,6 +164,8 @@ impl ServerConfig {
         };
 
         Ok(Self {
+            max_connections: optional_limit(SERVER_SECTION, section, "max_connections")?,
+            max_handshakes: optional_limit(SERVER_SECTION, section, "max_handshakes")?,
             listen: parse_socket(
                 SERVER_SECTION,
                 "listen",
@@ -322,6 +330,26 @@ fn required<'a>(
 ) -> Result<&'a str, ConfigError> {
     keys.get(key)
         .ok_or(ConfigError::MissingKey { section, key })
+}
+
+fn optional_limit(
+    name: &'static str,
+    section: &Section,
+    key: &'static str,
+) -> Result<Option<usize>, ConfigError> {
+    section
+        .get(key)
+        .map(|raw| {
+            raw.parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| ConfigError::Invalid {
+                    section: name,
+                    key,
+                    msg: "expected a positive integer".to_owned(),
+                })
+        })
+        .transpose()
 }
 
 fn optional_bool(
@@ -584,5 +612,37 @@ mod tests {
         ServerConfig::load(root.join("server.ini")).unwrap();
         ServerConfig::load(root.join("server-socks5.ini")).unwrap();
         ServerConfig::load(root.join("server-tcp-brutal.ini")).unwrap();
+    }
+    #[test]
+    fn connection_limits_parse_and_reject_invalid_values() {
+        for section in [CLIENT_SECTION, SERVER_SECTION] {
+            let base = format!(
+                "[{section}]\nlisten=127.0.0.1:1234\nserver=127.0.0.1:1235\npsk=0123456789abcdef\nversion=v4\n"
+            );
+            for (value, valid) in [
+                ("1", true),
+                ("2048", true),
+                ("0", false),
+                ("-1", false),
+                ("invalid", false),
+                ("999999999999999999999999", false),
+            ] {
+                for key in ["max_connections", "max_handshakes"] {
+                    let input = format!("{base}{key}={value}\n");
+                    let result = if section == CLIENT_SECTION {
+                        ClientConfig::parse(&input)
+                            .map(|cfg| (cfg.max_connections, cfg.max_handshakes))
+                    } else {
+                        ServerConfig::parse(&input)
+                            .map(|cfg| (cfg.max_connections, cfg.max_handshakes))
+                    };
+                    assert_eq!(result.is_ok(), valid, "{section}: {key}={value}");
+                    if valid {
+                        let (a, b) = result.unwrap();
+                        assert_eq!(a.or(b), value.parse().ok());
+                    }
+                }
+            }
+        }
     }
 }

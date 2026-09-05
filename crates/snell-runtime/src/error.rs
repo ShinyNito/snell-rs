@@ -79,3 +79,9 @@ impl SessionError {
         matches!(self, Self::Cancelled) || self.is_stale_pool_error()
     }
 }
+
+impl From<tokio::time::error::Elapsed> for SessionError {
+    fn from(_: tokio::time::error::Elapsed) -> Self {
+        Self::HandshakeTimeout
+    }
+}

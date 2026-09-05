@@ -37,6 +37,14 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 
+      - name: Build process-test binary
+        shell: bash
+        run: |
+          cargo build --locked -p snell
+          binary="$PWD/target/debug/snell-rs"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="$(cygpath -m "$binary.exe")"; fi
+          echo "SNELL_RS_TEST_BIN=$binary" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: cargo test --workspace --locked --all-features
 

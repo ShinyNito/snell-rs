@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use snell_protocol::{
     CLIENT_POOL_MAX_IDLE_SECS, CLIENT_POOL_MAX_SIZE, V4Decoder, V4Encoder, V6ShapedDecoder,
@@ -40,6 +42,7 @@ pub struct ReusePool {
     inner: Arc<Mutex<VecDeque<PooledEntry>>>,
     max_size: usize,
     max_idle: Duration,
+    changed: Arc<Notify>,
 }
 
 impl Default for ReusePool {
@@ -61,6 +64,7 @@ impl ReusePool {
             inner: Arc::new(Mutex::new(VecDeque::with_capacity(max_size))),
             max_size,
             max_idle,
+            changed: Arc::new(Notify::new()),
         }
     }
 
@@ -83,6 +87,12 @@ impl ReusePool {
             return false;
         }
         let mut entries = self.lock();
+        while entries
+            .front()
+            .is_some_and(|entry| entry.returned_at.elapsed() >= self.max_idle)
+        {
+            entries.pop_front();
+        }
         if entries.len() >= self.max_size {
             return false;
         }
@@ -90,7 +100,35 @@ impl ReusePool {
             conn,
             returned_at: Instant::now(),
         });
+        drop(entries);
+        self.changed.notify_one();
         true
+    }
+
+    /// Drive idle eviction even when no new connection checks out a pool entry.
+    /// `serve_client` polls this alongside accept and shutdown. Standalone pool
+    /// owners can poll it in their own owner task; cancellation preserves entries.
+    pub async fn expire_idle(&self) {
+        loop {
+            let changed = self.changed.notified();
+            let deadline = self
+                .lock()
+                .front()
+                .map(|entry| entry.returned_at + self.max_idle);
+            match deadline {
+                None => changed.await,
+                Some(deadline) => tokio::select! {
+                    _ = changed => {},
+                    _ = tokio::time::sleep_until(deadline) => {
+                        let mut entries = self.lock();
+                        while entries.front().is_some_and(|entry| entry.returned_at.elapsed() >= self.max_idle) {
+                            entries.pop_front();
+                        }
+                        return;
+                    }
+                },
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -167,5 +205,37 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(pool.take().is_none());
         assert_eq!(pool.len(), 0);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn expiry_closes_socket_without_checkout() {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut peer = listener.accept().await.unwrap().0;
+        let psk = snell_protocol::Psk::new(b"0123456789abcdef").unwrap();
+        let pool = ReusePool::with_limits(1, Duration::from_secs(1));
+        assert!(pool.put(PooledConn {
+            stream,
+            codec: PooledCodec::V4 {
+                encoder: V4Encoder::os(&psk).unwrap(),
+                decoder: V4Decoder::new(psk),
+            }
+        }));
+        pool.expire_idle().await;
+        assert!(pool.is_empty());
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn codec_storage_sizes() {
+        eprintln!(
+            "codec_bytes v4={} shaped={} unshaped={} pooled={}",
+            std::mem::size_of::<(V4Encoder, V4Decoder)>(),
+            std::mem::size_of::<(V6ShapedEncoder, V6ShapedDecoder)>(),
+            std::mem::size_of::<(V6UnshapedEncoder, V6UnshapedDecoder)>(),
+            std::mem::size_of::<PooledConn>()
+        );
     }
 }

@@ -1,6 +1,7 @@
 name: Miri
 
 on:
+  pull_request:
   workflow_dispatch:
   schedule:
     - cron: "17 5 * * 1"
@@ -10,6 +11,7 @@ permissions:
 
 jobs:
   miri:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     env:
       # rust-toolchain.toml pins 1.98.0, which has no miri component.
@@ -25,5 +27,9 @@ jobs:
           MIRIFLAGS: "-Zmiri-disable-isolation"
       - name: Miri accept backoff
         run: "cargo miri test -p snell-runtime --lib --all-features platform::accept"
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+      - name: Miri bounded UDP buffer storage
+        run: cargo miri test -p snell-runtime --lib packet::tests::lease_buf_mut_is_bounded_by_its_charged_capacity
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"

@@ -5,10 +5,9 @@ All crates stay unpublished (`publish = false`).
 
 # Non-negotiable rules
 
-- Preserve verified wire behavior documented in `docs/PROTOCOL.md`.
-- Complete only the current phase in docs/PLAN.md.
+- Preserve verified wire behavior covered by protocol and golden fixtures.
 - Do not add speculative abstractions.
-- Do not use unsafe outside the approved buffer/platform modules.
+- Keep unsafe confined to `snell-protocol/src/buffer.rs` and the runtime `bufio`, `packet`, and platform modules.
 - Do not add unbounded queues, maps, pools, tasks, or buffers.
 - Do not claim a performance improvement without benchmark evidence.
 - Do not use channels in the TCP per-connection data path.
@@ -27,7 +26,7 @@ All crates stay unpublished (`publish = false`).
 
 # Required commands
 
-Run before finishing every phase:
+Run before submitting changes:
 
 ```bash
 cargo fmt --all -- --check
@@ -39,14 +38,14 @@ cargo deny check
 If `cargo nextest` is unavailable, `cargo test --workspace --all-features` is
 the fallback. `xtask check` runs fmt, clippy, test, and deny.
 
-Run phase-specific golden, differential, interop, fuzz, Miri, sanitizer, and
-benchmark commands documented in that phase.
+Run the applicable golden, differential, interop, fuzz, Miri, sanitizer, and
+benchmark checks provided by the test crates and workflows.
 
 # Change discipline
 
 Before editing:
 
-1. Read REQUIREMENTS.md, PROTOCOL.md, ARCHITECTURE.md, and the current phase.
+1. Read the repository instructions, manifests, affected modules, and fixtures.
 2. Inspect the existing code in this repository completely.
 3. State the invariant being implemented.
 4. Add or update the failing test first where practical.

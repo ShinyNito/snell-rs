@@ -35,6 +35,22 @@ impl DnsResolver {
         Ok(Self { resolver })
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_server(addr: SocketAddr) -> Self {
+        use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+        let mut ns = NameServerConfig::udp(addr.ip());
+        ns.connections[0].port = addr.port();
+        let cfg = ResolverConfig::from_parts(None, Vec::new(), vec![ns]);
+        let mut builder = TokioResolver::builder_with_config(cfg, TokioRuntimeProvider::default());
+        builder.options_mut().timeout = DNS_TIMEOUT;
+        builder.options_mut().attempts = 1;
+        builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4Only;
+        Self {
+            resolver: builder.build().unwrap(),
+        }
+    }
+
     pub async fn resolve(&self, host: &str, port: u16) -> Result<SocketAddr, SessionError> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(SocketAddr::new(ip, port));

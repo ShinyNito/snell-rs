@@ -28,10 +28,10 @@ pub struct V6ShapedEncoder<E = OsEntropy, C = UnixClock> {
     reserving: bool,
     poisoned: bool,
     plain_prefix_len: usize,
-    max_payload: usize,
+    pub(crate) max_payload: usize,
     record_prefix_len: usize,
     max_padding_len: usize,
-    payload_start: usize,
+    pub(crate) payload_start: usize,
     header_start: usize,
     padding_start: usize,
     prefix_start: usize,
@@ -40,8 +40,8 @@ pub struct V6ShapedEncoder<E = OsEntropy, C = UnixClock> {
 
 #[must_use = "unsealed reservations are cancelled on drop"]
 pub struct V6ShapedReservation<'a, E: Entropy = OsEntropy, C: Clock = UnixClock> {
-    encoder: &'a mut V6ShapedEncoder<E, C>,
-    buf: &'a mut EncodeBuffer,
+    pub(crate) encoder: &'a mut V6ShapedEncoder<E, C>,
+    pub(crate) buf: &'a mut EncodeBuffer,
     sealed: bool,
 }
 
@@ -114,18 +114,10 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         let fixed = salt_block_len + record_prefix_len + HEADER_CIPHER_LEN + max_padding_len;
         let record_cap = fixed + max_payload + TAG_LEN;
         let record_start = buf.reserve_record(record_cap, fixed)?;
-        if first {
-            self.profile.write_salt_block(
-                &self.salt,
-                buf.range_mut(record_start, record_start + salt_block_len),
-            )?;
-        }
         let prefix_start = record_start + salt_block_len;
         let header_start = prefix_start + record_prefix_len;
         let padding_start = header_start + HEADER_CIPHER_LEN;
         let payload_start = padding_start + max_padding_len;
-        self.profile
-            .fill_official(self.seq, buf.range_mut(prefix_start, header_start));
         buf.extend_from_slice(prefix)?;
 
         self.plain_prefix_len = prefix.len();
@@ -202,6 +194,18 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         padding_len: usize,
         payload_len: usize,
     ) -> Result<()> {
+        // Reserve can be cancelled by a Pending read. Materialize only records
+        // that will actually be sealed, without changing the wire bytes.
+        if !self.salt_sent {
+            self.profile.write_salt_block(
+                &self.salt,
+                buf.range_mut(self.record_start, self.prefix_start),
+            )?;
+        }
+        self.profile.fill_official(
+            self.seq,
+            buf.range_mut(self.prefix_start, self.header_start),
+        );
         write_v6_plain_header(
             buf.range_mut(self.header_start, self.header_start + HEADER_PLAIN_LEN),
             padding_len,
@@ -276,17 +280,6 @@ impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
         self.buf.range_mut(start, end)
     }
 
-    /// Uninitialized payload slot after the prefix. Fill a prefix of it (for
-    /// example through Tokio `ReadBuf::uninit`), then call [`Self::seal_init`].
-    /// Do not mix with [`Self::payload_mut`]. Empty once materialized.
-    pub fn payload_uninit(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
-        let cap = self.encoder.max_payload - self.encoder.plain_prefix_len;
-        if self.buf.end() != self.encoder.payload_start + self.encoder.plain_prefix_len {
-            return &mut [];
-        }
-        &mut self.buf.spare_uninit()[..cap]
-    }
-
     pub fn capacity(&self) -> usize {
         self.encoder.max_payload - self.encoder.plain_prefix_len
     }
@@ -304,20 +297,6 @@ impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
         if total > self.encoder.max_payload {
             return Err(Error::PayloadTooLarge);
         }
-        self.sealed = true;
-        self.encoder.finish(self.buf, total)
-    }
-
-    /// Seal after the caller initialized `written` bytes of
-    /// [`Self::payload_uninit`]. Commits them without zero-filling first.
-    pub fn seal_init(mut self, written: usize) -> Result<()> {
-        let total = crate::buffer::commit_init_payload(
-            self.buf,
-            self.encoder.payload_start,
-            self.encoder.plain_prefix_len,
-            self.encoder.max_payload,
-            written,
-        )?;
         self.sealed = true;
         self.encoder.finish(self.buf, total)
     }
@@ -580,6 +559,7 @@ impl fmt::Debug for V6ShapedDecoder {
 mod tests {
     use super::*;
     use crate::{EncodeBuffer, FixedClock, RepeatEntropy, V6_WIRE_CAP};
+    use bytes::BufMut;
 
     fn psk() -> Psk {
         Psk::new(b"0123456789abcdef").unwrap()
@@ -634,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn seal_init_wire_matches_payload_mut() {
+    fn buf_mut_wire_matches_payload_mut() {
         let mut a_enc = encoder();
         let mut a = EncodeBuffer::new(V6_WIRE_CAP);
         let mut b_enc = encoder();
@@ -647,8 +627,8 @@ mod tests {
             rec.seal(msg.len()).unwrap();
 
             let mut rec = b_enc.reserve(&mut b, &[], hint).unwrap();
-            rec.payload_uninit()[..msg.len()].write_copy_of_slice(msg);
-            rec.seal_init(msg.len()).unwrap();
+            rec.put_slice(msg);
+            rec.seal(msg.len()).unwrap();
         }
         assert_eq!(a.pending(), b.pending());
     }
@@ -846,5 +826,48 @@ mod tests {
         let rec = enc.reserve(&mut out, &[], MAX_PACKET_SIZE_V6).unwrap();
         let profile = Profile::derive(psk().as_bytes()).unwrap();
         assert!(rec.capacity() <= profile.first_record_cap());
+    }
+    #[test]
+    fn cancelled_reservations_preserve_profile_wire_and_hint_budget() {
+        use bytes::BufMut;
+        for seed in 0..32u8 {
+            let psk = Psk::new([seed; 16]).unwrap();
+            let mut a = V6ShapedEncoder::with_salt(
+                &psk,
+                [7; 16],
+                RepeatEntropy { byte: 0x3c },
+                FixedClock::new(0),
+            )
+            .unwrap();
+            let mut b = V6ShapedEncoder::with_salt(
+                &psk,
+                [7; 16],
+                RepeatEntropy { byte: 0x3c },
+                FixedClock::new(0),
+            )
+            .unwrap();
+            let mut out_a = EncodeBuffer::new(crate::V6_WIRE_CAP);
+            let mut out_b = EncodeBuffer::new(crate::V6_WIRE_CAP);
+            let payload = vec![0x42; crate::MAX_PACKET_SIZE_V6];
+            for _ in 0..32 {
+                drop(
+                    a.reserve(&mut out_a, &[], crate::MAX_PACKET_SIZE_V6)
+                        .unwrap(),
+                );
+                let mut r_a = a
+                    .reserve(&mut out_a, &[], crate::MAX_PACKET_SIZE_V6)
+                    .unwrap();
+                let mut r_b = b.reserve(&mut out_b, &[], crate::MAX_PACKET_SIZE).unwrap();
+                assert_eq!(r_a.capacity(), r_b.capacity());
+                let n = r_a.capacity();
+                r_a.put_slice(&payload[..n]);
+                r_b.put_slice(&payload[..n]);
+                r_a.seal(n).unwrap();
+                r_b.seal(n).unwrap();
+                assert_eq!(out_a.pending(), out_b.pending());
+                out_a.advance(out_a.len()).unwrap();
+                out_b.advance(out_b.len()).unwrap();
+            }
+        }
     }
 }

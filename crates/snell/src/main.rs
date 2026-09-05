@@ -110,6 +110,14 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
     if let Some(path) = args.config {
         let cfg = FileClientConfig::load(path)?;
         return Ok(ClientConfig {
+            limits: snell_runtime::TcpLimits {
+                max_connections: cfg
+                    .max_connections
+                    .unwrap_or(snell_runtime::TcpLimits::default().max_connections),
+                max_handshakes: cfg
+                    .max_handshakes
+                    .unwrap_or(snell_runtime::TcpLimits::default().max_handshakes),
+            },
             listen: cfg.listen,
             server: cfg.server,
             psk: cfg.psk,
@@ -120,6 +128,7 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
         });
     }
     Ok(ClientConfig {
+        limits: Default::default(),
         listen: args.listen.expect("required by clap"),
         server: args.server.expect("required by clap"),
         psk: snell_config::parse_psk_str(&args.psk.expect("required by clap"))?,
@@ -134,6 +143,14 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
     if let Some(path) = args.config {
         let cfg = FileServerConfig::load(path)?;
         return Ok(ServerConfig {
+            limits: snell_runtime::TcpLimits {
+                max_connections: cfg
+                    .max_connections
+                    .unwrap_or(snell_runtime::TcpLimits::default().max_connections),
+                max_handshakes: cfg
+                    .max_handshakes
+                    .unwrap_or(snell_runtime::TcpLimits::default().max_handshakes),
+            },
             listen: cfg.listen,
             psk: cfg.psk,
             selection: cfg.selection,
@@ -156,6 +173,7 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
         )?),
     };
     Ok(ServerConfig {
+        limits: Default::default(),
         listen: args.listen.expect("required by clap"),
         psk: snell_config::parse_psk_str(&args.psk.expect("required by clap"))?,
         selection,

@@ -8,7 +8,7 @@ members = [
   "crates/snell-testkit",
   "xtask",
 ]
-exclude = ["repos"]
+exclude = ["repos", "fuzz"]
 
 [workspace.package]
 edition = "2024"

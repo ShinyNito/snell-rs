@@ -52,6 +52,7 @@ async fn start_pair_reuse(
     let (stop_client, client_rx) = oneshot::channel();
 
     let server_cfg = ServerConfig {
+        limits: Default::default(),
         listen: server_addr,
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(version),
@@ -67,6 +68,7 @@ async fn start_pair_reuse(
     });
 
     let client_cfg = ClientConfig {
+        limits: Default::default(),
         listen: socks,
         server: server_addr,
         psk,
@@ -235,6 +237,7 @@ async fn handshake_timeout() {
     let server_addr = server_listener.local_addr().unwrap();
     let (stop_server, server_rx) = oneshot::channel::<()>();
     let cfg = ServerConfig {
+        limits: Default::default(),
         listen: server_addr,
         psk,
         selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
@@ -285,6 +288,7 @@ async fn socks5_reply_when_snell_closes_after_dial() {
     let socks = client_listener.local_addr().unwrap();
     let (stop_client, client_rx) = oneshot::channel::<()>();
     let cfg = ClientConfig {
+        limits: Default::default(),
         listen: socks,
         server: snell_addr,
         psk,
@@ -429,6 +433,7 @@ async fn start_counted(
     let (stop_client, client_rx) = oneshot::channel();
 
     let server_cfg = ServerConfig {
+        limits: Default::default(),
         listen: server_addr,
         psk: psk.clone(),
         selection,
@@ -449,12 +454,20 @@ async fn start_counted(
             let kdf = kdf.clone();
             let replay = replay.clone();
             tokio::spawn(async move {
-                let _ = handle_server(stream, server_cfg, kdf, replay).await;
+                let _ = handle_server(
+                    stream,
+                    Arc::new(server_cfg),
+                    kdf,
+                    replay,
+                    crate::admission::Handshake::new(None),
+                )
+                .await;
             });
         }
     });
 
     let client_cfg = ClientConfig {
+        limits: Default::default(),
         listen: socks,
         server: server_addr,
         psk,
@@ -647,64 +660,54 @@ fn exact_mode_does_not_probe() {
 }
 
 #[tokio::test]
-async fn early_payload_over_64kib_is_rejected() {
+async fn early_payload_limit_is_independent_of_socket_readiness() {
     use snell_protocol::{
-        Address, EncodeBuffer, MAX_CONNECT_REQUEST_LEN, SERVER_EARLY_PAYLOAD_MAX,
-        encode_connect_request,
+        EncodeBuffer, MAX_CONNECT_REQUEST_LEN, SERVER_EARLY_PAYLOAD_MAX, encode_connect_request,
     };
 
-    let psk = Psk::new(PSK.to_vec()).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let cfg = ServerConfig {
-        listen: addr,
-        psk: psk.clone(),
-        selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
-        outbound: Outbound::Direct,
-        udp: UdpOptions::default(),
-        tcp_brutal: None,
-    };
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        handle_server(
-            stream,
-            cfg,
-            Arc::new(KdfLimiter::new()),
-            Arc::new(ReplayCache::new()),
+    let psk = Psk::new(PSK).unwrap();
+    let destination = Address::from("127.0.0.1:9".parse::<SocketAddr>().unwrap());
+    let kdf = KdfLimiter::new();
+    for payload_len in [SERVER_EARLY_PAYLOAD_MAX, SERVER_EARLY_PAYLOAD_MAX + 1] {
+        let mut encoder = V4Encoder::os(&psk).unwrap();
+        let mut encode = EncodeBuffer::new(256 * 1024);
+        let mut req = [0u8; MAX_CONNECT_REQUEST_LEN];
+        let n = encode_connect_request(&mut req, destination.as_view(), false).unwrap();
+        let mut plain = req[..n].to_vec();
+        plain.resize(n + payload_len, b'x');
+        let mut offset = 0;
+        while offset < plain.len() {
+            let mut reservation = encoder
+                .reserve(&mut encode, &[], plain.len() - offset)
+                .unwrap();
+            let take = reservation.capacity().min(plain.len() - offset);
+            reservation.payload_mut()[..take].copy_from_slice(&plain[offset..offset + take]);
+            reservation.seal(take).unwrap();
+            offset += take;
+        }
+        // All input is ready: a real socket may return Pending between segments,
+        // at which point later bytes belong to steady relay, not early prefetch.
+        let mut wire = encode.pending();
+        let mut decoder = V4Decoder::new(psk.clone());
+        let mut recv = crate::session::new_recv();
+        let result = crate::session::read_server_connect(
+            &mut decoder,
+            &mut recv,
+            &mut wire,
+            &kdf,
+            &psk,
+            None,
         )
-        .await
-    });
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    let mut encoder = V4Encoder::os(&psk).unwrap();
-    let mut encode = EncodeBuffer::new(256 * 1024);
-    let dest = Address::from("127.0.0.1:9".parse::<SocketAddr>().unwrap());
-    let mut req = [0u8; MAX_CONNECT_REQUEST_LEN];
-    let n = encode_connect_request(&mut req, dest.as_view(), false).unwrap();
-    let mut plain = req[..n].to_vec();
-    plain.extend(std::iter::repeat_n(b'x', SERVER_EARLY_PAYLOAD_MAX + 1));
-    let mut offset = 0;
-    while offset < plain.len() {
-        let mut reservation = encoder
-            .reserve(&mut encode, &[], plain.len() - offset)
-            .unwrap();
-        let take = reservation.capacity().min(plain.len() - offset);
-        reservation.payload_mut()[..take].copy_from_slice(&plain[offset..offset + take]);
-        reservation.seal(take).unwrap();
-        offset += take;
+        .await;
+        if payload_len > SERVER_EARLY_PAYLOAD_MAX {
+            assert!(matches!(result, Err(SessionError::EarlyPayloadTooLarge)));
+        } else {
+            let crate::session::ServerFirst::Connect(connect) = result.unwrap() else {
+                panic!("expected CONNECT");
+            };
+            assert_eq!(connect.leftover, vec![b'x'; payload_len]);
+        }
     }
-    tokio::io::AsyncWriteExt::write_all(&mut client, encode.pending())
-        .await
-        .unwrap();
-
-    let result = timeout(Duration::from_secs(5), server)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        matches!(result, Err(crate::SessionError::EarlyPayloadTooLarge)),
-        "{result:?}"
-    );
 }
 
 #[tokio::test]
@@ -748,6 +751,7 @@ async fn start_pair_udp(
     let (stop_server, server_rx) = oneshot::channel();
     let (stop_client, client_rx) = oneshot::channel();
     let server_cfg = ServerConfig {
+        limits: Default::default(),
         listen: server_addr,
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(version),
@@ -762,6 +766,7 @@ async fn start_pair_udp(
         .await;
     });
     let client_cfg = ClientConfig {
+        limits: Default::default(),
         listen: socks,
         server: server_addr,
         psk,
@@ -1146,4 +1151,107 @@ async fn socks5_udp_proxy_once(mut stream: TcpStream) -> io::Result<()> {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn server_admission_and_shutdown_bound_pending_handshakes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = ServerConfig {
+        limits: crate::TcpLimits {
+            max_connections: 1,
+            max_handshakes: 1,
+        },
+        listen: addr,
+        psk: Psk::new(PSK).unwrap(),
+        selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
+        outbound: Outbound::Direct,
+        udp: UdpOptions::default(),
+        tcp_brutal: None,
+    };
+    let (stop, stopped) = oneshot::channel();
+    let task = tokio::spawn(serve_server(listener, config, async {
+        let _ = stopped.await;
+    }));
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    first.write_all(&[7]).await.unwrap();
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    assert!(
+        matches!(
+            timeout(Duration::from_secs(2), second.read(&mut [0; 1])).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        ),
+        "over-limit socket must close, not queue another task"
+    );
+    stop.send(()).unwrap();
+    timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            timeout(Duration::from_secs(2), first.read(&mut [0; 1])).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        ),
+        "shutdown must cancel accepted sessions"
+    );
+}
+
+#[tokio::test]
+async fn client_admission_recovers_after_cancel_and_closes_on_shutdown() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = ClientConfig {
+        limits: crate::TcpLimits {
+            max_connections: 1,
+            max_handshakes: 1,
+        },
+        listen: addr,
+        server: "127.0.0.1:9".parse().unwrap(),
+        psk: Psk::new(PSK).unwrap(),
+        version: ProtocolFlavor::V4,
+        reuse: false,
+        pool: None,
+        udp: UdpOptions::default(),
+    };
+    let (stop, stopped) = oneshot::channel();
+    let task = tokio::spawn(serve_client(listener, config, async {
+        let _ = stopped.await;
+    }));
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    first.write_all(&[5, 1, 0]).await.unwrap();
+    let mut reply = [0; 2];
+    first.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply, [5, 0]);
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), second.read(&mut [0; 1])).await,
+        Ok(Ok(0)) | Ok(Err(_))
+    ));
+    drop(first);
+    let mut recovered = timeout(Duration::from_secs(2), async {
+        loop {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            if stream.write_all(&[5, 1, 0]).await.is_ok()
+                && stream.read_exact(&mut reply).await.is_ok()
+            {
+                break stream;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(reply, [5, 0]);
+    stop.send(()).unwrap();
+    timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), recovered.read(&mut [0; 1])).await,
+        Ok(Ok(0)) | Ok(Err(_))
+    ));
 }

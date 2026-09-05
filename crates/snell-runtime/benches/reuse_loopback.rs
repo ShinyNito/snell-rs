@@ -84,6 +84,7 @@ async fn start_pair(flavor: ProtocolFlavor, pool: ReusePool) -> Pair {
     let (stop_server, server_rx) = oneshot::channel::<()>();
     let (stop_client, client_rx) = oneshot::channel::<()>();
     let server_cfg = ServerConfig {
+        limits: Default::default(),
         listen: server_addr,
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(flavor),
@@ -98,6 +99,7 @@ async fn start_pair(flavor: ProtocolFlavor, pool: ReusePool) -> Pair {
         .await;
     });
     let client_cfg = ClientConfig {
+        limits: Default::default(),
         listen: socks,
         server: server_addr,
         psk,

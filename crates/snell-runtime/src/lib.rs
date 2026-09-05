@@ -9,6 +9,7 @@
 
 #![deny(unsafe_code)]
 
+mod admission;
 mod auto;
 mod bufio;
 mod client;
@@ -34,6 +35,7 @@ use snell_protocol::TCP_CONNECT_TIMEOUT_SECS;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::time::timeout;
 
+pub use admission::TcpLimits;
 pub use client::{ClientConfig, run_client, serve_client};
 pub use error::SessionError;
 pub use outbound::Outbound;

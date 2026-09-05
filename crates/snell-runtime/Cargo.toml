@@ -45,6 +45,7 @@ tokio = { workspace = true, features = [
   "rt-multi-thread",
   "sync",
   "time",
+  "test-util",
 ] }
 
 [[bench]]

@@ -36,13 +36,29 @@ fn check() -> anyhow::Result<()> {
     run(Command::new("cargo").args([
         "clippy",
         "--workspace",
+        "--locked",
         "--all-targets",
         "--all-features",
         "--",
         "-D",
         "warnings",
     ]))?;
-    run(Command::new("cargo").args(["nextest", "run", "--workspace", "--all-features"]))?;
+    let has_nextest = Command::new("cargo")
+        .args(["nextest", "--version"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let test = if has_nextest {
+        vec![
+            "nextest",
+            "run",
+            "--workspace",
+            "--locked",
+            "--all-features",
+        ]
+    } else {
+        vec!["test", "--workspace", "--locked", "--all-features"]
+    };
+    run(Command::new("cargo").args(test))?;
     run(Command::new("cargo").args(["deny", "check"]))?;
     Ok(())
 }
