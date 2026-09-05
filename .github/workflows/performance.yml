@@ -44,7 +44,12 @@ jobs:
           rustc -vV > results/environment.txt
           uname -a >> results/environment.txt
           lscpu >> results/environment.txt
-          cat /sys/fs/cgroup/cpu.max >> results/environment.txt
+          if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+            cat /sys/fs/cgroup/cpu.max >> results/environment.txt
+          else
+            echo 'root cgroup v2 cpu.max unavailable' >> results/environment.txt
+            cat /proc/self/cgroup >> results/environment.txt
+          fi
           echo 'base=${{ github.event.pull_request.base.sha }} head=${{ github.event.pull_request.head.sha }}' >> results/environment.txt
           (cd baseline && cargo build --release --locked -p snell)
           (cd candidate && cargo build --release --locked -p snell)
