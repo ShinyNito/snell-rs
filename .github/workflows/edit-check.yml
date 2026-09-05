@@ -16,17 +16,38 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: work
-          shared-key: memory-throughput-validation
       - name: Apply source changes in isolated worktree
         id: apply
         run: |
           git -C control worktree add --detach ../work 5c3c4312189c4b10fd462df47fe67babaa1f8981
           cd work
           python3 ../control/.ci/apply.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('crates/snell-protocol/src/v4.rs')
+          s=p.read_text().replace('seal_init_wire_matches', 'append_payload_wire_matches')
+          a=s.index('    #[test]\n    fn seal_init_after_payload_mut_fails_closed()')
+          b=s.index('    const PADDED_HELLO_HEX', a)
+          s=s[:a]+'''    #[test]
+              fn materialized_payload_has_no_append_capacity() {
+                  let mut encoder = encoder_no_padding();
+                  let mut out = encode_buf();
+                  let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
+                  rec.payload_mut()[..5].copy_from_slice(b"hello");
+                  assert_eq!(bytes::BufMut::remaining_mut(&rec.payload_buf()), 0);
+                  rec.seal(5).unwrap();
+                  assert_eq!(out.pending(), expected_first_no_padding(b"hello"));
+              }
+
+          '''+s[b:]
+          p.write_text(s)
+          PY
           cargo fmt --all
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          shared-key: memory-throughput-validation
+          cache-on-failure: true
       - name: Save candidate commit
         if: always() && steps.apply.outcome == 'success'
         working-directory: work
@@ -46,3 +67,20 @@ jobs:
         if: always() && steps.apply.outcome == 'success'
         working-directory: work
         run: cargo test --workspace --locked --all-features
+      - name: Export source and offline compiler inputs
+        if: always() && steps.apply.outcome == 'success'
+        run: |
+          mkdir export
+          git -C work archive HEAD | gzip > export/source.tar.gz
+          git -C control archive 99b57ab1b0178e3bcd0faf73e66fd474f643a374 | gzip > export/baseline.tar.gz
+          printf '%s\n' "$(git -C work rev-parse HEAD)" > export/COMMIT
+          sysroot=$(rustc --print sysroot)
+          tar -czf export/toolchain.tar.gz -C "$sysroot" bin lib libexec
+          tar -czf export/registry.tar.gz -C "$HOME/.cargo" registry
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.apply.outcome == 'success'
+        with:
+          name: isolated-build-inputs
+          path: export/
+          retention-days: 2
+          compression-level: 0
