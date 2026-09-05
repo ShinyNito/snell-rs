@@ -7,15 +7,15 @@ use std::time::Duration;
 use snell_protocol::{
     Address, AddressRef, COMMAND_UDP, DecodeStatus, EncodeBuffer, Error, MAX_CONNECT_REQUEST_LEN,
     MAX_PACKET_SIZE, MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk, REUSE_IDLE_TIMEOUT_SECS,
-    RecordKind, RecvBuffer, SERVER_EARLY_PAYLOAD_MAX, ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS,
-    V6_WIRE_CAP, aead_key, encode_connect_request, encode_reject, encode_tunnel_reply,
-    encode_udp_request, encode_udp_response, encode_udp_setup, udp_request_len, udp_response_len,
+    RecordKind, RecvBuffer, SERVER_EARLY_PAYLOAD_MAX, ServerReply, V6_WIRE_CAP, aead_key,
+    encode_connect_request, encode_reject, encode_tunnel_reply, encode_udp_request,
+    encode_udp_response, encode_udp_setup, udp_request_len, udp_response_len,
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::bufio::{drain_encode, read_into_recv};
+use crate::bufio::{drain_encode, poll_read_buf, read_into_recv};
 use crate::codec::{TcpDecoder, TcpEncoder, TcpReservation};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
@@ -24,27 +24,14 @@ use crate::replay::ReplayCache;
 const RECORD_HINT: usize = MAX_PACKET_SIZE;
 pub(crate) const HANDSHAKE_PLAIN_MAX: usize = MAX_CONNECT_REQUEST_LEN + MAX_PACKET_SIZE_V6;
 
-/// Per-connection buffer cap for both TCP and UDP-over-TCP sessions:
-/// exactly one maximum v6 wire record. The receive side needs this much
-/// contiguous space to decode a max-size shaped record; the encode side
-/// flushes through pump backpressure, so a larger cap only raises the
-/// retained per-connection high-water mark without helping throughput.
+/// Lazy buffers grow only on demand, with one maximum shaped record as the
+/// hard limit. Idle shrinking never changes the accepted protocol lengths.
 pub(crate) fn new_recv() -> RecvBuffer {
     RecvBuffer::new(V6_WIRE_CAP)
 }
 
 pub(crate) fn new_encode() -> EncodeBuffer {
     EncodeBuffer::new(V6_WIRE_CAP)
-}
-
-pub(crate) async fn with_handshake_timeout<F, T>(fut: F) -> Result<T, SessionError>
-where
-    F: Future<Output = Result<T, SessionError>>,
-{
-    match timeout(Duration::from_secs(TCP_HANDSHAKE_TIMEOUT_SECS), fut).await {
-        Ok(result) => result,
-        Err(_) => Err(SessionError::HandshakeTimeout),
-    }
 }
 
 pub(crate) async fn with_reuse_idle_timeout<F, T>(fut: F) -> Result<T, SessionError>
@@ -214,6 +201,7 @@ pub(crate) async fn read_server_tunnel<D: TcpDecoder, R: AsyncRead + Unpin>(
 pub(crate) struct ServerConnect {
     pub destination: Address,
     pub leftover: Vec<u8>,
+    pub early_eof: bool,
     pub reuse: bool,
 }
 
@@ -253,13 +241,15 @@ pub(crate) async fn read_server_connect<D: TcpDecoder, R: AsyncRead + Unpin>(
                     Ok(ParseState::Need(_)) => {}
                     Ok(ParseState::Done((request, n))) => {
                         let mut leftover = plain.filled()[n..].to_vec();
-                        drain_early_payload(decoder, recv, kdf, psk, &mut leftover).await?;
+                        let early_eof =
+                            drain_early_payload(decoder, recv, reader, &mut leftover).await?;
                         if leftover.len() > SERVER_EARLY_PAYLOAD_MAX {
                             return Err(SessionError::EarlyPayloadTooLarge);
                         }
                         return Ok(ServerFirst::Connect(ServerConnect {
                             destination: request.destination,
                             leftover,
+                            early_eof,
                             reuse: request.reuse,
                         }));
                     }
@@ -290,29 +280,47 @@ pub(crate) enum RecordEvent {
     Data(snell_protocol::DecodedRecord),
 }
 
-async fn drain_early_payload<D: TcpDecoder>(
+/// Prefetch only bytes already ready after CONNECT authentication. The wire
+/// budget bounds CPU work even for padding-heavy records. Pending never delays
+/// the outbound connection, and a consumed zero chunk remains visible to relay.
+async fn drain_early_payload<D: TcpDecoder, R: AsyncRead + Unpin>(
     decoder: &mut D,
     recv: &mut RecvBuffer,
-    kdf: &KdfLimiter,
-    psk: &Psk,
+    reader: &mut R,
     leftover: &mut Vec<u8>,
-) -> Result<(), SessionError> {
+) -> Result<bool, SessionError> {
+    let mut read_bytes = 0usize;
     loop {
-        if leftover.len() > SERVER_EARLY_PAYLOAD_MAX {
-            return Ok(());
-        }
-        maybe_install_kdf(decoder, recv, kdf, psk).await?;
-        match decoder.decode(recv) {
-            Ok(DecodeStatus::NeedMore { .. }) => return Ok(()),
-            Ok(DecodeStatus::Record(record)) => {
+        match decoder.decode(recv)? {
+            DecodeStatus::NeedMore { minimum } => {
+                if read_bytes >= 2 * V6_WIRE_CAP {
+                    return Ok(false);
+                }
+                recv.spare_capacity_mut(minimum.saturating_sub(recv.len()).max(1))?;
+                match poll_fn(|cx| Poll::Ready(poll_read_buf(reader, recv, cx))).await {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(Ok(0)) if recv.is_empty() => return Ok(true),
+                    Poll::Ready(Ok(0)) => {
+                        return Err(
+                            io::Error::new(io::ErrorKind::UnexpectedEof, "eof mid-record").into(),
+                        );
+                    }
+                    Poll::Ready(Ok(n)) => read_bytes += n,
+                    Poll::Ready(Err(error)) => return Err(error),
+                }
+            }
+            DecodeStatus::Record(record) => {
                 if record.kind == RecordKind::ZeroChunk {
                     decoder.consume(recv, &record)?;
-                    return Ok(());
+                    return Ok(true);
                 }
-                leftover.extend_from_slice(record.plaintext(recv.filled()));
+                let payload = record.plaintext(recv.filled());
+                if payload.len() > SERVER_EARLY_PAYLOAD_MAX.saturating_sub(leftover.len()) {
+                    return Err(SessionError::EarlyPayloadTooLarge);
+                }
+                leftover.extend_from_slice(payload);
                 decoder.consume(recv, &record)?;
             }
-            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -352,8 +360,8 @@ pub(crate) async fn maybe_install_kdf<D: TcpDecoder>(
         return Ok(());
     }
     let salt = decoder.kdf_salt(recv)?;
-    let psk_bytes = psk.as_bytes().to_vec();
-    let key = kdf.run(move || aead_key(&psk_bytes, &salt)).await??;
+    let psk = psk.clone();
+    let key = kdf.run(move || aead_key(psk.as_bytes(), &salt)).await??;
     decoder.install_aead(salt, key)?;
     Ok(())
 }
@@ -361,23 +369,26 @@ pub(crate) async fn maybe_install_kdf<D: TcpDecoder>(
 pub(crate) async fn wait_reuse_idle<R: AsyncRead + Unpin>(
     reader: &mut R,
     recv: &mut RecvBuffer,
+    encode: &mut EncodeBuffer,
 ) -> Result<(), SessionError> {
     if !recv.is_empty() {
         return Ok(());
     }
     with_reuse_idle_timeout(async {
-        loop {
-            let n = read_into_recv(reader, recv).await?;
-            if n == 0 {
-                return Err(SessionError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "eof during reuse idle",
-                )));
+        let result = tokio::select! {
+            result = read_into_recv(reader, recv) => result,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                recv.shrink_idle();
+                encode.shrink_idle();
+                read_into_recv(reader, recv).await
             }
-            if !recv.is_empty() {
-                return Ok(());
-            }
+        }?;
+        if result == 0 {
+            return Err(
+                io::Error::new(io::ErrorKind::UnexpectedEof, "eof during reuse idle").into(),
+            );
         }
+        Ok(())
     })
     .await
 }
@@ -394,37 +405,13 @@ pub(crate) fn server_may_reuse<D: TcpDecoder>(encode: &EncodeBuffer, decoder: &D
     encode.is_empty() && !decoder.has_unconsumed_plaintext()
 }
 
-/// Drop the session's touched buffer pages while a reuse connection sits
-/// idle: reallocate fresh (untouched) capacity, preserving live bytes.
-pub(crate) fn release_bulk(
-    recv: RecvBuffer,
-    encode: EncodeBuffer,
-) -> Result<(RecvBuffer, EncodeBuffer), SessionError> {
-    let live = recv.filled().to_vec();
-    drop(recv);
-    drop(encode);
-    let mut next = new_recv();
-    next.extend_from_slice(&live)?;
-    Ok((next, new_encode()))
-}
-
-/// Upgrade an auto-detect prefix buffer to full bulk capacity.
-pub(crate) fn ensure_bulk(recv: RecvBuffer) -> Result<RecvBuffer, SessionError> {
-    if recv.max() >= V6_WIRE_CAP {
-        return Ok(recv);
-    }
-    let live = recv.filled().to_vec();
-    let mut next = new_recv();
-    next.extend_from_slice(&live)?;
-    Ok(next)
-}
-
 async fn fill_until<R: AsyncRead + Unpin>(
     reader: &mut R,
     recv: &mut RecvBuffer,
     minimum: usize,
 ) -> Result<(), SessionError> {
     while recv.len() < minimum {
+        recv.spare_capacity_mut(minimum - recv.len())?;
         let n = read_into_recv(reader, recv).await?;
         if n == 0 {
             return Err(SessionError::Io(io::Error::new(
@@ -444,22 +431,21 @@ pub(crate) async fn relay<E: TcpEncoder, D: TcpDecoder>(
     decoder: &mut D,
     recv: &mut RecvBuffer,
     encode: &mut EncodeBuffer,
-    initial_to_plain: &[u8],
-    initial_to_snell: &[u8],
+    initial_to_plain: Vec<u8>,
+    initial_eof: bool,
     keep_snell_open: bool,
 ) -> Result<(), SessionError> {
     if !initial_to_plain.is_empty() {
-        tokio::io::AsyncWriteExt::write_all(plain, initial_to_plain).await?;
+        tokio::io::AsyncWriteExt::write_all(plain, &initial_to_plain).await?;
     }
-    if !initial_to_snell.is_empty() {
-        write_plain_records(encoder, encode, snell, initial_to_snell).await?;
-    }
+    // The early-payload owner must not live across the steady-state relay.
+    drop(initial_to_plain);
 
     let (mut snell_r, mut snell_w) = snell.split();
     let (mut plain_r, mut plain_w) = plain.split();
     tokio::try_join!(
         pump_plain_to_snell(&mut plain_r, &mut snell_w, encoder, encode, keep_snell_open,),
-        pump_snell_to_plain(&mut snell_r, &mut plain_w, decoder, recv),
+        pump_snell_to_plain(&mut snell_r, &mut plain_w, decoder, recv, initial_eof),
     )?;
     Ok(())
 }
@@ -504,28 +490,19 @@ where
                             if reservation.capacity() == 0 {
                                 break;
                             }
-                            let read = {
-                                // Uninit payload slot: the kernel writes it, so the
-                                // reserve path never zero-fills the payload region.
-                                let mut read_buf = ReadBuf::uninit(reservation.payload_uninit());
-                                match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
-                                    Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-                                    Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                                    Poll::Pending => Poll::Pending,
-                                }
-                            };
+                            let read = poll_read_buf(reader, &mut reservation, cx);
                             match read {
                                 Poll::Ready(Ok(0)) => {
                                     local_eof = true;
                                     break;
                                 }
                                 Poll::Ready(Ok(n)) => {
-                                    if let Err(error) = reservation.seal_init(n) {
+                                    if let Err(error) = reservation.seal(n) {
                                         return Poll::Ready(Err(error.into()));
                                     }
                                 }
                                 Poll::Ready(Err(error)) => {
-                                    return Poll::Ready(Err(error.into()));
+                                    return Poll::Ready(Err(error));
                                 }
                                 Poll::Pending => {
                                     if !had_pending {
@@ -595,6 +572,7 @@ async fn pump_snell_to_plain<R, W, D>(
     writer: &mut W,
     decoder: &mut D,
     recv: &mut RecvBuffer,
+    initial_eof: bool,
 ) -> Result<(), SessionError>
 where
     R: AsyncRead + Unpin,
@@ -611,7 +589,7 @@ where
     let mut write_off = 0usize;
     let mut end_after_batch = false;
     let mut deferred: Option<SessionError> = None;
-    let mut protocol_end = false;
+    let mut protocol_end = initial_eof;
     let mut shutting_down = false;
     poll_fn(|cx| {
         loop {
@@ -690,19 +668,14 @@ where
                                 "decoder need exceeds filled",
                             ))));
                         }
-                        let n = {
-                            let spare = match recv.spare_capacity_mut(1) {
-                                Ok(spare) => spare,
-                                Err(error) => return Poll::Ready(Err(error.into())),
-                            };
-                            let mut buf = ReadBuf::uninit(spare);
-                            match Pin::new(&mut *reader).poll_read(cx, &mut buf) {
-                                Poll::Ready(Ok(())) => buf.filled().len(),
-                                Poll::Ready(Err(error)) => {
-                                    return Poll::Ready(Err(error.into()));
-                                }
-                                Poll::Pending => return Poll::Pending,
-                            }
+                        // No batch is outstanding here, so growth/compaction is safe.
+                        if let Err(error) = recv.spare_capacity_mut(minimum - recv.len()) {
+                            return Poll::Ready(Err(error.into()));
+                        }
+                        let n = match poll_read_buf(reader, recv, cx) {
+                            Poll::Ready(Ok(n)) => n,
+                            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                            Poll::Pending => return Poll::Pending,
                         };
                         if n == 0 {
                             if recv.is_empty() {
@@ -714,9 +687,6 @@ where
                                 io::ErrorKind::UnexpectedEof,
                                 "eof mid-record",
                             ))));
-                        }
-                        if let Err(error) = recv.commit_init(n) {
-                            return Poll::Ready(Err(error.into()));
                         }
                     }
                     Ok(DecodeStatus::Record(record)) => {
@@ -755,4 +725,102 @@ where
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BufMut;
+    use snell_protocol::{FixedClock, RepeatEntropy, V4Decoder, V4Encoder};
+    use tokio::io::{AsyncWriteExt, duplex};
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_releases_bulk_after_grace_and_preserves_next_bytes() {
+        let (mut reader, mut writer) = duplex(128);
+        let mut recv = new_recv();
+        let mut encode = new_encode();
+        recv.put_slice(&vec![1; 60_000]);
+        recv.consume(60_000).unwrap();
+        encode.reserve_zeroed(60_000).unwrap();
+        encode.advance(60_000).unwrap();
+        let incoming = async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            writer.write_all(b"next").await.unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            wait_reuse_idle(&mut reader, &mut recv, &mut encode),
+            incoming
+        );
+        result.unwrap();
+        assert_eq!(recv.filled(), b"next");
+        assert!(recv.capacity() <= 4096);
+        assert_eq!(encode.capacity(), 0);
+        assert_eq!(recv.max(), V6_WIRE_CAP);
+    }
+
+    #[tokio::test]
+    async fn pipelined_reuse_does_not_shrink_or_discard_live_bytes() {
+        let (mut reader, _writer) = duplex(1);
+        let mut recv = new_recv();
+        let mut encode = new_encode();
+        recv.put_slice(&vec![9; 60_000]);
+        let capacity = recv.capacity();
+        wait_reuse_idle(&mut reader, &mut recv, &mut encode)
+            .await
+            .unwrap();
+        assert_eq!(recv.capacity(), capacity);
+        assert_eq!(recv.filled(), vec![9; 60_000]);
+    }
+
+    #[tokio::test]
+    async fn early_zero_chunk_preserves_next_connect_and_half_close() {
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
+        let mut encoder = V4Encoder::with_salt(
+            &psk,
+            [7; 16],
+            0,
+            RepeatEntropy { byte: 0x3c },
+            FixedClock::new(0),
+        )
+        .unwrap();
+        let mut decoder = V4Decoder::new(psk.clone());
+        let mut encoded = new_encode();
+        let dest = Address::from("127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap());
+        let mut req = [0; MAX_CONNECT_REQUEST_LEN];
+        let n = encode_connect_request(&mut req, dest.as_view(), true).unwrap();
+        let mut first = encoder.reserve(&mut encoded, &req[..n], 5).unwrap();
+        first.put_slice(b"hello");
+        first.seal(5).unwrap();
+        encoder
+            .reserve(&mut encoded, &[], 0)
+            .unwrap()
+            .seal(0)
+            .unwrap();
+        encoder
+            .reserve(&mut encoded, &req[..n], 0)
+            .unwrap()
+            .seal(0)
+            .unwrap();
+        let (mut reader, mut writer) = duplex(4096);
+        writer.write_all(encoded.pending()).await.unwrap();
+        let mut recv = new_recv();
+        let kdf = KdfLimiter::new();
+        let first = read_server_connect(&mut decoder, &mut recv, &mut reader, &kdf, &psk, None)
+            .await
+            .unwrap();
+        let ServerFirst::Connect(first) = first else {
+            panic!("CONNECT");
+        };
+        assert!(first.early_eof);
+        assert_eq!(first.leftover, b"hello");
+        let second = read_server_connect(&mut decoder, &mut recv, &mut reader, &kdf, &psk, None)
+            .await
+            .unwrap();
+        let ServerFirst::Connect(second) = second else {
+            panic!("CONNECT");
+        };
+        assert_eq!(second.destination, dest);
+        assert!(!second.early_eof);
+        assert!(second.leftover.is_empty());
+    }
 }

@@ -1,23 +1,19 @@
-use std::mem::MaybeUninit;
+use bytes::BufMut;
 
 use snell_protocol::{
-    AES_128_KEY_LEN, DecodeStatus, DecodedRecord, EncodeBuffer, RecvBuffer, Result, SALT_LEN,
+    AES_128_KEY_LEN, DecodeStatus, DecodedRecord, EncodeBuffer, Psk, RecvBuffer, Result, SALT_LEN,
     V4Decoder, V4Encoder, V4Reservation, V6ShapedDecoder, V6ShapedEncoder, V6ShapedReservation,
     V6UnshapedDecoder, V6UnshapedEncoder, V6UnshapedReservation,
 };
 
-pub(crate) trait TcpReservation {
+pub(crate) trait TcpReservation: BufMut {
     fn payload_mut(&mut self) -> &mut [u8];
-    /// Uninitialized payload slot; pair with [`Self::seal_init`] after filling
-    /// a prefix through `ReadBuf::uninit`. Do not mix with `payload_mut`.
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>];
     fn capacity(&self) -> usize;
     fn seal(self, written: usize) -> Result<()>;
-    /// Seal after initializing `written` bytes of [`Self::payload_uninit`].
-    fn seal_init(self, written: usize) -> Result<()>;
 }
 
-pub(crate) trait TcpEncoder {
+pub(crate) trait TcpEncoder: Sized {
+    fn from_psk(psk: &Psk) -> Result<Self>;
     fn reserve<'a>(
         &'a mut self,
         buf: &'a mut EncodeBuffer,
@@ -26,7 +22,8 @@ pub(crate) trait TcpEncoder {
     ) -> Result<impl TcpReservation + 'a>;
 }
 
-pub(crate) trait TcpDecoder {
+pub(crate) trait TcpDecoder: Sized {
+    fn from_psk(psk: Psk) -> Result<Self>;
     fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus>;
     fn consume(&mut self, buf: &mut RecvBuffer, record: &DecodedRecord) -> Result<()>;
     fn replay_identity(&self) -> Option<[u8; SALT_LEN]>;
@@ -41,10 +38,6 @@ impl TcpReservation for V4Reservation<'_> {
         V4Reservation::payload_mut(self)
     }
 
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        V4Reservation::payload_uninit(self)
-    }
-
     fn capacity(&self) -> usize {
         V4Reservation::capacity(self)
     }
@@ -52,13 +45,12 @@ impl TcpReservation for V4Reservation<'_> {
     fn seal(self, written: usize) -> Result<()> {
         V4Reservation::seal(self, written)
     }
-
-    fn seal_init(self, written: usize) -> Result<()> {
-        V4Reservation::seal_init(self, written)
-    }
 }
 
 impl TcpEncoder for V4Encoder {
+    fn from_psk(psk: &Psk) -> Result<Self> {
+        Self::os(psk)
+    }
     fn reserve<'a>(
         &'a mut self,
         buf: &'a mut EncodeBuffer,
@@ -70,6 +62,9 @@ impl TcpEncoder for V4Encoder {
 }
 
 impl TcpDecoder for V4Decoder {
+    fn from_psk(psk: Psk) -> Result<Self> {
+        Ok(Self::new(psk))
+    }
     fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus> {
         V4Decoder::decode(self, buf)
     }
@@ -104,10 +99,6 @@ impl TcpReservation for V6ShapedReservation<'_> {
         V6ShapedReservation::payload_mut(self)
     }
 
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        V6ShapedReservation::payload_uninit(self)
-    }
-
     fn capacity(&self) -> usize {
         V6ShapedReservation::capacity(self)
     }
@@ -115,13 +106,12 @@ impl TcpReservation for V6ShapedReservation<'_> {
     fn seal(self, written: usize) -> Result<()> {
         V6ShapedReservation::seal(self, written)
     }
-
-    fn seal_init(self, written: usize) -> Result<()> {
-        V6ShapedReservation::seal_init(self, written)
-    }
 }
 
 impl TcpEncoder for V6ShapedEncoder {
+    fn from_psk(psk: &Psk) -> Result<Self> {
+        Self::os(psk)
+    }
     fn reserve<'a>(
         &'a mut self,
         buf: &'a mut EncodeBuffer,
@@ -133,6 +123,9 @@ impl TcpEncoder for V6ShapedEncoder {
 }
 
 impl TcpDecoder for V6ShapedDecoder {
+    fn from_psk(psk: Psk) -> Result<Self> {
+        Self::new(psk)
+    }
     fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus> {
         V6ShapedDecoder::decode(self, buf)
     }
@@ -167,10 +160,6 @@ impl TcpReservation for V6UnshapedReservation<'_> {
         V6UnshapedReservation::payload_mut(self)
     }
 
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        V6UnshapedReservation::payload_uninit(self)
-    }
-
     fn capacity(&self) -> usize {
         V6UnshapedReservation::capacity(self)
     }
@@ -178,13 +167,12 @@ impl TcpReservation for V6UnshapedReservation<'_> {
     fn seal(self, written: usize) -> Result<()> {
         V6UnshapedReservation::seal(self, written)
     }
-
-    fn seal_init(self, written: usize) -> Result<()> {
-        V6UnshapedReservation::seal_init(self, written)
-    }
 }
 
 impl TcpEncoder for V6UnshapedEncoder {
+    fn from_psk(psk: &Psk) -> Result<Self> {
+        Self::os(psk)
+    }
     fn reserve<'a>(
         &'a mut self,
         buf: &'a mut EncodeBuffer,
@@ -196,6 +184,9 @@ impl TcpEncoder for V6UnshapedEncoder {
 }
 
 impl TcpDecoder for V6UnshapedDecoder {
+    fn from_psk(psk: Psk) -> Result<Self> {
+        Ok(Self::new(psk))
+    }
     fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus> {
         V6UnshapedDecoder::decode(self, buf)
     }

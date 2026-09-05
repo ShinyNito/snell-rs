@@ -23,16 +23,16 @@ pub struct V6UnshapedEncoder<E = OsEntropy, C = UnixClock> {
     reserving: bool,
     poisoned: bool,
     prefix_len: usize,
-    max_payload: usize,
-    payload_start: usize,
+    pub(crate) max_payload: usize,
+    pub(crate) payload_start: usize,
     header_start: usize,
     record_start: usize,
 }
 
 #[must_use = "unsealed reservations are cancelled on drop"]
 pub struct V6UnshapedReservation<'a, E: Entropy = OsEntropy, C: Clock = UnixClock> {
-    encoder: &'a mut V6UnshapedEncoder<E, C>,
-    buf: &'a mut EncodeBuffer,
+    pub(crate) encoder: &'a mut V6UnshapedEncoder<E, C>,
+    pub(crate) buf: &'a mut EncodeBuffer,
     sealed: bool,
 }
 
@@ -193,17 +193,6 @@ impl<E: Entropy, C: Clock> V6UnshapedReservation<'_, E, C> {
         self.buf.range_mut(start, end)
     }
 
-    /// Uninitialized payload slot after the prefix. Fill a prefix of it (for
-    /// example through Tokio `ReadBuf::uninit`), then call [`Self::seal_init`].
-    /// Do not mix with [`Self::payload_mut`]. Empty once materialized.
-    pub fn payload_uninit(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
-        let cap = self.encoder.max_payload - self.encoder.prefix_len;
-        if self.buf.end() != self.encoder.payload_start + self.encoder.prefix_len {
-            return &mut [];
-        }
-        &mut self.buf.spare_uninit()[..cap]
-    }
-
     pub fn capacity(&self) -> usize {
         self.encoder.max_payload - self.encoder.prefix_len
     }
@@ -217,20 +206,6 @@ impl<E: Entropy, C: Clock> V6UnshapedReservation<'_, E, C> {
         if total > self.encoder.max_payload {
             return Err(Error::PayloadTooLarge);
         }
-        self.sealed = true;
-        self.encoder.finish(self.buf, total)
-    }
-
-    /// Seal after the caller initialized `written` bytes of
-    /// [`Self::payload_uninit`]. Commits them without zero-filling first.
-    pub fn seal_init(mut self, written: usize) -> Result<()> {
-        let total = crate::buffer::commit_init_payload(
-            self.buf,
-            self.encoder.payload_start,
-            self.encoder.prefix_len,
-            self.encoder.max_payload,
-            written,
-        )?;
         self.sealed = true;
         self.encoder.finish(self.buf, total)
     }
@@ -445,6 +420,7 @@ impl fmt::Debug for V6UnshapedDecoder {
 mod tests {
     use super::*;
     use crate::{EncodeBuffer, FixedClock, RepeatEntropy, V4_WIRE_CAP};
+    use bytes::BufMut;
 
     fn psk() -> Psk {
         Psk::new(b"0123456789abcdef").unwrap()
@@ -499,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn seal_init_wire_matches_payload_mut() {
+    fn buf_mut_wire_matches_payload_mut() {
         let mut a_enc = encoder();
         let mut a = EncodeBuffer::new(V4_WIRE_CAP);
         let mut b_enc = encoder();
@@ -510,8 +486,8 @@ mod tests {
             rec.seal(msg.len()).unwrap();
 
             let mut rec = b_enc.reserve(&mut b, &[], hint).unwrap();
-            rec.payload_uninit()[..msg.len()].write_copy_of_slice(msg);
-            rec.seal_init(msg.len()).unwrap();
+            rec.put_slice(msg);
+            rec.seal(msg.len()).unwrap();
         }
         assert_eq!(a.pending(), b.pending());
     }

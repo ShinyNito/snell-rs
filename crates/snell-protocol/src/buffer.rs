@@ -3,25 +3,36 @@
 
 use std::mem::MaybeUninit;
 
+use bytes::{BufMut, buf::UninitSlice};
+
 use crate::{Error, Result};
 
 /// Contiguous receive allocation: `consumed | live | uninitialized cap`.
 ///
-/// Fixed capacity: `new(max)` does `Vec::with_capacity(max)` and never reallocates.
-/// `storage.len()` is the live end. Front `start` is consumed. The kernel writes
-/// [`Self::spare_capacity_mut`], which is the whole tail, not `min` bytes.
+/// Allocation is lazy and grows geometrically, bounded by the legal wire limit.
+/// `storage.len()` is the initialized end; `start` is consumed. `BufMut` allows
+/// an I/O adapter to append initialized bytes without zeroing or copying them.
+///
+/// Advancing uninitialized storage requires an explicit unsafe contract:
+/// ```compile_fail
+/// use bytes::BufMut;
+/// let mut buf = snell_protocol::RecvBuffer::new(4096);
+/// buf.advance_mut(1);
+/// ```
 pub struct RecvBuffer {
     storage: Vec<u8>,
     start: usize,
     max: usize,
+    saturated: bool,
 }
 
 impl RecvBuffer {
     pub fn new(max: usize) -> Self {
         Self {
-            storage: Vec::with_capacity(max),
+            storage: Vec::new(),
             start: 0,
             max,
+            saturated: false,
         }
     }
 
@@ -45,21 +56,49 @@ impl RecvBuffer {
         self.max
     }
 
+    pub fn capacity(&self) -> usize {
+        self.storage.capacity()
+    }
+
+    /// Enlarge a probe's legal limit without reallocating or moving live data.
+    pub fn raise_limit(&mut self, max: usize) {
+        self.max = self.max.max(max);
+    }
+
+    /// Keep only live bytes and a small receive window while idle.
+    /// Call only when no decoded records still refer to the previous layout.
+    pub fn shrink_idle(&mut self) {
+        self.compact();
+        self.saturated = false;
+        let target = self.len().max(4096).min(self.max);
+        if self.storage.capacity() > target {
+            self.storage.shrink_to(target);
+        }
+    }
+
     /// Ensure at least `min` writable bytes, then return the entire uninitialized tail.
     ///
-    /// Compacts only when `max - len < min`. Capacity is `>= max` for the lifetime
-    /// of the buffer; this never grows.
+    /// Compacts only when the tail is too short. A full read allows the next
+    /// read to grow its window, so bulk traffic is not stuck at the initial size.
     pub fn spare_capacity_mut(&mut self, min: usize) -> Result<&mut [MaybeUninit<u8>]> {
-        let live = self.len();
-        if live.checked_add(min).is_none_or(|needed| needed > self.max) {
+        if self.len().checked_add(min).is_none_or(|n| n > self.max) {
             return Err(Error::PayloadTooLarge);
         }
-        if self.max - self.storage.len() < min {
+        if self.storage.capacity().min(self.max) - self.storage.len() < min {
             self.compact();
         }
-        let writable = self.max - self.storage.len();
-        let spare = self.storage.spare_capacity_mut();
-        Ok(&mut spare[..writable])
+        let demand = self.storage.len() + min;
+        let target = if self.saturated && self.storage.capacity() < self.max {
+            demand
+                .max(self.storage.capacity().saturating_mul(2))
+                .min(self.max)
+        } else {
+            demand
+        };
+        grow(&mut self.storage, target, self.max);
+        self.saturated = false;
+        let writable = self.storage.capacity().min(self.max) - self.storage.len();
+        Ok(&mut self.storage.spare_capacity_mut()[..writable])
     }
 
     /// Copy `bytes` into the uninitialized tail. Test and assembler helper.
@@ -79,29 +118,20 @@ impl RecvBuffer {
     ///
     /// `storage[old_len..old_len + n]` must already be initialized.
     pub unsafe fn commit(&mut self, n: usize) -> Result<()> {
-        let writable = self.max - self.storage.len();
+        let writable = self.storage.capacity().min(self.max) - self.storage.len();
         if n > writable {
             return Err(Error::BufferTooSmall {
                 needed: self.storage.len().saturating_add(n),
                 available: self.storage.len() + writable,
             });
         }
+        self.saturated = n > 0 && n == writable;
         let new_len = self.storage.len() + n;
         // SAFETY: caller initialized `old_len..new_len`; `n <= writable`.
         unsafe {
             self.storage.set_len(new_len);
         }
         Ok(())
-    }
-
-    /// Commit `n` bytes previously initialized in the spare tail.
-    ///
-    /// Callers must have filled `storage[old_len..old_len + n]` through
-    /// [`Self::spare_capacity_mut`] (for example Tokio `ReadBuf::uninit`).
-    /// The `unsafe` stays in this buffer module.
-    pub fn commit_init(&mut self, n: usize) -> Result<()> {
-        // SAFETY: caller initialized `n` bytes of the spare tail.
-        unsafe { self.commit(n) }
     }
 
     pub fn consume(&mut self, n: usize) -> Result<()> {
@@ -145,7 +175,7 @@ pub struct EncodeBuffer {
 impl EncodeBuffer {
     pub fn new(max: usize) -> Self {
         Self {
-            storage: Vec::with_capacity(max),
+            storage: Vec::new(),
             sent: 0,
             max,
         }
@@ -171,6 +201,14 @@ impl EncodeBuffer {
         self.max
     }
 
+    /// Release empty backing storage; pending wire is never discarded.
+    pub fn shrink_idle(&mut self) {
+        if self.is_empty() {
+            self.storage = Vec::new();
+            self.sent = 0;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn filled_len(&self) -> usize {
         self.storage.len()
@@ -178,19 +216,16 @@ impl EncodeBuffer {
 
     /// Ensure at least `min` writable bytes, then return the entire uninitialized tail.
     pub fn spare_capacity_mut(&mut self, min: usize) -> Result<&mut [MaybeUninit<u8>]> {
-        let unsent = self.len();
-        if unsent
-            .checked_add(min)
-            .is_none_or(|needed| needed > self.max)
-        {
+        if self.len().checked_add(min).is_none_or(|n| n > self.max) {
             return Err(Error::PayloadTooLarge);
         }
-        if self.max - self.storage.len() < min {
+        if self.storage.capacity().min(self.max) - self.storage.len() < min {
             self.compact();
         }
-        let writable = self.max - self.storage.len();
-        let spare = self.storage.spare_capacity_mut();
-        Ok(&mut spare[..writable])
+        let demand = self.storage.len() + min;
+        grow(&mut self.storage, demand, self.max);
+        let writable = self.storage.capacity().min(self.max) - self.storage.len();
+        Ok(&mut self.storage.spare_capacity_mut()[..writable])
     }
 
     /// Absolute end index of committed storage. Record bookkeeping only;
@@ -205,7 +240,7 @@ impl EncodeBuffer {
     ///
     /// Until `total - fixed` further bytes are committed, subsequent
     /// [`Self::reserve_zeroed`], [`Self::extend_from_slice`], and
-    /// [`Self::commit_init`] calls within the record cannot compact or fail
+    /// [`Self::commit`] calls within the record cannot compact or fail
     /// for capacity, so absolute indices stay valid.
     pub(crate) fn reserve_record(&mut self, total: usize, fixed: usize) -> Result<usize> {
         debug_assert!(fixed <= total);
@@ -231,20 +266,11 @@ impl EncodeBuffer {
 
     /// Entire uninitialized tail without compaction. The caller may initialize
     /// a prefix of it (for example through Tokio `ReadBuf::uninit`) and then
-    /// commit with [`Self::commit_init`].
+    /// commit with [`Self::commit`].
     pub(crate) fn spare_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        let writable = self.max - self.storage.len();
+        let writable = self.storage.capacity().min(self.max) - self.storage.len();
         let spare = self.storage.spare_capacity_mut();
         &mut spare[..writable]
-    }
-
-    /// Commit `n` bytes previously initialized in the spare tail.
-    ///
-    /// Callers must have filled `storage[old_len..old_len + n]` through
-    /// [`Self::spare_uninit`]. The `unsafe` stays in this buffer module.
-    pub(crate) fn commit_init(&mut self, n: usize) -> Result<()> {
-        // SAFETY: caller initialized `n` bytes of the spare tail.
-        unsafe { self.commit(n) }
     }
 
     /// Zero-fill `n` bytes of spare and commit them. Returns the start index after compact.
@@ -265,7 +291,7 @@ impl EncodeBuffer {
     ///
     /// `storage[old_len..old_len + n]` must already be initialized.
     pub unsafe fn commit(&mut self, n: usize) -> Result<()> {
-        let writable = self.max - self.storage.len();
+        let writable = self.storage.capacity().min(self.max) - self.storage.len();
         if n > writable {
             return Err(Error::BufferTooSmall {
                 needed: self.storage.len().saturating_add(n),
@@ -327,28 +353,73 @@ impl EncodeBuffer {
     }
 }
 
-/// Shared reservation `seal_init` bookkeeping: validate the payload slot is
-/// still uninitialized spare, then commit `written` caller-initialized bytes.
-/// Returns the total payload length including the prefix.
-pub(crate) fn commit_init_payload(
-    buf: &mut EncodeBuffer,
-    payload_start: usize,
-    prefix_len: usize,
-    max_payload: usize,
-    written: usize,
-) -> Result<usize> {
-    let total = prefix_len
-        .checked_add(written)
-        .ok_or(Error::PayloadTooLarge)?;
-    if total > max_payload {
-        return Err(Error::PayloadTooLarge);
+/// Shared bounded growth; length remains the initialized prefix.
+fn grow(storage: &mut Vec<u8>, needed: usize, max: usize) {
+    if needed > storage.capacity() {
+        let target = needed
+            .checked_next_power_of_two()
+            .unwrap_or(max)
+            .max(4096)
+            .min(max);
+        storage.reserve_exact(target - storage.len());
     }
-    if buf.end() != payload_start + prefix_len {
-        return Err(Error::PendingWire);
-    }
-    buf.commit_init(written)?;
-    Ok(total)
 }
+
+// SAFETY: chunk_mut exposes only writable tail storage. advance_mut's caller
+// must initialize exactly the prefix being committed, as required by BufMut.
+unsafe impl BufMut for RecvBuffer {
+    fn remaining_mut(&self) -> usize {
+        self.max - self.len()
+    }
+
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        if self.remaining_mut() == 0 {
+            return UninitSlice::new(&mut []);
+        }
+        UninitSlice::uninit(
+            self.spare_capacity_mut(1)
+                .expect("remaining receive capacity"),
+        )
+    }
+
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        // SAFETY: the BufMut caller initialized cnt bytes in chunk_mut().
+        unsafe { self.commit(cnt).expect("initialized receive tail") }
+    }
+}
+
+// Reservation fields are crate-private only so the unsafe BufMut implementation
+// can stay in this module. No codec or runtime is trusted to commit a bare usize.
+macro_rules! reservation_buf_mut {
+    ($reservation:ident) => {
+        // SAFETY: the slot was reserved before this implementation is exposed.
+        // Remaining length excludes headers, padding, prefixes and the AEAD tag.
+        unsafe impl<E: crate::Entropy, C: crate::Clock> BufMut for crate::$reservation<'_, E, C> {
+            fn remaining_mut(&self) -> usize {
+                (self.encoder.payload_start + self.encoder.max_payload)
+                    .saturating_sub(self.buf.end())
+            }
+
+            fn chunk_mut(&mut self) -> &mut UninitSlice {
+                let remaining = self.remaining_mut();
+                UninitSlice::uninit(&mut self.buf.spare_uninit()[..remaining])
+            }
+
+            unsafe fn advance_mut(&mut self, cnt: usize) {
+                assert!(
+                    cnt <= self.remaining_mut(),
+                    "initialized payload exceeds slot"
+                );
+                // SAFETY: BufMut requires the caller to initialize this prefix.
+                unsafe { self.buf.commit(cnt).expect("reserved payload capacity") }
+            }
+        }
+    };
+}
+
+reservation_buf_mut!(V4Reservation);
+reservation_buf_mut!(V6ShapedReservation);
+reservation_buf_mut!(V6UnshapedReservation);
 
 #[cfg(test)]
 mod tests {
@@ -440,11 +511,11 @@ mod tests {
     }
 
     #[test]
-    fn commit_init_advances_filled() {
+    fn initialized_append_advances_filled() {
         let mut buf = RecvBuffer::new(8);
         let spare = buf.spare_capacity_mut(2).unwrap();
         spare[..2].write_copy_of_slice(b"ab");
-        buf.commit_init(2).unwrap();
+        unsafe { buf.commit(2).unwrap() };
         assert_eq!(buf.filled(), b"ab");
     }
 
@@ -459,7 +530,7 @@ mod tests {
         buf.extend_from_slice(b"abcd").unwrap();
         let spare = buf.spare_uninit();
         spare[..4].write_copy_of_slice(b"efgh");
-        buf.commit_init(4).unwrap();
+        unsafe { buf.commit(4).unwrap() };
         buf.reserve_zeroed(4).unwrap();
         assert_eq!(buf.end(), 16);
         assert_eq!(buf.pending(), b"\0\0\0\0abcdefgh\0\0\0\0");
@@ -486,5 +557,51 @@ mod tests {
         assert!(buf.truncate(9).is_err());
         buf.truncate(6).unwrap();
         assert_eq!(buf.pending().len(), 3);
+    }
+    #[test]
+    fn lazy_allocations_and_idle_shrink_preserve_limits_and_live_bytes() {
+        let mut recv = RecvBuffer::new(crate::V6_WIRE_CAP);
+        let mut encode = EncodeBuffer::new(crate::V6_WIRE_CAP);
+        assert_eq!(recv.capacity(), 0);
+        assert_eq!(encode.capacity(), 0);
+        recv.extend_from_slice(&vec![7; 60_000]).unwrap();
+        recv.consume(59_997).unwrap();
+        recv.shrink_idle();
+        assert_eq!(recv.filled(), &[7; 3]);
+        assert!(recv.capacity() <= 4096);
+        assert_eq!(recv.max(), crate::V6_WIRE_CAP);
+        encode.reserve_zeroed(60_000).unwrap();
+        encode.shrink_idle();
+        assert_eq!(encode.len(), 60_000, "pending wire must survive idle trim");
+        encode.advance(60_000).unwrap();
+        encode.shrink_idle();
+        assert_eq!(encode.capacity(), 0);
+        recv.consume(3).unwrap();
+        recv.extend_from_slice(&vec![9; crate::V6_WIRE_CAP])
+            .unwrap();
+        assert_eq!(recv.len(), crate::V6_WIRE_CAP);
+        assert!(recv.extend_from_slice(&[0]).is_err());
+    }
+
+    #[test]
+    fn probe_upgrade_preserves_live_prefix_without_copying() {
+        let mut recv = RecvBuffer::new(4096);
+        recv.put_slice(b"prefix");
+        let ptr = recv.filled().as_ptr();
+        recv.raise_limit(crate::V6_WIRE_CAP);
+        assert_eq!(recv.filled().as_ptr(), ptr);
+        assert_eq!(recv.filled(), b"prefix");
+        recv.put_slice(&vec![1; 32_000]);
+        assert_eq!(&recv.filled()[..6], b"prefix");
+    }
+
+    #[test]
+    fn initialized_buf_mut_does_not_expose_unwritten_tail() {
+        let mut recv = RecvBuffer::new(8192);
+        recv.put_slice(b"hello");
+        assert_eq!(recv.filled(), b"hello");
+        recv.consume(5).unwrap();
+        recv.put_slice(b"x");
+        assert_eq!(recv.filled(), b"x");
     }
 }

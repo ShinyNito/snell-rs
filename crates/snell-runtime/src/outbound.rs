@@ -43,30 +43,23 @@ pub(crate) struct UdpRecv<'a> {
     pub payload: &'a [u8],
 }
 
-/// Per-association UDP buffers hold capacity only; datagrams are received
-/// with `recv_buf_from` (uninit append) and sends are built with
-/// `extend_from_slice`, so only bytes actually carried are ever dirtied.
+/// The socket is shared by the two directions; each pump owns its own buffers.
+/// DNS/send backpressure must not prevent the independent receive direction.
 pub(crate) enum UdpFlow {
     Direct {
         socket: UdpSocket,
-        recv: Vec<u8>,
     },
     Socks5 {
         _control: TcpStream,
         socket: UdpSocket,
         relay: SocketAddr,
-        send: Vec<u8>,
-        recv: Vec<u8>,
     },
 }
 
 impl UdpFlow {
     async fn direct() -> Result<Self, SessionError> {
         let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
-        Ok(Self::Direct {
-            socket,
-            recv: Vec::with_capacity(UDP_DATAGRAM_MAX),
-        })
+        Ok(Self::Direct { socket })
     }
 
     async fn socks5(server: SocketAddr, dns: &DnsResolver) -> Result<Self, SessionError> {
@@ -83,16 +76,15 @@ impl UdpFlow {
             _control: stream,
             socket,
             relay,
-            send: Vec::with_capacity(UDP_DATAGRAM_MAX),
-            recv: Vec::with_capacity(UDP_DATAGRAM_MAX),
         })
     }
 
     pub(crate) async fn send(
-        &mut self,
+        &self,
         dest: AddressRef<'_>,
         payload: &[u8],
         dns: &DnsResolver,
+        send: &mut Vec<u8>,
     ) -> Result<(), SessionError> {
         match self {
             Self::Direct { socket, .. } => {
@@ -103,12 +95,7 @@ impl UdpFlow {
                 socket.send_to(payload, addr).await?;
                 Ok(())
             }
-            Self::Socks5 {
-                socket,
-                relay,
-                send,
-                ..
-            } => {
+            Self::Socks5 { socket, relay, .. } => {
                 let mut hdr = [0u8; 3 + MAX_UDP_PACKET_ADDR_LEN];
                 let hdr_len = socks5::encode_udp_header(&mut hdr, 0, dest)?;
                 if hdr_len.saturating_add(payload.len()) > UDP_DATAGRAM_MAX {
@@ -123,13 +110,14 @@ impl UdpFlow {
         }
     }
 
-    pub(crate) async fn recv(
-        &mut self,
+    pub(crate) async fn recv<'a>(
+        &self,
+        recv: &'a mut Vec<u8>,
         frag_dropped: &AtomicU64,
         invalid: &AtomicU64,
-    ) -> Result<UdpRecv<'_>, SessionError> {
+    ) -> Result<UdpRecv<'a>, SessionError> {
         match self {
-            Self::Direct { socket, recv } => {
+            Self::Direct { socket } => {
                 recv.clear();
                 let (_, from) = socket.recv_buf_from(recv).await?;
                 Ok(UdpRecv {
@@ -137,7 +125,7 @@ impl UdpFlow {
                     payload: recv.as_slice(),
                 })
             }
-            Self::Socks5 { socket, recv, .. } => loop {
+            Self::Socks5 { socket, .. } => loop {
                 recv.clear();
                 socket.recv_buf_from(recv).await?;
                 let packet = match socks5::parse_udp_packet(recv) {

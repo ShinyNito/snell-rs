@@ -9,16 +9,18 @@ use snell_protocol::{
     V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{Instrument, debug, info, warn};
 
+use crate::admission::Handshake;
 use crate::codec::{TcpDecoder, TcpEncoder};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::platform::{AcceptLoop, prepare_session_stream};
 use crate::pool::{PooledCodec, PooledConn, ReusePool};
 use crate::session::{
-    client_may_pool, new_encode, new_recv, read_server_tunnel, relay, with_handshake_timeout,
-    write_connect,
+    client_may_pool, new_encode, new_recv, read_server_tunnel, relay, write_connect,
 };
 use crate::socks::{Socks5Command, accept_socks5, socks5_reply_from_error, write_socks5_reply};
 use crate::udp::{UdpHub, UdpOptions};
@@ -26,6 +28,7 @@ use crate::{bind_listener, connect_tcp};
 
 #[derive(Clone)]
 pub struct ClientConfig {
+    pub limits: crate::TcpLimits,
     pub listen: SocketAddr,
     pub server: SocketAddr,
     pub psk: Psk,
@@ -38,6 +41,7 @@ pub struct ClientConfig {
 impl std::fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientConfig")
+            .field("limits", &self.limits)
             .field("listen", &self.listen)
             .field("server", &self.server)
             .field("psk", &self.psk)
@@ -64,14 +68,18 @@ pub async fn serve_client(
     config: ClientConfig,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SessionError> {
+    config.limits.validate()?;
+    let config = Arc::new(config);
     tokio::pin!(shutdown);
+    let handshakes = Arc::new(Semaphore::new(config.limits.max_handshakes));
+    let mut sessions = JoinSet::new();
     let kdf = Arc::new(KdfLimiter::new());
     let pool = if config.reuse {
         Some(config.pool.clone().unwrap_or_default())
     } else {
         None
     };
-    let hub = UdpHub::start(listener.local_addr()?, config.clone(), kdf.clone()).await?;
+    let hub = UdpHub::start(listener.local_addr()?, &config, kdf.clone()).await?;
     let mut accept = AcceptLoop::new(&listener);
     let session_ids = AtomicU64::new(1);
     info!(listen = %listener.local_addr()?, "client started");
@@ -79,19 +87,27 @@ pub async fn serve_client(
         tokio::select! {
             _ = &mut shutdown => {
                 info!("client shutting down");
+                sessions.shutdown().await;
                 return Ok(());
             }
+            joined = sessions.join_next(), if !sessions.is_empty() => {
+                if let Some(Err(error)) = joined { warn!(%error, "session task failed"); }
+            }
+            _ = async { if let Some(pool) = &pool { pool.expire_idle().await; } else { std::future::pending().await } } => {}
             accepted = accept.next() => {
                 let (stream, peer) = accepted?;
+                if sessions.len() >= config.limits.max_connections { continue; }
+                let Ok(permit) = handshakes.clone().try_acquire_owned() else { continue; };
+                let handshake = Handshake::new(Some(permit));
                 let config = config.clone();
                 let kdf = kdf.clone();
                 let pool = pool.clone();
                 let hub = hub.clone();
                 let id = session_ids.fetch_add(1, Ordering::Relaxed);
                 let span = tracing::info_span!("session", id, peer = %peer);
-                tokio::spawn(async move {
+                sessions.spawn(async move {
                     debug!("accepted");
-                    match handle_client(stream, config, kdf, pool, hub).await {
+                    match handle_client(stream, config, kdf, pool, hub, handshake).await {
                         Ok(()) => debug!("session finished"),
                         Err(error) if error.is_peer_closed() => {
                             debug!(error = %error, "session closed by peer");
@@ -108,76 +124,76 @@ pub async fn serve_client(
 
 async fn handle_client(
     mut local: TcpStream,
-    config: ClientConfig,
+    config: Arc<ClientConfig>,
     kdf: Arc<KdfLimiter>,
     pool: Option<ReusePool>,
     hub: UdpHub,
+    handshake: Handshake,
 ) -> Result<(), SessionError> {
     prepare_session_stream(&local)?;
-    match with_handshake_timeout(accept_socks5(&mut local)).await? {
+    match handshake.run(accept_socks5(&mut local)).await?? {
         Socks5Command::Connect(destination) => {
-            client_handshake_and_relay(&mut local, config, &destination, &kdf, pool.as_ref()).await
+            client_handshake_and_relay(
+                &mut local,
+                &config,
+                &destination,
+                &kdf,
+                pool.as_ref(),
+                handshake,
+            )
+            .await
         }
-        Socks5Command::UdpAssociate => hub.handle_associate(local).await,
+        Socks5Command::UdpAssociate => hub.handle_associate(local, handshake).await,
     }
 }
 
 async fn client_handshake_and_relay(
     local: &mut TcpStream,
-    config: ClientConfig,
+    config: &ClientConfig,
     destination: &Address,
     kdf: &KdfLimiter,
     pool: Option<&ReusePool>,
+    mut handshake: Handshake,
 ) -> Result<(), SessionError> {
     let reuse = pool.is_some();
-    let mut from_pool = false;
-    let (snell, codec) = if let Some(pool) = pool
-        && let Some(conn) = pool.take()
-    {
-        from_pool = true;
-        debug!(
-            pool_len = pool.len(),
-            "checked out connection from reuse pool"
-        );
-        (conn.stream, conn.codec)
-    } else {
-        match dial_and_codec(config.server, &config.psk, config.version, kdf).await {
-            Ok(pair) => pair,
-            Err(error) => return Err(write_socks5_fail(local, error).await),
+    let setup = handshake
+        .run(async {
+            let mut pooled = pool.and_then(ReusePool::take);
+            let (opened, from_pool) = loop {
+                let from_pool = pooled.is_some();
+                let (snell, codec) = match pooled.take() {
+                    Some(conn) => (conn.stream, conn.codec),
+                    None => dial_and_codec(config.server, &config.psk, config.version, kdf).await?,
+                };
+                match open_session(snell, codec, destination, reuse, kdf, &config.psk).await {
+                    // The single pool entry is consumed, so only one retry is possible.
+                    Err(error) if from_pool && error.is_stale_pool_error() => continue,
+                    result => break (result?, from_pool),
+                }
+            };
+            write_socks5_reply(local, Reply::Succeeded).await?;
+            Ok((opened, from_pool))
+        })
+        .await?;
+    let (opened, from_pool) = match setup {
+        Ok(opened) => opened,
+        Err(error) => {
+            let _ = handshake
+                .run(write_socks5_reply(local, socks5_reply_from_error(&error)))
+                .await?;
+            return Err(error);
         }
     };
-
-    let opened = open_session(snell, codec, destination, reuse, kdf, &config.psk).await;
+    handshake.finish();
+    info!(target = %destination, version = ?config.version, reused = from_pool,
+        "handshake completed, tunnel established");
     let Opened {
         snell,
         codec,
         leftover,
         encode,
         recv,
-    } = match opened {
-        Ok(opened) => opened,
-        Err(error) if from_pool && error.is_stale_pool_error() => {
-            from_pool = false;
-            let (snell, codec) =
-                match dial_and_codec(config.server, &config.psk, config.version, kdf).await {
-                    Ok(pair) => pair,
-                    Err(error) => return Err(write_socks5_fail(local, error).await),
-                };
-            match open_session(snell, codec, destination, reuse, kdf, &config.psk).await {
-                Ok(opened) => opened,
-                Err(error) => return Err(write_socks5_fail(local, error).await),
-            }
-        }
-        Err(error) => return Err(write_socks5_fail(local, error).await),
-    };
-
-    write_socks5_reply(local, Reply::Succeeded).await?;
-    info!(
-        target = %destination,
-        version = ?config.version,
-        reused = from_pool,
-        "handshake completed, tunnel established"
-    );
+    } = opened;
     finish_session(local, snell, codec, leftover, encode, recv, reuse, pool).await
 }
 
@@ -221,12 +237,6 @@ async fn new_codec(
             })
         }
     }
-}
-
-async fn write_socks5_fail(local: &mut TcpStream, error: impl Into<SessionError>) -> SessionError {
-    let error = error.into();
-    let _ = write_socks5_reply(local, socks5_reply_from_error(&error)).await;
-    error
 }
 
 struct Opened {
@@ -304,92 +314,67 @@ async fn open_session(
 async fn finish_session(
     local: &mut TcpStream,
     mut snell: TcpStream,
-    codec: PooledCodec,
+    mut codec: PooledCodec,
     leftover: Vec<u8>,
     mut encode: EncodeBuffer,
     mut recv: RecvBuffer,
     reuse: bool,
     pool: Option<&ReusePool>,
 ) -> Result<(), SessionError> {
-    let back = match codec {
-        PooledCodec::V4 {
-            mut encoder,
-            mut decoder,
-        } => {
+    let may_pool = match &mut codec {
+        PooledCodec::V4 { encoder, decoder } => {
             relay(
                 &mut snell,
                 local,
-                &mut encoder,
-                &mut decoder,
+                encoder,
+                decoder,
                 &mut recv,
                 &mut encode,
-                &leftover,
-                &[],
+                leftover,
+                false,
                 reuse,
             )
             .await?;
-            if reuse && client_may_pool(&encode, &recv, &decoder) {
-                Some(PooledConn {
-                    stream: snell,
-                    codec: PooledCodec::V4 { encoder, decoder },
-                })
-            } else {
-                None
-            }
+            client_may_pool(&encode, &recv, decoder)
         }
-        PooledCodec::V6Shaped {
-            mut encoder,
-            mut decoder,
-        } => {
+        PooledCodec::V6Shaped { encoder, decoder } => {
             relay(
                 &mut snell,
                 local,
-                &mut encoder,
-                &mut decoder,
+                encoder,
+                decoder,
                 &mut recv,
                 &mut encode,
-                &leftover,
-                &[],
+                leftover,
+                false,
                 reuse,
             )
             .await?;
-            if reuse && client_may_pool(&encode, &recv, &decoder) {
-                Some(PooledConn {
-                    stream: snell,
-                    codec: PooledCodec::V6Shaped { encoder, decoder },
-                })
-            } else {
-                None
-            }
+            client_may_pool(&encode, &recv, decoder)
         }
-        PooledCodec::V6Unshaped {
-            mut encoder,
-            mut decoder,
-        } => {
+        PooledCodec::V6Unshaped { encoder, decoder } => {
             relay(
                 &mut snell,
                 local,
-                &mut encoder,
-                &mut decoder,
+                encoder,
+                decoder,
                 &mut recv,
                 &mut encode,
-                &leftover,
-                &[],
+                leftover,
+                false,
                 reuse,
             )
             .await?;
-            if reuse && client_may_pool(&encode, &recv, &decoder) {
-                Some(PooledConn {
-                    stream: snell,
-                    codec: PooledCodec::V6Unshaped { encoder, decoder },
-                })
-            } else {
-                None
-            }
+            client_may_pool(&encode, &recv, decoder)
         }
     };
-    if let (Some(pool), Some(conn)) = (pool, back)
-        && pool.put(conn)
+    if reuse
+        && may_pool
+        && let Some(pool) = pool
+        && pool.put(PooledConn {
+            stream: snell,
+            codec,
+        })
     {
         debug!(pool_len = pool.len(), "returned connection to reuse pool");
     }
@@ -409,9 +394,6 @@ async fn open_tunnel<E: TcpEncoder, D: TcpDecoder>(
     psk: &Psk,
 ) -> Result<Vec<u8>, SessionError> {
     prepare_session_stream(snell)?;
-    with_handshake_timeout(async {
-        write_connect(encoder, encode, snell, destination.as_view(), reuse).await?;
-        read_server_tunnel(decoder, recv, snell, kdf, psk).await
-    })
-    .await
+    write_connect(encoder, encode, snell, destination.as_view(), reuse).await?;
+    read_server_tunnel(decoder, recv, snell, kdf, psk).await
 }

@@ -4,10 +4,14 @@
 //! ownership of a [`PacketBuf`]; they do not memcpy payload to enqueue.
 //! Each checked-out buffer returns itself on drop, including cancellation.
 
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+use bytes::{BufMut, buf::UninitSlice};
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct PacketBuf {
-    /// `data.len()` is the datagram length. Fills go through [`Self::storage_mut`]
+    /// `data.len()` is the datagram length. Fills go through [`BufMut`]
     /// (uninit append, e.g. `recv_buf_from` / `extend_from_slice`), so pooled
     /// reuse never memsets storage and only bytes actually written are dirtied.
     data: Vec<u8>,
@@ -19,21 +23,31 @@ impl PacketBuf {
         &self.data
     }
 
-    /// Cleared backing storage for an append-style fill. Callers must not
-    /// write past the existing capacity ([`PacketPool::acquire`] sized it);
-    /// growth would escape the pool's byte accounting.
-    pub fn storage_mut(&mut self) -> &mut Vec<u8> {
+    pub fn clear(&mut self) {
         self.data.clear();
-        &mut self.data
-    }
-
-    pub fn len(&self) -> usize {
-        self.data.len()
     }
 
     #[cfg(test)]
     pub fn from_test(data: Vec<u8>) -> Self {
         Self { data, pool: None }
+    }
+}
+
+// SAFETY: leases expose only the already charged tail; they cannot reallocate.
+unsafe impl BufMut for PacketBuf {
+    fn remaining_mut(&self) -> usize {
+        self.data.capacity() - self.data.len()
+    }
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        UninitSlice::uninit(self.data.spare_capacity_mut())
+    }
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        assert!(
+            cnt <= self.remaining_mut(),
+            "packet initialized beyond capacity"
+        );
+        // SAFETY: BufMut requires the caller to initialize this exact tail prefix.
+        unsafe { self.data.set_len(self.data.len() + cnt) };
     }
 }
 
@@ -86,7 +100,14 @@ impl PacketPool {
             });
         }
         let mut inner = self.lock();
-        if let Some(idx) = inner.free.iter().rposition(|buf| buf.capacity() >= min_cap) {
+        if let Some(idx) = inner
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, buf)| buf.capacity() >= min_cap)
+            .min_by_key(|(_, buf)| buf.capacity())
+            .map(|(index, _)| index)
+        {
             let data = inner.free.swap_remove(idx);
             inner.live += 1;
             return Some(PacketBuf {
@@ -94,12 +115,19 @@ impl PacketPool {
                 pool: Some(self.inner.clone()),
             });
         }
-        let held = inner.live + inner.free.len();
-        if held >= self.max_bufs {
+        if min_cap > self.max_bytes || self.max_bufs == 0 {
             return None;
         }
-        if inner.bytes.saturating_add(min_cap) > self.max_bytes {
-            return None;
+        // Free undersized buffers must not prevent a legal larger datagram.
+        // Live leases are never evicted or removed from the byte accounting.
+        while inner.live + inner.free.len() >= self.max_bufs
+            || inner
+                .bytes
+                .checked_add(min_cap)
+                .is_none_or(|bytes| bytes > self.max_bytes)
+        {
+            let old = inner.free.pop()?;
+            inner.bytes -= old.capacity();
         }
         let data = Vec::with_capacity(min_cap);
         // Charge actual capacity, not just the requested minimum.
@@ -115,10 +143,11 @@ impl PacketPool {
         })
     }
 
-    pub fn release(&self, buf: PacketBuf) {
-        // Existing explicit-return sites and implicit error/cancel paths use
-        // the same owner. Returning to a different pool cannot corrupt counts.
-        drop(buf);
+    pub fn trim(&self) {
+        let mut inner = self.lock();
+        let freed: usize = inner.free.iter().map(Vec::capacity).sum();
+        inner.free.clear();
+        inner.bytes -= freed;
     }
 
     #[cfg(test)]
@@ -149,16 +178,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn storage_mut_clears_len_and_keeps_capacity() {
+    fn clear_keeps_charged_capacity() {
         let pool = PacketPool::new(1, 1024);
         let mut buf = pool.acquire(8).unwrap();
-        buf.storage_mut().extend_from_slice(&[0xAA; 8]);
+        buf.put_slice(&[0xAA; 8]);
         assert_eq!(buf.as_slice(), &[0xAA; 8]);
-        let cap = buf.storage_mut().capacity();
+        buf.clear();
+        let cap = buf.remaining_mut();
         assert!(cap >= 8);
-        assert_eq!(buf.len(), 0, "storage_mut starts a fresh datagram");
-        buf.storage_mut().extend_from_slice(&[0x55; 2]);
-        pool.release(buf);
+        assert_eq!(buf.as_slice().len(), 0, "clear starts a fresh datagram");
+        buf.put_slice(&[0x55; 2]);
+        drop(buf);
         assert_eq!(pool.live(), 0);
     }
 
@@ -168,7 +198,7 @@ mod tests {
         let a = pool.acquire(64).unwrap();
         assert!(pool.acquire(64).is_none());
         assert_eq!(pool.live(), 1);
-        pool.release(a);
+        drop(a);
         assert_eq!(pool.live(), 0);
         assert!(pool.acquire(64).is_some());
     }
@@ -178,7 +208,7 @@ mod tests {
         let pool = PacketPool::new(8, 100);
         let a = pool.acquire(80).unwrap();
         assert!(pool.acquire(80).is_none());
-        pool.release(a);
+        drop(a);
     }
 
     #[test]
@@ -187,8 +217,8 @@ mod tests {
         let a = pool.acquire(32).unwrap();
         let b = pool.acquire(32).unwrap();
         assert_eq!(pool.allocated_bufs(), 2);
-        pool.release(a);
-        pool.release(b);
+        drop(a);
+        drop(b);
         assert!(pool.allocated_bufs() <= 2);
         assert!(pool.allocated_bytes() <= 1024);
     }
@@ -252,9 +282,37 @@ mod tests {
     fn empty_and_test_buffers_do_not_change_pool_accounting() {
         let pool = PacketPool::new(1, 1024);
         drop(pool.acquire(0).unwrap());
-        pool.release(PacketBuf::from_test(vec![1, 2, 3]));
+        drop(PacketBuf::from_test(vec![1, 2, 3]));
         assert_eq!(pool.live(), 0);
         assert_eq!(pool.allocated_bufs(), 0);
         assert_eq!(pool.allocated_bytes(), 0);
+    }
+    #[test]
+    fn larger_packet_replaces_idle_small_buffers_without_exceeding_budget() {
+        let pool = PacketPool::new(2, 1024);
+        let a = pool.acquire(64).unwrap();
+        let b = pool.acquire(64).unwrap();
+        drop((a, b));
+        let large = pool.acquire(512).unwrap();
+        assert!(pool.allocated_bufs() <= 2);
+        assert!(pool.allocated_bytes() <= 1024);
+        pool.trim();
+        assert_eq!(pool.allocated_bytes(), 512);
+        drop(large);
+        pool.trim();
+        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn lease_buf_mut_is_bounded_by_its_charged_capacity() {
+        let pool = PacketPool::new(1, 64);
+        let mut buf = pool.acquire(64).unwrap();
+        buf.put_slice(&[1; 63]);
+        assert_eq!(buf.remaining_mut(), 1);
+        buf.put_u8(2);
+        assert_eq!(buf.remaining_mut(), 0);
+        assert_eq!(buf.as_slice().len(), 64);
+        assert_eq!(pool.allocated_bytes(), 64);
     }
 }

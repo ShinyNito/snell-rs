@@ -4,6 +4,7 @@
 //! Each association owns one Snell TCP. Idle uses a per-association `Sleep`,
 //! not an O(N) map scan. Queue full is `try_send` failure plus a real counter.
 
+use bytes::BufMut;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
@@ -19,9 +20,11 @@ use snell_protocol::{
 
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::Instant;
 
+use crate::admission::Handshake;
 use crate::client::dial_and_codec;
 use crate::codec::{TcpDecoder, TcpEncoder};
 use crate::dns::DnsResolver;
@@ -31,9 +34,8 @@ use crate::outbound::Outbound;
 use crate::packet::{PacketBuf, PacketPool};
 use crate::pool::PooledCodec;
 use crate::session::{
-    RecordEvent, decode_once, ensure_bulk, new_encode, new_recv, read_server_tunnel,
-    with_handshake_timeout, write_reject, write_tunnel, write_udp_request, write_udp_response,
-    write_udp_setup,
+    RecordEvent, decode_once, new_encode, new_recv, read_server_tunnel, write_reject, write_tunnel,
+    write_udp_request, write_udp_response, write_udp_setup,
 };
 use crate::socks::write_socks5_reply_bind;
 
@@ -128,7 +130,6 @@ type ControlId = u64;
 enum Ctrl {
     Add(ControlId),
     Remove(ControlId),
-    Closed(SocketAddr),
 }
 
 struct InboundDgram {
@@ -140,6 +141,7 @@ struct InboundDgram {
 struct AssocEntry {
     tx: mpsc::Sender<InboundDgram>,
     control: ControlId,
+    task: AbortHandle,
 }
 
 struct Control {
@@ -159,14 +161,68 @@ pub(crate) struct UdpHub {
     bind: SocketAddr,
     ctrl: mpsc::Sender<Ctrl>,
     next_control: Arc<AtomicU64>,
-    control_count: Arc<AtomicU64>,
-    limits: UdpLimits,
+    controls: Arc<Semaphore>,
+    _task: Arc<DispatcherTask>,
+}
+
+struct DispatcherTask(JoinHandle<()>);
+
+impl Drop for DispatcherTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct ControlLease {
+    id: ControlId,
+    remove: Option<mpsc::OwnedPermit<Ctrl>>,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl Drop for ControlLease {
+    fn drop(&mut self) {
+        if let Some(permit) = self.remove.take() {
+            permit.send(Ctrl::Remove(self.id));
+        }
+    }
+}
+
+/// Local to one association, not a global atomic hot spot. The two futures
+/// update actual I/O progress; the timer wakes only at a possible expiry.
+struct Activity {
+    start: Instant,
+    last: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+    fn touch(&self) {
+        self.last.store(
+            self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+    async fn expired(&self, idle: Duration) {
+        loop {
+            let deadline =
+                self.start + Duration::from_nanos(self.last.load(Ordering::Relaxed)) + idle;
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
 }
 
 impl UdpHub {
     pub async fn start(
         listen: SocketAddr,
-        config: crate::ClientConfig,
+        config: &crate::ClientConfig,
         kdf: Arc<KdfLimiter>,
     ) -> Result<Self, SessionError> {
         let socket = UdpSocket::bind(SocketAddr::new(listen.ip(), 0)).await?;
@@ -177,8 +233,15 @@ impl UdpHub {
         let pool = Arc::new(PacketPool::new(limits.pool_bufs, limits.pool_bytes));
         let ctrl_cap = limits
             .max_controls
-            .saturating_add(limits.max_associations)
-            .max(1);
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(1))
+            .filter(|n| *n <= Semaphore::MAX_PERMITS)
+            .ok_or_else(|| {
+                SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "UDP control capacity is too large",
+                ))
+            })?;
         let (ctrl_tx, ctrl_rx) = mpsc::channel(ctrl_cap);
         let dial = Dial {
             server: config.server,
@@ -186,10 +249,9 @@ impl UdpHub {
             version: config.version,
             kdf,
         };
-        tokio::spawn(dispatcher(
+        let task = tokio::spawn(dispatcher(
             socket,
             ctrl_rx,
-            ctrl_tx.clone(),
             pool,
             metrics.clone(),
             limits,
@@ -199,8 +261,8 @@ impl UdpHub {
             bind,
             ctrl: ctrl_tx,
             next_control: Arc::new(AtomicU64::new(1)),
-            control_count: Arc::new(AtomicU64::new(0)),
-            limits,
+            controls: Arc::new(Semaphore::new(limits.max_controls)),
+            _task: Arc::new(DispatcherTask(task)),
         })
     }
 
@@ -208,29 +270,59 @@ impl UdpHub {
         self.bind
     }
 
-    pub async fn handle_associate(&self, mut local: TcpStream) -> Result<(), SessionError> {
-        let prev = self.control_count.fetch_add(1, Ordering::Relaxed);
-        if prev >= self.limits.max_controls as u64 {
-            self.control_count.fetch_sub(1, Ordering::Relaxed);
-            write_socks5_reply_bind(&mut local, Reply::GeneralFailure, self.bind_addr()).await?;
-            return Err(SessionError::UdpLimit);
-        }
-        let id = self.next_control.fetch_add(1, Ordering::Relaxed);
-        if self.ctrl.send(Ctrl::Add(id)).await.is_err() {
-            self.control_count.fetch_sub(1, Ordering::Relaxed);
-            return Err(SessionError::Cancelled);
-        }
-        write_socks5_reply_bind(&mut local, Reply::Succeeded, self.bind_addr()).await?;
-        let mut buf = [0u8; 1];
-        loop {
-            match local.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
+    pub async fn handle_associate(
+        &self,
+        mut local: TcpStream,
+        mut handshake: Handshake,
+    ) -> Result<(), SessionError> {
+        let slot = match self.controls.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                handshake
+                    .run(write_socks5_reply_bind(
+                        &mut local,
+                        Reply::GeneralFailure,
+                        self.bind_addr(),
+                    ))
+                    .await??;
+                return Err(SessionError::UdpLimit);
             }
-        }
-        let _ = self.ctrl.send(Ctrl::Remove(id)).await;
-        self.control_count.fetch_sub(1, Ordering::Relaxed);
+        };
+        let id = self.next_control.fetch_add(1, Ordering::Relaxed);
+        // Reserve the removal message before publishing Add. Drop never has to
+        // await or hope try_send succeeds when the control channel is full.
+        let remove = handshake
+            .run(async {
+                self.ctrl
+                    .clone()
+                    .reserve_owned()
+                    .await
+                    .map_err(|_| SessionError::Cancelled)
+            })
+            .await??;
+        handshake
+            .run(async {
+                self.ctrl
+                    .send(Ctrl::Add(id))
+                    .await
+                    .map_err(|_| SessionError::Cancelled)
+            })
+            .await??;
+        let _lease = ControlLease {
+            id,
+            remove: Some(remove),
+            _slot: slot,
+        };
+        handshake
+            .run(write_socks5_reply_bind(
+                &mut local,
+                Reply::Succeeded,
+                self.bind_addr(),
+            ))
+            .await??;
+        handshake.finish();
+        let mut buf = [0u8; 1];
+        while matches!(local.read(&mut buf).await, Ok(1..)) {}
         Ok(())
     }
 }
@@ -264,7 +356,6 @@ fn offer(
 async fn dispatcher(
     socket: Arc<UdpSocket>,
     mut ctrl_rx: mpsc::Receiver<Ctrl>,
-    ctrl_tx: mpsc::Sender<Ctrl>,
     pool: Arc<PacketPool>,
     metrics: Arc<UdpMetrics>,
     limits: UdpLimits,
@@ -272,58 +363,53 @@ async fn dispatcher(
 ) {
     let mut map: HashMap<SocketAddr, AssocEntry> = HashMap::new();
     let mut controls: HashMap<ControlId, Control> = HashMap::new();
-    // Uninit-append receives: the kernel writes the datagram, so neither the
-    // scratch sink nor pooled buffers are ever zero-filled up front.
-    let mut drop_scratch: Vec<u8> = Vec::with_capacity(UDP_DATAGRAM_MAX);
+    let mut tasks = JoinSet::new();
+    let mut scratch = Vec::with_capacity(UDP_DATAGRAM_MAX);
     let mut held = pool.acquire(UDP_DATAGRAM_MAX);
     loop {
-        if let Some(mut buf) = held.take() {
-            let result = {
-                let storage = buf.storage_mut();
-                tokio::select! {
-                    ctrl = ctrl_rx.recv() => Err(ctrl),
-                    result = socket.recv_buf_from(storage) => Ok(result),
-                }
-            };
-            match result {
-                Err(None) => return,
-                Err(Some(ctrl)) => {
-                    held = Some(buf);
-                    apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
-                }
-                Ok(Ok((_, peer))) => {
-                    handle_datagram(
-                        peer,
-                        buf,
-                        &mut map,
-                        &mut controls,
-                        &pool,
-                        &metrics,
-                        limits,
-                        &dial,
-                        &socket,
-                        &ctrl_tx,
-                    );
-                    held = pool.acquire(UDP_DATAGRAM_MAX);
-                }
-                Ok(Err(_)) => {
-                    held = Some(buf);
+        if let Some(buf) = held.as_mut() {
+            buf.clear();
+        }
+        scratch.clear();
+        tokio::select! {
+            ctrl = ctrl_rx.recv() => {
+                let Some(ctrl) = ctrl else { return; };
+                apply_ctrl(ctrl, &mut map, &mut controls);
+                if controls.is_empty() { pool.trim(); }
+            }
+            joined = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                if let Some(joined) = joined {
+                    let ended = match joined {
+                        Ok((id, peer)) => Some((id, peer)),
+                        Err(error) => map.iter().find(|(_, entry)| entry.task.id() == error.id())
+                            .map(|(peer, _)| (error.id(), *peer)),
+                    };
+                    if let Some((id, peer)) = ended
+                        && map.get(&peer).is_some_and(|entry| entry.task.id() == id)
+                        && let Some(entry) = map.remove(&peer)
+                        && let Some(control) = controls.get_mut(&entry.control) {
+                            control.peers.remove(&peer);
+                    }
                 }
             }
-        } else {
-            tokio::select! {
-                ctrl = ctrl_rx.recv() => {
-                    let Some(ctrl) = ctrl else { return; };
-                    apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
+            result = async {
+                match held.as_mut() {
+                    Some(buf) => socket.recv_buf_from(buf).await,
+                    None => socket.recv_buf_from(&mut scratch).await,
                 }
-                result = socket.recv_buf_from(&mut drop_scratch) => {
-                    drop_scratch.clear();
-                    if result.is_ok() {
+            } => {
+                if let Ok((_, peer)) = result {
+                    if let Some(buf) = held.take() {
+                        handle_datagram(peer, buf, &mut map, &mut controls, &metrics,
+                            limits, &dial, &socket, &pool, &mut tasks);
+                    } else {
                         metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
                     }
-                    held = pool.acquire(UDP_DATAGRAM_MAX);
                 }
             }
+        }
+        if held.is_none() {
+            held = pool.acquire(UDP_DATAGRAM_MAX);
         }
     }
 }
@@ -332,7 +418,6 @@ fn apply_ctrl(
     ctrl: Ctrl,
     map: &mut HashMap<SocketAddr, AssocEntry>,
     controls: &mut HashMap<ControlId, Control>,
-    metrics: &UdpMetrics,
 ) {
     match ctrl {
         Ctrl::Add(id) => {
@@ -346,17 +431,9 @@ fn apply_ctrl(
         Ctrl::Remove(id) => {
             if let Some(control) = controls.remove(&id) {
                 for peer in control.peers {
-                    if map.remove(&peer).is_some() {
-                        metrics.associations.fetch_sub(1, Ordering::Relaxed);
+                    if let Some(entry) = map.remove(&peer) {
+                        entry.task.abort();
                     }
-                }
-            }
-        }
-        Ctrl::Closed(peer) => {
-            if let Some(entry) = map.remove(&peer) {
-                metrics.associations.fetch_sub(1, Ordering::Relaxed);
-                if let Some(control) = controls.get_mut(&entry.control) {
-                    control.peers.remove(&peer);
                 }
             }
         }
@@ -369,76 +446,60 @@ fn handle_datagram(
     buf: PacketBuf,
     map: &mut HashMap<SocketAddr, AssocEntry>,
     controls: &mut HashMap<ControlId, Control>,
-    pool: &Arc<PacketPool>,
     metrics: &Arc<UdpMetrics>,
     limits: UdpLimits,
     dial: &Dial,
     socket: &Arc<UdpSocket>,
-    ctrl_tx: &mpsc::Sender<Ctrl>,
+    pool: &Arc<PacketPool>,
+    tasks: &mut JoinSet<SocketAddr>,
 ) {
     let packet = match socks5::parse_udp_packet(buf.as_slice()) {
         Ok(packet) => packet,
         Err(_) => {
             metrics.invalid.fetch_add(1, Ordering::Relaxed);
-            pool.release(buf);
             return;
         }
     };
     if packet.frag != 0 {
         metrics.frag_dropped.fetch_add(1, Ordering::Relaxed);
-        pool.release(buf);
         return;
     }
-    let dest = packet.destination.into_owned();
-    let header_len = packet.header_len;
     let dgram = InboundDgram {
-        dest,
-        header_len,
+        dest: packet.destination.into_owned(),
+        header_len: packet.header_len,
         buf,
     };
-
     if let Some(entry) = map.get(&peer) {
-        if let Err(buf) = offer(&entry.tx, dgram, metrics) {
-            pool.release(buf);
-        }
+        let _ = offer(&entry.tx, dgram, metrics);
         return;
     }
-
-    if controls.is_empty() {
-        metrics.invalid.fetch_add(1, Ordering::Relaxed);
-        pool.release(dgram.buf);
-        return;
-    }
-    if map.len() >= limits.max_associations {
+    if tasks.len() >= limits.max_associations {
         metrics.map_full.fetch_add(1, Ordering::Relaxed);
-        pool.release(dgram.buf);
         return;
     }
     let Some(control) = pick_control(controls) else {
-        pool.release(dgram.buf);
+        metrics.invalid.fetch_add(1, Ordering::Relaxed);
         return;
     };
     let (tx, rx) = mpsc::channel(limits.queue_max.max(1));
-    if let Err(buf) = offer(&tx, dgram, metrics) {
-        pool.release(buf);
+    if offer(&tx, dgram, metrics).is_err() {
         return;
     }
-    map.insert(peer, AssocEntry { tx, control });
-    if let Some(slot) = controls.get_mut(&control) {
-        slot.peers.insert(peer);
-    }
     metrics.associations.fetch_add(1, Ordering::Relaxed);
-    tracing::debug!(client = %peer, "udp association created");
-    tokio::spawn(client_assoc(
+    let guard = AssocGuard(metrics.clone());
+    let task = tasks.spawn(client_assoc(
         rx,
         peer,
         socket.clone(),
         dial.clone(),
-        ctrl_tx.clone(),
-        metrics.clone(),
+        guard,
         limits.idle,
         pool.clone(),
     ));
+    map.insert(peer, AssocEntry { tx, control, task });
+    if let Some(slot) = controls.get_mut(&control) {
+        slot.peers.insert(peer);
+    }
 }
 
 enum AssocEnd {
@@ -452,23 +513,19 @@ async fn client_assoc(
     peer: SocketAddr,
     socks_udp: Arc<UdpSocket>,
     dial: Dial,
-    ctrl: mpsc::Sender<Ctrl>,
-    metrics: Arc<UdpMetrics>,
+    guard: AssocGuard,
     idle: Duration,
     pool: Arc<PacketPool>,
-) {
-    let end = client_assoc_inner(&mut rx, peer, socks_udp, dial, &metrics, idle, &pool).await;
-    if matches!(end, Ok(AssocEnd::Idle)) {
+) -> SocketAddr {
+    let metrics = &guard.0;
+    if matches!(
+        client_assoc_inner(&mut rx, peer, socks_udp, dial, metrics, idle, &pool).await,
+        Ok(AssocEnd::Idle)
+    ) {
         metrics.idle_expired.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(client = %peer, "udp association expired after idle timeout");
     }
-    // Datagrams still queued when the association dies (dial failure, TCP
-    // error, idle race) must return to the pool, or its live count leaks.
-    rx.close();
-    while let Ok(dgram) = rx.try_recv() {
-        pool.release(dgram.buf);
-    }
-    let _ = ctrl.send(Ctrl::Closed(peer)).await;
+    // Receiver drop releases queued leases; the guard also runs on task abort.
+    peer
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -481,8 +538,15 @@ async fn client_assoc_inner(
     idle: Duration,
     pool: &PacketPool,
 ) -> Result<AssocEnd, SessionError> {
-    let (mut snell, codec) =
-        dial_and_codec(dial.server, &dial.psk, dial.version, &dial.kdf).await?;
+    let handshake = Handshake::new(None);
+    let (mut snell, codec) = handshake
+        .run(dial_and_codec(
+            dial.server,
+            &dial.psk,
+            dial.version,
+            &dial.kdf,
+        ))
+        .await??;
     let mut encode = new_encode();
     let mut recv = new_recv();
     match codec {
@@ -490,16 +554,17 @@ async fn client_assoc_inner(
             mut encoder,
             mut decoder,
         } => {
-            open_udp(
-                &mut snell,
-                &mut encoder,
-                &mut decoder,
-                &mut encode,
-                &mut recv,
-                &dial.kdf,
-                &dial.psk,
-            )
-            .await?;
+            handshake
+                .run(open_udp(
+                    &mut snell,
+                    &mut encoder,
+                    &mut decoder,
+                    &mut encode,
+                    &mut recv,
+                    &dial.kdf,
+                    &dial.psk,
+                ))
+                .await??;
             pump_client(
                 &mut snell,
                 &mut encoder,
@@ -521,16 +586,17 @@ async fn client_assoc_inner(
             mut encoder,
             mut decoder,
         } => {
-            open_udp(
-                &mut snell,
-                &mut encoder,
-                &mut decoder,
-                &mut encode,
-                &mut recv,
-                &dial.kdf,
-                &dial.psk,
-            )
-            .await?;
+            handshake
+                .run(open_udp(
+                    &mut snell,
+                    &mut encoder,
+                    &mut decoder,
+                    &mut encode,
+                    &mut recv,
+                    &dial.kdf,
+                    &dial.psk,
+                ))
+                .await??;
             pump_client(
                 &mut snell,
                 &mut encoder,
@@ -552,16 +618,17 @@ async fn client_assoc_inner(
             mut encoder,
             mut decoder,
         } => {
-            open_udp(
-                &mut snell,
-                &mut encoder,
-                &mut decoder,
-                &mut encode,
-                &mut recv,
-                &dial.kdf,
-                &dial.psk,
-            )
-            .await?;
+            handshake
+                .run(open_udp(
+                    &mut snell,
+                    &mut encoder,
+                    &mut decoder,
+                    &mut encode,
+                    &mut recv,
+                    &dial.kdf,
+                    &dial.psk,
+                ))
+                .await??;
             pump_client(
                 &mut snell,
                 &mut encoder,
@@ -592,7 +659,7 @@ async fn open_udp<E: TcpEncoder, D: TcpDecoder>(
     psk: &Psk,
 ) -> Result<(), SessionError> {
     crate::platform::prepare_session_stream(snell)?;
-    with_handshake_timeout(async {
+    {
         write_udp_setup(encoder, encode, snell).await?;
         let leftover = read_server_tunnel(decoder, recv, snell, kdf, psk).await?;
         if !leftover.is_empty() {
@@ -601,8 +668,7 @@ async fn open_udp<E: TcpEncoder, D: TcpDecoder>(
             )));
         }
         Ok(())
-    })
-    .await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -612,7 +678,7 @@ async fn pump_client<E, D>(
     decoder: &mut D,
     encode: &mut EncodeBuffer,
     recv: &mut RecvBuffer,
-    kdf: &crate::kdf::KdfLimiter,
+    kdf: &KdfLimiter,
     psk: &Psk,
     rx: &mut mpsc::Receiver<InboundDgram>,
     peer: SocketAddr,
@@ -626,46 +692,45 @@ where
     D: TcpDecoder,
 {
     let (mut snell_r, mut snell_w) = snell.split();
-    let sleep = tokio::time::sleep(idle);
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            _ = &mut sleep => return Ok(AssocEnd::Idle),
-            dgram = rx.recv() => {
-                let Some(dgram) = dgram else {
-                    return Ok(AssocEnd::Closed);
-                };
-                sleep.as_mut().reset(Instant::now() + idle);
-                let payload = &dgram.buf.as_slice()[dgram.header_len.min(dgram.buf.len())..];
-                let result = write_udp_request(
-                    encoder,
-                    encode,
-                    &mut snell_w,
-                    dgram.dest.as_view(),
-                    payload,
-                )
-                .await;
-                pool.release(dgram.buf);
-                match result {
-                    Err(SessionError::Protocol(Error::PayloadTooLarge)) => {
-                        metrics.oversize.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(error) => return Err(error),
-                    Ok(()) => {}
+    let activity = Activity::new();
+    let upload = async {
+        while let Some(dgram) = rx.recv().await {
+            let payload = &dgram.buf.as_slice()[dgram.header_len..];
+            match write_udp_request(encoder, encode, &mut snell_w, dgram.dest.as_view(), payload)
+                .await
+            {
+                Err(SessionError::Protocol(Error::PayloadTooLarge)) => {
+                    metrics.oversize.fetch_add(1, Ordering::Relaxed);
                 }
+                Err(error) => return Err(error),
+                Ok(()) => activity.touch(),
             }
-            record = decode_once(decoder, recv, &mut snell_r, kdf, psk) => {
-                sleep.as_mut().reset(Instant::now() + idle);
-                match record? {
-                    RecordEvent::Zero => return Ok(AssocEnd::Closed),
-                    RecordEvent::Data(record) => {
-                        let plain = record.plaintext(recv.filled());
-                        send_socks_response(socks_udp, peer, plain, metrics, pool).await?;
-                        decoder.consume(recv, &record)?;
-                    }
+        }
+        Ok(AssocEnd::Closed)
+    };
+    let download = async {
+        loop {
+            match decode_once(decoder, recv, &mut snell_r, kdf, psk).await? {
+                RecordEvent::Zero => return Ok(AssocEnd::Closed),
+                RecordEvent::Data(record) => {
+                    activity.touch();
+                    send_socks_response(
+                        socks_udp,
+                        peer,
+                        record.plaintext(recv.filled()),
+                        metrics,
+                        pool,
+                    )
+                    .await?;
+                    decoder.consume(recv, &record)?;
                 }
             }
         }
+    };
+    tokio::select! {
+        result = upload => result,
+        result = download => result,
+        _ = activity.expired(idle) => Ok(AssocEnd::Idle),
     }
 }
 
@@ -698,24 +763,23 @@ async fn send_socks_response(
         metrics.oversize.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
-    let mut out = match pool.acquire(UDP_DATAGRAM_MAX) {
+    let capacity = needed.max(2048).next_power_of_two().min(UDP_DATAGRAM_MAX);
+    let mut out = match pool.acquire(capacity) {
         Some(buf) => buf,
         None => {
             metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
     };
-    let storage = out.storage_mut();
-    storage.extend_from_slice(&hdr[..hdr_len]);
-    storage.extend_from_slice(pkt.payload);
+    out.put_slice(&hdr[..hdr_len]);
+    out.put_slice(pkt.payload);
     socks_udp.send_to(out.as_slice(), peer).await?;
-    pool.release(out);
     Ok(())
 }
 
-struct AssocGuard<'a>(&'a UdpMetrics);
+struct AssocGuard(Arc<UdpMetrics>);
 
-impl Drop for AssocGuard<'_> {
+impl Drop for AssocGuard {
     fn drop(&mut self) {
         self.0.associations.fetch_sub(1, Ordering::Relaxed);
     }
@@ -723,51 +787,47 @@ impl Drop for AssocGuard<'_> {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
-    mut snell: TcpStream,
-    mut encoder: E,
-    mut decoder: D,
+    snell: &mut TcpStream,
+    encoder: &mut E,
+    decoder: &mut D,
     outbound: Outbound,
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
-    mut recv: RecvBuffer,
-    mut encode: EncodeBuffer,
+    recv: &mut RecvBuffer,
+    encode: &mut EncodeBuffer,
     udp: &UdpOptions,
+    mut handshake: crate::admission::Handshake,
 ) -> Result<(), SessionError> {
     let prev = udp.metrics.associations.fetch_add(1, Ordering::Relaxed);
     if prev >= udp.limits.max_associations as u64 {
         udp.metrics.associations.fetch_sub(1, Ordering::Relaxed);
         udp.metrics.map_full.fetch_add(1, Ordering::Relaxed);
-        let _ = write_reject(
-            &mut encoder,
-            &mut encode,
-            &mut snell,
-            "udp association limit",
-        )
-        .await;
+        let _ = handshake
+            .run(write_reject(
+                encoder,
+                encode,
+                snell,
+                "udp association limit",
+            ))
+            .await?;
         return Err(SessionError::UdpLimit);
     }
-    let _guard = AssocGuard(&udp.metrics);
-    recv = ensure_bulk(recv)?;
-    let mut flow = match outbound.open_udp(&udp.dns).await {
+    let _guard = AssocGuard(udp.metrics.clone());
+    recv.raise_limit(snell_protocol::V6_WIRE_CAP);
+    let flow = match handshake.run(outbound.open_udp(&udp.dns)).await? {
         Ok(flow) => flow,
         Err(error) => {
-            let _ = write_reject(&mut encoder, &mut encode, &mut snell, &error.to_string()).await;
+            let _ = handshake
+                .run(write_reject(encoder, encode, snell, &error.to_string()))
+                .await?;
             return Err(error);
         }
     };
-    write_tunnel(&mut encoder, &mut encode, &mut snell).await?;
-    pump_server(
-        &mut snell,
-        &mut encoder,
-        &mut decoder,
-        &mut encode,
-        &mut recv,
-        kdf,
-        psk,
-        &mut flow,
-        udp,
-    )
-    .await
+    handshake
+        .run(write_tunnel(encoder, encode, snell))
+        .await??;
+    handshake.finish();
+    pump_server(snell, encoder, decoder, encode, recv, kdf, psk, &flow, udp).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -777,9 +837,9 @@ async fn pump_server<E, D>(
     decoder: &mut D,
     encode: &mut EncodeBuffer,
     recv: &mut RecvBuffer,
-    kdf: &crate::kdf::KdfLimiter,
+    kdf: &KdfLimiter,
     psk: &Psk,
-    flow: &mut crate::outbound::UdpFlow,
+    flow: &crate::outbound::UdpFlow,
     udp: &UdpOptions,
 ) -> Result<(), SessionError>
 where
@@ -787,58 +847,66 @@ where
     D: TcpDecoder,
 {
     let (mut snell_r, mut snell_w) = snell.split();
-    let sleep = tokio::time::sleep(udp.limits.idle);
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            _ = &mut sleep => {
-                udp.metrics.idle_expired.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("udp association expired after idle timeout");
-                return Ok(());
-            }
-            record = decode_once(decoder, recv, &mut snell_r, kdf, psk) => {
-                sleep.as_mut().reset(Instant::now() + udp.limits.idle);
-                match record? {
-                    RecordEvent::Zero => return Ok(()),
-                    RecordEvent::Data(record) => {
-                        let plain = record.plaintext(recv.filled());
-                        match decode_udp_request(plain) {
-                            Ok(pkt) => {
-                                if flow
-                                    .send(pkt.address, pkt.payload, &udp.dns)
-                                    .await
-                                    .is_err()
-                                {
-                                    udp.metrics.invalid.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            Err(_) => {
+    let activity = Activity::new();
+    let upload = async {
+        let mut send = Vec::new();
+        loop {
+            match decode_once(decoder, recv, &mut snell_r, kdf, psk).await? {
+                RecordEvent::Zero => return Ok(()),
+                RecordEvent::Data(record) => {
+                    activity.touch();
+                    let plain = record.plaintext(recv.filled());
+                    match decode_udp_request(plain) {
+                        Ok(pkt) => {
+                            if flow
+                                .send(pkt.address, pkt.payload, &udp.dns, &mut send)
+                                .await
+                                .is_err()
+                            {
                                 udp.metrics.invalid.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                activity.touch();
                             }
                         }
-                        decoder.consume(recv, &record)?;
+                        Err(_) => {
+                            udp.metrics.invalid.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
+                    decoder.consume(recv, &record)?;
                 }
             }
-            reply = flow.recv(&udp.metrics.frag_dropped, &udp.metrics.invalid) => {
-                sleep.as_mut().reset(Instant::now() + udp.limits.idle);
-                let reply = reply?;
-                match write_udp_response(
-                    encoder,
-                    encode,
-                    &mut snell_w,
-                    reply.addr.as_view(),
-                    reply.payload,
-                )
-                .await
-                {
-                    Err(SessionError::Protocol(Error::PayloadTooLarge)) => {
-                        udp.metrics.oversize.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(error) => return Err(error),
-                    Ok(()) => {}
+        }
+    };
+    let download = async {
+        let mut packet = Vec::with_capacity(UDP_DATAGRAM_MAX);
+        loop {
+            let reply = flow
+                .recv(&mut packet, &udp.metrics.frag_dropped, &udp.metrics.invalid)
+                .await?;
+            activity.touch();
+            match write_udp_response(
+                encoder,
+                encode,
+                &mut snell_w,
+                reply.addr.as_view(),
+                reply.payload,
+            )
+            .await
+            {
+                Err(SessionError::Protocol(Error::PayloadTooLarge)) => {
+                    udp.metrics.oversize.fetch_add(1, Ordering::Relaxed);
                 }
+                Err(error) => return Err(error),
+                Ok(()) => activity.touch(),
             }
+        }
+    };
+    tokio::select! {
+        result = upload => result,
+        result = download => result,
+        _ = activity.expired(udp.limits.idle) => {
+            udp.metrics.idle_expired.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 }
@@ -848,85 +916,13 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    #[test]
-    fn lookup_is_hashmap_get_not_a_scan() {
-        use std::cell::Cell;
-        use std::hash::{Hash, Hasher};
-
-        thread_local! {
-            static EQS: Cell<usize> = const { Cell::new(0) };
-            static HASHES: Cell<usize> = const { Cell::new(0) };
-        }
-
-        #[derive(Clone, Copy)]
-        struct ProbeKey {
-            id: u16,
-        }
-
-        impl PartialEq for ProbeKey {
-            fn eq(&self, other: &Self) -> bool {
-                EQS.with(|c| c.set(c.get() + 1));
-                self.id == other.id
-            }
-        }
-        impl Eq for ProbeKey {}
-        impl Hash for ProbeKey {
-            fn hash<H: Hasher>(&self, state: &mut H) {
-                HASHES.with(|c| c.set(c.get() + 1));
-                self.id.hash(state);
-            }
-        }
-
-        fn entry() -> AssocEntry {
-            let (tx, _rx) = mpsc::channel(1);
-            AssocEntry { tx, control: 1 }
-        }
-
-        fn snapshot() -> (usize, usize) {
-            (EQS.with(Cell::get), HASHES.with(Cell::get))
-        }
-
-        let mut map = HashMap::new();
-        for id in 0..2000u16 {
-            map.insert(ProbeKey { id }, entry());
-        }
-
-        let (eq_before, hash_before) = snapshot();
-        let hit = map.get(&ProbeKey { id: 0 });
-        let hit_eqs = EQS.with(Cell::get) - eq_before;
-        let hit_hashes = HASHES.with(Cell::get) - hash_before;
-        assert!(hit.is_some());
-        assert!(
-            hit_hashes >= 1,
-            "HashMap::get hashes the key; a table scan would not: hashes={hit_hashes}"
-        );
-        assert!(
-            hit_eqs < 32,
-            "HashMap::get must not Eq every key: eqs={hit_eqs}"
-        );
-
-        let (eq_before, hash_before) = snapshot();
-        let miss = map.get(&ProbeKey { id: 2001 });
-        let miss_eqs = EQS.with(Cell::get) - eq_before;
-        let miss_hashes = HASHES.with(Cell::get) - hash_before;
-        assert!(miss.is_none());
-        assert!(
-            miss_hashes >= 1,
-            "missing-key get must hash; a scan would only Eq: hashes={miss_hashes}"
-        );
-        assert!(
-            miss_eqs < 32,
-            "missing-key scan would Eq all 2000 entries: eqs={miss_eqs}"
-        );
-    }
-
     #[tokio::test]
     async fn assoc_dial_failure_releases_queued_buffers() {
         let pool = Arc::new(PacketPool::new(4, 1024 * 1024));
         let (tx, rx) = mpsc::channel(4);
         for _ in 0..2 {
             let mut buf = pool.acquire(64).unwrap();
-            buf.storage_mut().extend_from_slice(b"ping");
+            buf.put_slice(b"ping");
             tx.try_send(InboundDgram {
                 dest: Address::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
                 header_len: 0,
@@ -941,7 +937,6 @@ mod tests {
             listener.local_addr().unwrap()
         };
         let socks_udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
         let metrics = Arc::new(UdpMetrics::default());
         let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 3456));
         client_assoc(
@@ -954,13 +949,14 @@ mod tests {
                 version: ProtocolFlavor::V4,
                 kdf: Arc::new(KdfLimiter::new()),
             },
-            ctrl_tx,
-            metrics,
+            {
+                metrics.associations.fetch_add(1, Ordering::Relaxed);
+                AssocGuard(metrics)
+            },
             Duration::from_secs(5),
             pool.clone(),
         )
         .await;
-        assert!(matches!(ctrl_rx.recv().await, Some(Ctrl::Closed(_))));
         assert_eq!(
             pool.live(),
             0,
@@ -981,5 +977,133 @@ mod tests {
         let second = offer(&tx, dummy(), &metrics);
         assert!(second.is_err(), "queue full must not report success");
         assert_eq!(metrics.queue_full.load(Ordering::Relaxed), 1);
+    }
+    #[tokio::test]
+    async fn control_cancellation_delivers_reserved_remove_and_restores_slot() {
+        let sem = Arc::new(Semaphore::new(1));
+        let (tx, mut rx) = mpsc::channel(2);
+        let permit = tx.clone().reserve_owned().await.unwrap();
+        tx.send(Ctrl::Add(7)).await.unwrap();
+        let lease = ControlLease {
+            id: 7,
+            remove: Some(permit),
+            _slot: sem.clone().acquire_owned().await.unwrap(),
+        };
+        // No await is possible in Drop, but a full queue cannot lose Remove.
+        drop(lease);
+        assert_eq!(sem.available_permits(), 1);
+        assert!(matches!(rx.recv().await, Some(Ctrl::Add(7))));
+        assert!(matches!(rx.recv().await, Some(Ctrl::Remove(7))));
+    }
+
+    #[tokio::test]
+    async fn slow_dns_does_not_block_udp_reply_or_idle_timeout() {
+        use crate::outbound::UdpFlow;
+        use snell_protocol::{V4Decoder, V4Encoder};
+        let dns_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let flow_addr = socket.local_addr().unwrap();
+        let flow = UdpFlow::Direct { socket };
+        let mut opts = UdpOptions::new().unwrap();
+        opts.dns = DnsResolver::test_server(dns_socket.local_addr().unwrap());
+        opts.limits.idle = Duration::from_millis(700);
+        let metrics = opts.metrics.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut server = listener.accept().await.unwrap().0;
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
+        let server_psk = psk.clone();
+        let task = tokio::spawn(async move {
+            let mut enc = V4Encoder::os(&server_psk).unwrap();
+            let mut dec = V4Decoder::new(server_psk.clone());
+            pump_server(
+                &mut server,
+                &mut enc,
+                &mut dec,
+                &mut new_encode(),
+                &mut new_recv(),
+                &KdfLimiter::new(),
+                &server_psk,
+                &flow,
+                &opts,
+            )
+            .await
+        });
+        let mut enc = V4Encoder::os(&psk).unwrap();
+        write_udp_request(
+            &mut enc,
+            &mut new_encode(),
+            &mut client,
+            snell_protocol::AddressRef::Domain {
+                host: "pending.test.",
+                port: 53,
+            },
+            b"query",
+        )
+        .await
+        .unwrap();
+        // Receiving the DNS query proves the upload branch is waiting in lookup.
+        tokio::time::timeout(Duration::from_secs(2), dns_socket.recv_from(&mut [0; 2048]))
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        reply
+            .send_to(b"independent reply", flow_addr)
+            .await
+            .unwrap();
+        let mut dec = V4Decoder::new(psk.clone());
+        let mut recv = new_recv();
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            decode_once(&mut dec, &mut recv, &mut client, &KdfLimiter::new(), &psk),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let RecordEvent::Data(record) = result else {
+            panic!("UDP data");
+        };
+        assert_eq!(
+            decode_udp_response(record.plaintext(recv.filled()))
+                .unwrap()
+                .payload,
+            b"independent reply"
+        );
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(metrics.idle_expired.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn send_error_returns_output_lease() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pool = PacketPool::new(2, 4096);
+        let mut plain = [0; 128];
+        let n = snell_protocol::encode_udp_response(
+            &mut plain,
+            snell_protocol::AddressRef::Ip("127.0.0.1:53".parse().unwrap()),
+            b"reply",
+        )
+        .unwrap();
+        let result = send_socks_response(
+            &socket,
+            "[::1]:53".parse().unwrap(),
+            &plain[..n],
+            &UdpMetrics::default(),
+            &pool,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "IPv4 socket cannot send to IPv6 destination"
+        );
+        assert_eq!(pool.live(), 0);
+        assert!(pool.acquire(2048).is_some());
     }
 }
