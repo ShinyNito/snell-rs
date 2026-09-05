@@ -1,6 +1,7 @@
 name: Sanitizer
 
 on:
+  pull_request:
   workflow_dispatch:
   schedule:
     - cron: "17 6 * * 1"
@@ -10,6 +11,7 @@ permissions:
 
 jobs:
   asan:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: nightly
@@ -25,4 +27,4 @@ jobs:
         env:
           RUSTFLAGS: "-Zsanitizer=address"
           RUSTDOCFLAGS: "-Zsanitizer=address"
-          ASAN_OPTIONS: detect_leaks=0
+          ASAN_OPTIONS: detect_leaks=1

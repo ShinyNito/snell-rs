@@ -1,6 +1,7 @@
 name: Fuzz
 
 on:
+  pull_request:
   workflow_dispatch:
   schedule:
     - cron: "17 4 * * *"
@@ -10,17 +11,21 @@ permissions:
 
 jobs:
   fuzz:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
-      - name: Skip until Phase 2 fuzz targets exist
-        run: |
-          if [ ! -d fuzz/fuzz_targets ] || [ -z "$(ls -A fuzz/fuzz_targets 2>/dev/null)" ]; then
-            echo "no fuzz targets yet; Phase 2+"
-            exit 0
-          fi
-          cargo install cargo-fuzz --locked
-          cargo fuzz build
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Decode malformed records
+        run: cargo fuzz run record_decode -- -max_total_time=30 -max_len=134836 -rss_limit_mb=1024
+      - name: Fragmented authenticated roundtrips
+        run: cargo fuzz run record_roundtrip -- -max_total_time=30 -max_len=65538 -rss_limit_mb=1024
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts

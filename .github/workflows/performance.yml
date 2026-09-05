@@ -1,0 +1,74 @@
+name: Performance
+on:
+  pull_request:
+    paths:
+      - 'crates/snell-protocol/**'
+      - 'crates/snell-runtime/**'
+      - 'crates/snell/**'
+      - 'scripts/bench_isolated.py'
+      - '.github/workflows/performance.yml'
+permissions:
+  contents: read
+jobs:
+  isolated:
+    name: Isolated ${{ matrix.flavor }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: v4
+            args: '--version 4'
+          - flavor: v6-shaped
+            args: '--version 6'
+          - flavor: v6-unshaped
+            args: '--version 6 --unshaped'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: candidate
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          path: baseline
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Build both revisions with identical settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir results
+          rustc -vV > results/environment.txt
+          uname -a >> results/environment.txt
+          lscpu >> results/environment.txt
+          cat /sys/fs/cgroup/cpu.max >> results/environment.txt
+          echo 'base=${{ github.event.pull_request.base.sha }} head=${{ github.event.pull_request.head.sha }}' >> results/environment.txt
+          (cd baseline && cargo build --release --locked -p snell)
+          (cd candidate && cargo build --release --locked -p snell)
+      - name: Alternate isolated baseline and candidate measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mode in download mixed idle churn; do
+            extra=()
+            case "$mode" in
+              mixed) extra+=(--connections 8) ;;
+              idle) extra+=(--connections 100) ;;
+              churn) extra+=(--reuse) ;;
+            esac
+            python3 candidate/scripts/bench_isolated.py \
+              --binary "$PWD/candidate/target/release/snell-rs" \
+              --baseline "$PWD/baseline/target/release/snell-rs" \
+              --client-binary "$PWD/baseline/target/release/snell-rs" \
+              --workers 2 --seconds 10 --repeat 5 --mode "$mode" \
+              ${{ matrix.args }} "${extra[@]}" | tee "results/$mode.jsonl"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: isolated-${{ matrix.flavor }}
+          path: results/
+          retention-days: 14
