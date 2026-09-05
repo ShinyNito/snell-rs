@@ -249,15 +249,10 @@ impl<E: Entropy, C: Clock> V4Reservation<'_, E, C> {
         self.buf.range_mut(start, end)
     }
 
-    /// Uninitialized payload slot after the prefix. Fill a prefix of it (for
-    /// example through Tokio `ReadBuf::uninit`), then call [`Self::seal_init`].
-    /// Do not mix with [`Self::payload_mut`]. Empty once materialized.
-    pub fn payload_uninit(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
-        let cap = self.encoder.max_payload - self.encoder.prefix_len;
-        if self.buf.end() != self.encoder.payload_start + self.encoder.prefix_len {
-            return &mut [];
-        }
-        &mut self.buf.spare_uninit()[..cap]
+    /// Append into the reserved payload without zero-filling unused capacity.
+    pub fn payload_buf(&mut self) -> crate::PayloadBuffer<'_> {
+        let end = self.encoder.payload_start + self.encoder.max_payload;
+        crate::PayloadBuffer::new(self.buf, end)
     }
 
     pub fn capacity(&self) -> usize {
@@ -277,20 +272,6 @@ impl<E: Entropy, C: Clock> V4Reservation<'_, E, C> {
         if total > self.encoder.max_payload {
             return Err(Error::PayloadTooLarge);
         }
-        self.sealed = true;
-        self.encoder.finish(self.buf, total)
-    }
-
-    /// Seal after the caller initialized `written` bytes of
-    /// [`Self::payload_uninit`]. Commits them without zero-filling first.
-    pub fn seal_init(mut self, written: usize) -> Result<()> {
-        let total = crate::buffer::commit_init_payload(
-            self.buf,
-            self.encoder.payload_start,
-            self.encoder.prefix_len,
-            self.encoder.max_payload,
-            written,
-        )?;
         self.sealed = true;
         self.encoder.finish(self.buf, total)
     }
@@ -1096,8 +1077,8 @@ mod tests {
             rec.seal(msg.len()).unwrap();
 
             let mut rec = b_enc.reserve(&mut b, &[], hint).unwrap();
-            rec.payload_uninit()[..msg.len()].write_copy_of_slice(msg);
-            rec.seal_init(msg.len()).unwrap();
+            bytes::BufMut::put_slice(&mut rec.payload_buf(), msg);
+            rec.seal(msg.len()).unwrap();
         }
         assert_eq!(a.pending(), b.pending());
     }
@@ -1114,8 +1095,8 @@ mod tests {
         rec.seal(5).unwrap();
 
         let mut rec = b_enc.reserve(&mut b, b"pfx", 5).unwrap();
-        rec.payload_uninit()[..5].write_copy_of_slice(b"hello");
-        rec.seal_init(5).unwrap();
+        bytes::BufMut::put_slice(&mut rec.payload_buf(), b"hello");
+        rec.seal(5).unwrap();
 
         assert_eq!(a.pending(), b.pending());
     }
@@ -1127,7 +1108,7 @@ mod tests {
         let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         assert!(rec.payload_uninit().is_empty());
-        assert_eq!(rec.seal_init(5), Err(Error::PendingWire));
+        assert_eq!(rec.seal(5), Err(Error::PendingWire));
         assert!(out.is_empty(), "failed seal cancels the record");
         // The encoder recovers: the next reservation seals normally.
         let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();

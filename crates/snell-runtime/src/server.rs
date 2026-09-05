@@ -19,8 +19,8 @@ use crate::outbound::Outbound;
 use crate::platform::{self, AcceptLoop, TcpBrutal, prepare_session_stream};
 use crate::replay::ReplayCache;
 use crate::session::{
-    ServerFirst, ensure_bulk, new_encode, new_recv, read_server_connect, relay, release_bulk,
-    server_may_reuse, wait_reuse_idle, with_handshake_timeout, write_reject, write_tunnel,
+    ServerFirst, new_encode, new_recv, read_server_connect, relay, server_may_reuse,
+    wait_reuse_idle, with_handshake_timeout, write_reject, write_tunnel,
 };
 use crate::udp::{UdpOptions, run_server_udp};
 
@@ -279,8 +279,7 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
             "handshake completed, tunnel established"
         );
 
-        recv = ensure_bulk(recv)?;
-        encode = new_encode();
+        recv.set_max(snell_protocol::V6_WIRE_CAP)?;
         relay(
             &mut snell,
             &mut remote,
@@ -288,8 +287,7 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
             &mut decoder,
             &mut recv,
             &mut encode,
-            &connect.leftover,
-            &[],
+            connect.leftover,
             connect.reuse,
         )
         .await?;
@@ -299,8 +297,10 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
         if !server_may_reuse(&encode, &decoder) {
             return Ok(());
         }
-        let released = release_bulk(recv, encode)?;
-        recv = released.0;
-        encode = released.1;
+        // Pipelined reuse continues immediately without allocation churn.
+        if recv.is_empty() {
+            recv.shrink_idle();
+            encode.shrink_idle()?;
+        }
     }
 }

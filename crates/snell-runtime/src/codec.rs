@@ -1,4 +1,4 @@
-use std::mem::MaybeUninit;
+use snell_protocol::PayloadBuffer;
 
 use snell_protocol::{
     AES_128_KEY_LEN, DecodeStatus, DecodedRecord, EncodeBuffer, RecvBuffer, Result, SALT_LEN,
@@ -8,13 +8,9 @@ use snell_protocol::{
 
 pub(crate) trait TcpReservation {
     fn payload_mut(&mut self) -> &mut [u8];
-    /// Uninitialized payload slot; pair with [`Self::seal_init`] after filling
-    /// a prefix through `ReadBuf::uninit`. Do not mix with `payload_mut`.
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>];
+    fn payload_buf(&mut self) -> PayloadBuffer<'_>;
     fn capacity(&self) -> usize;
     fn seal(self, written: usize) -> Result<()>;
-    /// Seal after initializing `written` bytes of [`Self::payload_uninit`].
-    fn seal_init(self, written: usize) -> Result<()>;
 }
 
 pub(crate) trait TcpEncoder {
@@ -41,8 +37,8 @@ impl TcpReservation for V4Reservation<'_> {
         V4Reservation::payload_mut(self)
     }
 
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        V4Reservation::payload_uninit(self)
+    fn payload_buf(&mut self) -> PayloadBuffer<'_> {
+        V4Reservation::payload_buf(self)
     }
 
     fn capacity(&self) -> usize {
@@ -51,10 +47,6 @@ impl TcpReservation for V4Reservation<'_> {
 
     fn seal(self, written: usize) -> Result<()> {
         V4Reservation::seal(self, written)
-    }
-
-    fn seal_init(self, written: usize) -> Result<()> {
-        V4Reservation::seal_init(self, written)
     }
 }
 
@@ -104,8 +96,8 @@ impl TcpReservation for V6ShapedReservation<'_> {
         V6ShapedReservation::payload_mut(self)
     }
 
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        V6ShapedReservation::payload_uninit(self)
+    fn payload_buf(&mut self) -> PayloadBuffer<'_> {
+        V6ShapedReservation::payload_buf(self)
     }
 
     fn capacity(&self) -> usize {
@@ -114,10 +106,6 @@ impl TcpReservation for V6ShapedReservation<'_> {
 
     fn seal(self, written: usize) -> Result<()> {
         V6ShapedReservation::seal(self, written)
-    }
-
-    fn seal_init(self, written: usize) -> Result<()> {
-        V6ShapedReservation::seal_init(self, written)
     }
 }
 
@@ -167,8 +155,8 @@ impl TcpReservation for V6UnshapedReservation<'_> {
         V6UnshapedReservation::payload_mut(self)
     }
 
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        V6UnshapedReservation::payload_uninit(self)
+    fn payload_buf(&mut self) -> PayloadBuffer<'_> {
+        V6UnshapedReservation::payload_buf(self)
     }
 
     fn capacity(&self) -> usize {
@@ -177,10 +165,6 @@ impl TcpReservation for V6UnshapedReservation<'_> {
 
     fn seal(self, written: usize) -> Result<()> {
         V6UnshapedReservation::seal(self, written)
-    }
-
-    fn seal_init(self, written: usize) -> Result<()> {
-        V6UnshapedReservation::seal_init(self, written)
     }
 }
 

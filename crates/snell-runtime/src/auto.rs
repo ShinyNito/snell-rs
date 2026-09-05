@@ -177,9 +177,9 @@ async fn advance<D: TcpDecoder>(
                     *state = Cand::Invalid;
                     return Ok(());
                 }
-                let bytes = record.plaintext(recv.filled()).to_vec();
+                let pushed = plain.push(record.plaintext(recv.filled()));
                 decoder.consume(recv, &record)?;
-                if plain.push(&bytes).is_err() {
+                if pushed.is_err() {
                     *state = Cand::Invalid;
                     return Ok(());
                 }
