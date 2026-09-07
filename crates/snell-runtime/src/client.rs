@@ -1,4 +1,4 @@
-use crate::buffer::{BufferPool, OwnedBuffer};
+use crate::buffer::{BufferPool, PooledBuffer};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -225,8 +225,7 @@ struct Opened {
     snell: TcpStream,
     codec: PooledCodec,
     leftover: Vec<u8>,
-    encode: OwnedBuffer,
-    recv: OwnedBuffer,
+    recv: PooledBuffer,
 }
 
 async fn open_session(
@@ -238,14 +237,13 @@ async fn open_session(
     psk: &Psk,
     buffers: &Arc<BufferPool>,
 ) -> Result<Opened, SessionError> {
-    let mut encode = OwnedBuffer::new(buffers, snell_protocol::V6_WIRE_CAP);
-    let mut recv = OwnedBuffer::new(buffers, snell_protocol::V6_WIRE_CAP);
+    let mut recv = buffers.get(snell_protocol::V6_WIRE_CAP);
     let leftover = with_codec!(&mut codec, |encoder, decoder| {
         open_tunnel(
             &mut snell,
             encoder,
             decoder,
-            &mut encode,
+            buffers,
             &mut recv,
             destination,
             reuse,
@@ -258,7 +256,6 @@ async fn open_session(
         snell,
         codec,
         leftover,
-        encode,
         recv,
     })
 }
@@ -273,22 +270,14 @@ async fn finish_session(
         mut snell,
         mut codec,
         leftover,
-        mut encode,
         mut recv,
     } = opened;
     let reusable = with_codec!(&mut codec, |encoder, decoder| {
         relay(
-            &mut snell,
-            local,
-            encoder,
-            decoder,
-            &mut recv,
-            &mut encode,
-            leftover,
-            reuse,
+            &mut snell, local, encoder, decoder, &mut recv, leftover, reuse,
         )
         .await?;
-        reuse && client_may_pool(&encode, &recv, decoder)
+        reuse && client_may_pool(&recv, decoder)
     });
     if reusable
         && let Some(pool) = pool
@@ -307,8 +296,8 @@ async fn open_tunnel<E: TcpEncoder, D: TcpDecoder>(
     snell: &mut TcpStream,
     encoder: &mut E,
     decoder: &mut D,
-    encode: &mut OwnedBuffer,
-    recv: &mut OwnedBuffer,
+    buffers: &Arc<BufferPool>,
+    recv: &mut PooledBuffer,
     destination: &Address,
     reuse: bool,
     kdf: &KdfLimiter,
@@ -316,7 +305,7 @@ async fn open_tunnel<E: TcpEncoder, D: TcpDecoder>(
 ) -> Result<Vec<u8>, SessionError> {
     prepare_session_stream(snell)?;
     with_handshake_timeout(async {
-        write_connect(encoder, encode, snell, destination.as_view(), reuse).await?;
+        write_connect(encoder, buffers, snell, destination.as_view(), reuse).await?;
         read_server_tunnel(decoder, recv, snell, kdf, psk).await
     })
     .await

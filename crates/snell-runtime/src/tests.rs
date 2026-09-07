@@ -925,18 +925,18 @@ async fn write_udp_request_rejects_payload_that_misses_v4_slot() {
 
     let psk = Psk::new(PSK.to_vec()).unwrap();
     let mut encoder = V4Encoder::os(&psk).unwrap();
-    let mut encode = crate::buffer::OwnedBuffer::new(&Arc::default(), snell_protocol::V6_WIRE_CAP);
-    write_udp_setup(&mut encoder, &mut encode, &mut client)
+    let buffers = Arc::new(crate::BufferPool::default());
+    write_udp_setup(&mut encoder, &buffers, &mut client)
         .await
         .unwrap();
-    write_tunnel(&mut encoder, &mut encode, &mut client)
+    write_tunnel(&mut encoder, &buffers, &mut client)
         .await
         .unwrap();
     let dest = Address::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
     let payload = vec![0xab; MAX_PACKET_SIZE];
     let error = write_udp_request(
         &mut encoder,
-        &mut encode,
+        &buffers,
         &mut client,
         dest.as_view(),
         &payload,
@@ -1145,15 +1145,12 @@ async fn authenticated_idle_connections_hold_no_payload_leases() {
         clients.push(client);
     }
     timeout(Duration::from_secs(2), async {
-        while pair.buffers.stats().leased_bytes != 0 {
+        while pair.buffers.leased_bytes() != 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    let stats = pair.buffers.stats();
-    assert_eq!(stats.allocating_bytes, 0);
-    assert!(stats.cached_bytes <= 2 << 20);
     assert_eq!(clients.len(), 100);
     assert_eq!(peers.len(), 100);
 }

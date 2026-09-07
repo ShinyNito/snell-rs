@@ -1,3 +1,4 @@
+use crate::buffer::PooledBuffer;
 use crate::bufio::TcpReservation;
 
 // Dispatch once around setup/relay while each record loop remains monomorphized.
@@ -38,7 +39,7 @@ pub(crate) trait TcpEncoder {
 
 pub(crate) trait TcpDecoder {
     fn decode(&mut self, buf: &mut Buffer) -> Result<DecodeStatus>;
-    fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()>;
+    fn consume(&mut self, buf: &mut PooledBuffer, record: &DecodedRecord) -> Result<()>;
     fn replay_identity(&self) -> Option<[u8; SALT_LEN]>;
     fn has_unconsumed_plaintext(&self) -> bool;
     fn kdf_need(&self) -> usize;
@@ -62,8 +63,10 @@ impl TcpDecoder for V4Decoder {
         V4Decoder::decode(self, buf)
     }
 
-    fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
-        V4Decoder::consume(self, buf, record)
+    fn consume(&mut self, buf: &mut PooledBuffer, record: &DecodedRecord) -> Result<()> {
+        V4Decoder::consume(self, buf, record)?;
+        buf.release_empty();
+        Ok(())
     }
 
     fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
@@ -103,8 +106,10 @@ impl TcpDecoder for V6ShapedDecoder {
         V6ShapedDecoder::decode(self, buf)
     }
 
-    fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
-        V6ShapedDecoder::consume(self, buf, record)
+    fn consume(&mut self, buf: &mut PooledBuffer, record: &DecodedRecord) -> Result<()> {
+        V6ShapedDecoder::consume(self, buf, record)?;
+        buf.release_empty();
+        Ok(())
     }
 
     fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
@@ -144,8 +149,10 @@ impl TcpDecoder for V6UnshapedDecoder {
         V6UnshapedDecoder::decode(self, buf)
     }
 
-    fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
-        V6UnshapedDecoder::consume(self, buf, record)
+    fn consume(&mut self, buf: &mut PooledBuffer, record: &DecodedRecord) -> Result<()> {
+        V6UnshapedDecoder::consume(self, buf, record)?;
+        buf.release_empty();
+        Ok(())
     }
 
     fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {

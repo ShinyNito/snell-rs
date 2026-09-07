@@ -1,4 +1,4 @@
-use crate::buffer::{BufferPool, OwnedBuffer};
+use crate::buffer::{BufferPool, PooledBuffer};
 use snell_protocol::{
     AUTO_DETECT_PREFIX_MAX, AUTO_DETECT_TIMEOUT_SECS, COMMAND_UDP, DecodeStatus, Error, ParseState,
     PlainStream, Psk, RecordKind, SERVER_EARLY_PAYLOAD_MAX, V4Decoder, V4Encoder, V6ShapedDecoder,
@@ -27,13 +27,13 @@ pub(crate) enum Detected {
     V4 {
         encoder: V4Encoder,
         decoder: V4Decoder,
-        recv: OwnedBuffer,
+        recv: PooledBuffer,
         first: ServerFirst,
     },
     V6Shaped {
         encoder: V6ShapedEncoder,
         decoder: V6ShapedDecoder,
-        recv: OwnedBuffer,
+        recv: PooledBuffer,
         first: ServerFirst,
     },
 }
@@ -63,15 +63,15 @@ async fn detect_inner(
     replay: &ReplayCache,
     buffers: &Arc<BufferPool>,
 ) -> Result<Detected, SessionError> {
-    let mut prefix = OwnedBuffer::new(buffers, AUTO_DETECT_PREFIX_MAX);
+    let mut prefix = buffers.get(AUTO_DETECT_PREFIX_MAX);
     let mut v4 = V4Decoder::new(psk.clone());
-    let mut v4_recv = OwnedBuffer::new(buffers, snell_protocol::V6_WIRE_CAP);
+    let mut v4_recv = buffers.get_empty(snell_protocol::V6_WIRE_CAP);
     let mut v4_fed = 0usize;
     let mut v4_plain = PlainStream::new(HANDSHAKE_PLAIN_MAX);
     let mut v4_state = Cand::NeedMore;
 
     let mut v6 = V6ShapedDecoder::new(psk.clone())?;
-    let mut v6_recv = OwnedBuffer::new(buffers, snell_protocol::V6_WIRE_CAP);
+    let mut v6_recv = buffers.get_empty(snell_protocol::V6_WIRE_CAP);
     let mut v6_fed = 0usize;
     let mut v6_plain = PlainStream::new(HANDSHAKE_PLAIN_MAX);
     let mut v6_state = Cand::NeedMore;
@@ -146,7 +146,11 @@ async fn detect_inner(
     }
 }
 
-fn feed(dst: &mut OwnedBuffer, fed: &mut usize, prefix: &OwnedBuffer) -> Result<(), SessionError> {
+fn feed(
+    dst: &mut PooledBuffer,
+    fed: &mut usize,
+    prefix: &PooledBuffer,
+) -> Result<(), SessionError> {
     if *fed >= prefix.len() {
         return Ok(());
     }
@@ -157,7 +161,7 @@ fn feed(dst: &mut OwnedBuffer, fed: &mut usize, prefix: &OwnedBuffer) -> Result<
 
 async fn advance<D: TcpDecoder>(
     decoder: &mut D,
-    recv: &mut OwnedBuffer,
+    recv: &mut PooledBuffer,
     plain: &mut PlainStream,
     state: &mut Cand,
     kdf: &KdfLimiter,
@@ -170,6 +174,7 @@ async fn advance<D: TcpDecoder>(
         maybe_install_kdf(decoder, recv, kdf, psk).await?;
         match decoder.decode(recv) {
             Ok(DecodeStatus::NeedMore { minimum }) => {
+                recv.release_empty();
                 if recv.len() >= minimum {
                     *state = Cand::Invalid;
                 }

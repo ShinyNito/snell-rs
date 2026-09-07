@@ -13,6 +13,7 @@ default = []
 unsafe-raw = ["snell-protocol/unsafe-raw"]
 
 [dependencies]
+crossbeam-queue = "0.3"
 snell-protocol = { path = "../snell-protocol", version = "0.1.0" }
 bytes.workspace = true
 hickory-resolver.workspace = true
@@ -65,9 +66,5 @@ name = "udp_loopback"
 harness = false
 
 [[bench]]
-name = "pgo_train"
-harness = false
-
-[[bench]]
-name = "quiet_tunnel"
+name = "staggered_tunnel"
 harness = false

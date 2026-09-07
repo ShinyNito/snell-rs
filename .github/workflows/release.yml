@@ -58,9 +58,7 @@ jobs:
           path: snell-rs-${{ github.ref_name }}-sbom.cdx.json
 
   build:
-    # One job per target: the PGO script trains once at a portable
-    # target-cpu, then builds one artifact per cpu in matrix.cpus.
-    # Artifact names stay <target> or <target>-vN as before.
+    # One job per target, with one release artifact per explicit CPU level.
     name: Build ${{ matrix.target }}
     needs: validate
     runs-on: ${{ matrix.os }}
@@ -114,13 +112,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: ${{ matrix.target }}
-          components: llvm-tools-preview
       - name: Install musl-tools
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: PGO release build
+      - name: Release build
         shell: bash
-        run: bash .github/scripts/pgo-release-build.sh "${{ matrix.target }}" "${{ matrix.binary }}" ${{ matrix.cpus }}
+        run: bash .github/scripts/release-build.sh "${{ matrix.target }}" "${{ matrix.binary }}" ${{ matrix.cpus }}
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         run: |
@@ -131,8 +128,7 @@ jobs:
             esac
             stage="snell-rs-${{ github.ref_name }}-${{ matrix.target }}${suffix}"
             mkdir -p "${stage}"
-            cp "pgo-data/bin/${cpu}/${{ matrix.binary }}" "${stage}/"
-            cp "pgo-data/bin/${cpu}/PGO" "${stage}/"
+            cp "target/release-artifacts/${{ matrix.target }}/${cpu}/${{ matrix.binary }}" "${stage}/"
             cp LICENSE README.md "${stage}/"
             tar -czf "${stage}.tar.gz" "${stage}"
             shasum -a 256 "${stage}.tar.gz" | tee "${stage}.tar.gz.sha256"
@@ -145,8 +141,7 @@ jobs:
             $suffix = if ($cpu -like 'x86-64-v*') { '-' + $cpu.Substring(7) } else { '' }
             $stage = "snell-rs-${{ github.ref_name }}-${{ matrix.target }}$suffix"
             New-Item -ItemType Directory -Path $stage | Out-Null
-            Copy-Item "pgo-data/bin/$cpu/${{ matrix.binary }}" $stage
-            Copy-Item "pgo-data/bin/$cpu/PGO" $stage
+            Copy-Item "target/release-artifacts/${{ matrix.target }}/$cpu/${{ matrix.binary }}" $stage
             Copy-Item LICENSE, README.md $stage
             Compress-Archive -Path $stage -DestinationPath "$stage.zip"
             $hash = (Get-FileHash -Algorithm SHA256 "$stage.zip").Hash.ToLower()

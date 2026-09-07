@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+- Release builds no longer use synthetic PGO training; explicit CPU variants
+  and release optimization settings are retained.
+
+## 1.0.0-rc.4
+
+### Changed
+- TCP sessions decode consecutive records ahead and flush them with one vectored
+  write, while keeping record order and wire behavior unchanged.
+- TCP and UDP buffer sizing avoids unnecessary high-water memory and zeroing.
+- Release PGO training uses a dedicated mixed-traffic workload at a portable CPU
+  level and reuses one profile across the target's CPU variants.
+
+### Fixed
+- Queued UDP buffers are returned to the bounded pool whenever an association
+  exits.
+
+## 1.0.0-rc.3
+
+### Changed
+- TCP record payload slots remain uninitialized until filled, avoiding redundant
+  zeroing while preserving wire bytes.
+- UDP packet buffers are reused and processed in place, avoiding per-datagram
+  copies and repeated buffer initialization.
+
+## 1.0.0-rc.2
+
+### Changed
+- Unknown INI keys are ignored instead of rejecting the config.
+- `tcp_brutal_send_mbps` / `tcp_brutal_cwnd_gain` without `tcp_brutal = true` are ignored.
+- Linux TCP Brutal is applied per accepted connection. If the kernel module or sockopt is unusable, the server logs a warning and continues without Brutal instead of refusing to start.
+
 ## 1.0.0-rc.1
 
 First release candidate of `snell-rs`. All crates remain unpublished (`publish = false`). The distributed product is the `snell-rs` binary.

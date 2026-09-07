@@ -1,10 +1,10 @@
 //! UDP in-flight quotas. Backing storage belongs to the shared BufferPool.
 use crate::SessionError;
-use crate::buffer::{BufferPool, OwnedBuffer};
+use crate::buffer::{BufferPool, PooledBuffer};
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct PacketBuf {
-    data: OwnedBuffer,
+    data: PooledBuffer,
     quota: Arc<PacketQuota>,
 }
 
@@ -16,12 +16,6 @@ impl PacketBuf {
         // Acquisition fixed both byte quota and storage capacity.
         self.data.extend_from_slice(bytes)?;
         Ok(())
-    }
-    pub async fn recv_from(
-        &mut self,
-        socket: &tokio::net::UdpSocket,
-    ) -> Result<std::net::SocketAddr, SessionError> {
-        crate::bufio::recv_datagram(socket, &mut self.data).await
     }
 }
 impl Drop for PacketBuf {
@@ -48,7 +42,7 @@ impl PacketQuota {
         }
     }
     pub fn acquire(self: &Arc<Self>, min: usize) -> Option<PacketBuf> {
-        let mut data = OwnedBuffer::new(&self.buffers, snell_protocol::UDP_DATAGRAM_MAX);
+        let mut data = self.buffers.get(snell_protocol::UDP_DATAGRAM_MAX);
         data.ensure(min).ok()?;
         let mut held = self.held.lock().expect("UDP quota lock");
         if held.0 >= self.max_bufs || data.capacity() > self.max_bytes.saturating_sub(held.1) {
@@ -60,6 +54,25 @@ impl PacketQuota {
             data,
             quota: Arc::clone(self),
         })
+    }
+    pub async fn recv_from(
+        self: &Arc<Self>,
+        socket: &tokio::net::UdpSocket,
+    ) -> Result<Option<(PacketBuf, std::net::SocketAddr)>, SessionError> {
+        std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            match socket.poll_recv_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+                Poll::Pending => return Poll::Pending,
+            }
+            let Some(mut packet) = self.acquire(snell_protocol::UDP_DATAGRAM_MAX) else {
+                return Poll::Ready(Ok(None));
+            };
+            crate::bufio::poll_recv_datagram(socket, &mut packet.data, cx)
+                .map(|result| result.map(|peer| Some((packet, peer))))
+        })
+        .await
     }
     #[cfg(test)]
     pub fn live(&self) -> usize {
@@ -83,7 +96,7 @@ mod tests {
         assert!(b.as_slice().is_empty());
         assert!(pool.acquire(129).is_none());
         drop(b);
-        assert_eq!(buffers.stats().leased_bytes, 0);
+        assert_eq!(buffers.leased_bytes(), 0);
     }
     #[tokio::test]
     async fn receiver_drop_releases_queued_datagrams() {

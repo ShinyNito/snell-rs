@@ -12,7 +12,7 @@
 mod auto;
 mod buffer;
 mod bufio;
-pub use buffer::{BufferLimits, BufferPool, BufferStats};
+pub use buffer::BufferPool;
 mod client;
 mod codec;
 mod dns;

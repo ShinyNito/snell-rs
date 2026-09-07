@@ -1,5 +1,4 @@
 /target
-/pgo-data/
 **/*.rs.bk
 .DS_Store
 CLAUDE.local.md

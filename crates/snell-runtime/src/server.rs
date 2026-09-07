@@ -1,4 +1,4 @@
-use crate::buffer::{BufferPool, OwnedBuffer};
+use crate::buffer::{BufferPool, PooledBuffer};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -171,7 +171,6 @@ pub(crate) async fn handle_server(
                         &kdf,
                         &config.psk,
                         recv,
-                        OwnedBuffer::new(&config.buffers, snell_protocol::V6_WIRE_CAP),
                         first,
                         &config.udp,
                     )
@@ -191,7 +190,6 @@ pub(crate) async fn handle_server(
                         &kdf,
                         &config.psk,
                         recv,
-                        OwnedBuffer::new(&config.buffers, snell_protocol::V6_WIRE_CAP),
                         first,
                         &config.udp,
                     )
@@ -217,7 +215,7 @@ where
     E: TcpEncoder + Send + 'static,
     F: FnOnce() -> Result<E, ProtocolError> + Send + 'static,
 {
-    let mut recv = OwnedBuffer::new(&config.buffers, snell_protocol::V6_WIRE_CAP);
+    let mut recv = config.buffers.get(snell_protocol::V6_WIRE_CAP);
     let (first, encoder) = with_handshake_timeout(async {
         let first = read_server_connect(
             &mut decoder,
@@ -241,7 +239,6 @@ where
         kdf,
         &config.psk,
         recv,
-        OwnedBuffer::new(&config.buffers, snell_protocol::V6_WIRE_CAP),
         first,
         &config.udp,
     )
@@ -256,20 +253,18 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
     outbound: Outbound,
     kdf: &KdfLimiter,
     psk: &Psk,
-    mut recv: OwnedBuffer,
-    mut encode: OwnedBuffer,
+    mut recv: PooledBuffer,
     mut command: ServerFirst,
     udp: &UdpOptions,
 ) -> Result<(), SessionError> {
+    let buffers = Arc::clone(recv.pool());
     let mut reused = false;
     loop {
         let connect = match command {
             ServerFirst::Connect(connect) => connect,
             ServerFirst::Udp => {
-                return run_server_udp(
-                    snell, encoder, decoder, outbound, kdf, psk, recv, encode, udp,
-                )
-                .await;
+                return run_server_udp(snell, encoder, decoder, outbound, kdf, psk, recv, udp)
+                    .await;
             }
         };
         let ServerConnect {
@@ -280,15 +275,14 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
 
         let mut remote = match with_handshake_timeout(async {
             let remote = outbound.connect(&destination).await?;
-            write_tunnel(&mut encoder, &mut encode, &mut snell).await?;
+            write_tunnel(&mut encoder, &buffers, &mut snell).await?;
             Ok(remote)
         })
         .await
         {
             Ok(remote) => remote,
             Err(error) => {
-                let _ =
-                    write_reject(&mut encoder, &mut encode, &mut snell, &error.to_string()).await;
+                let _ = write_reject(&mut encoder, &buffers, &mut snell, &error.to_string()).await;
                 return Err(error);
             }
         };
@@ -305,7 +299,6 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
             &mut encoder,
             &mut decoder,
             &mut recv,
-            &mut encode,
             leftover,
             reuse,
         )
@@ -313,11 +306,10 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
         if !reuse {
             return Ok(());
         }
-        if !server_may_reuse(&encode, &decoder) {
+        if !server_may_reuse(&decoder) {
             return Ok(());
         }
         recv.release_empty();
-        encode.release_empty();
         wait_reuse_idle(&mut snell, &mut recv).await?;
         command = with_handshake_timeout(read_server_connect(
             &mut decoder,
@@ -339,10 +331,11 @@ mod tests {
 
     #[tokio::test]
     async fn silent_peer_does_not_queue_response_kdf() {
-        for flavor in [
-            ProtocolFlavor::V4,
-            ProtocolFlavor::V6Shaped,
-            ProtocolFlavor::V6Unshaped,
+        for selection in [
+            ProtocolSelection::Exact(ProtocolFlavor::V4),
+            ProtocolSelection::Exact(ProtocolFlavor::V6Shaped),
+            ProtocolSelection::Exact(ProtocolFlavor::V6Unshaped),
+            ProtocolSelection::Auto,
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let _peer = TcpStream::connect(listener.local_addr().unwrap())
@@ -352,10 +345,14 @@ mod tests {
             let kdf = Arc::new(KdfLimiter::new());
             let _blocked = kdf.block_for_test();
             let buffers = Arc::new(BufferPool::default());
+            for _ in 0..4 {
+                let mut buffer = buffers.get(snell_protocol::V6_WIRE_CAP);
+                buffer.ensure(4096).unwrap();
+            }
             let config = ServerConfig {
                 listen: listener.local_addr().unwrap(),
                 psk: Psk::new(b"0123456789abcdef").unwrap(),
-                selection: ProtocolSelection::Exact(flavor),
+                selection,
                 outbound: Outbound::Direct,
                 udp: UdpOptions::default(),
                 buffers: buffers.clone(),
@@ -378,9 +375,9 @@ mod tests {
             assert_eq!(
                 kdf.queued_for_test(),
                 0,
-                "{flavor:?}: no response KDF before request"
+                "{selection:?}: no response KDF before request"
             );
-            assert_eq!(buffers.stats().leased_bytes, 0);
+            assert_eq!(buffers.leased_bytes(), 0);
             assert_eq!(handshakes.available_permits(), 0);
             drop(session);
             assert_eq!(handshakes.available_permits(), 1);
@@ -422,12 +419,17 @@ mod tests {
             let mut encoder = V4Encoder::os(&psk).unwrap();
             let mut decoder = V4Decoder::new(psk.clone());
             let client_buffers = Arc::new(BufferPool::default());
-            let mut send = OwnedBuffer::new(&client_buffers, snell_protocol::V6_WIRE_CAP);
-            let mut recv = OwnedBuffer::new(&client_buffers, snell_protocol::V6_WIRE_CAP);
+            let mut recv = client_buffers.get(snell_protocol::V6_WIRE_CAP);
             let target = snell_protocol::Address::from(upstream.local_addr().unwrap());
-            write_connect(&mut encoder, &mut send, &mut peer, target.as_view(), false)
-                .await
-                .unwrap();
+            write_connect(
+                &mut encoder,
+                &client_buffers,
+                &mut peer,
+                target.as_view(),
+                false,
+            )
+            .await
+            .unwrap();
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 read_server_tunnel(&mut decoder, &mut recv, &mut peer, &KdfLimiter::new(), &psk),
@@ -439,7 +441,7 @@ mod tests {
             assert_eq!(handshakes.available_permits(), 1);
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
-            assert_eq!(buffers.stats().leased_bytes, 0);
+            assert_eq!(buffers.leased_bytes(), 0);
         }
     }
 }

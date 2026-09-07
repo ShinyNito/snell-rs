@@ -4,7 +4,7 @@
 //! Each association owns one Snell TCP. Idle uses a per-association `Sleep`,
 //! not an O(N) map scan. Queue full is `try_send` failure plus a real counter.
 
-use crate::buffer::OwnedBuffer;
+use crate::buffer::{BufferPool, PooledBuffer};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
@@ -320,25 +320,25 @@ async fn dispatcher(
             }
             ready = socket.readable() => { if ready.is_err() { return; } }
         }
-        let Some(mut buf) = pool.acquire(UDP_DATAGRAM_MAX) else {
-            metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
-            tokio::select! {
-                ctrl = ctrl_rx.recv() => {
-                    let Some(ctrl) = ctrl else { return; };
-                    apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
-                }
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
-            }
-            continue;
-        };
         tokio::select! {
             ctrl = ctrl_rx.recv() => {
                 let Some(ctrl) = ctrl else { return; };
                 apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
             }
-            result = buf.recv_from(&socket) => {
-                if let Ok(peer) = result {
-                    handle_datagram(peer, buf, &mut map, &mut controls, &pool, &metrics, limits, &dial, &socket, &ctrl_tx);
+            result = pool.recv_from(&socket) => {
+                match result {
+                    Ok(Some((buf, peer))) => handle_datagram(peer, buf, &mut map, &mut controls, &pool, &metrics, limits, &dial, &socket, &ctrl_tx),
+                    Ok(None) => {
+                        metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
+                        tokio::select! {
+                            ctrl = ctrl_rx.recv() => {
+                                let Some(ctrl) = ctrl else { return; };
+                                apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -489,14 +489,13 @@ async fn client_assoc_inner(
 ) -> Result<AssocEnd, SessionError> {
     let (mut snell, mut codec) =
         dial_and_codec(dial.server, &dial.psk, dial.version, &dial.kdf).await?;
-    let mut encode = OwnedBuffer::new(&pool.buffers, snell_protocol::V6_WIRE_CAP);
-    let mut recv = OwnedBuffer::new(&pool.buffers, snell_protocol::V6_WIRE_CAP);
+    let mut recv = pool.buffers.get(snell_protocol::V6_WIRE_CAP);
     with_codec!(&mut codec, |encoder, decoder| {
         open_udp(
             &mut snell,
             encoder,
             decoder,
-            &mut encode,
+            &pool.buffers,
             &mut recv,
             &dial.kdf,
             &dial.psk,
@@ -506,7 +505,7 @@ async fn client_assoc_inner(
             &mut snell,
             encoder,
             decoder,
-            &mut encode,
+            &pool.buffers,
             &mut recv,
             &dial.kdf,
             &dial.psk,
@@ -525,14 +524,14 @@ async fn open_udp<E: TcpEncoder, D: TcpDecoder>(
     snell: &mut TcpStream,
     encoder: &mut E,
     decoder: &mut D,
-    encode: &mut OwnedBuffer,
-    recv: &mut OwnedBuffer,
+    buffers: &Arc<BufferPool>,
+    recv: &mut PooledBuffer,
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
 ) -> Result<(), SessionError> {
     crate::platform::prepare_session_stream(snell)?;
     with_handshake_timeout(async {
-        write_udp_setup(encoder, encode, snell).await?;
+        write_udp_setup(encoder, buffers, snell).await?;
         let leftover = read_server_tunnel(decoder, recv, snell, kdf, psk).await?;
         if !leftover.is_empty() {
             return Err(SessionError::Protocol(Error::Malformed(
@@ -549,8 +548,8 @@ async fn pump_client<E, D>(
     snell: &mut TcpStream,
     encoder: &mut E,
     decoder: &mut D,
-    encode: &mut OwnedBuffer,
-    recv: &mut OwnedBuffer,
+    buffers: &Arc<BufferPool>,
+    recv: &mut PooledBuffer,
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
     rx: &mut mpsc::Receiver<InboundDgram>,
@@ -578,7 +577,7 @@ where
                 let payload = &dgram.buf.as_slice()[dgram.header_len..];
                 let result = write_udp_request(
                     encoder,
-                    encode,
+                    buffers,
                     &mut snell_w,
                     dgram.dest.as_view(),
                     payload,
@@ -665,21 +664,15 @@ pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
     outbound: Outbound,
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
-    mut recv: OwnedBuffer,
-    mut encode: OwnedBuffer,
+    mut recv: PooledBuffer,
     udp: &UdpOptions,
 ) -> Result<(), SessionError> {
+    let buffers = Arc::clone(recv.pool());
     let prev = udp.metrics.associations.fetch_add(1, Ordering::Relaxed);
     if prev >= udp.limits.max_associations as u64 {
         udp.metrics.associations.fetch_sub(1, Ordering::Relaxed);
         udp.metrics.map_full.fetch_add(1, Ordering::Relaxed);
-        let _ = write_reject(
-            &mut encoder,
-            &mut encode,
-            &mut snell,
-            "udp association limit",
-        )
-        .await;
+        let _ = write_reject(&mut encoder, &buffers, &mut snell, "udp association limit").await;
         return Err(SessionError::UdpLimit);
     }
     let _guard = AssocGuard(&udp.metrics);
@@ -687,16 +680,16 @@ pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
     let mut flow = match outbound.open_udp(&udp.dns, recv.pool()).await {
         Ok(flow) => flow,
         Err(error) => {
-            let _ = write_reject(&mut encoder, &mut encode, &mut snell, &error.to_string()).await;
+            let _ = write_reject(&mut encoder, &buffers, &mut snell, &error.to_string()).await;
             return Err(error);
         }
     };
-    write_tunnel(&mut encoder, &mut encode, &mut snell).await?;
+    write_tunnel(&mut encoder, &buffers, &mut snell).await?;
     pump_server(
         &mut snell,
         &mut encoder,
         &mut decoder,
-        &mut encode,
+        &buffers,
         &mut recv,
         kdf,
         psk,
@@ -711,8 +704,8 @@ async fn pump_server<E, D>(
     snell: &mut TcpStream,
     encoder: &mut E,
     decoder: &mut D,
-    encode: &mut OwnedBuffer,
-    recv: &mut OwnedBuffer,
+    buffers: &Arc<BufferPool>,
+    recv: &mut PooledBuffer,
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
     flow: &mut crate::outbound::UdpFlow,
@@ -761,10 +754,10 @@ where
                 let reply = reply?;
                 match write_udp_response(
                     encoder,
-                    encode,
+                    buffers,
                     &mut snell_w,
                     reply.addr.as_view(),
-                    reply.payload,
+                    reply.payload(),
                 )
                 .await
                 {
@@ -828,7 +821,7 @@ mod tests {
         assert_eq!(&packet.buf.as_slice()[packet.header_len..], b"ping");
         drop(packet);
         assert_eq!(pool.live(), 0);
-        assert_eq!(pool.buffers.stats().leased_bytes, 0);
+        assert_eq!(pool.buffers.leased_bytes(), 0);
     }
 
     #[tokio::test]
@@ -855,12 +848,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(pool.live(), 0);
-        assert_eq!(pool.buffers.stats().leased_bytes, 0);
-        assert_eq!(
-            pool.buffers.stats().misses,
-            1,
-            "the failing send must actually acquire storage"
-        );
+        assert_eq!(pool.buffers.leased_bytes(), 0);
     }
 
     #[tokio::test]

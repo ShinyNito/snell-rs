@@ -10,8 +10,9 @@ use std::task::{Context, Poll};
 use snell_protocol::{Result, V4Reservation, V6ShapedReservation, V6UnshapedReservation};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::buffer::OwnedBuffer;
+use crate::buffer::{BufferPool, PooledBuffer};
 use crate::error::SessionError;
+use std::sync::Arc;
 
 /// Socket readiness avoids leasing/preparing a record only to discover Pending.
 /// Both owned handshake streams and borrowed relay halves use Tokio's readiness.
@@ -32,22 +33,20 @@ impl ReadReady for tokio::net::tcp::ReadHalf<'_> {
 pub(crate) const READ_WINDOW: usize = snell_protocol::V6_WIRE_CAP;
 
 /// Filled bytes and the initialization commit stay in the same audited poll.
-/// Active capacity survives Pending; the relay owns its quiet deadline.
+/// Only incomplete input retains a lease across Pending.
 pub(crate) fn poll_read_into<R: ReadReady + Unpin>(
     reader: &mut R,
-    recv: &mut OwnedBuffer,
+    recv: &mut PooledBuffer,
     minimum: usize,
     window: usize,
     cx: &mut Context<'_>,
 ) -> Poll<std::result::Result<usize, SessionError>> {
+    recv.release_empty();
     match reader.poll_ready(cx) {
         Poll::Ready(Ok(())) => {}
         Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
         Poll::Pending => return Poll::Pending,
     }
-    let cold = recv.capacity() == 0;
-    // A false readiness after quiet must not buy a full bulk window.
-    let window = if cold { window.min(4096) } else { window };
     let needed = minimum
         .max(recv.len().saturating_add(1))
         .max(window.min(recv.max()));
@@ -68,9 +67,7 @@ pub(crate) fn poll_read_into<R: ReadReady + Unpin>(
         }
         Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
         Poll::Pending => {
-            if cold {
-                recv.release_empty();
-            }
+            recv.release_empty();
             Poll::Pending
         }
     }
@@ -78,7 +75,7 @@ pub(crate) fn poll_read_into<R: ReadReady + Unpin>(
 
 pub(crate) async fn read_into_recv<R: ReadReady + Unpin>(
     reader: &mut R,
-    recv: &mut OwnedBuffer,
+    recv: &mut PooledBuffer,
     minimum: usize,
 ) -> std::result::Result<usize, SessionError> {
     poll_fn(|cx| poll_read_into(reader, recv, minimum, 4096, cx)).await
@@ -108,7 +105,7 @@ pub(crate) fn poll_read_record<R: ReadReady + Unpin, T: TcpReservation>(
 
 pub(crate) async fn drain_encode<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    encode: &mut OwnedBuffer,
+    encode: &mut PooledBuffer,
 ) -> std::result::Result<(), SessionError> {
     while !encode.is_empty() {
         let n = poll_fn(|cx| Pin::new(&mut *writer).poll_write(cx, encode.filled())).await?;
@@ -188,28 +185,40 @@ impl TcpReservation for V6UnshapedReservation<'_> {
 
 pub(crate) async fn recv_datagram(
     socket: &tokio::net::UdpSocket,
-    recv: &mut OwnedBuffer,
-) -> std::result::Result<std::net::SocketAddr, SessionError> {
-    let len = recv.len();
-    recv.consume(len)?;
+    buffers: &Arc<BufferPool>,
+) -> std::result::Result<(PooledBuffer, std::net::SocketAddr), SessionError> {
     poll_fn(|cx| {
-        let spare = match recv.spare_capacity_mut(1) {
-            Ok(s) => s,
-            Err(e) => return Poll::Ready(Err(e.into())),
-        };
-        let mut read = ReadBuf::uninit(spare);
-        match socket.poll_recv_from(cx, &mut read) {
-            Poll::Ready(Ok(peer)) => {
-                let n = read.filled().len();
-                // SAFETY: the datagram was written into this exact spare slice.
-                match unsafe { recv.commit(n) } {
-                    Ok(()) => Poll::Ready(Ok(peer)),
-                    Err(e) => Poll::Ready(Err(e.into())),
-                }
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-            Poll::Pending => Poll::Pending,
+        match socket.poll_recv_ready(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+            Poll::Pending => return Poll::Pending,
         }
+        let mut buffer = buffers.get(snell_protocol::UDP_DATAGRAM_MAX);
+        if let Err(error) = buffer.ensure(snell_protocol::UDP_DATAGRAM_MAX) {
+            return Poll::Ready(Err(error));
+        }
+        poll_recv_datagram(socket, &mut buffer, cx).map(|result| result.map(|peer| (buffer, peer)))
     })
     .await
+}
+
+pub(crate) fn poll_recv_datagram(
+    socket: &tokio::net::UdpSocket,
+    recv: &mut PooledBuffer,
+    cx: &mut Context<'_>,
+) -> Poll<std::result::Result<std::net::SocketAddr, SessionError>> {
+    let spare = match recv.spare_capacity_mut(1) {
+        Ok(s) => s,
+        Err(e) => return Poll::Ready(Err(e.into())),
+    };
+    let mut read = ReadBuf::uninit(spare);
+    match socket.poll_recv_from(cx, &mut read) {
+        Poll::Ready(Ok(peer)) => {
+            let n = read.filled().len();
+            // SAFETY: the datagram was written into this exact spare slice.
+            Poll::Ready(unsafe { recv.commit(n) }.map(|()| peer).map_err(Into::into))
+        }
+        Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+        Poll::Pending => Poll::Pending,
+    }
 }
