@@ -5,13 +5,13 @@
 use std::time::Instant;
 
 use snell_protocol::{
-    DecodeStatus, EncodeBuffer, FixedClock, Psk, RecordKind, RecvBuffer, RepeatEntropy, SALT_LEN,
-    V4_WIRE_CAP, V4Decoder, V4Encoder,
+    Buffer, DecodeStatus, FixedClock, Psk, RecordKind, RepeatEntropy, SALT_LEN, V4_WIRE_CAP,
+    V4Decoder, V4Encoder,
 };
 
 fn seal_and_take(
     encoder: &mut V4Encoder<RepeatEntropy, FixedClock>,
-    buf: &mut EncodeBuffer,
+    buf: &mut Buffer,
     payload: &[u8],
 ) -> Vec<u8> {
     {
@@ -19,12 +19,12 @@ fn seal_and_take(
         rec.payload_mut()[..payload.len()].copy_from_slice(payload);
         rec.seal(payload.len()).unwrap();
     }
-    let wire = buf.pending().to_vec();
-    buf.advance(wire.len()).unwrap();
+    let wire = buf.filled().to_vec();
+    buf.consume(wire.len()).unwrap();
     wire
 }
 
-fn decode_one(decoder: &mut V4Decoder, buf: &mut RecvBuffer, wire: &[u8]) -> usize {
+fn decode_one(decoder: &mut V4Decoder, buf: &mut Buffer, wire: &[u8]) -> usize {
     buf.extend_from_slice(wire).unwrap();
     let mut decoded = 0usize;
     loop {
@@ -56,8 +56,8 @@ fn main() {
     )
     .unwrap();
     let mut decoder = V4Decoder::new(psk);
-    let mut recv = RecvBuffer::new(64 * 1024);
-    let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+    let mut recv = Buffer::new(64 * 1024);
+    let mut out = Buffer::new(V4_WIRE_CAP);
 
     let warmup = [0xABu8; 64];
     let first = seal_and_take(&mut encoder, &mut out, &warmup);

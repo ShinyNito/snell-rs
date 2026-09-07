@@ -1,8 +1,8 @@
 use crate::socks5::{self, Command};
 use crate::{
-    Address, AddressRef, DecodeStatus, EncodeBuffer, Error, FixedClock, HEADER_CIPHER_LEN,
-    ParseState, Psk, RecvBuffer, RepeatEntropy, SALT_LEN, V4_WIRE_CAP, V4Decoder, V4Encoder,
-    decode_connect_request_prefix, encode_connect_request,
+    Address, AddressRef, Buffer, DecodeStatus, Error, FixedClock, HEADER_CIPHER_LEN, ParseState,
+    Psk, RepeatEntropy, SALT_LEN, V4_WIRE_CAP, V4Decoder, V4Encoder, decode_connect_request_prefix,
+    encode_connect_request,
 };
 
 #[test]
@@ -61,7 +61,7 @@ fn random_peer_input_does_not_panic() {
         let _ = crate::decode_server_reply(&buf);
         let psk = Psk::new(b"0123456789abcdef").unwrap();
         let mut v6u = crate::V6UnshapedDecoder::new(psk.clone());
-        let mut recv = RecvBuffer::new(256);
+        let mut recv = Buffer::new(256);
         let _ = recv.extend_from_slice(&buf);
         match v6u.decode(&mut recv) {
             Ok(_)
@@ -75,7 +75,7 @@ fn random_peer_input_does_not_panic() {
             Err(error) => panic!("unexpected unshaped error {error:?}"),
         }
         if let Ok(mut v6s) = crate::V6ShapedDecoder::new(psk) {
-            let mut recv = RecvBuffer::new(256);
+            let mut recv = Buffer::new(256);
             let _ = recv.extend_from_slice(&buf);
             match v6s.decode(&mut recv) {
                 Ok(_)
@@ -102,13 +102,13 @@ fn v4_hello_wire() -> Vec<u8> {
         FixedClock::new(0),
     )
     .unwrap();
-    let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+    let mut out = Buffer::new(V4_WIRE_CAP);
     {
         let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    out.pending().to_vec()
+    out.filled().to_vec()
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn v4_record_byte_at_a_time() {
     let wire = v4_hello_wire();
     let psk = Psk::new(b"0123456789abcdef").unwrap();
     let mut decoder = V4Decoder::new(psk);
-    let mut buf = RecvBuffer::new(4096);
+    let mut buf = Buffer::new(4096);
     for (i, byte) in wire.iter().enumerate() {
         buf.extend_from_slice(&[*byte]).unwrap();
         match decoder.decode(&mut buf).unwrap() {
@@ -145,7 +145,7 @@ fn v4_random_ciphertext_does_not_panic() {
         }
         let psk = Psk::new(b"0123456789abcdef").unwrap();
         let mut decoder = V4Decoder::new(psk);
-        let mut buf = RecvBuffer::new(256);
+        let mut buf = Buffer::new(256);
         buf.extend_from_slice(&wire).unwrap();
         match decoder.decode(&mut buf) {
             Ok(DecodeStatus::NeedMore { .. })
@@ -161,11 +161,11 @@ fn v4_random_ciphertext_does_not_panic() {
     }
 }
 
-fn push(buf: &mut RecvBuffer, bytes: &[u8]) {
+fn push(buf: &mut Buffer, bytes: &[u8]) {
     buf.extend_from_slice(bytes).unwrap();
 }
 
-fn decode_hello(decoder: &mut V4Decoder, buf: &mut RecvBuffer) {
+fn decode_hello(decoder: &mut V4Decoder, buf: &mut Buffer) {
     match decoder.decode(buf).unwrap() {
         DecodeStatus::Record(record) => {
             assert_eq!(record.plaintext(buf.filled()), b"hello");
@@ -184,7 +184,7 @@ fn v4_hello_split_at_every_offset() {
     let psk = Psk::new(b"0123456789abcdef").unwrap();
     for cut in 0..=wire.len() {
         let mut decoder = V4Decoder::new(psk.clone());
-        let mut buf = RecvBuffer::new(4096);
+        let mut buf = Buffer::new(4096);
         push(&mut buf, &wire[..cut]);
         if cut < wire.len() {
             match decoder.decode(&mut buf).unwrap() {
@@ -209,25 +209,25 @@ fn v4_two_records_one_commit() {
         FixedClock::new(0),
     )
     .unwrap();
-    let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+    let mut out = Buffer::new(V4_WIRE_CAP);
     {
         let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    let first = out.pending().to_vec();
-    out.advance(first.len()).unwrap();
+    let first = out.filled().to_vec();
+    out.consume(first.len()).unwrap();
     {
         let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"world");
         rec.seal(5).unwrap();
     }
-    let second = out.pending().to_vec();
+    let second = out.filled().to_vec();
     let mut both = first;
     both.extend_from_slice(&second);
 
     let mut decoder = V4Decoder::new(psk);
-    let mut buf = RecvBuffer::new(4096);
+    let mut buf = Buffer::new(4096);
     push(&mut buf, &both);
     match decoder.decode(&mut buf).unwrap() {
         DecodeStatus::Record(record) => {

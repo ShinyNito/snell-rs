@@ -6,6 +6,8 @@ use crate::platform::PlatformError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
+    #[error("buffer budget exceeded")]
+    BufferBudgetExceeded,
     #[error("handshake timed out")]
     HandshakeTimeout,
     #[error("tcp connect timed out")]

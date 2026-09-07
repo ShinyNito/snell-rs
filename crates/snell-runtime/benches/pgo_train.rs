@@ -108,6 +108,7 @@ async fn start_pair(
         psk: psk.clone(),
         selection,
         outbound: Outbound::Direct,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
         tcp_brutal: None,
     };
@@ -124,6 +125,7 @@ async fn start_pair(
         version: flavor,
         reuse: pool.is_some(),
         pool,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
     };
     tokio::spawn(async move {

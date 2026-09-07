@@ -9,8 +9,8 @@ use crate::header::{parse_v6_plain_header, write_v6_plain_header};
 use crate::kdf::aead_key;
 use crate::record::{DecodeStatus, DecodedRecord, RecordKind};
 use crate::{
-    Clock, EncodeBuffer, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE,
-    Nonce, OsEntropy, Psk, RecvBuffer, Result, SALT_LEN, TAG_LEN, UnixClock,
+    Buffer, Clock, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE, Nonce,
+    OsEntropy, Psk, Result, SALT_LEN, TAG_LEN, UnixClock,
 };
 
 pub struct V6UnshapedEncoder<E = OsEntropy, C = UnixClock> {
@@ -32,7 +32,7 @@ pub struct V6UnshapedEncoder<E = OsEntropy, C = UnixClock> {
 #[must_use = "unsealed reservations are cancelled on drop"]
 pub struct V6UnshapedReservation<'a, E: Entropy = OsEntropy, C: Clock = UnixClock> {
     encoder: &'a mut V6UnshapedEncoder<E, C>,
-    buf: &'a mut EncodeBuffer,
+    buf: &'a mut Buffer,
     sealed: bool,
 }
 
@@ -66,7 +66,7 @@ impl<E: Entropy, C: Clock> V6UnshapedEncoder<E, C> {
 
     pub fn reserve<'buf>(
         &'buf mut self,
-        buf: &'buf mut EncodeBuffer,
+        buf: &'buf mut Buffer,
         prefix: &[u8],
         hint: usize,
     ) -> Result<V6UnshapedReservation<'buf, E, C>> {
@@ -107,7 +107,7 @@ impl<E: Entropy, C: Clock> V6UnshapedEncoder<E, C> {
         })
     }
 
-    fn finish(&mut self, buf: &mut EncodeBuffer, payload_len: usize) -> Result<()> {
+    fn finish(&mut self, buf: &mut Buffer, payload_len: usize) -> Result<()> {
         if payload_len > self.max_payload {
             self.reserving = false;
             buf.truncate(self.record_start)?;
@@ -139,7 +139,7 @@ impl<E: Entropy, C: Clock> V6UnshapedEncoder<E, C> {
         result
     }
 
-    fn seal_record(&mut self, buf: &mut EncodeBuffer, payload_len: usize) -> Result<()> {
+    fn seal_record(&mut self, buf: &mut Buffer, payload_len: usize) -> Result<()> {
         write_v6_plain_header(
             buf.range_mut(self.header_start, self.header_start + HEADER_PLAIN_LEN),
             0,
@@ -223,7 +223,7 @@ impl<E: Entropy, C: Clock> V6UnshapedReservation<'_, E, C> {
 
     /// Seal after the caller initialized `written` bytes of
     /// [`Self::payload_uninit`]. Commits them without zero-filling first.
-    pub fn seal_init(mut self, written: usize) -> Result<()> {
+    pub(crate) fn seal_init_impl(mut self, written: usize) -> Result<()> {
         let total = crate::buffer::commit_init_payload(
             self.buf,
             self.encoder.payload_start,
@@ -304,7 +304,7 @@ impl V6UnshapedDecoder {
         }
     }
 
-    pub fn kdf_salt(&self, buf: &RecvBuffer) -> Result<[u8; SALT_LEN]> {
+    pub fn kdf_salt(&self, buf: &Buffer) -> Result<[u8; SALT_LEN]> {
         if buf.len() < SALT_LEN {
             return Err(Error::Truncated);
         }
@@ -323,7 +323,7 @@ impl V6UnshapedDecoder {
         Ok(())
     }
 
-    pub fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus> {
+    pub fn decode(&mut self, buf: &mut Buffer) -> Result<DecodeStatus> {
         loop {
             match self.step {
                 ReadStep::Salt => {
@@ -405,7 +405,7 @@ impl V6UnshapedDecoder {
         }
     }
 
-    pub fn consume(&mut self, buf: &mut RecvBuffer, record: &DecodedRecord) -> Result<()> {
+    pub fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
         self.pending = self
             .pending
             .checked_sub(record.consumed)
@@ -421,7 +421,7 @@ impl V6UnshapedDecoder {
     /// `minimum` is measured from the start of `filled()` and includes
     /// `pending`. A record must fit the buffer on its own; when outstanding
     /// records crowd it out, report `NeedMore` so the caller drains first.
-    fn decode_need(&self, buf: &RecvBuffer, minimum: usize) -> Result<Option<DecodeStatus>> {
+    fn decode_need(&self, buf: &Buffer, minimum: usize) -> Result<Option<DecodeStatus>> {
         if minimum - self.pending > buf.max() {
             Err(Error::PayloadTooLarge)
         } else if buf.len() < minimum {
@@ -444,7 +444,7 @@ impl fmt::Debug for V6UnshapedDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EncodeBuffer, FixedClock, RepeatEntropy, V4_WIRE_CAP};
+    use crate::{Buffer, FixedClock, RepeatEntropy, V4_WIRE_CAP};
 
     fn psk() -> Psk {
         Psk::new(b"0123456789abcdef").unwrap()
@@ -460,11 +460,11 @@ mod tests {
         .unwrap()
     }
 
-    fn collect(buf: &EncodeBuffer) -> Vec<u8> {
-        buf.pending().to_vec()
+    fn collect(buf: &Buffer) -> Vec<u8> {
+        buf.filled().to_vec()
     }
 
-    fn decode_plain(decoder: &mut V6UnshapedDecoder, buf: &mut RecvBuffer, wire: &[u8]) -> Vec<u8> {
+    fn decode_plain(decoder: &mut V6UnshapedDecoder, buf: &mut Buffer, wire: &[u8]) -> Vec<u8> {
         buf.extend_from_slice(wire).unwrap();
         let mut plain = Vec::new();
         loop {
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn hello_round_trips_and_matches_v4_no_padding_layout() {
         let mut enc = encoder();
-        let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+        let mut out = Buffer::new(V4_WIRE_CAP);
         {
             let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"hello");
@@ -493,7 +493,7 @@ mod tests {
         let wire = collect(&out);
         assert_eq!(&wire[..SALT_LEN], &[7u8; SALT_LEN]);
         let mut decoder = V6UnshapedDecoder::new(psk());
-        let mut buf = RecvBuffer::new(4096);
+        let mut buf = Buffer::new(4096);
         assert_eq!(decode_plain(&mut decoder, &mut buf, &wire), b"hello");
         assert_eq!(decoder.replay_identity(), Some([7u8; SALT_LEN]));
     }
@@ -501,9 +501,9 @@ mod tests {
     #[test]
     fn seal_init_wire_matches_payload_mut() {
         let mut a_enc = encoder();
-        let mut a = EncodeBuffer::new(V4_WIRE_CAP);
+        let mut a = Buffer::new(V4_WIRE_CAP);
         let mut b_enc = encoder();
-        let mut b = EncodeBuffer::new(V4_WIRE_CAP);
+        let mut b = Buffer::new(V4_WIRE_CAP);
         for (msg, hint) in [(&b"hello"[..], 5), (b"steady", 6), (b"abc", 8)] {
             let mut rec = a_enc.reserve(&mut a, &[], hint).unwrap();
             rec.payload_mut()[..msg.len()].copy_from_slice(msg);
@@ -511,22 +511,22 @@ mod tests {
 
             let mut rec = b_enc.reserve(&mut b, &[], hint).unwrap();
             rec.payload_uninit()[..msg.len()].write_copy_of_slice(msg);
-            rec.seal_init(msg.len()).unwrap();
+            rec.seal_init_impl(msg.len()).unwrap();
         }
-        assert_eq!(a.pending(), b.pending());
+        assert_eq!(a.filled(), b.filled());
     }
 
     #[test]
     fn second_record_has_no_salt() {
         let mut enc = encoder();
-        let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+        let mut out = Buffer::new(V4_WIRE_CAP);
         {
             let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"hello");
             rec.seal(5).unwrap();
         }
         let first = collect(&out);
-        out.advance(first.len()).unwrap();
+        out.consume(first.len()).unwrap();
         {
             let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"world");
@@ -537,14 +537,14 @@ mod tests {
         let mut both = first;
         both.extend_from_slice(&second);
         let mut decoder = V6UnshapedDecoder::new(psk());
-        let mut buf = RecvBuffer::new(4096);
+        let mut buf = Buffer::new(4096);
         assert_eq!(decode_plain(&mut decoder, &mut buf, &both), b"helloworld");
     }
 
     #[test]
     fn two_records_share_pending_without_advance() {
         let mut enc = encoder();
-        let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+        let mut out = Buffer::new(V4_WIRE_CAP);
         {
             let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"hello");
@@ -557,11 +557,11 @@ mod tests {
             rec.seal(5).unwrap();
         }
         let pending = collect(&out);
-        out.advance(first_len).unwrap();
+        out.consume(first_len).unwrap();
         let rest = collect(&out);
         assert_eq!(&pending[first_len..], rest.as_slice());
         let mut decoder = V6UnshapedDecoder::new(psk());
-        let mut buf = RecvBuffer::new(4096);
+        let mut buf = Buffer::new(4096);
         assert_eq!(
             decode_plain(&mut decoder, &mut buf, &pending),
             b"helloworld"
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn decode_ahead_batches_records_before_consume() {
         let mut enc = encoder();
-        let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+        let mut out = Buffer::new(V4_WIRE_CAP);
         for msg in [&b"hello"[..], b"world"] {
             let mut rec = enc.reserve(&mut out, &[], msg.len()).unwrap();
             rec.payload_mut()[..msg.len()].copy_from_slice(msg);
@@ -579,7 +579,7 @@ mod tests {
         }
         let wire = collect(&out);
         let mut decoder = V6UnshapedDecoder::new(psk());
-        let mut buf = RecvBuffer::new(4096);
+        let mut buf = Buffer::new(4096);
         buf.extend_from_slice(&wire).unwrap();
         let DecodeStatus::Record(first) = decoder.decode(&mut buf).unwrap() else {
             panic!("first record not ready");
@@ -604,12 +604,12 @@ mod tests {
     #[test]
     fn zero_chunk_is_header_only() {
         let mut enc = encoder();
-        let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+        let mut out = Buffer::new(V4_WIRE_CAP);
         enc.reserve(&mut out, &[], 0).unwrap().seal(0).unwrap();
         let wire = collect(&out);
         assert_eq!(wire.len(), SALT_LEN + HEADER_CIPHER_LEN);
         let mut decoder = V6UnshapedDecoder::new(psk());
-        let mut buf = RecvBuffer::new(4096);
+        let mut buf = Buffer::new(4096);
         buf.extend_from_slice(&wire).unwrap();
         match decoder.decode(&mut buf).unwrap() {
             DecodeStatus::Record(record) => {
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn reserved_nonzero_fails() {
         let mut enc = encoder();
-        let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+        let mut out = Buffer::new(V4_WIRE_CAP);
         {
             let mut rec = enc.reserve(&mut out, &[], 1).unwrap();
             rec.payload_mut()[0] = 1;
@@ -634,7 +634,7 @@ mod tests {
         let last = wire.len() - 1;
         wire[last] ^= 1;
         let mut decoder = V6UnshapedDecoder::new(psk());
-        let mut buf = RecvBuffer::new(4096);
+        let mut buf = Buffer::new(4096);
         buf.extend_from_slice(&wire).unwrap();
         assert_eq!(decoder.decode(&mut buf), Err(Error::Aead));
     }
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn second_record_compacts_over_unsent_prefix() {
         let mut enc = encoder();
-        let mut out = EncodeBuffer::new(100);
+        let mut out = Buffer::new(100);
         {
             let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"hello");
@@ -658,7 +658,7 @@ mod tests {
         }
         let first = collect(&out);
         assert_eq!(first.len(), 60);
-        out.advance(10).unwrap();
+        out.consume(10).unwrap();
         {
             let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"world");
@@ -668,7 +668,7 @@ mod tests {
         assert_eq!(&pending[..50], &first[10..]);
         assert_eq!(pending.len(), 50 + 44);
         let mut decoder = V6UnshapedDecoder::new(psk());
-        let mut buf = RecvBuffer::new(4096);
+        let mut buf = Buffer::new(4096);
         assert_eq!(decode_plain(&mut decoder, &mut buf, &first), b"hello");
         assert_eq!(
             decode_plain(&mut decoder, &mut buf, &pending[50..]),
@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn drop_cancels_reservation() {
         let mut enc = encoder();
-        let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+        let mut out = Buffer::new(V4_WIRE_CAP);
         {
             let mut rec = enc.reserve(&mut out, &[], 8).unwrap();
             rec.payload_mut()[0] = 1;

@@ -5,18 +5,14 @@ use std::mem::MaybeUninit;
 
 use crate::{Error, Result};
 
-/// Contiguous receive allocation: `consumed | live | uninitialized cap`.
-///
-/// Fixed capacity: `new(max)` does `Vec::with_capacity(max)` and never reallocates.
-/// `storage.len()` is the live end. Front `start` is consumed. The kernel writes
-/// [`Self::spare_capacity_mut`], which is the whole tail, not `min` bytes.
-pub struct RecvBuffer {
+/// Fixed backing allocation and a live byte range; never grows implicitly.
+pub struct Buffer {
     storage: Vec<u8>,
     start: usize,
     max: usize,
 }
 
-impl RecvBuffer {
+impl Buffer {
     pub fn new(max: usize) -> Self {
         Self {
             storage: Vec::with_capacity(max),
@@ -25,142 +21,60 @@ impl RecvBuffer {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.storage.len() - self.start
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.start == self.storage.len()
-    }
-
-    pub fn filled(&self) -> &[u8] {
-        &self.storage[self.start..]
+    /// No allocation; the runtime supplies backing storage on demand.
+    pub fn empty(max: usize) -> Self {
+        Self {
+            storage: Vec::new(),
+            start: 0,
+            max,
+        }
     }
 
     pub fn filled_mut(&mut self) -> &mut [u8] {
         &mut self.storage[self.start..]
     }
 
-    pub fn max(&self) -> usize {
-        self.max
-    }
-
-    /// Ensure at least `min` writable bytes, then return the entire uninitialized tail.
-    ///
-    /// Compacts only when `max - len < min`. Capacity is `>= max` for the lifetime
-    /// of the buffer; this never grows.
-    pub fn spare_capacity_mut(&mut self, min: usize) -> Result<&mut [MaybeUninit<u8>]> {
-        let live = self.len();
-        if live.checked_add(min).is_none_or(|needed| needed > self.max) {
-            return Err(Error::PayloadTooLarge);
-        }
-        if self.max - self.storage.len() < min {
-            self.compact();
-        }
-        let writable = self.max - self.storage.len();
-        let spare = self.storage.spare_capacity_mut();
-        Ok(&mut spare[..writable])
-    }
-
-    /// Copy `bytes` into the uninitialized tail. Test and assembler helper.
-    pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let spare = self.spare_capacity_mut(bytes.len())?;
-        spare[..bytes.len()].write_copy_of_slice(bytes);
-        // SAFETY: `write_copy_of_slice` initialized `bytes.len()` bytes of the tail.
-        unsafe { self.commit(bytes.len()) }
-    }
-
-    /// Advance `len` after the caller has initialized `n` bytes of the spare tail.
-    ///
-    /// # Safety
-    ///
-    /// `storage[old_len..old_len + n]` must already be initialized.
-    pub unsafe fn commit(&mut self, n: usize) -> Result<()> {
-        let writable = self.max - self.storage.len();
-        if n > writable {
+    /// Replace the allocation, copying only live bytes. Invalidates absolute
+    /// codec offsets: callers must first consume every decoded record.
+    pub fn replace_storage(&mut self, mut storage: Vec<u8>) -> Result<Vec<u8>> {
+        if storage.capacity() < self.len() {
             return Err(Error::BufferTooSmall {
-                needed: self.storage.len().saturating_add(n),
-                available: self.storage.len() + writable,
+                needed: self.len(),
+                available: storage.capacity(),
             });
         }
-        let new_len = self.storage.len() + n;
-        // SAFETY: caller initialized `old_len..new_len`; `n <= writable`.
-        unsafe {
-            self.storage.set_len(new_len);
-        }
-        Ok(())
-    }
-
-    /// Commit `n` bytes previously initialized in the spare tail.
-    ///
-    /// Callers must have filled `storage[old_len..old_len + n]` through
-    /// [`Self::spare_capacity_mut`] (for example Tokio `ReadBuf::uninit`).
-    /// The `unsafe` stays in this buffer module.
-    pub fn commit_init(&mut self, n: usize) -> Result<()> {
-        // SAFETY: caller initialized `n` bytes of the spare tail.
-        unsafe { self.commit(n) }
-    }
-
-    pub fn consume(&mut self, n: usize) -> Result<()> {
-        if n > self.len() {
-            return Err(Error::BufferTooSmall {
-                needed: n,
-                available: self.len(),
-            });
-        }
-        self.start += n;
-        if self.start == self.storage.len() {
-            self.storage.clear();
-            self.start = 0;
-        }
-        Ok(())
-    }
-
-    fn compact(&mut self) {
-        if self.start == 0 {
-            return;
-        }
-        let live = self.storage.len() - self.start;
-        let end = self.storage.len();
-        self.storage.copy_within(self.start..end, 0);
-        self.storage.truncate(live);
+        storage.clear();
+        storage.extend_from_slice(self.filled());
         self.start = 0;
+        let mut previous = std::mem::replace(&mut self.storage, storage);
+        previous.clear();
+        Ok(previous)
     }
-}
 
-/// Contiguous encode allocation: `sent | unsent bytes | uninitialized spare`.
-///
-/// The codec writes Snell records directly into the spare and seals in place.
-/// TCP is a byte stream: [`Self::pending`] is one slice for `write()`, not
-/// one iovec per record.
-pub struct EncodeBuffer {
-    storage: Vec<u8>,
-    sent: usize,
-    max: usize,
-}
-
-impl EncodeBuffer {
-    pub fn new(max: usize) -> Self {
-        Self {
-            storage: Vec::with_capacity(max),
-            sent: 0,
-            max,
+    /// Release storage only when there are no live bytes.
+    pub fn take_empty_storage(&mut self) -> Option<Vec<u8>> {
+        if !self.is_empty() {
+            return None;
         }
+        self.start = 0;
+        Some(std::mem::take(&mut self.storage))
     }
 
-    pub fn pending(&self) -> &[u8] {
-        &self.storage[self.sent..]
+    pub fn into_storage(mut self) -> Vec<u8> {
+        self.storage.clear();
+        self.storage
+    }
+
+    pub fn filled(&self) -> &[u8] {
+        &self.storage[self.start..]
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sent == self.storage.len()
+        self.start == self.storage.len()
     }
 
     pub fn len(&self) -> usize {
-        self.storage.len() - self.sent
+        self.storage.len() - self.start
     }
 
     pub fn capacity(&self) -> usize {
@@ -178,17 +92,20 @@ impl EncodeBuffer {
 
     /// Ensure at least `min` writable bytes, then return the entire uninitialized tail.
     pub fn spare_capacity_mut(&mut self, min: usize) -> Result<&mut [MaybeUninit<u8>]> {
-        let unsent = self.len();
-        if unsent
-            .checked_add(min)
-            .is_none_or(|needed| needed > self.max)
-        {
+        let live = self.len();
+        if live.checked_add(min).is_none_or(|needed| needed > self.max) {
             return Err(Error::PayloadTooLarge);
         }
-        if self.max - self.storage.len() < min {
+        if self.capacity().min(self.max) - self.storage.len() < min {
             self.compact();
         }
-        let writable = self.max - self.storage.len();
+        let writable = self.capacity().min(self.max) - self.storage.len();
+        if writable < min {
+            return Err(Error::BufferTooSmall {
+                needed: self.len() + min,
+                available: self.capacity(),
+            });
+        }
         let spare = self.storage.spare_capacity_mut();
         Ok(&mut spare[..writable])
     }
@@ -205,7 +122,7 @@ impl EncodeBuffer {
     ///
     /// Until `total - fixed` further bytes are committed, subsequent
     /// [`Self::reserve_zeroed`], [`Self::extend_from_slice`], and
-    /// [`Self::commit_init`] calls within the record cannot compact or fail
+    /// [`Self::commit`] calls within the record cannot compact or fail
     /// for capacity, so absolute indices stay valid.
     pub(crate) fn reserve_record(&mut self, total: usize, fixed: usize) -> Result<usize> {
         debug_assert!(fixed <= total);
@@ -219,7 +136,7 @@ impl EncodeBuffer {
     }
 
     /// Copy `bytes` into the uninitialized tail and commit them.
-    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -231,20 +148,11 @@ impl EncodeBuffer {
 
     /// Entire uninitialized tail without compaction. The caller may initialize
     /// a prefix of it (for example through Tokio `ReadBuf::uninit`) and then
-    /// commit with [`Self::commit_init`].
+    /// commit with [`Self::commit`].
     pub(crate) fn spare_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        let writable = self.max - self.storage.len();
+        let writable = self.capacity().min(self.max) - self.storage.len();
         let spare = self.storage.spare_capacity_mut();
         &mut spare[..writable]
-    }
-
-    /// Commit `n` bytes previously initialized in the spare tail.
-    ///
-    /// Callers must have filled `storage[old_len..old_len + n]` through
-    /// [`Self::spare_uninit`]. The `unsafe` stays in this buffer module.
-    pub(crate) fn commit_init(&mut self, n: usize) -> Result<()> {
-        // SAFETY: caller initialized `n` bytes of the spare tail.
-        unsafe { self.commit(n) }
     }
 
     /// Zero-fill `n` bytes of spare and commit them. Returns the start index after compact.
@@ -264,8 +172,14 @@ impl EncodeBuffer {
     /// # Safety
     ///
     /// `storage[old_len..old_len + n]` must already be initialized.
+    ///
+    /// A bare length is not an initialization proof:
+    /// ```compile_fail
+    /// let mut buffer = snell_protocol::Buffer::new(16);
+    /// buffer.commit(16).unwrap();
+    /// ```
     pub unsafe fn commit(&mut self, n: usize) -> Result<()> {
-        let writable = self.max - self.storage.len();
+        let writable = self.capacity().min(self.max) - self.storage.len();
         if n > writable {
             return Err(Error::BufferTooSmall {
                 needed: self.storage.len().saturating_add(n),
@@ -289,7 +203,7 @@ impl EncodeBuffer {
 
     /// Indices are absolute in `storage` and invalid across compact.
     pub(crate) fn truncate(&mut self, len: usize) -> Result<()> {
-        if len < self.sent || len > self.storage.len() {
+        if len < self.start || len > self.storage.len() {
             return Err(Error::BufferTooSmall {
                 needed: len,
                 available: self.storage.len(),
@@ -299,31 +213,31 @@ impl EncodeBuffer {
         Ok(())
     }
 
-    pub fn advance(&mut self, written: usize) -> Result<()> {
-        let remaining = self.storage.len() - self.sent;
+    pub fn consume(&mut self, written: usize) -> Result<()> {
+        let remaining = self.storage.len() - self.start;
         if written > remaining {
             return Err(Error::BufferTooSmall {
                 needed: written,
                 available: remaining,
             });
         }
-        self.sent += written;
-        if self.sent == self.storage.len() {
+        self.start += written;
+        if self.start == self.storage.len() {
             self.storage.clear();
-            self.sent = 0;
+            self.start = 0;
         }
         Ok(())
     }
 
     fn compact(&mut self) {
-        if self.sent == 0 {
+        if self.start == 0 {
             return;
         }
-        let live = self.storage.len() - self.sent;
+        let live = self.storage.len() - self.start;
         let end = self.storage.len();
-        self.storage.copy_within(self.sent..end, 0);
+        self.storage.copy_within(self.start..end, 0);
         self.storage.truncate(live);
-        self.sent = 0;
+        self.start = 0;
     }
 }
 
@@ -331,7 +245,7 @@ impl EncodeBuffer {
 /// still uninitialized spare, then commit `written` caller-initialized bytes.
 /// Returns the total payload length including the prefix.
 pub(crate) fn commit_init_payload(
-    buf: &mut EncodeBuffer,
+    buf: &mut Buffer,
     payload_start: usize,
     prefix_len: usize,
     max_payload: usize,
@@ -346,8 +260,44 @@ pub(crate) fn commit_init_payload(
     if buf.end() != payload_start + prefix_len {
         return Err(Error::PendingWire);
     }
-    buf.commit_init(written)?;
+    // SAFETY: the public reservation entry point is unsafe and requires these
+    // exact payload bytes to have been initialized. This helper is crate-private.
+    unsafe {
+        buf.commit(written)?;
+    }
     Ok(total)
+}
+
+// Unsafe entry points live here, alongside the storage initialization boundary.
+impl<E: crate::Entropy, C: crate::Clock> crate::V4Reservation<'_, E, C> {
+    /// Seal bytes initialized directly in the uninitialized payload slot.
+    ///
+    /// # Safety
+    /// The first `written` bytes of this reservation's `payload_uninit()`
+    /// must have been initialized since the reservation was created.
+    pub unsafe fn seal_init(self, written: usize) -> Result<()> {
+        self.seal_init_impl(written)
+    }
+}
+impl<E: crate::Entropy, C: crate::Clock> crate::V6ShapedReservation<'_, E, C> {
+    /// Seal bytes initialized directly in the uninitialized payload slot.
+    ///
+    /// # Safety
+    /// The first `written` bytes of this reservation's `payload_uninit()`
+    /// must have been initialized since the reservation was created.
+    pub unsafe fn seal_init(self, written: usize) -> Result<()> {
+        self.seal_init_impl(written)
+    }
+}
+impl<E: crate::Entropy, C: crate::Clock> crate::V6UnshapedReservation<'_, E, C> {
+    /// Seal bytes initialized directly in the uninitialized payload slot.
+    ///
+    /// # Safety
+    /// The first `written` bytes of this reservation's `payload_uninit()`
+    /// must have been initialized since the reservation was created.
+    pub unsafe fn seal_init(self, written: usize) -> Result<()> {
+        self.seal_init_impl(written)
+    }
 }
 
 #[cfg(test)]
@@ -356,7 +306,7 @@ mod tests {
 
     #[test]
     fn recv_compact_only_when_needed() {
-        let mut buf = RecvBuffer::new(8);
+        let mut buf = Buffer::new(8);
         buf.extend_from_slice(b"abcd").unwrap();
         buf.consume(2).unwrap();
         buf.extend_from_slice(b"efghij").unwrap();
@@ -365,7 +315,7 @@ mod tests {
 
     #[test]
     fn spare_returns_entire_tail_not_min() {
-        let mut buf = RecvBuffer::new(64);
+        let mut buf = Buffer::new(64);
         let spare = buf.spare_capacity_mut(2).unwrap();
         assert!(spare.len() >= 2);
         assert_eq!(spare.len(), 64);
@@ -373,7 +323,7 @@ mod tests {
 
     #[test]
     fn does_not_compact_when_tail_already_fits() {
-        let mut buf = RecvBuffer::new(8);
+        let mut buf = Buffer::new(8);
         buf.extend_from_slice(b"abcd").unwrap();
         buf.consume(2).unwrap();
         let spare = buf.spare_capacity_mut(1).unwrap();
@@ -383,7 +333,7 @@ mod tests {
 
     #[test]
     fn commit_rejects_past_writable_tail() {
-        let mut buf = RecvBuffer::new(8);
+        let mut buf = Buffer::new(8);
         buf.extend_from_slice(b"ab").unwrap();
         assert_eq!(
             unsafe { buf.commit(7) },
@@ -397,7 +347,7 @@ mod tests {
 
     #[test]
     fn consume_rejects_past_filled() {
-        let mut buf = RecvBuffer::new(8);
+        let mut buf = Buffer::new(8);
         buf.extend_from_slice(b"ab").unwrap();
         assert_eq!(
             buf.consume(3),
@@ -415,42 +365,45 @@ mod tests {
 
     #[test]
     fn encode_buffer_partial_advance_is_contiguous() {
-        let mut buf = EncodeBuffer::new(64);
+        let mut buf = Buffer::new(64);
         buf.reserve_zeroed(5).unwrap();
         buf.range_mut(0, 5).copy_from_slice(b"hello");
         buf.reserve_zeroed(5).unwrap();
         buf.range_mut(5, 10).copy_from_slice(b"world");
-        assert_eq!(buf.pending(), b"helloworld");
-        buf.advance(3).unwrap();
-        assert_eq!(buf.pending(), b"loworld");
-        buf.advance(7).unwrap();
+        assert_eq!(buf.filled(), b"helloworld");
+        buf.consume(3).unwrap();
+        assert_eq!(buf.filled(), b"loworld");
+        buf.consume(7).unwrap();
         assert!(buf.is_empty());
     }
 
     #[test]
     fn encode_buffer_compacts_unsent_when_tail_is_short() {
-        let mut buf = EncodeBuffer::new(8);
+        let mut buf = Buffer::new(8);
         buf.reserve_zeroed(6).unwrap();
         buf.range_mut(0, 6).copy_from_slice(b"abcdef");
-        buf.advance(4).unwrap();
+        buf.consume(4).unwrap();
         buf.reserve_zeroed(6).unwrap();
         buf.range_mut(buf.filled_len() - 6, buf.filled_len())
             .copy_from_slice(b"ghijkl");
-        assert_eq!(buf.pending(), b"efghijkl");
+        assert_eq!(buf.filled(), b"efghijkl");
     }
 
     #[test]
     fn commit_init_advances_filled() {
-        let mut buf = RecvBuffer::new(8);
+        let mut buf = Buffer::new(8);
         let spare = buf.spare_capacity_mut(2).unwrap();
         spare[..2].write_copy_of_slice(b"ab");
-        buf.commit_init(2).unwrap();
+        // SAFETY: the preceding write initialized two spare bytes.
+        unsafe {
+            buf.commit(2).unwrap();
+        }
         assert_eq!(buf.filled(), b"ab");
     }
 
     #[test]
     fn reserve_record_commits_only_fixed_part() {
-        let mut buf = EncodeBuffer::new(64);
+        let mut buf = Buffer::new(64);
         let start = buf.reserve_record(16, 4).unwrap();
         assert_eq!(start, 0);
         assert_eq!(buf.end(), 4);
@@ -459,32 +412,35 @@ mod tests {
         buf.extend_from_slice(b"abcd").unwrap();
         let spare = buf.spare_uninit();
         spare[..4].write_copy_of_slice(b"efgh");
-        buf.commit_init(4).unwrap();
+        // SAFETY: the preceding write initialized four spare bytes.
+        unsafe {
+            buf.commit(4).unwrap();
+        }
         buf.reserve_zeroed(4).unwrap();
         assert_eq!(buf.end(), 16);
-        assert_eq!(buf.pending(), b"\0\0\0\0abcdefgh\0\0\0\0");
+        assert_eq!(buf.filled(), b"\0\0\0\0abcdefgh\0\0\0\0");
     }
 
     #[test]
     fn reserve_record_compacts_once_and_rejects_oversize() {
-        let mut buf = EncodeBuffer::new(8);
+        let mut buf = Buffer::new(8);
         buf.reserve_zeroed(6).unwrap();
         buf.range_mut(0, 6).copy_from_slice(b"abcdef");
-        buf.advance(4).unwrap();
+        buf.consume(4).unwrap();
         let start = buf.reserve_record(6, 2).unwrap();
         assert_eq!(start, 2, "compacted so the record fits the tail");
-        assert_eq!(buf.pending(), b"ef\0\0");
+        assert_eq!(buf.filled(), b"ef\0\0");
         assert_eq!(buf.reserve_record(64, 0), Err(Error::PayloadTooLarge));
     }
 
     #[test]
     fn truncate_rejects_below_sent_or_past_len() {
-        let mut buf = EncodeBuffer::new(16);
+        let mut buf = Buffer::new(16);
         buf.reserve_zeroed(8).unwrap();
-        buf.advance(3).unwrap();
+        buf.consume(3).unwrap();
         assert!(buf.truncate(2).is_err());
         assert!(buf.truncate(9).is_err());
         buf.truncate(6).unwrap();
-        assert_eq!(buf.pending().len(), 3);
+        assert_eq!(buf.filled().len(), 3);
     }
 }

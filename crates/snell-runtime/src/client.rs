@@ -1,3 +1,4 @@
+use crate::buffer::{BufferPool, OwnedBuffer};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -5,20 +6,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use snell_protocol::socks5::Reply;
 use snell_protocol::{
-    Address, EncodeBuffer, ProtocolFlavor, Psk, RecvBuffer, V4Decoder, V4Encoder, V6ShapedDecoder,
-    V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
+    Address, ProtocolFlavor, Psk, V4Decoder, V4Encoder, V6ShapedDecoder, V6ShapedEncoder,
+    V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{Instrument, debug, info, warn};
 
-use crate::codec::{TcpDecoder, TcpEncoder};
+use crate::codec::{TcpDecoder, TcpEncoder, with_codec};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::platform::{AcceptLoop, prepare_session_stream};
 use crate::pool::{PooledCodec, PooledConn, ReusePool};
 use crate::session::{
-    client_may_pool, new_encode, new_recv, read_server_tunnel, relay, with_handshake_timeout,
-    write_connect,
+    client_may_pool, read_server_tunnel, relay, with_handshake_timeout, write_connect,
 };
 use crate::socks::{Socks5Command, accept_socks5, socks5_reply_from_error, write_socks5_reply};
 use crate::udp::{UdpHub, UdpOptions};
@@ -33,6 +33,7 @@ pub struct ClientConfig {
     pub reuse: bool,
     pub pool: Option<ReusePool>,
     pub udp: UdpOptions,
+    pub buffers: Arc<BufferPool>,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -72,6 +73,7 @@ pub async fn serve_client(
         None
     };
     let hub = UdpHub::start(listener.local_addr()?, config.clone(), kdf.clone()).await?;
+    let mut reuse_maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut accept = AcceptLoop::new(&listener);
     let session_ids = AtomicU64::new(1);
     info!(listen = %listener.local_addr()?, "client started");
@@ -80,6 +82,9 @@ pub async fn serve_client(
             _ = &mut shutdown => {
                 info!("client shutting down");
                 return Ok(());
+            }
+            _ = reuse_maintenance.tick(), if pool.is_some() => {
+                if let Some(pool) = &pool { pool.expire(); }
             }
             accepted = accept.next() => {
                 let (stream, peer) = accepted?;
@@ -130,45 +135,32 @@ async fn client_handshake_and_relay(
     pool: Option<&ReusePool>,
 ) -> Result<(), SessionError> {
     let reuse = pool.is_some();
-    let mut from_pool = false;
-    let (snell, codec) = if let Some(pool) = pool
-        && let Some(conn) = pool.take()
-    {
-        from_pool = true;
-        debug!(
-            pool_len = pool.len(),
-            "checked out connection from reuse pool"
-        );
-        (conn.stream, conn.codec)
-    } else {
-        match dial_and_codec(config.server, &config.psk, config.version, kdf).await {
-            Ok(pair) => pair,
+    let mut pooled = pool.and_then(ReusePool::take);
+    let (opened, from_pool) = loop {
+        let from_pool = pooled.is_some();
+        let (snell, codec) = match pooled.take() {
+            Some(conn) => (conn.stream, conn.codec),
+            None => match dial_and_codec(config.server, &config.psk, config.version, kdf).await {
+                Ok(pair) => pair,
+                Err(error) => return Err(write_socks5_fail(local, error).await),
+            },
+        };
+        match open_session(
+            snell,
+            codec,
+            destination,
+            reuse,
+            kdf,
+            &config.psk,
+            &config.buffers,
+        )
+        .await
+        {
+            Ok(opened) => break (opened, from_pool),
+            // The pooled option is consumed, so only this first attempt can retry.
+            Err(error) if from_pool && error.is_stale_pool_error() => continue,
             Err(error) => return Err(write_socks5_fail(local, error).await),
         }
-    };
-
-    let opened = open_session(snell, codec, destination, reuse, kdf, &config.psk).await;
-    let Opened {
-        snell,
-        codec,
-        leftover,
-        encode,
-        recv,
-    } = match opened {
-        Ok(opened) => opened,
-        Err(error) if from_pool && error.is_stale_pool_error() => {
-            from_pool = false;
-            let (snell, codec) =
-                match dial_and_codec(config.server, &config.psk, config.version, kdf).await {
-                    Ok(pair) => pair,
-                    Err(error) => return Err(write_socks5_fail(local, error).await),
-                };
-            match open_session(snell, codec, destination, reuse, kdf, &config.psk).await {
-                Ok(opened) => opened,
-                Err(error) => return Err(write_socks5_fail(local, error).await),
-            }
-        }
-        Err(error) => return Err(write_socks5_fail(local, error).await),
     };
 
     write_socks5_reply(local, Reply::Succeeded).await?;
@@ -178,7 +170,7 @@ async fn client_handshake_and_relay(
         reused = from_pool,
         "handshake completed, tunnel established"
     );
-    finish_session(local, snell, codec, leftover, encode, recv, reuse, pool).await
+    finish_session(local, opened, reuse, pool).await
 }
 
 pub(crate) async fn dial_and_codec(
@@ -233,8 +225,8 @@ struct Opened {
     snell: TcpStream,
     codec: PooledCodec,
     leftover: Vec<u8>,
-    encode: EncodeBuffer,
-    recv: RecvBuffer,
+    encode: OwnedBuffer,
+    recv: OwnedBuffer,
 }
 
 async fn open_session(
@@ -244,53 +236,24 @@ async fn open_session(
     reuse: bool,
     kdf: &KdfLimiter,
     psk: &Psk,
+    buffers: &Arc<BufferPool>,
 ) -> Result<Opened, SessionError> {
-    let mut encode = new_encode();
-    let mut recv = new_recv();
-    let leftover = match &mut codec {
-        PooledCodec::V4 { encoder, decoder } => {
-            open_tunnel(
-                &mut snell,
-                encoder,
-                decoder,
-                &mut encode,
-                &mut recv,
-                destination,
-                reuse,
-                kdf,
-                psk,
-            )
-            .await?
-        }
-        PooledCodec::V6Shaped { encoder, decoder } => {
-            open_tunnel(
-                &mut snell,
-                encoder,
-                decoder,
-                &mut encode,
-                &mut recv,
-                destination,
-                reuse,
-                kdf,
-                psk,
-            )
-            .await?
-        }
-        PooledCodec::V6Unshaped { encoder, decoder } => {
-            open_tunnel(
-                &mut snell,
-                encoder,
-                decoder,
-                &mut encode,
-                &mut recv,
-                destination,
-                reuse,
-                kdf,
-                psk,
-            )
-            .await?
-        }
-    };
+    let mut encode = OwnedBuffer::new(buffers, snell_protocol::V6_WIRE_CAP);
+    let mut recv = OwnedBuffer::new(buffers, snell_protocol::V6_WIRE_CAP);
+    let leftover = with_codec!(&mut codec, |encoder, decoder| {
+        open_tunnel(
+            &mut snell,
+            encoder,
+            decoder,
+            &mut encode,
+            &mut recv,
+            destination,
+            reuse,
+            kdf,
+            psk,
+        )
+        .await?
+    });
     Ok(Opened {
         snell,
         codec,
@@ -300,96 +263,39 @@ async fn open_session(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn finish_session(
     local: &mut TcpStream,
-    mut snell: TcpStream,
-    codec: PooledCodec,
-    leftover: Vec<u8>,
-    mut encode: EncodeBuffer,
-    mut recv: RecvBuffer,
+    opened: Opened,
     reuse: bool,
     pool: Option<&ReusePool>,
 ) -> Result<(), SessionError> {
-    let back = match codec {
-        PooledCodec::V4 {
-            mut encoder,
-            mut decoder,
-        } => {
-            relay(
-                &mut snell,
-                local,
-                &mut encoder,
-                &mut decoder,
-                &mut recv,
-                &mut encode,
-                &leftover,
-                &[],
-                reuse,
-            )
-            .await?;
-            if reuse && client_may_pool(&encode, &recv, &decoder) {
-                Some(PooledConn {
-                    stream: snell,
-                    codec: PooledCodec::V4 { encoder, decoder },
-                })
-            } else {
-                None
-            }
-        }
-        PooledCodec::V6Shaped {
-            mut encoder,
-            mut decoder,
-        } => {
-            relay(
-                &mut snell,
-                local,
-                &mut encoder,
-                &mut decoder,
-                &mut recv,
-                &mut encode,
-                &leftover,
-                &[],
-                reuse,
-            )
-            .await?;
-            if reuse && client_may_pool(&encode, &recv, &decoder) {
-                Some(PooledConn {
-                    stream: snell,
-                    codec: PooledCodec::V6Shaped { encoder, decoder },
-                })
-            } else {
-                None
-            }
-        }
-        PooledCodec::V6Unshaped {
-            mut encoder,
-            mut decoder,
-        } => {
-            relay(
-                &mut snell,
-                local,
-                &mut encoder,
-                &mut decoder,
-                &mut recv,
-                &mut encode,
-                &leftover,
-                &[],
-                reuse,
-            )
-            .await?;
-            if reuse && client_may_pool(&encode, &recv, &decoder) {
-                Some(PooledConn {
-                    stream: snell,
-                    codec: PooledCodec::V6Unshaped { encoder, decoder },
-                })
-            } else {
-                None
-            }
-        }
-    };
-    if let (Some(pool), Some(conn)) = (pool, back)
-        && pool.put(conn)
+    let Opened {
+        mut snell,
+        mut codec,
+        leftover,
+        mut encode,
+        mut recv,
+    } = opened;
+    let reusable = with_codec!(&mut codec, |encoder, decoder| {
+        relay(
+            &mut snell,
+            local,
+            encoder,
+            decoder,
+            &mut recv,
+            &mut encode,
+            leftover,
+            reuse,
+        )
+        .await?;
+        reuse && client_may_pool(&encode, &recv, decoder)
+    });
+    if reusable
+        && let Some(pool) = pool
+        && pool.put(PooledConn {
+            stream: snell,
+            codec,
+        })
     {
         debug!(pool_len = pool.len(), "returned connection to reuse pool");
     }
@@ -401,8 +307,8 @@ async fn open_tunnel<E: TcpEncoder, D: TcpDecoder>(
     snell: &mut TcpStream,
     encoder: &mut E,
     decoder: &mut D,
-    encode: &mut EncodeBuffer,
-    recv: &mut RecvBuffer,
+    encode: &mut OwnedBuffer,
+    recv: &mut OwnedBuffer,
     destination: &Address,
     reuse: bool,
     kdf: &KdfLimiter,

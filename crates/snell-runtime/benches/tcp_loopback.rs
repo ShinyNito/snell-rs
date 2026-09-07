@@ -56,11 +56,9 @@ async fn run() {
         let large_elapsed = large_started.elapsed();
 
         let small = [0x5Au8; SMALL_SIZE];
-        let small_started = Instant::now();
-        ping_pong(&mut stream, &small, SMALL_ROUNDS)
+        let (small_elapsed, latency) = ping_pong(&mut stream, &small, SMALL_ROUNDS)
             .await
             .expect("small");
-        let small_elapsed = small_started.elapsed();
 
         stream.shutdown().await.expect("shutdown");
         echo.join.await.expect("echo join").expect("echo copy");
@@ -69,7 +67,8 @@ async fn run() {
             "{flavor:?} tcp loopback established session, handshake excluded from large/small\n\
              handshake: elapsed={handshake_elapsed:?}\n\
              large: bytes={LARGE_BYTES} chunk={LARGE_CHUNK} elapsed={large_elapsed:?}\n\
-             small: rounds={SMALL_ROUNDS} size={SMALL_SIZE} elapsed={small_elapsed:?}"
+             small: rounds={SMALL_ROUNDS} size={SMALL_SIZE} elapsed={small_elapsed:?} p50_ns={} p95_ns={} p99_ns={}",
+            latency[0], latency[1], latency[2]
         );
     }
 }
@@ -99,6 +98,7 @@ async fn start_pair(flavor: ProtocolFlavor) -> Pair {
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(flavor),
         outbound: Outbound::Direct,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
         tcp_brutal: None,
     };
@@ -115,6 +115,7 @@ async fn start_pair(flavor: ProtocolFlavor) -> Pair {
         version: flavor,
         reuse: false,
         pool: None,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
@@ -224,14 +225,25 @@ async fn pipelined_echo(
     Ok(())
 }
 
-async fn ping_pong(stream: &mut TcpStream, msg: &[u8], rounds: usize) -> io::Result<()> {
+async fn ping_pong(
+    stream: &mut TcpStream,
+    msg: &[u8],
+    rounds: usize,
+) -> io::Result<(std::time::Duration, [u128; 3])> {
     let mut echoed = vec![0u8; msg.len()];
+    let mut samples = Vec::with_capacity(rounds);
+    let started = Instant::now();
     for _ in 0..rounds {
+        let round = Instant::now();
         stream.write_all(msg).await?;
         stream.read_exact(&mut echoed).await?;
+        samples.push(round.elapsed().as_nanos());
         if echoed != msg {
             return Err(io::Error::other("small message echo mismatch"));
         }
     }
-    Ok(())
+    let elapsed = started.elapsed();
+    samples.sort_unstable();
+    let latency = [50, 95, 99].map(|percent| samples[(rounds * percent).div_ceil(100) - 1]);
+    Ok((elapsed, latency))
 }

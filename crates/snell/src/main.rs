@@ -116,6 +116,7 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
             version: cfg.version,
             reuse: cfg.reuse,
             pool: None,
+            buffers: Default::default(),
             udp: UdpOptions::new()?,
         });
     }
@@ -126,6 +127,7 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
         version: snell_config::parse_client_version(&args.version.expect("required by clap"))?,
         reuse: args.reuse,
         pool: None,
+        buffers: Default::default(),
         udp: UdpOptions::new()?,
     })
 }
@@ -138,6 +140,7 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
             psk: cfg.psk,
             selection: cfg.selection,
             outbound: map_outbound(cfg.outbound),
+            buffers: Default::default(),
             udp: UdpOptions::new()?,
             tcp_brutal: cfg.tcp_brutal.map(|brutal| TcpBrutal {
                 send_mbps: brutal.send_mbps,
@@ -163,6 +166,7 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
             Some(server) => Outbound::Socks5 { server },
             None => Outbound::Direct,
         },
+        buffers: Default::default(),
         udp: UdpOptions::new()?,
         tcp_brutal: None,
     })

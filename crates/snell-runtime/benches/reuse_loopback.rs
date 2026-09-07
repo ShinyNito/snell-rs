@@ -43,6 +43,16 @@ async fn run() {
         echo.join.await.unwrap().unwrap();
         let first = started.elapsed();
 
+        // EOF can arrive before the client task has returned its codec to the pool.
+        // Wait outside the timed window so the second sample really checks out a lease.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while pool.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first session returned to pool");
+
         let echo = spawn_echo().await.expect("echo2");
         let started = Instant::now();
         let mut stream = socks5_connect(pair.socks, echo.addr).await.expect("c2");
@@ -56,8 +66,8 @@ async fn run() {
 
         eprintln!(
             "{flavor:?} reuse two SOCKS5 echoes\n\
-             first (dial+kdf): elapsed={first:?}\n\
-             second (pooled): elapsed={second:?}\n\
+             first session echo (includes dial and handshake): elapsed={first:?}\n\
+             second session echo (reuse enabled): elapsed={second:?}\n\
              pool_len={}",
             pool.len()
         );
@@ -88,6 +98,7 @@ async fn start_pair(flavor: ProtocolFlavor, pool: ReusePool) -> Pair {
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(flavor),
         outbound: Outbound::Direct,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
         tcp_brutal: None,
     };
@@ -104,6 +115,7 @@ async fn start_pair(flavor: ProtocolFlavor, pool: ReusePool) -> Pair {
         version: flavor,
         reuse: true,
         pool: Some(pool),
+        buffers: Default::default(),
         udp: UdpOptions::default(),
     };
     tokio::spawn(async move {

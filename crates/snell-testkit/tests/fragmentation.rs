@@ -1,7 +1,7 @@
 use snell_protocol::{
-    DecodeStatus, EncodeBuffer, FixedClock, HEADER_CIPHER_LEN, MAX_PACKET_SIZE, Psk, RecvBuffer,
-    RepeatEntropy, SALT_LEN, V4_WIRE_CAP, V4Decoder, V4Encoder, V6UnshapedDecoder,
-    V6UnshapedEncoder, next_v4_chunk_limit,
+    Buffer, DecodeStatus, FixedClock, HEADER_CIPHER_LEN, MAX_PACKET_SIZE, Psk, RepeatEntropy,
+    SALT_LEN, V4_WIRE_CAP, V4Decoder, V4Encoder, V6UnshapedDecoder, V6UnshapedEncoder,
+    next_v4_chunk_limit,
 };
 use snell_testkit::FRAGMENTATION_CASES;
 
@@ -20,8 +20,8 @@ fn hello_encoder() -> V4Encoder<RepeatEntropy, FixedClock> {
     .unwrap()
 }
 
-fn encode_buf() -> EncodeBuffer {
-    EncodeBuffer::new(V4_WIRE_CAP)
+fn encode_buf() -> Buffer {
+    Buffer::new(V4_WIRE_CAP)
 }
 
 fn v4_hello_wire() -> Vec<u8> {
@@ -32,14 +32,14 @@ fn v4_hello_wire() -> Vec<u8> {
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    out.pending().to_vec()
+    out.filled().to_vec()
 }
 
-fn push(buf: &mut RecvBuffer, bytes: &[u8]) {
+fn push(buf: &mut Buffer, bytes: &[u8]) {
     buf.extend_from_slice(bytes).unwrap();
 }
 
-fn decode_hello(decoder: &mut V4Decoder, buf: &mut RecvBuffer) {
+fn decode_hello(decoder: &mut V4Decoder, buf: &mut Buffer) {
     match decoder.decode(buf).unwrap() {
         DecodeStatus::Record(record) => {
             assert_eq!(record.plaintext(buf.filled()), b"hello");
@@ -51,7 +51,7 @@ fn decode_hello(decoder: &mut V4Decoder, buf: &mut RecvBuffer) {
 
 fn feed_chunks(chunks: &[&[u8]]) {
     let mut decoder = V4Decoder::new(psk());
-    let mut buf = RecvBuffer::new(4096);
+    let mut buf = Buffer::new(4096);
     let mut got = false;
     for (i, chunk) in chunks.iter().enumerate() {
         push(&mut buf, chunk);
@@ -75,7 +75,7 @@ fn feed_chunks(chunks: &[&[u8]]) {
 fn byte_at_a_time() {
     let wire = v4_hello_wire();
     let mut decoder = V4Decoder::new(psk());
-    let mut buf = RecvBuffer::new(4096);
+    let mut buf = Buffer::new(4096);
     for (i, byte) in wire.iter().enumerate() {
         push(&mut buf, &[*byte]);
         match decoder.decode(&mut buf).unwrap() {
@@ -98,7 +98,7 @@ fn all_single_cuts() {
     assert_eq!(SALT_LEN + HEADER_CIPHER_LEN, 39);
     for cut in 0..=wire.len() {
         let mut decoder = V4Decoder::new(psk());
-        let mut buf = RecvBuffer::new(4096);
+        let mut buf = Buffer::new(4096);
         push(&mut buf, &wire[..cut]);
         if cut < wire.len() {
             match decoder.decode(&mut buf).unwrap() {
@@ -144,19 +144,19 @@ fn multi_record_read() {
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    let first = out.pending().to_vec();
-    out.advance(first.len()).unwrap();
+    let first = out.filled().to_vec();
+    out.consume(first.len()).unwrap();
     {
         let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"world");
         rec.seal(5).unwrap();
     }
-    let second = out.pending().to_vec();
+    let second = out.filled().to_vec();
     let mut both = first;
     both.extend_from_slice(&second);
 
     let mut decoder = V4Decoder::new(psk());
-    let mut buf = RecvBuffer::new(4096);
+    let mut buf = Buffer::new(4096);
     push(&mut buf, &both);
     match decoder.decode(&mut buf).unwrap() {
         DecodeStatus::Record(record) => {
@@ -183,12 +183,12 @@ fn partial_write() {
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    let wire = out.pending().to_vec();
-    out.advance(3).unwrap();
-    assert_eq!(out.pending(), &wire[3..]);
-    out.advance(2).unwrap();
-    assert_eq!(out.pending(), &wire[5..]);
-    out.advance(out.pending().len()).unwrap();
+    let wire = out.filled().to_vec();
+    out.consume(3).unwrap();
+    assert_eq!(out.filled(), &wire[3..]);
+    out.consume(2).unwrap();
+    assert_eq!(out.filled(), &wire[5..]);
+    out.consume(out.filled().len()).unwrap();
     assert!(out.is_empty());
 }
 
@@ -200,11 +200,11 @@ fn vectored_partial_write() {
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    let first_len = out.pending().len();
+    let first_len = out.filled().len();
     assert!(first_len > 1);
-    out.advance(1).unwrap();
-    assert_eq!(out.pending().len(), first_len - 1);
-    out.advance(out.pending().len()).unwrap();
+    out.consume(1).unwrap();
+    assert_eq!(out.filled().len(), first_len - 1);
+    out.consume(out.filled().len()).unwrap();
     assert!(out.is_empty());
 }
 
@@ -223,7 +223,7 @@ fn cancellation() {
         rec.payload_mut()[..3].copy_from_slice(b"one");
         rec.seal(3).unwrap();
     }
-    out.advance(out.pending().len()).unwrap();
+    out.consume(out.filled().len()).unwrap();
     let cancelled_cap;
     {
         let rec = encoder.reserve(&mut out, &[], MAX_PACKET_SIZE).unwrap();
@@ -265,14 +265,14 @@ fn v6_unshaped_hello_wire() -> Vec<u8> {
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    out.pending().to_vec()
+    out.filled().to_vec()
 }
 
 #[test]
 fn v6_unshaped_hello_byte_at_a_time() {
     let wire = v6_unshaped_hello_wire();
     let mut decoder = V6UnshapedDecoder::new(psk());
-    let mut buf = RecvBuffer::new(4096);
+    let mut buf = Buffer::new(4096);
     for (i, byte) in wire.iter().enumerate() {
         push(&mut buf, &[*byte]);
         match decoder.decode(&mut buf).unwrap() {
@@ -294,7 +294,7 @@ fn v6_unshaped_hello_every_cut() {
     let wire = v6_unshaped_hello_wire();
     for cut in 0..=wire.len() {
         let mut decoder = V6UnshapedDecoder::new(psk());
-        let mut buf = RecvBuffer::new(4096);
+        let mut buf = Buffer::new(4096);
         push(&mut buf, &wire[..cut]);
         if cut < wire.len() {
             match decoder.decode(&mut buf).unwrap() {

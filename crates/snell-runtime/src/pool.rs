@@ -93,6 +93,12 @@ impl ReusePool {
         true
     }
 
+    /// Drive from the listener's maintenance tick, including when unused.
+    pub fn expire(&self) {
+        self.lock()
+            .retain(|entry| entry.returned_at.elapsed() < self.max_idle);
+    }
+
     pub fn len(&self) -> usize {
         self.lock().len()
     }
@@ -124,10 +130,42 @@ mod tests {
     use std::thread;
     use tokio::net::TcpListener;
 
-    #[test]
-    fn drops_when_full() {
-        let pool = ReusePool::with_limits(0, Duration::from_secs(300));
-        assert_eq!(pool.len(), 0);
+    #[tokio::test]
+    async fn drops_when_full() {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = ReusePool::with_limits(1, Duration::from_secs(300));
+        let mut peers = Vec::new();
+        for accepted in [true, false] {
+            let stream = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let psk = snell_protocol::Psk::new(b"0123456789abcdef").unwrap();
+            assert_eq!(
+                pool.put(PooledConn {
+                    stream,
+                    codec: PooledCodec::V4 {
+                        encoder: V4Encoder::os(&psk).unwrap(),
+                        decoder: V4Decoder::new(psk),
+                    }
+                }),
+                accepted
+            );
+            assert_eq!(pool.len(), 1);
+            if !accepted {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), peer.read(&mut [0]))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+            } else {
+                // Keep the accepted socket live until the second insertion.
+                peers.push(peer);
+            }
+        }
     }
 
     #[tokio::test]

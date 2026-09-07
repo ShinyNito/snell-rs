@@ -1,4 +1,6 @@
+use crate::buffer::{BufferPool, OwnedBuffer};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -30,10 +32,14 @@ impl Outbound {
         }
     }
 
-    pub(crate) async fn open_udp(self, dns: &DnsResolver) -> Result<UdpFlow, SessionError> {
+    pub(crate) async fn open_udp(
+        self,
+        dns: &DnsResolver,
+        buffers: &Arc<BufferPool>,
+    ) -> Result<UdpFlow, SessionError> {
         match self {
-            Self::Direct => UdpFlow::direct().await,
-            Self::Socks5 { server } => UdpFlow::socks5(server, dns).await,
+            Self::Direct => UdpFlow::direct(buffers).await,
+            Self::Socks5 { server } => UdpFlow::socks5(server, dns, buffers).await,
         }
     }
 }
@@ -49,27 +55,31 @@ pub(crate) struct UdpRecv<'a> {
 pub(crate) enum UdpFlow {
     Direct {
         socket: UdpSocket,
-        recv: Vec<u8>,
+        recv: OwnedBuffer,
     },
     Socks5 {
         _control: TcpStream,
         socket: UdpSocket,
         relay: SocketAddr,
-        send: Vec<u8>,
-        recv: Vec<u8>,
+        send: OwnedBuffer,
+        recv: OwnedBuffer,
     },
 }
 
 impl UdpFlow {
-    async fn direct() -> Result<Self, SessionError> {
+    async fn direct(buffers: &Arc<BufferPool>) -> Result<Self, SessionError> {
         let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
         Ok(Self::Direct {
             socket,
-            recv: Vec::with_capacity(UDP_DATAGRAM_MAX),
+            recv: OwnedBuffer::new(buffers, UDP_DATAGRAM_MAX),
         })
     }
 
-    async fn socks5(server: SocketAddr, dns: &DnsResolver) -> Result<Self, SessionError> {
+    async fn socks5(
+        server: SocketAddr,
+        dns: &DnsResolver,
+        buffers: &Arc<BufferPool>,
+    ) -> Result<Self, SessionError> {
         let mut stream = connect_tcp(server).await?;
         let bind = socks5_udp_associate(&mut stream, dns).await?;
         let relay = rewrite_unspecified(bind, server);
@@ -83,8 +93,8 @@ impl UdpFlow {
             _control: stream,
             socket,
             relay,
-            send: Vec::with_capacity(UDP_DATAGRAM_MAX),
-            recv: Vec::with_capacity(UDP_DATAGRAM_MAX),
+            send: OwnedBuffer::new(buffers, UDP_DATAGRAM_MAX),
+            recv: OwnedBuffer::new(buffers, UDP_DATAGRAM_MAX),
         })
     }
 
@@ -114,10 +124,12 @@ impl UdpFlow {
                 if hdr_len.saturating_add(payload.len()) > UDP_DATAGRAM_MAX {
                     return Err(Error::PayloadTooLarge.into());
                 }
-                send.clear();
-                send.extend_from_slice(&hdr[..hdr_len]);
-                send.extend_from_slice(payload);
-                socket.send_to(send, *relay).await?;
+                send.extend(&hdr[..hdr_len])?;
+                send.extend(payload)?;
+                socket.send_to(send.filled(), *relay).await?;
+                let sent = send.len();
+                send.consume(sent)?;
+                send.release_empty();
                 Ok(())
             }
         }
@@ -130,17 +142,17 @@ impl UdpFlow {
     ) -> Result<UdpRecv<'_>, SessionError> {
         match self {
             Self::Direct { socket, recv } => {
-                recv.clear();
-                let (_, from) = socket.recv_buf_from(recv).await?;
+                recv.ensure(UDP_DATAGRAM_MAX)?;
+                let from = crate::bufio::recv_datagram(socket, recv).await?;
                 Ok(UdpRecv {
                     addr: Address::Ip(from),
-                    payload: recv.as_slice(),
+                    payload: recv.filled(),
                 })
             }
             Self::Socks5 { socket, recv, .. } => loop {
-                recv.clear();
-                socket.recv_buf_from(recv).await?;
-                let packet = match socks5::parse_udp_packet(recv) {
+                recv.ensure(UDP_DATAGRAM_MAX)?;
+                crate::bufio::recv_datagram(socket, recv).await?;
+                let packet = match socks5::parse_udp_packet(recv.filled()) {
                     Ok(packet) => packet,
                     Err(_) => {
                         invalid.fetch_add(1, Ordering::Relaxed);
@@ -155,7 +167,7 @@ impl UdpFlow {
                 let addr = packet.destination.into_owned();
                 return Ok(UdpRecv {
                     addr,
-                    payload: &recv[header_len..],
+                    payload: &recv.filled()[header_len..],
                 });
             },
         }

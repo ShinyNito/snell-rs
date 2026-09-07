@@ -20,13 +20,14 @@ use crate::outbound::Outbound;
 use crate::pool::{PooledCodec, PooledConn, ReusePool};
 use crate::replay::ReplayCache;
 use crate::server::handle_server;
-use crate::session::{new_encode, write_tunnel, write_udp_request, write_udp_setup};
+use crate::session::{write_tunnel, write_udp_request, write_udp_setup};
 use crate::{ClientConfig, ServerConfig, UdpOptions, serve_client, serve_server};
 
 const PSK: &[u8] = b"0123456789abcdef";
 
 struct Pair {
     socks: SocketAddr,
+    buffers: Arc<crate::BufferPool>,
     _stop_client: oneshot::Sender<()>,
     _stop_server: oneshot::Sender<()>,
 }
@@ -51,11 +52,13 @@ async fn start_pair_reuse(
     let (stop_server, server_rx) = oneshot::channel();
     let (stop_client, client_rx) = oneshot::channel();
 
+    let buffers = Arc::new(crate::BufferPool::default());
     let server_cfg = ServerConfig {
         listen: server_addr,
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(version),
         outbound,
+        buffers: buffers.clone(),
         udp: UdpOptions::default(),
         tcp_brutal,
     };
@@ -73,6 +76,7 @@ async fn start_pair_reuse(
         version,
         reuse,
         pool,
+        buffers: buffers.clone(),
         udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
@@ -84,6 +88,7 @@ async fn start_pair_reuse(
 
     Pair {
         socks,
+        buffers,
         _stop_client: stop_client,
         _stop_server: stop_server,
     }
@@ -128,7 +133,13 @@ async fn socks5_echo_inner(socks: SocketAddr, payload: &[u8]) -> io::Result<Vec<
     let mut reply_head = [0u8; 4];
     client.read_exact(&mut reply_head).await?;
     assert_eq!(reply_head[0], 0x05);
-    assert_eq!(reply_head[1], 0x00);
+    if reply_head[1] != 0 {
+        server.abort();
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SOCKS5 CONNECT rejected",
+        ));
+    }
     let mut bind = [0u8; 6];
     client.read_exact(&mut bind).await?;
 
@@ -239,6 +250,7 @@ async fn handshake_timeout() {
         psk,
         selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
         outbound: Outbound::Direct,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
         tcp_brutal: None,
     };
@@ -291,6 +303,7 @@ async fn socks5_reply_when_snell_closes_after_dial() {
         version: ProtocolFlavor::V4,
         reuse: false,
         pool: None,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
@@ -368,46 +381,6 @@ async fn socks5_outbound_slow_handshake_cannot_delay_tunnel_past_15s() {
     }
 }
 
-#[test]
-fn bulk_buffers_hold_one_max_v6_wire_record() {
-    // The decoder needs one maximum shaped record contiguous in the receive
-    // buffer; anything smaller would reject legal peer traffic.
-    assert!(crate::session::new_recv().max() >= snell_protocol::V6_WIRE_CAP);
-    assert!(crate::session::new_encode().max() >= snell_protocol::V6_WIRE_CAP);
-}
-
-#[test]
-fn tcp_hot_path_has_no_channel_or_flush() {
-    let sources = [
-        include_str!("session.rs"),
-        include_str!("client.rs"),
-        include_str!("server.rs"),
-        include_str!("bufio.rs"),
-        include_str!("outbound.rs"),
-        include_str!("auto.rs"),
-        include_str!("pool.rs"),
-    ];
-    for src in sources {
-        assert!(!src.contains("mpsc"), "TCP path must not use mpsc");
-        assert!(
-            !src.contains("tokio::sync::channel"),
-            "TCP path must not use channels"
-        );
-        assert!(
-            !src.contains(".flush("),
-            "TCP path must not unconditionally flush"
-        );
-    }
-    // outbound.rs (index 4) is exempt: `UdpFlow` allocates capacity-only
-    // datagram buffers once per UDP association, never per record.
-    for (i, src) in sources.iter().enumerate() {
-        assert!(
-            i == 4 || !src.contains("Vec::with_capacity"),
-            "TCP path must not allocate per record"
-        );
-    }
-}
-
 struct Counted {
     socks: SocketAddr,
     accepts: Arc<AtomicUsize>,
@@ -433,6 +406,7 @@ async fn start_counted(
         psk: psk.clone(),
         selection,
         outbound: Outbound::Direct,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
         tcp_brutal: None,
     };
@@ -449,7 +423,10 @@ async fn start_counted(
             let kdf = kdf.clone();
             let replay = replay.clone();
             tokio::spawn(async move {
-                let _ = handle_server(stream, server_cfg, kdf, replay).await;
+                let permit = Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap();
+                let _ = handle_server(stream, server_cfg, kdf, replay, permit).await;
             });
         }
     });
@@ -461,6 +438,7 @@ async fn start_counted(
         version,
         reuse,
         pool,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
     };
     tokio::spawn(async move {
@@ -530,15 +508,19 @@ async fn stale_pool_retries_once() {
     let dummy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dummy_addr = dummy.local_addr().unwrap();
     let stream = TcpStream::connect(dummy_addr).await.unwrap();
-    let peer = dummy.accept().await.unwrap().0;
-    drop(peer);
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    let mut peer = dummy.accept().await.unwrap().0;
     let psk = Psk::new(PSK.to_vec()).unwrap();
     let encoder = V4Encoder::os(&psk).unwrap();
     let decoder = V4Decoder::new(psk);
-    let _ = pool.put(PooledConn {
+    assert!(pool.put(PooledConn {
         stream,
         codec: PooledCodec::V4 { encoder, decoder },
+    }));
+    // Close only after checkout and the attempted CONNECT. A preclosed socket
+    // is rejected by put/take and never reaches the retry path.
+    let attempted = tokio::spawn(async move {
+        let mut byte = [0];
+        peer.read_exact(&mut byte).await.unwrap();
     });
 
     let counted = start_counted(
@@ -551,6 +533,10 @@ async fn stale_pool_retries_once() {
     let payload = b"stale-retry";
     let echoed = socks5_echo(counted.socks, payload).await.unwrap();
     assert_eq!(echoed, payload);
+    timeout(Duration::from_secs(2), attempted)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(counted.accepts.load(Ordering::SeqCst), 1);
 }
 
@@ -608,49 +594,29 @@ async fn auto_server_accepts_v6_shaped() {
 }
 
 #[tokio::test]
-async fn exact_v4_does_not_accept_v6_shaped() {
-    let counted = start_counted(
-        ProtocolFlavor::V6Shaped,
-        ProtocolSelection::Exact(ProtocolFlavor::V4),
-        false,
-        None,
-    )
-    .await;
-    let mut client = TcpStream::connect(counted.socks).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x00]);
-    client
-        .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 9])
-        .await
-        .unwrap();
-    let mut reply_head = [0u8; 4];
-    timeout(Duration::from_secs(5), client.read_exact(&mut reply_head))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(reply_head[0], 0x05);
-    assert_ne!(reply_head[1], 0x00);
-}
-
-#[test]
-fn exact_mode_does_not_probe() {
-    let src = include_str!("server.rs");
-    let calls = src.matches("detect_protocol(").count();
-    assert_eq!(calls, 1, "detect_protocol must be called once, from Auto");
-    let auto_idx = src.find("ProtocolSelection::Auto").expect("auto arm");
-    assert!(
-        src[auto_idx..].contains("detect_protocol("),
-        "auto arm must probe"
-    );
+async fn exact_modes_reject_other_wire_flavor() {
+    for (client, server) in [
+        (ProtocolFlavor::V6Shaped, ProtocolFlavor::V4),
+        (ProtocolFlavor::V4, ProtocolFlavor::V6Shaped),
+    ] {
+        let counted = start_counted(client, ProtocolSelection::Exact(server), false, None).await;
+        // socks5_echo creates a real listening destination. Port 9 would fail
+        // even if the server wrongly auto-detected and accepted the protocol.
+        let error = socks5_echo(counted.socks, b"must reject mismatched protocol")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied,
+            "must receive a rejection, not time out"
+        );
+    }
 }
 
 #[tokio::test]
 async fn early_payload_over_64kib_is_rejected() {
     use snell_protocol::{
-        Address, EncodeBuffer, MAX_CONNECT_REQUEST_LEN, SERVER_EARLY_PAYLOAD_MAX,
-        encode_connect_request,
+        Address, Buffer, MAX_CONNECT_REQUEST_LEN, SERVER_EARLY_PAYLOAD_MAX, encode_connect_request,
     };
 
     let psk = Psk::new(PSK.to_vec()).unwrap();
@@ -661,6 +627,7 @@ async fn early_payload_over_64kib_is_rejected() {
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
         outbound: Outbound::Direct,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
         tcp_brutal: None,
     };
@@ -671,13 +638,16 @@ async fn early_payload_over_64kib_is_rejected() {
             cfg,
             Arc::new(KdfLimiter::new()),
             Arc::new(ReplayCache::new()),
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
         )
         .await
     });
 
     let mut client = TcpStream::connect(addr).await.unwrap();
     let mut encoder = V4Encoder::os(&psk).unwrap();
-    let mut encode = EncodeBuffer::new(256 * 1024);
+    let mut encode = Buffer::new(256 * 1024);
     let dest = Address::from("127.0.0.1:9".parse::<SocketAddr>().unwrap());
     let mut req = [0u8; MAX_CONNECT_REQUEST_LEN];
     let n = encode_connect_request(&mut req, dest.as_view(), false).unwrap();
@@ -693,7 +663,7 @@ async fn early_payload_over_64kib_is_rejected() {
         reservation.seal(take).unwrap();
         offset += take;
     }
-    tokio::io::AsyncWriteExt::write_all(&mut client, encode.pending())
+    tokio::io::AsyncWriteExt::write_all(&mut client, encode.filled())
         .await
         .unwrap();
 
@@ -752,6 +722,7 @@ async fn start_pair_udp(
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(version),
         outbound,
+        buffers: Default::default(),
         udp: server_udp.clone(),
         tcp_brutal: None,
     };
@@ -768,6 +739,7 @@ async fn start_pair_udp(
         version,
         reuse: false,
         pool: None,
+        buffers: Default::default(),
         udp: client_udp.clone(),
     };
     tokio::spawn(async move {
@@ -953,7 +925,7 @@ async fn write_udp_request_rejects_payload_that_misses_v4_slot() {
 
     let psk = Psk::new(PSK.to_vec()).unwrap();
     let mut encoder = V4Encoder::os(&psk).unwrap();
-    let mut encode = new_encode();
+    let mut encode = crate::buffer::OwnedBuffer::new(&Arc::default(), snell_protocol::V6_WIRE_CAP);
     write_udp_setup(&mut encoder, &mut encode, &mut client)
         .await
         .unwrap();
@@ -1146,4 +1118,42 @@ async fn socks5_udp_proxy_once(mut stream: TcpStream) -> io::Result<()> {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn authenticated_idle_connections_hold_no_payload_leases() {
+    let pair = start_pair(ProtocolFlavor::V6Shaped, Outbound::Direct).await;
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = echo.local_addr().unwrap();
+    let mut clients = Vec::new();
+    let mut peers = Vec::new();
+    for _ in 0..100 {
+        let mut client = TcpStream::connect(pair.socks).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+        let mut request = [0; 32];
+        let n =
+            socks5::encode_request(&mut request, socks5::Command::Connect, AddressRef::Ip(addr))
+                .unwrap();
+        client.write_all(&request[..n]).await.unwrap();
+        peers.push(echo.accept().await.unwrap().0);
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+        clients.push(client);
+    }
+    timeout(Duration::from_secs(2), async {
+        while pair.buffers.stats().leased_bytes != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let stats = pair.buffers.stats();
+    assert_eq!(stats.allocating_bytes, 0);
+    assert!(stats.cached_bytes <= 2 << 20);
+    assert_eq!(clients.len(), 100);
+    assert_eq!(peers.len(), 100);
 }

@@ -6,10 +6,9 @@ const PSK: &str = "0123456789abcdef";
 static ORACLE_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[tokio::test]
+#[ignore = "requires SNELL_RS_TEST_BIN; cargo xtask check builds and runs this"]
 async fn v4_socks5_echo_roundtrip() {
-    let Some(binary) = process_bin() else {
-        return;
-    };
+    let binary = process_bin();
     let _lock = ORACLE_LOCK.lock().await;
 
     let pair = ProcessPair::spawn_v4(&binary, PSK)
@@ -23,10 +22,9 @@ async fn v4_socks5_echo_roundtrip() {
 }
 
 #[tokio::test]
+#[ignore = "requires SNELL_RS_TEST_BIN; cargo xtask check builds and runs this"]
 async fn v4_reuse_two_echoes() {
-    let Some(binary) = process_bin() else {
-        return;
-    };
+    let binary = process_bin();
     let _lock = ORACLE_LOCK.lock().await;
 
     let pair = ProcessPair::spawn(
@@ -50,10 +48,9 @@ async fn v4_reuse_two_echoes() {
 }
 
 #[tokio::test]
+#[ignore = "requires SNELL_RS_TEST_BIN; cargo xtask check builds and runs this"]
 async fn v4_throughput_64kib_x16() {
-    let Some(binary) = process_bin() else {
-        return;
-    };
+    let binary = process_bin();
     let _lock = ORACLE_LOCK.lock().await;
 
     let pair = ProcessPair::spawn_v4(&binary, PSK)
@@ -72,12 +69,6 @@ async fn v4_throughput_64kib_x16() {
     assert_eq!(report.bytes, 64 * 1024 * 16);
 }
 
-fn process_bin() -> Option<SnellBinary> {
-    match SnellBinary::from_env() {
-        Ok(binary) => Some(binary),
-        Err(_) => {
-            eprintln!("skipping: set SNELL_RS_TEST_BIN to a Snell binary");
-            None
-        }
-    }
+fn process_bin() -> SnellBinary {
+    SnellBinary::from_env().expect("set SNELL_RS_TEST_BIN to the built binary")
 }

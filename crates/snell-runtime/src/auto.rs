@@ -1,8 +1,10 @@
+use crate::buffer::{BufferPool, OwnedBuffer};
 use snell_protocol::{
     AUTO_DETECT_PREFIX_MAX, AUTO_DETECT_TIMEOUT_SECS, COMMAND_UDP, DecodeStatus, Error, ParseState,
-    PlainStream, Psk, RecordKind, RecvBuffer, SERVER_EARLY_PAYLOAD_MAX, V4Decoder, V4Encoder,
-    V6ShapedDecoder, V6ShapedEncoder,
+    PlainStream, Psk, RecordKind, SERVER_EARLY_PAYLOAD_MAX, V4Decoder, V4Encoder, V6ShapedDecoder,
+    V6ShapedEncoder,
 };
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 
@@ -25,13 +27,13 @@ pub(crate) enum Detected {
     V4 {
         encoder: V4Encoder,
         decoder: V4Decoder,
-        recv: RecvBuffer,
+        recv: OwnedBuffer,
         first: ServerFirst,
     },
     V6Shaped {
         encoder: V6ShapedEncoder,
         decoder: V6ShapedDecoder,
-        recv: RecvBuffer,
+        recv: OwnedBuffer,
         first: ServerFirst,
     },
 }
@@ -41,10 +43,11 @@ pub(crate) async fn detect_protocol(
     psk: Psk,
     kdf: &KdfLimiter,
     replay: &ReplayCache,
+    buffers: &Arc<BufferPool>,
 ) -> Result<Detected, SessionError> {
     match timeout(
         Duration::from_secs(AUTO_DETECT_TIMEOUT_SECS),
-        detect_inner(stream, psk, kdf, replay),
+        detect_inner(stream, psk, kdf, replay, buffers),
     )
     .await
     {
@@ -58,16 +61,17 @@ async fn detect_inner(
     psk: Psk,
     kdf: &KdfLimiter,
     replay: &ReplayCache,
+    buffers: &Arc<BufferPool>,
 ) -> Result<Detected, SessionError> {
-    let mut prefix = RecvBuffer::new(AUTO_DETECT_PREFIX_MAX);
+    let mut prefix = OwnedBuffer::new(buffers, AUTO_DETECT_PREFIX_MAX);
     let mut v4 = V4Decoder::new(psk.clone());
-    let mut v4_recv = RecvBuffer::new(AUTO_DETECT_PREFIX_MAX);
+    let mut v4_recv = OwnedBuffer::new(buffers, snell_protocol::V6_WIRE_CAP);
     let mut v4_fed = 0usize;
     let mut v4_plain = PlainStream::new(HANDSHAKE_PLAIN_MAX);
     let mut v4_state = Cand::NeedMore;
 
     let mut v6 = V6ShapedDecoder::new(psk.clone())?;
-    let mut v6_recv = RecvBuffer::new(AUTO_DETECT_PREFIX_MAX);
+    let mut v6_recv = OwnedBuffer::new(buffers, snell_protocol::V6_WIRE_CAP);
     let mut v6_fed = 0usize;
     let mut v6_plain = PlainStream::new(HANDSHAKE_PLAIN_MAX);
     let mut v6_state = Cand::NeedMore;
@@ -130,7 +134,7 @@ async fn detect_inner(
                 if prefix.len() >= prefix.max() {
                     return Err(SessionError::Aead);
                 }
-                let n = read_into_recv(stream, &mut prefix).await?;
+                let n = read_into_recv(stream, &mut prefix, 1).await?;
                 if n == 0 {
                     return Err(SessionError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -142,18 +146,18 @@ async fn detect_inner(
     }
 }
 
-fn feed(dst: &mut RecvBuffer, fed: &mut usize, prefix: &RecvBuffer) -> Result<(), SessionError> {
+fn feed(dst: &mut OwnedBuffer, fed: &mut usize, prefix: &OwnedBuffer) -> Result<(), SessionError> {
     if *fed >= prefix.len() {
         return Ok(());
     }
-    dst.extend_from_slice(&prefix.filled()[*fed..])?;
+    dst.extend(&prefix.filled()[*fed..])?;
     *fed = prefix.len();
     Ok(())
 }
 
 async fn advance<D: TcpDecoder>(
     decoder: &mut D,
-    recv: &mut RecvBuffer,
+    recv: &mut OwnedBuffer,
     plain: &mut PlainStream,
     state: &mut Cand,
     kdf: &KdfLimiter,
@@ -177,9 +181,9 @@ async fn advance<D: TcpDecoder>(
                     *state = Cand::Invalid;
                     return Ok(());
                 }
-                let bytes = record.plaintext(recv.filled()).to_vec();
+                let pushed = plain.push(record.plaintext(recv.filled()));
                 decoder.consume(recv, &record)?;
-                if plain.push(&bytes).is_err() {
+                if pushed.is_err() {
                     *state = Cand::Invalid;
                     return Ok(());
                 }

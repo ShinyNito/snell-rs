@@ -4,7 +4,7 @@ use core::fmt;
 
 use crate::header::{parse_v6_plain_header, write_v6_plain_header};
 use crate::record::{DecodeStatus, DecodedRecord, RecordKind};
-use crate::{EncodeBuffer, Error, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, RecvBuffer, Result};
+use crate::{Buffer, Error, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, Result};
 
 pub struct V6UnsafeRawEncoder {
     reserving: bool,
@@ -18,7 +18,7 @@ pub struct V6UnsafeRawEncoder {
 #[must_use = "unsealed reservations are cancelled on drop"]
 pub struct V6UnsafeRawReservation<'a> {
     encoder: &'a mut V6UnsafeRawEncoder,
-    buf: &'a mut EncodeBuffer,
+    buf: &'a mut Buffer,
     sealed: bool,
 }
 
@@ -36,7 +36,7 @@ impl V6UnsafeRawEncoder {
 
     pub fn reserve<'buf>(
         &'buf mut self,
-        buf: &'buf mut EncodeBuffer,
+        buf: &'buf mut Buffer,
         prefix: &[u8],
         hint: usize,
     ) -> Result<V6UnsafeRawReservation<'buf>> {
@@ -69,7 +69,7 @@ impl V6UnsafeRawEncoder {
         })
     }
 
-    fn finish(&mut self, buf: &mut EncodeBuffer, payload_len: usize) -> Result<()> {
+    fn finish(&mut self, buf: &mut Buffer, payload_len: usize) -> Result<()> {
         if payload_len > self.max_payload {
             self.reserving = false;
             buf.truncate(self.record_start)?;
@@ -160,7 +160,7 @@ impl V6UnsafeRawDecoder {
         None
     }
 
-    pub fn decode(&mut self, buf: &mut RecvBuffer) -> Result<DecodeStatus> {
+    pub fn decode(&mut self, buf: &mut Buffer) -> Result<DecodeStatus> {
         loop {
             match self.step {
                 ReadStep::Header => {
@@ -202,7 +202,7 @@ impl V6UnsafeRawDecoder {
         }
     }
 
-    pub fn consume(&mut self, buf: &mut RecvBuffer, record: &DecodedRecord) -> Result<()> {
+    pub fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
         self.pending = self
             .pending
             .checked_sub(record.consumed)
@@ -214,7 +214,7 @@ impl V6UnsafeRawDecoder {
     /// `minimum` is measured from the start of `filled()` and includes
     /// `pending`. A record must fit the buffer on its own; when outstanding
     /// records crowd it out, report `NeedMore` so the caller drains first.
-    fn decode_need(&self, buf: &RecvBuffer, minimum: usize) -> Result<Option<DecodeStatus>> {
+    fn decode_need(&self, buf: &Buffer, minimum: usize) -> Result<Option<DecodeStatus>> {
         if minimum - self.pending > buf.max() {
             Err(Error::PayloadTooLarge)
         } else if buf.len() < minimum {
@@ -242,16 +242,16 @@ impl fmt::Debug for V6UnsafeRawDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::EncodeBuffer;
+    use crate::Buffer;
 
-    fn collect(buf: &EncodeBuffer) -> Vec<u8> {
-        buf.pending().to_vec()
+    fn collect(buf: &Buffer) -> Vec<u8> {
+        buf.filled().to_vec()
     }
 
     #[test]
     fn hello_is_plain_header_plus_payload() {
         let mut enc = V6UnsafeRawEncoder::new();
-        let mut out = EncodeBuffer::new(64);
+        let mut out = Buffer::new(64);
         {
             let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"hello");
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(&wire[7..], b"hello");
 
         let mut decoder = V6UnsafeRawDecoder::new();
-        let mut buf = RecvBuffer::new(64);
+        let mut buf = Buffer::new(64);
         buf.extend_from_slice(&wire).unwrap();
         match decoder.decode(&mut buf).unwrap() {
             DecodeStatus::Record(record) => {
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn two_records_concat() {
         let mut enc = V6UnsafeRawEncoder::new();
-        let mut out = EncodeBuffer::new(64);
+        let mut out = Buffer::new(64);
         {
             let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"hello");
@@ -292,7 +292,7 @@ mod tests {
         }
         let wire = collect(&out);
         let mut decoder = V6UnsafeRawDecoder::new();
-        let mut buf = RecvBuffer::new(64);
+        let mut buf = Buffer::new(64);
         buf.extend_from_slice(&wire).unwrap();
         let mut plain = Vec::new();
         loop {
@@ -312,15 +312,15 @@ mod tests {
     #[test]
     fn decode_ahead_batches_records_before_consume() {
         let mut enc = V6UnsafeRawEncoder::new();
-        let mut out = EncodeBuffer::new(64);
+        let mut out = Buffer::new(64);
         for msg in [&b"hello"[..], b"world"] {
             let mut rec = enc.reserve(&mut out, &[], msg.len()).unwrap();
             rec.payload_mut()[..msg.len()].copy_from_slice(msg);
             rec.seal(msg.len()).unwrap();
         }
-        let wire = out.pending().to_vec();
+        let wire = out.filled().to_vec();
         let mut decoder = V6UnsafeRawDecoder::new();
-        let mut buf = RecvBuffer::new(64);
+        let mut buf = Buffer::new(64);
         buf.extend_from_slice(&wire).unwrap();
         let DecodeStatus::Record(first) = decoder.decode(&mut buf).unwrap() else {
             panic!("first record not ready");

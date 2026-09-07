@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use snell_protocol::{
-    ATYP_IPV4, COMMAND_CONNECT, COMMAND_CONNECT_V2, COMMAND_ERROR, COMMAND_TUNNEL, COMMAND_UDP,
-    COMMAND_UDP_FORWARD, DecodeStatus, ERROR_REJECT, EncodeBuffer, FixedClock, PROTOCOL_VERSION,
-    Psk, RecvBuffer, RepeatEntropy, SALT_LEN, V4_WIRE_CAP, V4Decoder, V4Encoder, V6_WIRE_CAP,
-    V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
+    ATYP_IPV4, Buffer, COMMAND_CONNECT, COMMAND_CONNECT_V2, COMMAND_ERROR, COMMAND_TUNNEL,
+    COMMAND_UDP, COMMAND_UDP_FORWARD, DecodeStatus, ERROR_REJECT, FixedClock, PROTOCOL_VERSION,
+    Psk, RepeatEntropy, SALT_LEN, V4_WIRE_CAP, V4Decoder, V4Encoder, V6_WIRE_CAP, V6ShapedDecoder,
+    V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use snell_testkit::load_golden_dir;
 
@@ -88,17 +88,17 @@ fn v4_record_fixture_round_trips() {
         FixedClock::new(0),
     )
     .unwrap();
-    let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+    let mut out = Buffer::new(V4_WIRE_CAP);
     {
         let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    let wire = out.pending().to_vec();
+    let wire = out.filled().to_vec();
     assert_eq!(wire, expected);
 
     let mut decoder = V4Decoder::new(psk);
-    let mut buf = RecvBuffer::new(4096);
+    let mut buf = Buffer::new(4096);
     buf.extend_from_slice(&wire).unwrap();
     match decoder.decode(&mut buf).unwrap() {
         DecodeStatus::Record(record) => {
@@ -125,17 +125,17 @@ fn v4_padded_record_fixture_matches_hex() {
         FixedClock::new(0),
     )
     .unwrap();
-    let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+    let mut out = Buffer::new(V4_WIRE_CAP);
     {
         let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    let wire = out.pending().to_vec();
+    let wire = out.filled().to_vec();
     assert_eq!(wire, expected);
 
     let mut decoder = V4Decoder::new(psk);
-    let mut buf = RecvBuffer::new(4096);
+    let mut buf = Buffer::new(4096);
     buf.extend_from_slice(&wire).unwrap();
     match decoder.decode(&mut buf).unwrap() {
         DecodeStatus::Record(record) => {
@@ -161,17 +161,17 @@ fn v6_unshaped_record_matches_v4_no_padding_hex() {
         FixedClock::new(0),
     )
     .unwrap();
-    let mut out = EncodeBuffer::new(V4_WIRE_CAP);
+    let mut out = Buffer::new(V4_WIRE_CAP);
     {
         let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    let wire = out.pending().to_vec();
+    let wire = out.filled().to_vec();
     assert_eq!(wire, expected);
 
     let mut decoder = V6UnshapedDecoder::new(psk);
-    let mut buf = RecvBuffer::new(4096);
+    let mut buf = Buffer::new(4096);
     buf.extend_from_slice(&wire).unwrap();
     match decoder.decode(&mut buf).unwrap() {
         DecodeStatus::Record(record) => {
@@ -198,17 +198,17 @@ fn v6_shaped_record_fixture_matches_hex() {
         FixedClock::new(0),
     )
     .unwrap();
-    let mut out = EncodeBuffer::new(V6_WIRE_CAP);
+    let mut out = Buffer::new(V6_WIRE_CAP);
     {
         let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
     }
-    let wire = out.pending().to_vec();
+    let wire = out.filled().to_vec();
     assert_eq!(wire, expected);
 
     let mut decoder = V6ShapedDecoder::new(psk).unwrap();
-    let mut buf = RecvBuffer::new(V6_WIRE_CAP);
+    let mut buf = Buffer::new(V6_WIRE_CAP);
     buf.extend_from_slice(&wire).unwrap();
     match decoder.decode(&mut buf).unwrap() {
         DecodeStatus::Record(record) => {

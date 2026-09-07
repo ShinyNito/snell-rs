@@ -3,14 +3,16 @@
 //! Owns sockets, tasks, timeouts, reuse, auto-detect, replay, outbound,
 //! bounded KDF, the SOCKS5 UDP dispatcher, and platform socket options.
 //! The TCP hot path uses borrowed split, `try_join!`, and a single
-//! `write(pending())` of [`EncodeBuffer`] — no `mpsc`, no per-record `Vec`,
+//! `write(filled())` of [`snell_protocol::Buffer`] — no `mpsc`, no per-record `Vec`,
 //! no unconditional `flush`. UDP associations may use a bounded `mpsc` per
 //! association.
 
 #![deny(unsafe_code)]
 
 mod auto;
+mod buffer;
 mod bufio;
+pub use buffer::{BufferLimits, BufferPool, BufferStats};
 mod client;
 mod codec;
 mod dns;

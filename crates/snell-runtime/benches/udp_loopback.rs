@@ -41,9 +41,14 @@ async fn run() {
     ] {
         let pair = start_pair(flavor).await;
         let echo = spawn_udp_echo().await.expect("echo");
-        let handshake_started = Instant::now();
+        let control_started = Instant::now();
         let session = socks5_udp_associate(pair.socks).await.expect("associate");
-        let handshake_elapsed = handshake_started.elapsed();
+        let control_elapsed = control_started.elapsed();
+        let tunnel_started = Instant::now();
+        ping_pong(&session, echo, &PAYLOAD, 1)
+            .await
+            .expect("first datagram establishes tunnel");
+        let tunnel_elapsed = tunnel_started.elapsed();
 
         ping_pong(&session, echo, &PAYLOAD, WARMUP_ROUNDS)
             .await
@@ -67,7 +72,8 @@ async fn run() {
 
         eprintln!(
             "{flavor:?} udp loopback established association, handshake excluded from ping-pong\n\
-             handshake: elapsed={handshake_elapsed:?}\n\
+             SOCKS5 control associate: elapsed={control_elapsed:?}\n\
+             first datagram (includes tunnel handshake): elapsed={tunnel_elapsed:?}\n\
              ping: rounds={PING_ROUNDS} size={} elapsed={ping_elapsed:?}\n\
              burst: rounds={BURST_ROUNDS} window={BURST_WINDOW} size={} elapsed={burst_elapsed:?}",
             PAYLOAD.len(),
@@ -101,6 +107,7 @@ async fn start_pair(flavor: ProtocolFlavor) -> Pair {
         psk: psk.clone(),
         selection: ProtocolSelection::Exact(flavor),
         outbound: Outbound::Direct,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
         tcp_brutal: None,
     };
@@ -117,6 +124,7 @@ async fn start_pair(flavor: ProtocolFlavor) -> Pair {
         version: flavor,
         reuse: false,
         pool: None,
+        buffers: Default::default(),
         udp: UdpOptions::default(),
     };
     tokio::spawn(async move {

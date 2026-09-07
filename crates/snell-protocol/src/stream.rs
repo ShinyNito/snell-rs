@@ -2,19 +2,19 @@ use crate::control::{
     ConnectRequest, ServerReply, decode_connect_request_prefix, decode_server_reply,
     decode_udp_setup_prefix,
 };
-use crate::{Error, ParseState, RecvBuffer, Result};
+use crate::{Buffer, Error, ParseState, Result};
 
 /// Handshake-only assembler: concatenates record plaintext across records.
 ///
 /// Bulk TCP after Tunnel/CONNECT must not go through this type.
 pub struct PlainStream {
-    buf: RecvBuffer,
+    buf: Buffer,
 }
 
 impl PlainStream {
     pub fn new(max: usize) -> Self {
         Self {
-            buf: RecvBuffer::new(max),
+            buf: Buffer::new(max),
         }
     }
 

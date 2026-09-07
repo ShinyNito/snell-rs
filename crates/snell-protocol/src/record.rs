@@ -1,9 +1,9 @@
 use std::ops::Range;
 
-/// Outcome of feeding ciphertext currently in a [`crate::RecvBuffer`].
+/// Outcome of feeding ciphertext currently in a [`crate::Buffer`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecodeStatus {
-    /// Need at least `minimum` bytes from the start of `RecvBuffer::filled`
+    /// Need at least `minimum` bytes from the start of `Buffer::filled`
     /// (including any returned-but-unconsumed records). When outstanding
     /// records leave no room for the next one, `minimum` can exceed the
     /// buffer capacity: consume the outstanding records first.

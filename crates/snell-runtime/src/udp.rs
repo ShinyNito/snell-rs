@@ -4,6 +4,7 @@
 //! Each association owns one Snell TCP. Idle uses a per-association `Sleep`,
 //! not an O(N) map scan. Queue full is `try_send` failure plus a real counter.
 
+use crate::buffer::OwnedBuffer;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
@@ -13,8 +14,8 @@ use std::time::Duration;
 
 use snell_protocol::socks5::{self, Reply};
 use snell_protocol::{
-    Address, EncodeBuffer, Error, MAX_UDP_PACKET_ADDR_LEN, ProtocolFlavor, Psk, RecvBuffer,
-    UDP_ASSOCIATION_IDLE_SECS, UDP_DATAGRAM_MAX, decode_udp_request, decode_udp_response,
+    Address, Error, MAX_UDP_PACKET_ADDR_LEN, ProtocolFlavor, Psk, UDP_ASSOCIATION_IDLE_SECS,
+    UDP_DATAGRAM_MAX, decode_udp_request, decode_udp_response,
 };
 
 use tokio::io::AsyncReadExt;
@@ -23,17 +24,15 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::client::dial_and_codec;
-use crate::codec::{TcpDecoder, TcpEncoder};
+use crate::codec::{TcpDecoder, TcpEncoder, with_codec};
 use crate::dns::DnsResolver;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
-use crate::packet::{PacketBuf, PacketPool};
-use crate::pool::PooledCodec;
+use crate::packet::{PacketBuf, PacketQuota};
 use crate::session::{
-    RecordEvent, decode_once, ensure_bulk, new_encode, new_recv, read_server_tunnel,
-    with_handshake_timeout, write_reject, write_tunnel, write_udp_request, write_udp_response,
-    write_udp_setup,
+    RecordEvent, decode_once, read_server_tunnel, with_handshake_timeout, write_reject,
+    write_tunnel, write_udp_request, write_udp_response, write_udp_setup,
 };
 use crate::socks::write_socks5_reply_bind;
 
@@ -161,6 +160,28 @@ pub(crate) struct UdpHub {
     next_control: Arc<AtomicU64>,
     control_count: Arc<AtomicU64>,
     limits: UdpLimits,
+    _dispatcher: Arc<StopDispatcher>,
+}
+
+struct StopDispatcher(tokio::task::AbortHandle);
+impl Drop for StopDispatcher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct ControlGuard {
+    count: Arc<AtomicU64>,
+    close: Option<mpsc::OwnedPermit<Ctrl>>,
+    id: ControlId,
+}
+impl Drop for ControlGuard {
+    fn drop(&mut self) {
+        if let Some(permit) = self.close.take() {
+            permit.send(Ctrl::Remove(self.id));
+        }
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl UdpHub {
@@ -174,9 +195,14 @@ impl UdpHub {
         let socket = Arc::new(socket);
         let limits = config.udp.limits;
         let metrics = config.udp.metrics.clone();
-        let pool = Arc::new(PacketPool::new(limits.pool_bufs, limits.pool_bytes));
+        let pool = Arc::new(PacketQuota::new(
+            config.buffers.clone(),
+            limits.pool_bufs,
+            limits.pool_bytes,
+        ));
         let ctrl_cap = limits
             .max_controls
+            .saturating_mul(2)
             .saturating_add(limits.max_associations)
             .max(1);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(ctrl_cap);
@@ -186,7 +212,7 @@ impl UdpHub {
             version: config.version,
             kdf,
         };
-        tokio::spawn(dispatcher(
+        let dispatcher = tokio::spawn(dispatcher(
             socket,
             ctrl_rx,
             ctrl_tx.clone(),
@@ -197,6 +223,7 @@ impl UdpHub {
         ));
         Ok(Self {
             bind,
+            _dispatcher: Arc::new(StopDispatcher(dispatcher.abort_handle())),
             ctrl: ctrl_tx,
             next_control: Arc::new(AtomicU64::new(1)),
             control_count: Arc::new(AtomicU64::new(0)),
@@ -216,10 +243,24 @@ impl UdpHub {
             return Err(SessionError::UdpLimit);
         }
         let id = self.next_control.fetch_add(1, Ordering::Relaxed);
-        if self.ctrl.send(Ctrl::Add(id)).await.is_err() {
-            self.control_count.fetch_sub(1, Ordering::Relaxed);
-            return Err(SessionError::Cancelled);
-        }
+        let mut guard = ControlGuard {
+            count: self.control_count.clone(),
+            close: None,
+            id,
+        };
+        // Reserve the close notification before registering the control. Drop
+        // can then notify cancellation without spawning or losing a full-queue send.
+        guard.close = Some(
+            self.ctrl
+                .clone()
+                .reserve_owned()
+                .await
+                .map_err(|_| SessionError::Cancelled)?,
+        );
+        self.ctrl
+            .send(Ctrl::Add(id))
+            .await
+            .map_err(|_| SessionError::Cancelled)?;
         write_socks5_reply_bind(&mut local, Reply::Succeeded, self.bind_addr()).await?;
         let mut buf = [0u8; 1];
         loop {
@@ -229,8 +270,6 @@ impl UdpHub {
                 Err(_) => break,
             }
         }
-        let _ = self.ctrl.send(Ctrl::Remove(id)).await;
-        self.control_count.fetch_sub(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -265,63 +304,41 @@ async fn dispatcher(
     socket: Arc<UdpSocket>,
     mut ctrl_rx: mpsc::Receiver<Ctrl>,
     ctrl_tx: mpsc::Sender<Ctrl>,
-    pool: Arc<PacketPool>,
+    pool: Arc<PacketQuota>,
     metrics: Arc<UdpMetrics>,
     limits: UdpLimits,
     dial: Dial,
 ) {
     let mut map: HashMap<SocketAddr, AssocEntry> = HashMap::new();
     let mut controls: HashMap<ControlId, Control> = HashMap::new();
-    // Uninit-append receives: the kernel writes the datagram, so neither the
-    // scratch sink nor pooled buffers are ever zero-filled up front.
-    let mut drop_scratch: Vec<u8> = Vec::with_capacity(UDP_DATAGRAM_MAX);
-    let mut held = pool.acquire(UDP_DATAGRAM_MAX);
     loop {
-        if let Some(mut buf) = held.take() {
-            let result = {
-                let storage = buf.storage_mut();
-                tokio::select! {
-                    ctrl = ctrl_rx.recv() => Err(ctrl),
-                    result = socket.recv_buf_from(storage) => Ok(result),
-                }
-            };
-            match result {
-                Err(None) => return,
-                Err(Some(ctrl)) => {
-                    held = Some(buf);
-                    apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
-                }
-                Ok(Ok((_, peer))) => {
-                    handle_datagram(
-                        peer,
-                        buf,
-                        &mut map,
-                        &mut controls,
-                        &pool,
-                        &metrics,
-                        limits,
-                        &dial,
-                        &socket,
-                        &ctrl_tx,
-                    );
-                    held = pool.acquire(UDP_DATAGRAM_MAX);
-                }
-                Ok(Err(_)) => {
-                    held = Some(buf);
-                }
+        tokio::select! {
+            ctrl = ctrl_rx.recv() => {
+                let Some(ctrl) = ctrl else { return; };
+                apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
+                continue;
             }
-        } else {
+            ready = socket.readable() => { if ready.is_err() { return; } }
+        }
+        let Some(mut buf) = pool.acquire(UDP_DATAGRAM_MAX) else {
+            metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
             tokio::select! {
                 ctrl = ctrl_rx.recv() => {
                     let Some(ctrl) = ctrl else { return; };
                     apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
                 }
-                result = socket.recv_buf_from(&mut drop_scratch) => {
-                    drop_scratch.clear();
-                    if result.is_ok() {
-                        metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
-                    }
-                    held = pool.acquire(UDP_DATAGRAM_MAX);
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            continue;
+        };
+        tokio::select! {
+            ctrl = ctrl_rx.recv() => {
+                let Some(ctrl) = ctrl else { return; };
+                apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
+            }
+            result = buf.recv_from(&socket) => {
+                if let Ok(peer) = result {
+                    handle_datagram(peer, buf, &mut map, &mut controls, &pool, &metrics, limits, &dial, &socket, &ctrl_tx);
                 }
             }
         }
@@ -369,7 +386,7 @@ fn handle_datagram(
     buf: PacketBuf,
     map: &mut HashMap<SocketAddr, AssocEntry>,
     controls: &mut HashMap<ControlId, Control>,
-    pool: &Arc<PacketPool>,
+    pool: &Arc<PacketQuota>,
     metrics: &Arc<UdpMetrics>,
     limits: UdpLimits,
     dial: &Dial,
@@ -380,13 +397,11 @@ fn handle_datagram(
         Ok(packet) => packet,
         Err(_) => {
             metrics.invalid.fetch_add(1, Ordering::Relaxed);
-            pool.release(buf);
             return;
         }
     };
     if packet.frag != 0 {
         metrics.frag_dropped.fetch_add(1, Ordering::Relaxed);
-        pool.release(buf);
         return;
     }
     let dest = packet.destination.into_owned();
@@ -398,29 +413,23 @@ fn handle_datagram(
     };
 
     if let Some(entry) = map.get(&peer) {
-        if let Err(buf) = offer(&entry.tx, dgram, metrics) {
-            pool.release(buf);
-        }
+        let _ = offer(&entry.tx, dgram, metrics);
         return;
     }
 
     if controls.is_empty() {
         metrics.invalid.fetch_add(1, Ordering::Relaxed);
-        pool.release(dgram.buf);
         return;
     }
     if map.len() >= limits.max_associations {
         metrics.map_full.fetch_add(1, Ordering::Relaxed);
-        pool.release(dgram.buf);
         return;
     }
     let Some(control) = pick_control(controls) else {
-        pool.release(dgram.buf);
         return;
     };
     let (tx, rx) = mpsc::channel(limits.queue_max.max(1));
-    if let Err(buf) = offer(&tx, dgram, metrics) {
-        pool.release(buf);
+    if offer(&tx, dgram, metrics).is_err() {
         return;
     }
     map.insert(peer, AssocEntry { tx, control });
@@ -455,7 +464,7 @@ async fn client_assoc(
     ctrl: mpsc::Sender<Ctrl>,
     metrics: Arc<UdpMetrics>,
     idle: Duration,
-    pool: Arc<PacketPool>,
+    pool: Arc<PacketQuota>,
 ) {
     let end = client_assoc_inner(&mut rx, peer, socks_udp, dial, &metrics, idle, &pool).await;
     if matches!(end, Ok(AssocEnd::Idle)) {
@@ -464,10 +473,7 @@ async fn client_assoc(
     }
     // Datagrams still queued when the association dies (dial failure, TCP
     // error, idle race) must return to the pool, or its live count leaks.
-    rx.close();
-    while let Ok(dgram) = rx.try_recv() {
-        pool.release(dgram.buf);
-    }
+    drop(rx);
     let _ = ctrl.send(Ctrl::Closed(peer)).await;
 }
 
@@ -479,115 +485,48 @@ async fn client_assoc_inner(
     dial: Dial,
     metrics: &UdpMetrics,
     idle: Duration,
-    pool: &PacketPool,
+    pool: &Arc<PacketQuota>,
 ) -> Result<AssocEnd, SessionError> {
-    let (mut snell, codec) =
+    let (mut snell, mut codec) =
         dial_and_codec(dial.server, &dial.psk, dial.version, &dial.kdf).await?;
-    let mut encode = new_encode();
-    let mut recv = new_recv();
-    match codec {
-        PooledCodec::V4 {
-            mut encoder,
-            mut decoder,
-        } => {
-            open_udp(
-                &mut snell,
-                &mut encoder,
-                &mut decoder,
-                &mut encode,
-                &mut recv,
-                &dial.kdf,
-                &dial.psk,
-            )
-            .await?;
-            pump_client(
-                &mut snell,
-                &mut encoder,
-                &mut decoder,
-                &mut encode,
-                &mut recv,
-                &dial.kdf,
-                &dial.psk,
-                rx,
-                peer,
-                &socks_udp,
-                metrics,
-                idle,
-                pool,
-            )
-            .await
-        }
-        PooledCodec::V6Shaped {
-            mut encoder,
-            mut decoder,
-        } => {
-            open_udp(
-                &mut snell,
-                &mut encoder,
-                &mut decoder,
-                &mut encode,
-                &mut recv,
-                &dial.kdf,
-                &dial.psk,
-            )
-            .await?;
-            pump_client(
-                &mut snell,
-                &mut encoder,
-                &mut decoder,
-                &mut encode,
-                &mut recv,
-                &dial.kdf,
-                &dial.psk,
-                rx,
-                peer,
-                &socks_udp,
-                metrics,
-                idle,
-                pool,
-            )
-            .await
-        }
-        PooledCodec::V6Unshaped {
-            mut encoder,
-            mut decoder,
-        } => {
-            open_udp(
-                &mut snell,
-                &mut encoder,
-                &mut decoder,
-                &mut encode,
-                &mut recv,
-                &dial.kdf,
-                &dial.psk,
-            )
-            .await?;
-            pump_client(
-                &mut snell,
-                &mut encoder,
-                &mut decoder,
-                &mut encode,
-                &mut recv,
-                &dial.kdf,
-                &dial.psk,
-                rx,
-                peer,
-                &socks_udp,
-                metrics,
-                idle,
-                pool,
-            )
-            .await
-        }
-    }
+    let mut encode = OwnedBuffer::new(&pool.buffers, snell_protocol::V6_WIRE_CAP);
+    let mut recv = OwnedBuffer::new(&pool.buffers, snell_protocol::V6_WIRE_CAP);
+    with_codec!(&mut codec, |encoder, decoder| {
+        open_udp(
+            &mut snell,
+            encoder,
+            decoder,
+            &mut encode,
+            &mut recv,
+            &dial.kdf,
+            &dial.psk,
+        )
+        .await?;
+        pump_client(
+            &mut snell,
+            encoder,
+            decoder,
+            &mut encode,
+            &mut recv,
+            &dial.kdf,
+            &dial.psk,
+            rx,
+            peer,
+            &socks_udp,
+            metrics,
+            idle,
+            pool,
+        )
+        .await
+    })
 }
 
 async fn open_udp<E: TcpEncoder, D: TcpDecoder>(
     snell: &mut TcpStream,
     encoder: &mut E,
     decoder: &mut D,
-    encode: &mut EncodeBuffer,
-    recv: &mut RecvBuffer,
+    encode: &mut OwnedBuffer,
+    recv: &mut OwnedBuffer,
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
 ) -> Result<(), SessionError> {
@@ -610,8 +549,8 @@ async fn pump_client<E, D>(
     snell: &mut TcpStream,
     encoder: &mut E,
     decoder: &mut D,
-    encode: &mut EncodeBuffer,
-    recv: &mut RecvBuffer,
+    encode: &mut OwnedBuffer,
+    recv: &mut OwnedBuffer,
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
     rx: &mut mpsc::Receiver<InboundDgram>,
@@ -619,7 +558,7 @@ async fn pump_client<E, D>(
     socks_udp: &UdpSocket,
     metrics: &UdpMetrics,
     idle: Duration,
-    pool: &PacketPool,
+    pool: &Arc<PacketQuota>,
 ) -> Result<AssocEnd, SessionError>
 where
     E: TcpEncoder,
@@ -636,7 +575,7 @@ where
                     return Ok(AssocEnd::Closed);
                 };
                 sleep.as_mut().reset(Instant::now() + idle);
-                let payload = &dgram.buf.as_slice()[dgram.header_len.min(dgram.buf.len())..];
+                let payload = &dgram.buf.as_slice()[dgram.header_len..];
                 let result = write_udp_request(
                     encoder,
                     encode,
@@ -645,7 +584,6 @@ where
                     payload,
                 )
                 .await;
-                pool.release(dgram.buf);
                 match result {
                     Err(SessionError::Protocol(Error::PayloadTooLarge)) => {
                         metrics.oversize.fetch_add(1, Ordering::Relaxed);
@@ -674,7 +612,7 @@ async fn send_socks_response(
     peer: SocketAddr,
     plain: &[u8],
     metrics: &UdpMetrics,
-    pool: &PacketPool,
+    pool: &Arc<PacketQuota>,
 ) -> Result<(), SessionError> {
     let pkt = match decode_udp_response(plain) {
         Ok(pkt) => pkt,
@@ -698,18 +636,16 @@ async fn send_socks_response(
         metrics.oversize.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
-    let mut out = match pool.acquire(UDP_DATAGRAM_MAX) {
+    let mut out = match pool.acquire(needed) {
         Some(buf) => buf,
         None => {
             metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
     };
-    let storage = out.storage_mut();
-    storage.extend_from_slice(&hdr[..hdr_len]);
-    storage.extend_from_slice(pkt.payload);
+    out.extend(&hdr[..hdr_len])?;
+    out.extend(pkt.payload)?;
     socks_udp.send_to(out.as_slice(), peer).await?;
-    pool.release(out);
     Ok(())
 }
 
@@ -729,8 +665,8 @@ pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
     outbound: Outbound,
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
-    mut recv: RecvBuffer,
-    mut encode: EncodeBuffer,
+    mut recv: OwnedBuffer,
+    mut encode: OwnedBuffer,
     udp: &UdpOptions,
 ) -> Result<(), SessionError> {
     let prev = udp.metrics.associations.fetch_add(1, Ordering::Relaxed);
@@ -747,8 +683,8 @@ pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
         return Err(SessionError::UdpLimit);
     }
     let _guard = AssocGuard(&udp.metrics);
-    recv = ensure_bulk(recv)?;
-    let mut flow = match outbound.open_udp(&udp.dns).await {
+
+    let mut flow = match outbound.open_udp(&udp.dns, recv.pool()).await {
         Ok(flow) => flow,
         Err(error) => {
             let _ = write_reject(&mut encoder, &mut encode, &mut snell, &error.to_string()).await;
@@ -775,8 +711,8 @@ async fn pump_server<E, D>(
     snell: &mut TcpStream,
     encoder: &mut E,
     decoder: &mut D,
-    encode: &mut EncodeBuffer,
-    recv: &mut RecvBuffer,
+    encode: &mut OwnedBuffer,
+    recv: &mut OwnedBuffer,
     kdf: &crate::kdf::KdfLimiter,
     psk: &Psk,
     flow: &mut crate::outbound::UdpFlow,
@@ -848,85 +784,92 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    #[test]
-    fn lookup_is_hashmap_get_not_a_scan() {
-        use std::cell::Cell;
-        use std::hash::{Hash, Hasher};
-
-        thread_local! {
-            static EQS: Cell<usize> = const { Cell::new(0) };
-            static HASHES: Cell<usize> = const { Cell::new(0) };
+    #[tokio::test]
+    async fn existing_association_routes_packets_and_releases_rejected_queue_items() {
+        let pool = Arc::new(PacketQuota::new(Arc::default(), 2, 1024));
+        let metrics = Arc::new(UdpMetrics::default());
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 3456));
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut map = HashMap::from([(peer, AssocEntry { tx, control: 7 })]);
+        let mut controls = HashMap::new();
+        let (ctrl, _ctrl_rx) = mpsc::channel(1);
+        let dial = Dial {
+            server: peer,
+            psk: Psk::new(b"0123456789abcdef").unwrap(),
+            version: ProtocolFlavor::V4,
+            kdf: Arc::new(KdfLimiter::new()),
+        };
+        let mut packet = [0u8; 64];
+        let header =
+            socks5::encode_udp_header(&mut packet, 0, snell_protocol::AddressRef::Ip(peer))
+                .unwrap();
+        packet[header..header + 4].copy_from_slice(b"ping");
+        for _ in 0..2 {
+            let mut buf = pool.acquire(header + 4).unwrap();
+            buf.extend(&packet[..header + 4]).unwrap();
+            handle_datagram(
+                peer,
+                buf,
+                &mut map,
+                &mut controls,
+                &pool,
+                &metrics,
+                UdpLimits::default(),
+                &dial,
+                &socket,
+                &ctrl,
+            );
         }
+        assert_eq!(map.len(), 1);
+        assert_eq!(metrics.queue_full.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.live(), 1);
+        let packet = rx.try_recv().unwrap();
+        assert_eq!(&packet.buf.as_slice()[packet.header_len..], b"ping");
+        drop(packet);
+        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.buffers.stats().leased_bytes, 0);
+    }
 
-        #[derive(Clone, Copy)]
-        struct ProbeKey {
-            id: u16,
-        }
-
-        impl PartialEq for ProbeKey {
-            fn eq(&self, other: &Self) -> bool {
-                EQS.with(|c| c.set(c.get() + 1));
-                self.id == other.id
-            }
-        }
-        impl Eq for ProbeKey {}
-        impl Hash for ProbeKey {
-            fn hash<H: Hasher>(&self, state: &mut H) {
-                HASHES.with(|c| c.set(c.get() + 1));
-                self.id.hash(state);
-            }
-        }
-
-        fn entry() -> AssocEntry {
-            let (tx, _rx) = mpsc::channel(1);
-            AssocEntry { tx, control: 1 }
-        }
-
-        fn snapshot() -> (usize, usize) {
-            (EQS.with(Cell::get), HASHES.with(Cell::get))
-        }
-
-        let mut map = HashMap::new();
-        for id in 0..2000u16 {
-            map.insert(ProbeKey { id }, entry());
-        }
-
-        let (eq_before, hash_before) = snapshot();
-        let hit = map.get(&ProbeKey { id: 0 });
-        let hit_eqs = EQS.with(Cell::get) - eq_before;
-        let hit_hashes = HASHES.with(Cell::get) - hash_before;
-        assert!(hit.is_some());
+    #[tokio::test]
+    async fn failed_socks_response_returns_lease() {
+        let pool = Arc::new(PacketQuota::new(Arc::default(), 2, 1024));
+        let metrics = UdpMetrics::default();
+        let mut plain = [0; 64];
+        let n = snell_protocol::encode_udp_response(
+            &mut plain,
+            snell_protocol::AddressRef::Ip("127.0.0.1:9".parse().unwrap()),
+            b"pong",
+        )
+        .unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         assert!(
-            hit_hashes >= 1,
-            "HashMap::get hashes the key; a table scan would not: hashes={hit_hashes}"
+            send_socks_response(
+                &socket,
+                "[::1]:9".parse().unwrap(),
+                &plain[..n],
+                &metrics,
+                &pool
+            )
+            .await
+            .is_err()
         );
-        assert!(
-            hit_eqs < 32,
-            "HashMap::get must not Eq every key: eqs={hit_eqs}"
-        );
-
-        let (eq_before, hash_before) = snapshot();
-        let miss = map.get(&ProbeKey { id: 2001 });
-        let miss_eqs = EQS.with(Cell::get) - eq_before;
-        let miss_hashes = HASHES.with(Cell::get) - hash_before;
-        assert!(miss.is_none());
-        assert!(
-            miss_hashes >= 1,
-            "missing-key get must hash; a scan would only Eq: hashes={miss_hashes}"
-        );
-        assert!(
-            miss_eqs < 32,
-            "missing-key scan would Eq all 2000 entries: eqs={miss_eqs}"
+        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.buffers.stats().leased_bytes, 0);
+        assert_eq!(
+            pool.buffers.stats().misses,
+            1,
+            "the failing send must actually acquire storage"
         );
     }
 
     #[tokio::test]
     async fn assoc_dial_failure_releases_queued_buffers() {
-        let pool = Arc::new(PacketPool::new(4, 1024 * 1024));
+        let pool = Arc::new(PacketQuota::new(Arc::default(), 4, 1024 * 1024));
         let (tx, rx) = mpsc::channel(4);
         for _ in 0..2 {
             let mut buf = pool.acquire(64).unwrap();
-            buf.storage_mut().extend_from_slice(b"ping");
+            buf.extend(b"ping").unwrap();
             tx.try_send(InboundDgram {
                 dest: Address::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
                 header_len: 0,
@@ -975,11 +918,59 @@ mod tests {
         let dummy = || InboundDgram {
             dest: Address::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
             header_len: 0,
-            buf: PacketBuf::from_test(vec![1, 2, 3]),
+            buf: Arc::new(PacketQuota::new(Arc::default(), 1, 64))
+                .acquire(3)
+                .unwrap(),
         };
         assert!(offer(&tx, dummy(), &metrics).is_ok());
         let second = offer(&tx, dummy(), &metrics);
         assert!(second.is_err(), "queue full must not report success");
         assert_eq!(metrics.queue_full.load(Ordering::Relaxed), 1);
+    }
+    #[tokio::test]
+    async fn cancelled_associate_removes_control_once() {
+        let (ctrl, mut rx) = mpsc::channel(2);
+        let count = Arc::new(AtomicU64::new(0));
+        let dispatcher = tokio::spawn(std::future::pending::<()>());
+        let hub = UdpHub {
+            bind: "127.0.0.1:1234".parse().unwrap(),
+            _dispatcher: Arc::new(StopDispatcher(dispatcher.abort_handle())),
+            ctrl,
+            next_control: Arc::new(AtomicU64::new(1)),
+            control_count: count.clone(),
+            limits: UdpLimits::default(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (local, _) = listener.accept().await.unwrap();
+        let task = tokio::spawn(async move { hub.handle_associate(local).await });
+        let mut reply = [0; 10];
+        peer.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+        assert!(matches!(rx.recv().await, Some(Ctrl::Add(1))));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(matches!(rx.recv().await, Some(Ctrl::Remove(1))));
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(rx.try_recv().is_err(), "one removal only");
+    }
+
+    #[tokio::test]
+    async fn control_drop_delivers_reserved_close_and_releases_count() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let count = Arc::new(AtomicU64::new(1));
+        let guard = ControlGuard {
+            count: count.clone(),
+            close: Some(tx.clone().reserve_owned().await.unwrap()),
+            id: 7,
+        };
+        tx.send(Ctrl::Add(7)).await.unwrap();
+        drop(guard);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(matches!(rx.recv().await, Some(Ctrl::Add(7))));
+        assert!(matches!(rx.recv().await, Some(Ctrl::Remove(7))));
     }
 }

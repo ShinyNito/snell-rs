@@ -45,6 +45,7 @@ tokio = { workspace = true, features = [
   "rt-multi-thread",
   "sync",
   "time",
+  "test-util",
 ] }
 
 [[bench]]
@@ -65,4 +66,8 @@ harness = false
 
 [[bench]]
 name = "pgo_train"
+harness = false
+
+[[bench]]
+name = "quiet_tunnel"
 harness = false
