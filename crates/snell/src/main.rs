@@ -11,6 +11,12 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+/// Proxying is allocation-heavy across many threads; mimalloc's per-thread
+/// heaps cut contention the system allocator hits on the buffer pool paths.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "snell-rs", version, about = "Snell client/server")]
 struct Cli {

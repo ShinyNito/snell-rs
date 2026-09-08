@@ -13,12 +13,16 @@ name = "snell-rs"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["mimalloc"]
+# Off-switch for environments without a C toolchain, or when a heap tool
+# (valgrind, ASan) needs the system allocator to see every allocation.
+mimalloc = ["dep:mimalloc"]
 unsafe-raw = ["snell-runtime/unsafe-raw"]
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+mimalloc = { workspace = true, optional = true }
 snell-config = { path = "../snell-config", version = "0.1.0" }
 snell-runtime = { path = "../snell-runtime", version = "0.1.0" }
 tracing-subscriber.workspace = true

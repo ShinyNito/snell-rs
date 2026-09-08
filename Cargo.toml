@@ -28,6 +28,7 @@ hickory-resolver = { version = "0.26.1", default-features = false, features = [
   "tokio",
   "system-config",
 ] }
+mimalloc = { version = "0.1.52", default-features = false }
 ring = "0.17"
 rustix = { version = "0.38", default-features = false, features = ["net", "std"] }
 thiserror = "2"
