@@ -693,14 +693,42 @@ fn mix_prf_stride(
     }
 }
 
+// Shared, PSK-independent table: 7 target populations × 8 positions × 256 bytes.
+// Build at compile time; no per-profile allocation or initialization is needed.
+static GENERATOR0_TABLE: [[[u8; 256]; 8]; 7] = build_generator0_table();
+
+const fn build_generator0_table() -> [[[u8; 256]; 8]; 7] {
+    let mut table = [[[0; 256]; 8]; 7];
+    let mut target = 1;
+    while target <= 7 {
+        let mut index = 0;
+        while index < 8 {
+            let mut byte = 0;
+            while byte < 256 {
+                table[target - 1][index][byte] =
+                    generator0_transform(byte as u8, index, target as u32);
+                byte += 1;
+            }
+            index += 1;
+        }
+        target += 1;
+    }
+    table
+}
+
 fn generator0_byte(orig: u8, index_mod: usize, target_bits: u32) -> u8 {
+    GENERATOR0_TABLE[target_bits as usize - 1][index_mod][orig as usize]
+}
+
+const fn generator0_transform(orig: u8, index_mod: usize, target_bits: u32) -> u8 {
     let mut b = orig;
     let mut ones = b.count_ones();
-    for k in 0..8 {
+    let mut k = 0;
+    while k < 8 {
         if ones == target_bits {
             break;
         }
-        let bit = (usize::from(orig) + index_mod + 3 * k) & 7;
+        let bit = (orig as usize + index_mod + 3 * k) & 7;
         let mask = 1u8 << bit;
         if ones < target_bits {
             if b & mask == 0 {
@@ -711,6 +739,7 @@ fn generator0_byte(orig: u8, index_mod: usize, target_bits: u32) -> u8 {
             b &= !mask;
             ones -= 1;
         }
+        k += 1;
     }
     b
 }
@@ -756,6 +785,33 @@ mod tests {
     use super::*;
 
     const TEST_PSK: &[u8] = b"test psk 16 byte";
+
+    #[test]
+    fn generator0_matches_canonical_bit_order_exhaustively() {
+        for target in 1..=7 {
+            for index in 0..8 {
+                for orig in 0..=255u8 {
+                    let mut expected = orig;
+                    // Canonical order visits each bit once, starting from
+                    // (orig + index) modulo eight and stepping by three.
+                    for k in 0..8 {
+                        let bit = (usize::from(orig) + index + 3 * k) & 7;
+                        match expected.count_ones().cmp(&target) {
+                            core::cmp::Ordering::Less => expected |= 1 << bit,
+                            core::cmp::Ordering::Greater => expected &= !(1 << bit),
+                            core::cmp::Ordering::Equal => break,
+                        }
+                    }
+                    let actual = generator0_byte(orig, index, target);
+                    assert_eq!(
+                        actual, expected,
+                        "orig={orig} index={index} target={target}"
+                    );
+                    assert_eq!(actual.count_ones(), target);
+                }
+            }
+        }
+    }
 
     #[test]
     fn profile_derivation_matches_canonical_constants() {
@@ -872,3 +928,6 @@ mod tests {
         assert_eq!(payload, original_payload);
     }
 }
+
+#[cfg(test)]
+mod bench;

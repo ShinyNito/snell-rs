@@ -11,6 +11,10 @@ use snell_protocol::{
     V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 
+mod support {
+    pub mod profile_cases;
+}
+
 const ROUNDS: usize = 20_000;
 const WARMUP: usize = 128;
 
@@ -26,7 +30,11 @@ fn main() {
             } else {
                 [true, false]
             } {
-                shaped(&psk, &payload, scattered);
+                for offset in 0..4 {
+                    let index = (offset + repetition) % 4;
+                    let (generator, key) = support::profile_cases::CASES[index];
+                    shaped(&Psk::new(key).unwrap(), &payload, scattered, generator);
+                }
             }
         }
     }
@@ -85,7 +93,7 @@ fn unshaped(psk: &Psk, payload: &[u8]) {
     });
 }
 
-fn shaped(psk: &Psk, payload: &[u8], scattered: bool) {
+fn shaped(psk: &Psk, payload: &[u8], scattered: bool, generator: u32) {
     let mut encoder = V6ShapedEncoder::with_salt(
         psk,
         [7; SALT_LEN],
@@ -101,7 +109,8 @@ fn shaped(psk: &Psk, payload: &[u8], scattered: bool) {
     } else {
         "v6-shaped contiguous"
     };
-    measure(name, payload, |mut remaining| {
+    let name = format!("{name} generator={generator}");
+    measure(&name, payload, |mut remaining| {
         let mut records = 0;
         while !remaining.is_empty() {
             let mut reservation = if scattered {
