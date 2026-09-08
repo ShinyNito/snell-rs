@@ -96,16 +96,18 @@ impl Buffer {
         if live.checked_add(min).is_none_or(|needed| needed > self.max) {
             return Err(Error::PayloadTooLarge);
         }
-        if self.capacity().min(self.max) - self.storage.len() < min {
-            self.compact();
-        }
-        let writable = self.capacity().min(self.max) - self.storage.len();
-        if writable < min {
+        // Preflight before compact: a failed reservation followed by growth
+        // must not copy the live bytes twice or invalidate offsets on error.
+        if self.capacity().min(self.max) - live < min {
             return Err(Error::BufferTooSmall {
                 needed: self.len() + min,
                 available: self.capacity(),
             });
         }
+        if self.capacity().min(self.max) - self.storage.len() < min {
+            self.compact();
+        }
+        let writable = self.capacity().min(self.max) - self.storage.len();
         let spare = self.storage.spare_capacity_mut();
         Ok(&mut spare[..writable])
     }
@@ -280,6 +282,16 @@ impl<E: crate::Entropy, C: crate::Clock> crate::V4Reservation<'_, E, C> {
     }
 }
 impl<E: crate::Entropy, C: crate::Clock> crate::V6ShapedReservation<'_, E, C> {
+    /// Seal caller-initialized payload from `reserve_scattered`.
+    /// Payloads remain in place. Returns the record's split offset; send `[split..]`
+    /// followed by `[..split]`, excluding neither range.
+    ///
+    /// # Safety
+    /// The first `written` bytes of `payload_uninit()` must be initialized.
+    pub unsafe fn seal_init_scattered(self, written: usize) -> Result<usize> {
+        self.seal_init_scattered_impl(written)
+    }
+
     /// Seal bytes initialized directly in the uninitialized payload slot.
     ///
     /// # Safety
@@ -303,6 +315,18 @@ impl<E: crate::Entropy, C: crate::Clock> crate::V6UnshapedReservation<'_, E, C> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_reservation_does_not_move_live_bytes() {
+        let mut buf = Buffer::empty(16);
+        buf.replace_storage(Vec::with_capacity(8)).unwrap();
+        buf.extend_from_slice(b"abcdefgh").unwrap();
+        buf.consume(6).unwrap();
+        let ptr = buf.filled().as_ptr();
+        assert!(buf.spare_capacity_mut(7).is_err());
+        assert_eq!(buf.filled().as_ptr(), ptr);
+        assert_eq!(buf.filled(), b"gh");
+    }
 
     #[test]
     fn recv_compact_only_when_needed() {

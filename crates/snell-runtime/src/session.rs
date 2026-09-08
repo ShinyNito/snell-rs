@@ -98,13 +98,13 @@ where
     F: FnOnce(&mut [u8]) -> snell_protocol::Result<usize>,
 {
     let mut encode = buffers.get(snell_protocol::V6_WIRE_CAP);
-    encode_record(encoder, &mut encode, needed, |slot| {
+    let (_, split) = encode_record(encoder, &mut encode, needed, |slot| {
         if slot.len() < needed {
             return Err(Error::PayloadTooLarge);
         }
         fill(slot)
     })?;
-    drain_encode(writer, &mut encode).await
+    drain_encode(writer, &mut encode, split).await
 }
 
 // Let the codec report the exact required capacity. This keeps protocol
@@ -114,15 +114,15 @@ fn encode_record<E: TcpEncoder>(
     encode: &mut PooledBuffer,
     hint: usize,
     fill: impl FnOnce(&mut [u8]) -> snell_protocol::Result<usize>,
-) -> Result<usize, SessionError> {
+) -> Result<(usize, usize), SessionError> {
     loop {
         let needed = match encoder.reserve(encode, &[], hint) {
             Err(Error::BufferTooSmall { needed, .. }) => needed,
             Err(error) => return Err(error.into()),
             Ok(mut reservation) => {
                 let n = fill(reservation.payload_mut())?;
-                reservation.seal(n)?;
-                return Ok(n);
+                let split = reservation.seal(n)?;
+                return Ok((n, split));
             }
         };
         encode.ensure(needed)?;
@@ -170,10 +170,7 @@ async fn write_plain_records<E: TcpEncoder, W: AsyncWrite + Unpin>(
 ) -> Result<(), SessionError> {
     let mut encode = buffers.get(snell_protocol::V6_WIRE_CAP);
     while !src.is_empty() {
-        if !encode.is_empty() {
-            drain_encode(writer, &mut encode).await?;
-        }
-        let take = encode_record(encoder, &mut encode, src.len(), |slot| {
+        let (take, split) = encode_record(encoder, &mut encode, src.len(), |slot| {
             let take = slot.len().min(src.len());
             if take == 0 {
                 return Err(Error::PayloadTooLarge);
@@ -181,9 +178,9 @@ async fn write_plain_records<E: TcpEncoder, W: AsyncWrite + Unpin>(
             slot[..take].copy_from_slice(&src[..take]);
             Ok(take)
         })?;
+        drain_encode(writer, &mut encode, split).await?;
         src = &src[take..];
     }
-    drain_encode(writer, &mut encode).await?;
     Ok(())
 }
 
@@ -470,6 +467,11 @@ where
     E: TcpEncoder,
 {
     let mut encode = buffers.get(snell_protocol::V6_WIRE_CAP);
+    // Shaped records store their body before their header. Preserve wire order
+    // in these ranges until the entire batch has drained.
+    let mut ranges = [const { 0..0 }; ENCODE_SLICES_MAX];
+    let mut count = 0;
+    let mut write_off = 0;
     let mut local_eof = false;
     let mut zero_sent = false;
     let mut shutting_down = false;
@@ -485,6 +487,10 @@ where
 
             if !local_eof && encode.is_empty() {
                 loop {
+                    if count > ENCODE_SLICES_MAX - 2 {
+                        break;
+                    }
+                    let start = encode.len();
                     let had_pending = !encode.is_empty();
                     match reader.poll_ready(cx) {
                         Poll::Ready(Ok(())) => {}
@@ -512,11 +518,17 @@ where
                         }
                     };
                     match read {
-                        Poll::Ready(Ok(0)) => {
+                        Poll::Ready(Ok((0, _))) => {
                             local_eof = true;
                             break;
                         }
-                        Poll::Ready(Ok(_)) => {}
+                        Poll::Ready(Ok((_, split))) => append_encode_ranges(
+                            &mut ranges,
+                            &mut count,
+                            start,
+                            encode.len(),
+                            split,
+                        ),
                         Poll::Ready(Err(SessionError::Protocol(Error::PayloadTooLarge)))
                             if had_pending =>
                         {
@@ -534,10 +546,14 @@ where
                 }
             }
 
-            if local_eof && !zero_sent {
+            if local_eof && !zero_sent && count <= ENCODE_SLICES_MAX - 2 {
+                let start = encode.len();
                 let had_pending = !encode.is_empty();
                 match encode_record(encoder, &mut encode, 0, |_| Ok(0)) {
-                    Ok(_) => zero_sent = true,
+                    Ok((_, split)) => {
+                        append_encode_ranges(&mut ranges, &mut count, start, encode.len(), split);
+                        zero_sent = true;
+                    }
                     Err(SessionError::Protocol(Error::PayloadTooLarge)) => {
                         if !had_pending {
                             return Poll::Ready(Err(Error::PayloadTooLarge.into()));
@@ -548,7 +564,34 @@ where
             }
 
             if !encode.is_empty() {
-                match Pin::new(&mut *writer).poll_write(cx, encode.filled()) {
+                let mut slices = [io::IoSlice::new(&[]); ENCODE_SLICES_MAX];
+                let mut slice_count = 0;
+                let mut skip = write_off;
+                for range in &ranges[..count] {
+                    if skip >= range.len() {
+                        skip -= range.len();
+                        continue;
+                    }
+                    slices[slice_count] =
+                        io::IoSlice::new(&encode.filled()[range.start + skip..range.end]);
+                    slice_count += 1;
+                    skip = 0;
+                }
+                if slice_count == 0 {
+                    let consumed = encode.len();
+                    if let Err(error) = encode.consume(consumed) {
+                        return Poll::Ready(Err(error.into()));
+                    }
+                    count = 0;
+                    write_off = 0;
+                    continue;
+                }
+                let written = if slice_count == 1 {
+                    Pin::new(&mut *writer).poll_write(cx, &slices[0])
+                } else {
+                    Pin::new(&mut *writer).poll_write_vectored(cx, &slices[..slice_count])
+                };
+                match written {
                     Poll::Ready(Ok(0)) => {
                         return Poll::Ready(Err(SessionError::Io(io::Error::new(
                             io::ErrorKind::WriteZero,
@@ -556,10 +599,7 @@ where
                         ))));
                     }
                     Poll::Ready(Ok(n)) => {
-                        if let Err(error) = encode.consume(n) {
-                            return Poll::Ready(Err(error.into()));
-                        }
-                        encode.release_empty();
+                        write_off += n;
                     }
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
                     Poll::Pending => return Poll::Pending,
@@ -580,6 +620,28 @@ where
         }
     })
     .await
+}
+
+const ENCODE_SLICES_MAX: usize = 64;
+
+fn append_encode_ranges(
+    ranges: &mut [std::ops::Range<usize>; ENCODE_SLICES_MAX],
+    count: &mut usize,
+    start: usize,
+    end: usize,
+    split: usize,
+) {
+    for range in [start + split..end, start..start + split] {
+        if range.is_empty() {
+            continue;
+        }
+        if *count != 0 && ranges[*count - 1].end == range.start {
+            ranges[*count - 1].end = range.end;
+        } else {
+            ranges[*count] = range;
+            *count += 1;
+        }
+    }
 }
 
 /// Vectored-write fan-in limit: at most this many decoded records are
@@ -944,6 +1006,122 @@ mod buffer_tests {
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn shaped_batches_survive_short_reads_and_partial_vectored_writes() {
+        struct ShortInput<'a>(&'a [u8]);
+        impl ReadReady for ShortInput<'_> {
+            fn poll_ready(&self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncRead for ShortInput<'_> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                dst: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let n = self.0.len().min(73).min(dst.remaining());
+                dst.put_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Poll::Ready(Ok(()))
+            }
+        }
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
+        let pool = Arc::new(BufferPool::default());
+        let data: Vec<u8> = (0..20_000).map(|n| n as u8).collect();
+        // Include a writer using AsyncWrite's scalar fallback, empty EOF, and
+        // EOF after sixteen records and exactly at the 32-record slice limit.
+        for (size, limit) in [
+            (0, 0),
+            (73 * 16, 0),
+            (73 * 32, 0),
+            (20_000, 1),
+            (20_000, 37),
+            (20_000, 2048),
+        ] {
+            let expected = &data[..size];
+            let mut encoder = snell_protocol::V6ShapedEncoder::os(&psk).unwrap();
+            let mut input = ShortInput(expected);
+            let bytes = if limit == 0 {
+                let mut output = GatedOutput {
+                    open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    bytes: Vec::new(),
+                };
+                pump_plain_to_snell(&mut input, &mut output, &mut encoder, &pool, false)
+                    .await
+                    .unwrap();
+                output.bytes
+            } else {
+                let mut output = Output {
+                    bytes: Vec::new(),
+                    limit,
+                    writes: 0,
+                    pending: true,
+                };
+                pump_plain_to_snell(&mut input, &mut output, &mut encoder, &pool, false)
+                    .await
+                    .unwrap();
+                output.bytes
+            };
+            assert_eq!(pool.leased_bytes(), 0);
+            let mut decoder = snell_protocol::V6ShapedDecoder::new(psk.clone()).unwrap();
+            let mut wire = snell_protocol::Buffer::new(bytes.len());
+            wire.extend_from_slice(&bytes).unwrap();
+            let mut actual = Vec::new();
+            let mut zeros = 0;
+            while !wire.is_empty() {
+                let DecodeStatus::Record(record) = decoder.decode(&mut wire).unwrap() else {
+                    panic!("truncated wire");
+                };
+                if record.kind == RecordKind::ZeroChunk {
+                    zeros += 1;
+                }
+                actual.extend_from_slice(record.plaintext(wire.filled()));
+                decoder.consume(&mut wire, &record).unwrap();
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(zeros, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn shaped_handshake_and_udp_records_survive_partial_writes() {
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
+        let pool = Arc::new(BufferPool::default());
+        let mut encoder = snell_protocol::V6ShapedEncoder::os(&psk).unwrap();
+        let mut output = Output {
+            bytes: Vec::new(),
+            limit: 37,
+            writes: 0,
+            pending: true,
+        };
+        let data: Vec<u8> = (0..20_000).map(|n| n as u8).collect();
+        write_plain_records(&mut encoder, &pool, &mut output, &data)
+            .await
+            .unwrap();
+        write_udp_plain(&mut encoder, &pool, &mut output, 96, |slot| {
+            slot[..96].fill(0x5a);
+            Ok(96)
+        })
+        .await
+        .unwrap();
+        assert_eq!(pool.leased_bytes(), 0);
+        let mut decoder = snell_protocol::V6ShapedDecoder::new(psk).unwrap();
+        let mut wire = snell_protocol::Buffer::new(output.bytes.len());
+        wire.extend_from_slice(&output.bytes).unwrap();
+        let mut actual = Vec::new();
+        while !wire.is_empty() {
+            let DecodeStatus::Record(record) = decoder.decode(&mut wire).unwrap() else {
+                panic!("truncated wire");
+            };
+            assert_eq!(record.kind, RecordKind::Data);
+            actual.extend_from_slice(record.plaintext(wire.filled()));
+            decoder.consume(&mut wire, &record).unwrap();
+        }
+        assert_eq!(&actual[..data.len()], data);
+        assert_eq!(&actual[data.len()..], &[0x5a; 96]);
     }
 
     #[tokio::test(start_paused = true)]

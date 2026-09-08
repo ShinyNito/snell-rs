@@ -6,8 +6,6 @@
 //! PSK is stored as [`Psk`] so `Debug` does not print the secret. UDP ASSOCIATE
 //! is handled in `snell-runtime`.
 
-#![deny(unsafe_code)]
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::net::SocketAddr;

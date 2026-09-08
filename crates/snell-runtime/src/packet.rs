@@ -12,6 +12,7 @@ impl PacketBuf {
     pub fn as_slice(&self) -> &[u8] {
         self.data.filled()
     }
+    #[cfg(test)]
     pub fn extend(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
         // Acquisition fixed both byte quota and storage capacity.
         self.data.extend_from_slice(bytes)?;

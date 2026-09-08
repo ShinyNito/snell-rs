@@ -1,4 +1,4 @@
-//! Allocation / timing microbench for the v4 record codec.
+//! Timing microbench for v4 encode, receive copy and decode (not allocation counting).
 //!
 //! Run: `cargo bench -p snell-protocol --bench v4_record`
 
@@ -9,19 +9,17 @@ use snell_protocol::{
     V4Decoder, V4Encoder,
 };
 
-fn seal_and_take(
+fn seal_and_take<'a>(
     encoder: &mut V4Encoder<RepeatEntropy, FixedClock>,
-    buf: &mut Buffer,
+    buf: &'a mut Buffer,
     payload: &[u8],
-) -> Vec<u8> {
+) -> &'a [u8] {
     {
         let mut rec = encoder.reserve(buf, &[], payload.len()).unwrap();
         rec.payload_mut()[..payload.len()].copy_from_slice(payload);
         rec.seal(payload.len()).unwrap();
     }
-    let wire = buf.filled().to_vec();
-    buf.consume(wire.len()).unwrap();
-    wire
+    buf.filled()
 }
 
 fn decode_one(decoder: &mut V4Decoder, buf: &mut Buffer, wire: &[u8]) -> usize {
@@ -61,7 +59,8 @@ fn main() {
 
     let warmup = [0xABu8; 64];
     let first = seal_and_take(&mut encoder, &mut out, &warmup);
-    let _ = decode_one(&mut decoder, &mut recv, &first);
+    let _ = decode_one(&mut decoder, &mut recv, first);
+    out.consume(out.len()).unwrap();
     let cap = out.capacity();
 
     let rounds = 10_000usize;
@@ -69,8 +68,9 @@ fn main() {
     let mut decoded = 0usize;
     for _ in 0..rounds {
         let wire = seal_and_take(&mut encoder, &mut out, &payload);
+        decoded += decode_one(&mut decoder, &mut recv, wire);
+        out.consume(out.len()).unwrap();
         assert_eq!(out.capacity(), cap);
-        decoded += decode_one(&mut decoder, &mut recv, &wire);
     }
     let elapsed = start.elapsed();
     eprintln!(

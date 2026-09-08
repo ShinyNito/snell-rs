@@ -76,6 +76,25 @@ impl BufferPool {
         }
     }
 
+    fn take_suitable(&self, needed: usize, start: usize) -> Option<Vec<u8>> {
+        for offset in 0..SHARDS {
+            let queue = &self.shards[(start + offset) % SHARDS].0;
+            // Bound the scan by the initial shard length, even if other
+            // threads return buffers concurrently. Put undersized blocks back
+            // unless a concurrent return filled their slot.
+            for _ in 0..queue.len() {
+                let Some(storage) = queue.pop() else {
+                    break;
+                };
+                if storage.capacity() >= needed {
+                    return Some(storage);
+                }
+                let _ = queue.push(storage);
+            }
+        }
+        None
+    }
+
     fn put(&self, mut storage: Vec<u8>, shard: usize) {
         let capacity = storage.capacity();
         if capacity == 0 {
@@ -105,22 +124,23 @@ impl PooledBuffer {
         if self.capacity() >= needed {
             return Ok(());
         }
-        if self.shard.is_none() {
-            let mut lease = self.pool.get(self.max());
-            std::mem::swap(self, &mut lease);
-            if self.capacity() >= needed {
-                return Ok(());
-            }
-        }
-        let capacity = CLASSES
-            .iter()
-            .copied()
-            .find(|&n| n >= needed)
-            .ok_or(Error::PayloadTooLarge)?;
-        let mut storage = Vec::new();
-        storage
-            .try_reserve_exact(capacity)
-            .map_err(|e| SessionError::Io(std::io::Error::other(e)))?;
+        let shard = *self
+            .shard
+            .get_or_insert_with(|| self.pool.next.fetch_add(1, Ordering::Relaxed) % SHARDS);
+        let storage = if let Some(storage) = self.pool.take_suitable(needed, shard) {
+            storage
+        } else {
+            let capacity = CLASSES
+                .iter()
+                .copied()
+                .find(|&n| n >= needed)
+                .ok_or(Error::PayloadTooLarge)?;
+            let mut storage = Vec::new();
+            storage
+                .try_reserve_exact(capacity)
+                .map_err(|e| SessionError::Io(std::io::Error::other(e)))?;
+            storage
+        };
         self.pool
             .leased_bytes
             .fetch_add(storage.capacity(), Ordering::Relaxed);
@@ -230,5 +250,59 @@ mod tests {
         b.release_empty();
         assert_eq!(b.capacity(), 0);
         assert_eq!(pool.leased_bytes(), 0);
+    }
+
+    #[test]
+    fn growth_reuses_suitable_cached_storage_and_preserves_live_bytes() {
+        for suitable_shard in [0, SHARDS - 1] {
+            let pool = Arc::new(BufferPool::default());
+            let mut lease = pool.get(4096);
+            lease.extend(b"discard live bytes").unwrap();
+            lease.consume(8).unwrap();
+            let suitable = Vec::with_capacity(1024);
+            let pointer = suitable.as_ptr();
+            for shard in 0..SHARDS {
+                let small_blocks = CACHED_BLOCKS / SHARDS - usize::from(shard == suitable_shard);
+                for _ in 0..small_blocks {
+                    pool.shards[shard].0.push(Vec::with_capacity(64)).unwrap();
+                }
+            }
+            pool.shards[suitable_shard].0.push(suitable).unwrap();
+
+            lease.ensure(512).unwrap();
+            assert_eq!(lease.filled(), b"live bytes");
+            assert_eq!(lease.filled().as_ptr(), pointer);
+            assert_eq!(lease.capacity(), 1024);
+            assert_eq!(pool.leased_bytes(), lease.capacity());
+            assert_eq!(
+                pool.shards.iter().map(|shard| shard.0.len()).sum::<usize>(),
+                CACHED_BLOCKS - 1
+            );
+            drop(lease);
+            assert_eq!(pool.leased_bytes(), 0);
+            assert!(pool.shards.iter().map(|shard| shard.0.len()).sum::<usize>() <= CACHED_BLOCKS);
+        }
+    }
+
+    #[test]
+    fn empty_lease_reuses_suitable_storage_from_another_shard() {
+        let pool = Arc::new(BufferPool::default());
+        let suitable = Vec::with_capacity(1024);
+        let pointer = suitable.as_ptr();
+        pool.shards[SHARDS - 1].0.push(suitable).unwrap();
+        let mut lease = pool.get_empty(1024);
+
+        lease.ensure(512).unwrap();
+        assert!(lease.is_empty());
+        assert_eq!(lease.filled().as_ptr(), pointer);
+        assert_eq!(lease.capacity(), 1024);
+        assert_eq!(pool.leased_bytes(), lease.capacity());
+        lease.release_empty();
+        assert_eq!(lease.capacity(), 0);
+        assert_eq!(pool.leased_bytes(), 0);
+        assert_eq!(
+            pool.shards.iter().map(|shard| shard.0.len()).sum::<usize>(),
+            1
+        );
     }
 }

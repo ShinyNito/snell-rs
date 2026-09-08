@@ -36,6 +36,7 @@ pub struct V6ShapedEncoder<E = OsEntropy, C = UnixClock> {
     padding_start: usize,
     prefix_start: usize,
     record_start: usize,
+    scattered: bool,
 }
 
 #[must_use = "unsealed reservations are cancelled on drop"]
@@ -79,6 +80,7 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
             padding_start: 0,
             prefix_start: 0,
             record_start: 0,
+            scattered: false,
         })
     }
 
@@ -87,6 +89,27 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         buf: &'buf mut Buffer,
         prefix: &[u8],
         hint: usize,
+    ) -> Result<V6ShapedReservation<'buf, E, C>> {
+        self.reserve_mode(buf, prefix, hint, false)
+    }
+
+    /// Reserve socket output with payload first, regardless of its size.
+    /// Pair with `seal_scattered` or `seal_init_scattered`.
+    pub fn reserve_scattered<'buf>(
+        &'buf mut self,
+        buf: &'buf mut Buffer,
+        prefix: &[u8],
+        hint: usize,
+    ) -> Result<V6ShapedReservation<'buf, E, C>> {
+        self.reserve_mode(buf, prefix, hint, true)
+    }
+
+    fn reserve_mode<'buf>(
+        &'buf mut self,
+        buf: &'buf mut Buffer,
+        prefix: &[u8],
+        hint: usize,
+        scattered: bool,
     ) -> Result<V6ShapedReservation<'buf, E, C>> {
         if self.poisoned {
             return Err(Error::Poisoned);
@@ -113,19 +136,26 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         let max_padding_len = self.profile.max_padding_len();
         let fixed = salt_block_len + record_prefix_len + HEADER_CIPHER_LEN + max_padding_len;
         let record_cap = fixed + max_payload + TAG_LEN;
-        let record_start = buf.reserve_record(record_cap, fixed)?;
-        if first {
-            self.profile.write_salt_block(
-                &self.salt,
-                buf.range_mut(record_start, record_start + salt_block_len),
-            )?;
-        }
+        let reserved_padding = if scattered {
+            0
+        } else {
+            self.profile
+                .final_padding_len(self.seq, record_prefix_len, max_payload, first)
+        };
+        let initialized = if scattered {
+            0
+        } else {
+            salt_block_len + record_prefix_len + HEADER_CIPHER_LEN + reserved_padding
+        };
+        let record_start = buf.reserve_record(record_cap, initialized)?;
         let prefix_start = record_start + salt_block_len;
         let header_start = prefix_start + record_prefix_len;
         let padding_start = header_start + HEADER_CIPHER_LEN;
-        let payload_start = padding_start + max_padding_len;
-        self.profile
-            .fill_official(self.seq, buf.range_mut(prefix_start, header_start));
+        let payload_start = if scattered {
+            record_start
+        } else {
+            padding_start + reserved_padding
+        };
         buf.extend_from_slice(prefix)?;
 
         self.plain_prefix_len = prefix.len();
@@ -137,6 +167,7 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         self.padding_start = padding_start;
         self.prefix_start = prefix_start;
         self.record_start = record_start;
+        self.scattered = scattered;
         self.reserving = true;
         Ok(V6ShapedReservation {
             encoder: self,
@@ -163,7 +194,7 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         limit
     }
 
-    fn finish(&mut self, buf: &mut Buffer, payload_len: usize) -> Result<()> {
+    fn finish(&mut self, buf: &mut Buffer, payload_len: usize, scattered: bool) -> Result<usize> {
         if payload_len > self.max_payload {
             self.reserving = false;
             buf.truncate(self.record_start)?;
@@ -171,8 +202,13 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         }
         let first = !self.salt_sent;
         let padding_len =
-            self.profile
-                .final_padding_len(self.seq, self.record_prefix_len, payload_len, first);
+            if payload_len == self.max_payload && self.payload_start != self.record_start {
+                // The hint was exact; reuse the padding decision made by reserve.
+                self.payload_start - self.padding_start
+            } else {
+                self.profile
+                    .final_padding_len(self.seq, self.record_prefix_len, payload_len, first)
+            };
         if padding_len > self.max_padding_len {
             self.reserving = false;
             buf.truncate(self.record_start)?;
@@ -180,7 +216,7 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         }
 
         let nonce_before = self.nonce;
-        let result = self.seal_record(buf, padding_len, payload_len);
+        let result = self.seal_record(buf, padding_len, payload_len, scattered);
         self.reserving = false;
         if result.is_err() {
             if self.nonce != nonce_before {
@@ -201,13 +237,65 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         buf: &mut Buffer,
         padding_len: usize,
         payload_len: usize,
-    ) -> Result<()> {
+        scattered: bool,
+    ) -> Result<usize> {
+        let body_len = if payload_len == 0 {
+            0
+        } else {
+            payload_len + TAG_LEN
+        };
+        let record_end;
+        if scattered {
+            let salt_len = if self.salt_sent {
+                0
+            } else {
+                self.profile.salt_block_len()
+            };
+            self.prefix_start = self.record_start + body_len + salt_len;
+            self.header_start = self.prefix_start + self.record_prefix_len;
+            self.padding_start = self.header_start + HEADER_CIPHER_LEN;
+            record_end = self.padding_start + padding_len;
+            // Discard unused materialized payload capacity. Commit only the tag
+            // and actual header/padding: records pack tightly with no holes.
+            buf.truncate(self.payload_start + payload_len)?;
+            buf.reserve_zeroed(record_end - buf.end())?;
+        } else {
+            let payload_start = self.padding_start + padding_len;
+            if payload_len > 0 && payload_start != self.payload_start {
+                // A short read may need more padding than the hint predicted.
+                let payload_end = payload_start + payload_len;
+                if buf.end() < payload_end {
+                    buf.reserve_zeroed(payload_end - buf.end())?;
+                }
+                buf.copy_within(self.payload_start, payload_start, payload_len);
+            }
+            record_end = payload_start + body_len;
+            if buf.end() < record_end {
+                buf.reserve_zeroed(record_end - buf.end())?;
+            } else {
+                buf.truncate(record_end)?;
+            }
+        }
+
+        // Generate salt, prefix and header directly at their final addresses.
+        if !self.salt_sent {
+            self.profile.write_salt_block(
+                &self.salt,
+                buf.range_mut(
+                    self.prefix_start - self.profile.salt_block_len(),
+                    self.prefix_start,
+                ),
+            )?;
+        }
+        self.profile.fill_official(
+            self.seq,
+            buf.range_mut(self.prefix_start, self.header_start),
+        );
         write_v6_plain_header(
             buf.range_mut(self.header_start, self.header_start + HEADER_PLAIN_LEN),
             padding_len,
             payload_len,
         )?;
-
         {
             let block = buf.range_mut(self.prefix_start, self.header_start + HEADER_CIPHER_LEN);
             let (prefix, hdr) = block.split_at_mut(self.record_prefix_len);
@@ -216,42 +304,33 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
             tag_dst.copy_from_slice(&tag);
         }
         self.nonce.increment();
-
-        let mut payload_start = self.payload_start;
-        if payload_len > 0 && padding_len < self.max_padding_len {
-            buf.copy_within(payload_start, self.padding_start + padding_len, payload_len);
-            payload_start = self.padding_start + padding_len;
-        }
-        let record_end = if payload_len == 0 {
-            self.padding_start + padding_len
-        } else {
-            payload_start + payload_len + TAG_LEN
-        };
-        if buf.end() < record_end {
-            // Zero-commit through the tag slot; never touches committed payload.
-            buf.reserve_zeroed(record_end - buf.end())?;
-        } else {
-            buf.truncate(record_end)?;
-        }
         self.profile.fill_official(
             self.seq,
             buf.range_mut(self.padding_start, self.padding_start + padding_len),
         );
 
         if payload_len > 0 {
-            {
-                let body = buf.range_mut(self.padding_start, record_end);
-                let (padding, rest) = body.split_at_mut(padding_len);
-                let (payload, tag_dst) = rest.split_at_mut(payload_len);
-                let tag = self.aead.seal(&self.nonce, padding, payload)?;
-                tag_dst.copy_from_slice(&tag);
-            }
+            let (padding, cipher_and_tag) = if scattered {
+                let (body, header) = buf
+                    .range_mut(self.record_start, record_end)
+                    .split_at_mut(body_len);
+                (
+                    &mut header[self.padding_start - self.record_start - body_len..],
+                    body,
+                )
+            } else {
+                buf.range_mut(self.padding_start, record_end)
+                    .split_at_mut(padding_len)
+            };
+            let (payload, tag_dst) = cipher_and_tag.split_at_mut(payload_len);
+            let tag = self.aead.seal(&self.nonce, padding, payload)?;
+            tag_dst.copy_from_slice(&tag);
             self.nonce.increment();
-            let body = buf.range_mut(self.padding_start, record_end);
-            let (padding, cipher_and_tag) = body.split_at_mut(padding_len);
             mix_padding_payload(&self.profile, self.seq, padding, cipher_and_tag);
         }
-        Ok(())
+        // Physical layout is [payload+tag][salt+prefix+header+padding]. Send
+        // [split..end] followed by [start..split] to preserve the wire layout.
+        Ok(if scattered { body_len } else { 0 })
     }
 }
 
@@ -295,7 +374,22 @@ impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
         self.encoder.max_padding_len
     }
 
-    pub fn seal(mut self, written: usize) -> Result<()> {
+    pub fn seal(self, written: usize) -> Result<()> {
+        self.seal_mode(written, false).map(|_| ())
+    }
+
+    /// Seal a `reserve_scattered` reservation without moving the payload.
+    /// Returns a split offset relative to this record's start. Send the
+    /// record's `[split..]` bytes followed by its `[..split]` bytes; both
+    /// ranges are needed. Zero chunks return zero.
+    pub fn seal_scattered(self, written: usize) -> Result<usize> {
+        self.seal_mode(written, true)
+    }
+
+    fn seal_mode(mut self, written: usize, scattered: bool) -> Result<usize> {
+        if scattered != self.encoder.scattered {
+            return Err(Error::PendingWire);
+        }
         let total = self
             .encoder
             .plain_prefix_len
@@ -304,13 +398,27 @@ impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
         if total > self.encoder.max_payload {
             return Err(Error::PayloadTooLarge);
         }
+        if self.buf.end() < self.encoder.payload_start + total {
+            return Err(Error::PendingWire);
+        }
         self.sealed = true;
-        self.encoder.finish(self.buf, total)
+        self.encoder.finish(self.buf, total, scattered)
     }
 
     /// Seal after the caller initialized `written` bytes of
     /// [`Self::payload_uninit`]. Commits them without zero-filling first.
-    pub(crate) fn seal_init_impl(mut self, written: usize) -> Result<()> {
+    pub(crate) fn seal_init_impl(self, written: usize) -> Result<()> {
+        self.seal_init_mode(written, false).map(|_| ())
+    }
+
+    pub(crate) fn seal_init_scattered_impl(self, written: usize) -> Result<usize> {
+        self.seal_init_mode(written, true)
+    }
+
+    fn seal_init_mode(mut self, written: usize, scattered: bool) -> Result<usize> {
+        if scattered != self.encoder.scattered {
+            return Err(Error::PendingWire);
+        }
         let total = crate::buffer::commit_init_payload(
             self.buf,
             self.encoder.payload_start,
@@ -319,7 +427,7 @@ impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
             written,
         )?;
         self.sealed = true;
-        self.encoder.finish(self.buf, total)
+        self.encoder.finish(self.buf, total, scattered)
     }
 }
 
@@ -631,6 +739,119 @@ mod tests {
         let mut buf = Buffer::new(V6_WIRE_CAP);
         assert_eq!(decode_plain(&mut decoder, &mut buf, &wire), b"hello");
         assert_eq!(decoder.replay_identity(), Some([7u8; SALT_LEN]));
+    }
+
+    #[test]
+    fn socket_records_match_contiguous_wire_and_pack_tightly() {
+        for key in [
+            b"0123456789abcdef".as_slice(),
+            b"another profile!",
+            b"short psk padded",
+            b"shape test 12345",
+        ] {
+            let psk = Psk::new(key).unwrap();
+            let make = || {
+                V6ShapedEncoder::with_salt(
+                    &psk,
+                    [7; SALT_LEN],
+                    RepeatEntropy { byte: 0x3c },
+                    FixedClock::new(0),
+                )
+                .unwrap()
+            };
+            let mut contiguous = make();
+            let mut scattered = make();
+            let mut expected = Buffer::new(V6_WIRE_CAP);
+            let mut actual = Buffer::new(V6_WIRE_CAP);
+            // Keep multiple records pending, and exercise short reads, zero chunks,
+            // prefixes, and both reservation initialization paths.
+            for seq in 0..32 {
+                let hint = if seq < 4 { 1024 } else { MAX_PACKET_SIZE_V6 };
+                let prefix = if seq % 3 == 0 { &b"prefix"[..] } else { &[] };
+                let mut a = contiguous.reserve(&mut expected, prefix, hint).unwrap();
+                let mut b = scattered
+                    .reserve_scattered(&mut actual, prefix, hint)
+                    .unwrap();
+                let n = if seq % 5 == 0 {
+                    0
+                } else {
+                    if seq % 2 == 0 {
+                        a.capacity().min(211)
+                    } else {
+                        a.capacity()
+                    }
+                };
+                a.payload_mut()[..n].fill(seq as u8);
+                a.seal(n).unwrap();
+                let payload_start = b.encoder.payload_start;
+                let record_start = b.encoder.record_start;
+                let payload_ptr = b.payload_uninit().as_ptr();
+                let split = if seq % 2 == 0 {
+                    b.payload_uninit()[..n].fill(core::mem::MaybeUninit::new(seq as u8));
+                    b.seal_init_scattered_impl(n).unwrap()
+                } else {
+                    b.payload_mut()[..n].fill(seq as u8);
+                    b.seal_scattered(n).unwrap()
+                };
+                let total = prefix.len() + n;
+                assert_eq!(
+                    payload_start, record_start,
+                    "all socket payloads start in place"
+                );
+                assert_eq!(split, if total == 0 { 0 } else { total + TAG_LEN });
+                if split != 0 {
+                    assert_eq!(
+                        actual
+                            .range_mut(payload_start + prefix.len(), payload_start + prefix.len())
+                            .as_ptr()
+                            .cast(),
+                        payload_ptr
+                    );
+                }
+                let physical = &actual.filled()[record_start..];
+                let wire: Vec<u8> = physical[split..]
+                    .iter()
+                    .chain(&physical[..split])
+                    .copied()
+                    .collect();
+                assert_eq!(wire, expected.filled());
+                assert_eq!(
+                    physical.len(),
+                    expected.len(),
+                    "no unused headroom between records"
+                );
+                expected.consume(expected.len()).unwrap();
+                if seq % 4 == 3 {
+                    actual.consume(actual.len()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scattered_seal_requires_initialized_payload_and_cancels_on_error() {
+        let mut enc = encoder();
+        let mut out = Buffer::new(V6_WIRE_CAP);
+        assert_eq!(
+            enc.reserve_scattered(&mut out, &[], 5)
+                .unwrap()
+                .seal_scattered(5),
+            Err(Error::PendingWire)
+        );
+        assert!(out.is_empty());
+        assert_eq!(enc.seq, 0);
+        assert!(!enc.salt_sent);
+        let mut rec = enc.reserve_scattered(&mut out, &[], 5).unwrap();
+        rec.payload_mut()[..5].copy_from_slice(b"hello");
+        let split = rec.seal_scattered(5).unwrap();
+        let mut wire = Buffer::new(V6_WIRE_CAP);
+        wire.extend_from_slice(&out.filled()[split..]).unwrap();
+        wire.extend_from_slice(&out.filled()[..split]).unwrap();
+        let mut decoder = V6ShapedDecoder::new(psk()).unwrap();
+        let DecodeStatus::Record(record) = decoder.decode(&mut wire).unwrap() else {
+            panic!("missing record");
+        };
+        assert_eq!(record.plaintext(wire.filled()), b"hello");
     }
 
     #[test]

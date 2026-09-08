@@ -65,7 +65,6 @@ impl TcpDecoder for V4Decoder {
 
     fn consume(&mut self, buf: &mut PooledBuffer, record: &DecodedRecord) -> Result<()> {
         V4Decoder::consume(self, buf, record)?;
-        buf.release_empty();
         Ok(())
     }
 
@@ -97,7 +96,7 @@ impl TcpEncoder for V6ShapedEncoder {
         prefix: &[u8],
         hint: usize,
     ) -> Result<impl TcpReservation + 'a> {
-        V6ShapedEncoder::reserve(self, buf, prefix, hint)
+        V6ShapedEncoder::reserve_scattered(self, buf, prefix, hint)
     }
 }
 
@@ -108,7 +107,6 @@ impl TcpDecoder for V6ShapedDecoder {
 
     fn consume(&mut self, buf: &mut PooledBuffer, record: &DecodedRecord) -> Result<()> {
         V6ShapedDecoder::consume(self, buf, record)?;
-        buf.release_empty();
         Ok(())
     }
 
@@ -151,7 +149,6 @@ impl TcpDecoder for V6UnshapedDecoder {
 
     fn consume(&mut self, buf: &mut PooledBuffer, record: &DecodedRecord) -> Result<()> {
         V6UnshapedDecoder::consume(self, buf, record)?;
-        buf.release_empty();
         Ok(())
     }
 

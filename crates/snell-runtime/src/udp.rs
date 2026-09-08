@@ -446,7 +446,7 @@ fn handle_datagram(
         ctrl_tx.clone(),
         metrics.clone(),
         limits.idle,
-        pool.clone(),
+        pool.buffers.clone(),
     ));
 }
 
@@ -464,9 +464,9 @@ async fn client_assoc(
     ctrl: mpsc::Sender<Ctrl>,
     metrics: Arc<UdpMetrics>,
     idle: Duration,
-    pool: Arc<PacketQuota>,
+    buffers: Arc<BufferPool>,
 ) {
-    let end = client_assoc_inner(&mut rx, peer, socks_udp, dial, &metrics, idle, &pool).await;
+    let end = client_assoc_inner(&mut rx, peer, socks_udp, dial, &metrics, idle, &buffers).await;
     if matches!(end, Ok(AssocEnd::Idle)) {
         metrics.idle_expired.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(client = %peer, "udp association expired after idle timeout");
@@ -477,7 +477,6 @@ async fn client_assoc(
     let _ = ctrl.send(Ctrl::Closed(peer)).await;
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn client_assoc_inner(
     rx: &mut mpsc::Receiver<InboundDgram>,
     peer: SocketAddr,
@@ -485,36 +484,19 @@ async fn client_assoc_inner(
     dial: Dial,
     metrics: &UdpMetrics,
     idle: Duration,
-    pool: &Arc<PacketQuota>,
+    buffers: &Arc<BufferPool>,
 ) -> Result<AssocEnd, SessionError> {
     let (mut snell, mut codec) =
         dial_and_codec(dial.server, &dial.psk, dial.version, &dial.kdf).await?;
-    let mut recv = pool.buffers.get(snell_protocol::V6_WIRE_CAP);
+    let mut recv = buffers.get(snell_protocol::V6_WIRE_CAP);
     with_codec!(&mut codec, |encoder, decoder| {
         open_udp(
-            &mut snell,
-            encoder,
-            decoder,
-            &pool.buffers,
-            &mut recv,
-            &dial.kdf,
-            &dial.psk,
+            &mut snell, encoder, decoder, buffers, &mut recv, &dial.kdf, &dial.psk,
         )
         .await?;
         pump_client(
-            &mut snell,
-            encoder,
-            decoder,
-            &pool.buffers,
-            &mut recv,
-            &dial.kdf,
-            &dial.psk,
-            rx,
-            peer,
-            &socks_udp,
-            metrics,
-            idle,
-            pool,
+            &mut snell, encoder, decoder, buffers, &mut recv, &dial.kdf, &dial.psk, rx, peer,
+            &socks_udp, metrics, idle,
         )
         .await
     })
@@ -557,7 +539,6 @@ async fn pump_client<E, D>(
     socks_udp: &UdpSocket,
     metrics: &UdpMetrics,
     idle: Duration,
-    pool: &Arc<PacketQuota>,
 ) -> Result<AssocEnd, SessionError>
 where
     E: TcpEncoder,
@@ -597,7 +578,7 @@ where
                     RecordEvent::Zero => return Ok(AssocEnd::Closed),
                     RecordEvent::Data(record) => {
                         let plain = record.plaintext(recv.filled());
-                        send_socks_response(socks_udp, peer, plain, metrics, pool).await?;
+                        send_socks_response(socks_udp, peer, plain, metrics).await?;
                         decoder.consume(recv, &record)?;
                     }
                 }
@@ -611,7 +592,6 @@ async fn send_socks_response(
     peer: SocketAddr,
     plain: &[u8],
     metrics: &UdpMetrics,
-    pool: &Arc<PacketQuota>,
 ) -> Result<(), SessionError> {
     let pkt = match decode_udp_response(plain) {
         Ok(pkt) => pkt,
@@ -620,8 +600,7 @@ async fn send_socks_response(
             return Ok(());
         }
     };
-    // Encode the SOCKS5 header on the stack, then append header and payload
-    // into the pooled buffer: only the bytes actually sent are dirtied.
+    // Keep the payload borrowed from the decoded record until the atomic send.
     let mut hdr = [0u8; 3 + MAX_UDP_PACKET_ADDR_LEN];
     let hdr_len = match socks5::encode_udp_header(&mut hdr, 0, pkt.address) {
         Ok(n) => n,
@@ -635,16 +614,7 @@ async fn send_socks_response(
         metrics.oversize.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
-    let mut out = match pool.acquire(needed) {
-        Some(buf) => buf,
-        None => {
-            metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-    };
-    out.extend(&hdr[..hdr_len])?;
-    out.extend(pkt.payload)?;
-    socks_udp.send_to(out.as_slice(), peer).await?;
+    crate::platform::send_udp_parts(socks_udp, peer, &hdr[..hdr_len], pkt.payload).await?;
     Ok(())
 }
 
@@ -825,8 +795,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_socks_response_returns_lease() {
-        let pool = Arc::new(PacketQuota::new(Arc::default(), 2, 1024));
+    async fn socks_responses_are_single_datagrams() {
+        let metrics = UdpMetrics::default();
+        let payload: Vec<u8> = (0..1400).map(|n| n as u8).collect();
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let sender = UdpSocket::bind(bind).await.unwrap();
+            let receiver = UdpSocket::bind(bind).await.unwrap();
+            for source in ["203.0.113.5:1234", "[2001:db8::5]:1234"] {
+                let source = snell_protocol::AddressRef::Ip(source.parse().unwrap());
+                for payload in [b"".as_slice(), payload.as_slice()] {
+                    let mut plain = vec![0; 1500];
+                    let n =
+                        snell_protocol::encode_udp_response(&mut plain, source, payload).unwrap();
+                    send_socks_response(
+                        &sender,
+                        receiver.local_addr().unwrap(),
+                        &plain[..n],
+                        &metrics,
+                    )
+                    .await
+                    .unwrap();
+                    let mut received = [0; 1500];
+                    let (n, peer) = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        receiver.recv_from(&mut received),
+                    )
+                    .await
+                    .expect("response must arrive as one datagram")
+                    .unwrap();
+                    assert_eq!(peer, sender.local_addr().unwrap());
+                    let packet = socks5::parse_udp_packet(&received[..n]).unwrap();
+                    assert_eq!(packet.frag, 0);
+                    assert_eq!(packet.destination, source);
+                    assert_eq!(&received[packet.header_len..n], payload);
+                    assert_eq!(
+                        receiver.try_recv_from(&mut received).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock,
+                        "header and payload must be sent in one datagram",
+                    );
+                }
+            }
+        }
+        assert_eq!(metrics.no_buffer.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn socks_response_propagates_socket_error() {
         let metrics = UdpMetrics::default();
         let mut plain = [0; 64];
         let n = snell_protocol::encode_udp_response(
@@ -836,19 +850,47 @@ mod tests {
         )
         .unwrap();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        assert!(
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            send_socks_response(&socket, "[::1]:9".parse().unwrap(), &plain[..n], &metrics),
+        )
+        .await
+        .expect("socket errors must not enter the readiness retry loop")
+        .unwrap_err();
+        assert!(matches!(error, SessionError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn oversized_socks_response_does_not_send_a_header_datagram() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut plain = vec![0; UDP_DATAGRAM_MAX];
+        // A Snell payload fits the runtime limit but exceeds IPv4's UDP limit
+        // once the SOCKS5 header is included. The OS must reject the whole send.
+        let payload = vec![0x5a; 65507];
+        let n = snell_protocol::encode_udp_response(
+            &mut plain,
+            snell_protocol::AddressRef::Ip("203.0.113.5:1234".parse().unwrap()),
+            &payload,
+        )
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
             send_socks_response(
-                &socket,
-                "[::1]:9".parse().unwrap(),
+                &sender,
+                receiver.local_addr().unwrap(),
                 &plain[..n],
-                &metrics,
-                &pool
-            )
-            .await
-            .is_err()
+                &UdpMetrics::default(),
+            ),
+        )
+        .await
+        .expect("an oversized datagram must not be retried")
+        .unwrap_err();
+        assert!(matches!(error, SessionError::Io(_)));
+        assert_eq!(
+            receiver.try_recv_from(&mut [0; 64]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
         );
-        assert_eq!(pool.live(), 0);
-        assert_eq!(pool.buffers.leased_bytes(), 0);
     }
 
     #[tokio::test]
@@ -888,7 +930,7 @@ mod tests {
             ctrl_tx,
             metrics,
             Duration::from_secs(5),
-            pool.clone(),
+            pool.buffers.clone(),
         )
         .await;
         assert!(matches!(ctrl_rx.recv().await, Some(Ctrl::Closed(_))));

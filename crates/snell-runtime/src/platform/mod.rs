@@ -10,6 +10,7 @@ mod linux;
 mod macos;
 #[cfg(unix)]
 mod tfo;
+mod udp;
 #[cfg(windows)]
 mod windows;
 
@@ -21,6 +22,7 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::net::{TcpSocket, TcpStream};
 
 pub(crate) use accept::AcceptLoop;
+pub(crate) use udp::send_udp_parts;
 
 /// Validated tcp-brutal request. Off unless config sets this.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
