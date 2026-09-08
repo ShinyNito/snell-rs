@@ -23,8 +23,8 @@ unsafe-raw = ["snell-runtime/unsafe-raw"]
 anyhow.workspace = true
 clap.workspace = true
 mimalloc = { workspace = true, optional = true }
-snell-config = { path = "../snell-config", version = "0.1.0" }
-snell-runtime = { path = "../snell-runtime", version = "0.1.0" }
+snell-config = { path = "../snell-config", version = "0.1.1" }
+snell-runtime = { path = "../snell-runtime", version = "0.1.1" }
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = [
   "io-util",
@@ -36,7 +36,7 @@ tokio = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-snell-testkit = { path = "../snell-testkit", version = "0.1.0" }
+snell-testkit = { path = "../snell-testkit", version = "0.1.1" }
 tokio = { workspace = true, features = [
   "io-util",
   "macros",

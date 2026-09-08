@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.1.1
+
+Internal optimization and build release. No protocol, wire format, configuration, or CLI changes; 0.1.0 clients and servers interoperate with 0.1.1 unchanged.
+
+### Added
+- mimalloc is the `snell-rs` binary's global allocator, behind a default-on `mimalloc` feature. Building with `--no-default-features` restores the system allocator for environments without a C toolchain. mimalloc's secure mode is off.
+
+### Changed
+- Shaped v6 records are sealed in place: the payload stays where the socket read placed it, and the salt block, record prefix, header and padding are written after it. Records are restored to wire order with vectored writes, removing the memmove that a padding-length change previously forced. Wire bytes are unchanged.
+- SOCKS5 UDP responses send the header and the borrowed payload as one vectored datagram, so the response path no longer repacks them through an intermediate buffer.
+- The generator0 byte table is computed at compile time into a shared PSK-independent static, replacing the per-call bit-fixup loop.
+- Session buffer growth reuses a large-enough cached block from the pool before allocating a new size class.
+- `Buffer::spare_capacity_mut` checks capacity before compacting, so a failed reservation no longer moves live bytes.
+
 ## 0.1.0
 
 First release of `snell-rs`. All crates remain unpublished (`publish = false`). The distributed product is the `snell-rs` binary.

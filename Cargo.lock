@@ -1178,7 +1178,7 @@ checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
 name = "snell"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "snell-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "snell-protocol",
  "thiserror",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "snell-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "blake2",
@@ -1212,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "snell-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "crossbeam-queue",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "snell-testkit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "snell-protocol",
  "thiserror",
@@ -1731,7 +1731,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",

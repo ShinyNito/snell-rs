@@ -14,7 +14,7 @@ unsafe-raw = ["snell-protocol/unsafe-raw"]
 
 [dependencies]
 crossbeam-queue = "0.3"
-snell-protocol = { path = "../snell-protocol", version = "0.1.0" }
+snell-protocol = { path = "../snell-protocol", version = "0.1.1" }
 bytes.workspace = true
 hickory-resolver.workspace = true
 socket2 = { version = "0.6", features = ["all"] }
@@ -38,7 +38,7 @@ rustix = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
-snell-testkit = { path = "../snell-testkit", version = "0.1.0" }
+snell-testkit = { path = "../snell-testkit", version = "0.1.1" }
 tokio = { workspace = true, features = [
   "io-util",
   "macros",
