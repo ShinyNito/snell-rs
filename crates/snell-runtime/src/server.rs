@@ -12,9 +12,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{Instrument, debug, info, warn};
 
-use crate::auto::{Detected, detect_protocol};
+use crate::auto::detect_protocol;
 use crate::bind_listener;
-use crate::codec::{TcpDecoder, TcpEncoder};
+use crate::codec::{TcpDecoder, TcpEncoder, with_codec};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
@@ -109,111 +109,75 @@ pub(crate) async fn handle_server(
     {
         warn!(error = %error, "tcp_brutal unavailable; continuing without it");
     }
+    let psk = &config.psk;
     match config.selection {
         ProtocolSelection::Exact(ProtocolFlavor::V4 | ProtocolFlavor::V5) => {
-            let psk = config.psk.clone();
-            let decoder = V4Decoder::new(config.psk.clone());
-            exact_session(snell, decoder, config, &kdf, None, handshake, move || {
-                V4Encoder::os(&psk)
-            })
-            .await
+            let decoder = V4Decoder::new(psk.clone());
+            exact_session(snell, decoder, config, &kdf, None, handshake, V4Encoder::os).await
         }
         ProtocolSelection::Exact(ProtocolFlavor::V6Shaped) => {
-            let psk = config.psk.clone();
-            let decoder = V6ShapedDecoder::new(config.psk.clone())?;
+            let decoder = V6ShapedDecoder::new(psk.clone());
+            let replay = Some(replay.as_ref());
             exact_session(
                 snell,
                 decoder,
                 config,
                 &kdf,
-                Some(replay.as_ref()),
+                replay,
                 handshake,
-                move || V6ShapedEncoder::os(&psk),
+                V6ShapedEncoder::os,
             )
             .await
         }
         ProtocolSelection::Exact(ProtocolFlavor::V6Unshaped) => {
-            let psk = config.psk.clone();
-            let decoder = V6UnshapedDecoder::new(config.psk.clone());
+            let decoder = V6UnshapedDecoder::new(psk.clone());
+            let replay = Some(replay.as_ref());
             exact_session(
                 snell,
                 decoder,
                 config,
                 &kdf,
-                Some(replay.as_ref()),
+                replay,
                 handshake,
-                move || V6UnshapedEncoder::os(&psk),
+                V6UnshapedEncoder::os,
             )
             .await
         }
         ProtocolSelection::Auto => {
-            let detected = detect_protocol(
-                &mut snell,
-                config.psk.clone(),
-                &kdf,
-                &replay,
-                &config.buffers,
-            )
-            .await?;
+            let (codec, recv, first) =
+                detect_protocol(&mut snell, psk, &kdf, &replay, &config.buffers).await?;
             drop(handshake);
-            match detected {
-                Detected::V4 {
+            with_codec!(codec, |encoder, decoder| {
+                server_session(
+                    snell,
                     encoder,
                     decoder,
+                    config.outbound,
+                    &kdf,
+                    &config.psk,
                     recv,
                     first,
-                } => {
-                    server_session(
-                        snell,
-                        encoder,
-                        decoder,
-                        config.outbound,
-                        &kdf,
-                        &config.psk,
-                        recv,
-                        first,
-                        &config.udp,
-                    )
-                    .await
-                }
-                Detected::V6Shaped {
-                    encoder,
-                    decoder,
-                    recv,
-                    first,
-                } => {
-                    server_session(
-                        snell,
-                        encoder,
-                        decoder,
-                        config.outbound,
-                        &kdf,
-                        &config.psk,
-                        recv,
-                        first,
-                        &config.udp,
-                    )
-                    .await
-                }
-            }
+                    &config.udp,
+                )
+                .await
+            })
         }
     }
 }
 
 // All exact flavors authenticate before deriving a response key, under one deadline.
-async fn exact_session<E, D, F>(
+async fn exact_session<E, D>(
     mut snell: TcpStream,
     mut decoder: D,
     config: ServerConfig,
     kdf: &KdfLimiter,
     replay: Option<&ReplayCache>,
     handshake: OwnedSemaphorePermit,
-    make_encoder: F,
+    make_encoder: fn(&Psk) -> Result<E, ProtocolError>,
 ) -> Result<(), SessionError>
 where
     D: TcpDecoder,
     E: TcpEncoder + Send + 'static,
-    F: FnOnce() -> Result<E, ProtocolError> + Send + 'static,
 {
     let mut recv = config.buffers.get(snell_protocol::V6_WIRE_CAP);
     let (first, encoder) = with_handshake_timeout(async {
@@ -226,7 +190,7 @@ where
             replay,
         )
         .await?;
-        let encoder = kdf.run(make_encoder).await??;
+        let encoder = kdf.derive(&config.psk, make_encoder).await?;
         Ok((first, encoder))
     })
     .await?;

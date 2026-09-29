@@ -82,8 +82,8 @@ fn fill_padding_bits<E: Entropy>(
     let bits = padding.len() * u8::BITS as usize;
     let mut rng = BitRng {
         entropy,
-        random: [0u8; 4096],
-        offset: 4096,
+        random: [[0u8; 8]; BIT_RNG_WORDS],
+        next: BIT_RNG_WORDS,
     };
     if target_ones <= bits - target_ones {
         padding.fill(0);
@@ -111,10 +111,12 @@ fn fill_padding_bits<E: Entropy>(
     Ok(())
 }
 
+const BIT_RNG_WORDS: usize = 512;
+
 struct BitRng<'a, E> {
     entropy: &'a mut E,
-    random: [u8; 4096],
-    offset: usize,
+    random: [[u8; 8]; BIT_RNG_WORDS],
+    next: usize,
 }
 
 impl<E: Entropy> BitRng<'_, E> {
@@ -122,14 +124,12 @@ impl<E: Entropy> BitRng<'_, E> {
         let span = max as u64 + 1;
         let zone = u64::MAX - (u64::MAX % span);
         loop {
-            if self.offset + 8 > self.random.len() {
-                self.entropy.fill(&mut self.random)?;
-                self.offset = 0;
+            if self.next == BIT_RNG_WORDS {
+                self.entropy.fill(self.random.as_flattened_mut())?;
+                self.next = 0;
             }
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&self.random[self.offset..self.offset + 8]);
-            self.offset += 8;
-            let value = u64::from_le_bytes(bytes);
+            let value = u64::from_le_bytes(self.random[self.next]);
+            self.next += 1;
             if value < zone {
                 return Ok((value % span) as usize);
             }

@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+Internal cleanup. No protocol, wire format, configuration, or CLI changes; golden fixtures are byte-identical.
+
+### Changed
+- Toolchain and MSRV are Rust 1.98.1.
+- Record codecs share one AEAD seal/open helper (which advances the nonce), one decode-ahead accounting type, and one reservation slot. Per-record layout now lives in the reservation instead of stale encoder fields.
+- PSK length is validated once, by `Psk`: `aead_key`, profile derivation and `V6ShapedDecoder::new` take `&Psk`/`Psk` and no longer re-check it; `V6ShapedDecoder::new` is infallible.
+- Provably unreachable clamps and branches in v6 profile derivation, salt-block shuffling and padding mixing are removed.
+- UDP request/response address encoding and decoding share one address-tail codec.
+- The runtime KDF path clones the zeroizing `Psk` instead of copying it into a plain `Vec`.
+- Plain encode batches are drained with Tokio's `write_all_buf` over `bytes::Buf::chain`; outbound SOCKS5 CONNECT and UDP ASSOCIATE share one negotiation; TCP Fast Open uses `libc` option constants; the replay cache stores each salt's timestamp once.
+- Auto-detect reuses the server's first-request parser and the client's codec enum.
+- Duplicated tests are merged: codec fragmentation cases run once per codec in `snell-testkit`, and golden fixtures are checked against the real encoders.
+
 ## 0.1.1
 
 Internal optimization and build release. No protocol, wire format, configuration, or CLI changes; 0.1.0 clients and servers interoperate with 0.1.1 unchanged.

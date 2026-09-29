@@ -24,7 +24,7 @@ use crate::socks::{Socks5Command, accept_socks5, socks5_reply_from_error, write_
 use crate::udp::{UdpHub, UdpOptions};
 use crate::{bind_listener, connect_tcp};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ClientConfig {
     pub listen: SocketAddr,
     pub server: SocketAddr,
@@ -34,20 +34,6 @@ pub struct ClientConfig {
     pub pool: Option<ReusePool>,
     pub udp: UdpOptions,
     pub buffers: Arc<BufferPool>,
-}
-
-impl std::fmt::Debug for ClientConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientConfig")
-            .field("listen", &self.listen)
-            .field("server", &self.server)
-            .field("psk", &self.psk)
-            .field("version", &self.version)
-            .field("reuse", &self.reuse)
-            .field("pool", &self.pool.as_ref().map(|_| "ReusePool"))
-            .field("udp", &self.udp)
-            .finish()
-    }
 }
 
 pub async fn run_client(config: ClientConfig) -> Result<(), SessionError> {
@@ -67,11 +53,9 @@ pub async fn serve_client(
 ) -> Result<(), SessionError> {
     tokio::pin!(shutdown);
     let kdf = Arc::new(KdfLimiter::new());
-    let pool = if config.reuse {
-        Some(config.pool.clone().unwrap_or_default())
-    } else {
-        None
-    };
+    let pool = config
+        .reuse
+        .then(|| config.pool.clone().unwrap_or_default());
     let hub = UdpHub::start(listener.local_addr()?, config.clone(), kdf.clone()).await?;
     let mut reuse_maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut accept = AcceptLoop::new(&listener);
@@ -189,30 +173,20 @@ async fn new_codec(
     version: ProtocolFlavor,
     kdf: &KdfLimiter,
 ) -> Result<PooledCodec, SessionError> {
-    match version {
-        ProtocolFlavor::V4 | ProtocolFlavor::V5 => {
-            let psk_enc = psk.clone();
-            let encoder = kdf.run(move || V4Encoder::os(&psk_enc)).await??;
-            Ok(PooledCodec::V4 {
-                encoder,
-                decoder: V4Decoder::new(psk.clone()),
-            })
-        }
-        ProtocolFlavor::V6Shaped => {
-            let psk_enc = psk.clone();
-            let encoder = kdf.run(move || V6ShapedEncoder::os(&psk_enc)).await??;
-            let decoder = V6ShapedDecoder::new(psk.clone())?;
-            Ok(PooledCodec::V6Shaped { encoder, decoder })
-        }
-        ProtocolFlavor::V6Unshaped => {
-            let psk_enc = psk.clone();
-            let encoder = kdf.run(move || V6UnshapedEncoder::os(&psk_enc)).await??;
-            Ok(PooledCodec::V6Unshaped {
-                encoder,
-                decoder: V6UnshapedDecoder::new(psk.clone()),
-            })
-        }
-    }
+    Ok(match version {
+        ProtocolFlavor::V4 | ProtocolFlavor::V5 => PooledCodec::V4 {
+            encoder: kdf.derive(psk, V4Encoder::os).await?,
+            decoder: V4Decoder::new(psk.clone()),
+        },
+        ProtocolFlavor::V6Shaped => PooledCodec::V6Shaped {
+            encoder: kdf.derive(psk, V6ShapedEncoder::os).await?,
+            decoder: V6ShapedDecoder::new(psk.clone()),
+        },
+        ProtocolFlavor::V6Unshaped => PooledCodec::V6Unshaped {
+            encoder: kdf.derive(psk, V6UnshapedEncoder::os).await?,
+            decoder: V6UnshapedDecoder::new(psk.clone()),
+        },
+    })
 }
 
 async fn write_socks5_fail(local: &mut TcpStream, error: impl Into<SessionError>) -> SessionError {

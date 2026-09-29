@@ -101,7 +101,7 @@ fn shaped(psk: &Psk, payload: &[u8], scattered: bool, generator: u32) {
         FixedClock::new(0),
     )
     .unwrap();
-    let mut decoder = V6ShapedDecoder::new(psk.clone()).unwrap();
+    let mut decoder = V6ShapedDecoder::new(psk.clone());
     let mut out = Buffer::new(V6_WIRE_CAP);
     let mut recv = Buffer::new(V6_WIRE_CAP);
     let name = if scattered {

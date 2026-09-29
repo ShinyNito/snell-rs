@@ -45,43 +45,41 @@ pub use server::{ServerConfig, run_server, serve_server};
 pub use snell_protocol::{ProtocolFlavor, ProtocolSelection};
 pub use udp::{UdpLimits, UdpMetrics, UdpOptions};
 
-pub(crate) fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
-    let socket = if addr.is_ipv4() {
-        TcpSocket::new_v4()?
+fn new_tcp_socket(addr: SocketAddr) -> io::Result<TcpSocket> {
+    if addr.is_ipv4() {
+        TcpSocket::new_v4()
     } else {
-        TcpSocket::new_v6()?
-    };
+        TcpSocket::new_v6()
+    }
+}
+
+/// Fast open is best-effort: only real I/O errors fail the socket.
+fn allow_unsupported(result: Result<(), PlatformError>) -> io::Result<()> {
+    match result {
+        Ok(()) | Err(PlatformError::Unsupported(_)) => Ok(()),
+        Err(PlatformError::Io(error)) => Err(error),
+    }
+}
+
+pub(crate) fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = new_tcp_socket(addr)?;
     socket.set_reuseaddr(true)?;
     socket.set_nodelay(true)?;
     socket.bind(addr)?;
-    match platform::set_tcp_fastopen_listener(&socket) {
-        Ok(()) | Err(PlatformError::Unsupported(_)) => {}
-        Err(PlatformError::Io(error)) => return Err(error),
-    }
+    allow_unsupported(platform::set_tcp_fastopen_listener(&socket))?;
     socket.listen(1024)
 }
 
 pub(crate) async fn connect_tcp(addr: SocketAddr) -> Result<TcpStream, SessionError> {
-    let socket = if addr.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
-    };
+    let socket = new_tcp_socket(addr)?;
     socket.set_nodelay(true)?;
-    match platform::set_tcp_fastopen_connect(&socket) {
-        Ok(()) | Err(PlatformError::Unsupported(_)) => {}
-        Err(PlatformError::Io(error)) => return Err(error.into()),
-    }
-    let stream = match timeout(
+    allow_unsupported(platform::set_tcp_fastopen_connect(&socket))?;
+    let stream = timeout(
         Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
         socket.connect(addr),
     )
     .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return Err(error.into()),
-        Err(_) => return Err(SessionError::ConnectTimeout),
-    };
+    .map_err(|_| SessionError::ConnectTimeout)??;
     platform::apply_keepalive(&stream)?;
     Ok(stream)
 }

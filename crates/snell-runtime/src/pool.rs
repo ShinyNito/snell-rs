@@ -42,6 +42,16 @@ pub struct ReusePool {
     max_idle: Duration,
 }
 
+impl std::fmt::Debug for ReusePool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReusePool")
+            .field("len", &self.len())
+            .field("max_size", &self.max_size)
+            .field("max_idle", &self.max_idle)
+            .finish()
+    }
+}
+
 impl Default for ReusePool {
     fn default() -> Self {
         Self::new()
@@ -66,16 +76,11 @@ impl ReusePool {
 
     pub(crate) fn take(&self) -> Option<PooledConn> {
         let mut entries = self.lock();
-        while let Some(entry) = entries.pop_front() {
-            if entry.returned_at.elapsed() >= self.max_idle {
-                continue;
-            }
-            if socket_dead(&entry.conn.stream) {
-                continue;
-            }
-            return Some(entry.conn);
-        }
-        None
+        std::iter::from_fn(|| entries.pop_front())
+            .find(|entry| {
+                entry.returned_at.elapsed() < self.max_idle && !socket_dead(&entry.conn.stream)
+            })
+            .map(|entry| entry.conn)
     }
 
     pub(crate) fn put(&self, conn: PooledConn) -> bool {
@@ -114,14 +119,13 @@ impl ReusePool {
     }
 }
 
+/// An idle pooled socket must have nothing to read: EOF, stray bytes, and
+/// errors all mean it can no longer carry a fresh session.
 fn socket_dead(stream: &TcpStream) -> bool {
-    let mut buf = [0u8; 1];
-    match stream.try_read(&mut buf) {
-        Ok(0) => true,
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
-        Err(_) => true,
-    }
+    !matches!(
+        stream.try_read(&mut [0u8; 1]),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    )
 }
 
 #[cfg(test)]

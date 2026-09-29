@@ -6,7 +6,6 @@
 //! PSK is stored as [`Psk`] so `Debug` does not print the secret. UDP ASSOCIATE
 //! is handled in `snell-runtime`.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -80,14 +79,16 @@ pub struct ServerConfig {
     pub tcp_brutal: Option<TcpBrutal>,
 }
 
+fn read_config(path: &Path) -> Result<String, ConfigError> {
+    fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
 impl ClientConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
-        let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        Self::parse(&raw)
+        Self::parse(&read_config(path.as_ref())?)
     }
 
     pub fn parse(raw: &str) -> Result<Self, ConfigError> {
@@ -117,12 +118,7 @@ impl ClientConfig {
 
 impl ServerConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
-        let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        Self::parse(&raw)
+        Self::parse(&read_config(path.as_ref())?)
     }
 
     pub fn parse(raw: &str) -> Result<Self, ConfigError> {
@@ -132,22 +128,7 @@ impl ServerConfig {
             .ok_or(ConfigError::MissingSection(SERVER_SECTION))?;
         let tcp_brutal = parse_tcp_brutal(section)?;
 
-        let selection = match section.get("version") {
-            None => {
-                if section.get("mode").is_some() {
-                    return Err(ConfigError::Invalid {
-                        section: SERVER_SECTION,
-                        key: "mode",
-                        msg: "mode is only valid when version = 6".to_owned(),
-                    });
-                }
-                ProtocolSelection::Auto
-            }
-            Some(version) => {
-                ProtocolSelection::Exact(parse_server_version(version, section.get("mode"))?)
-            }
-        };
-
+        let selection = parse_server_selection(section.get("version"), section.get("mode"))?;
         let outbound = match section.get("upstream_socks5") {
             None => Outbound::Direct,
             Some(value) => Outbound::Socks5 {
@@ -170,19 +151,13 @@ impl ServerConfig {
 }
 
 fn parse_tcp_brutal(section: &Section) -> Result<Option<TcpBrutal>, ConfigError> {
-    let enabled = optional_bool(SERVER_SECTION, section, "tcp_brutal")?.unwrap_or(false);
-    let send = section.get("tcp_brutal_send_mbps");
-    let gain = section.get("tcp_brutal_cwnd_gain");
-    if !enabled {
+    if !optional_bool(SERVER_SECTION, section, "tcp_brutal")?.unwrap_or(false) {
         return Ok(None);
     }
     let send_mbps = parse_u32(
         SERVER_SECTION,
         "tcp_brutal_send_mbps",
-        send.ok_or(ConfigError::MissingKey {
-            section: SERVER_SECTION,
-            key: "tcp_brutal_send_mbps",
-        })?,
+        required(SERVER_SECTION, section, "tcp_brutal_send_mbps")?,
     )?;
     if send_mbps == 0 || send_mbps > TCP_BRUTAL_SEND_MBPS_MAX {
         return Err(ConfigError::Invalid {
@@ -194,10 +169,7 @@ fn parse_tcp_brutal(section: &Section) -> Result<Option<TcpBrutal>, ConfigError>
     let cwnd_gain = parse_u32(
         SERVER_SECTION,
         "tcp_brutal_cwnd_gain",
-        gain.ok_or(ConfigError::MissingKey {
-            section: SERVER_SECTION,
-            key: "tcp_brutal_cwnd_gain",
-        })?,
+        required(SERVER_SECTION, section, "tcp_brutal_cwnd_gain")?,
     )?;
     if !(TCP_BRUTAL_CWND_GAIN_MIN..=TCP_BRUTAL_CWND_GAIN_MAX).contains(&cwnd_gain) {
         return Err(ConfigError::Invalid {
@@ -239,6 +211,27 @@ pub fn parse_client_version(value: &str) -> Result<ProtocolFlavor, ConfigError> 
     }
 }
 
+/// Server protocol from optional `version` and `mode`. No version selects
+/// auto-detect; `mode` refines `version = 6` only.
+pub fn parse_server_selection(
+    version: Option<&str>,
+    mode: Option<&str>,
+) -> Result<ProtocolSelection, ConfigError> {
+    match version {
+        Some(version) => parse_server_version(version, mode).map(ProtocolSelection::Exact),
+        None if mode.is_some() => Err(mode_requires_v6()),
+        None => Ok(ProtocolSelection::Auto),
+    }
+}
+
+fn mode_requires_v6() -> ConfigError {
+    ConfigError::Invalid {
+        section: SERVER_SECTION,
+        key: "mode",
+        msg: "mode is only valid when version = 6".to_owned(),
+    }
+}
+
 pub fn parse_server_version(
     version: &str,
     mode: Option<&str>,
@@ -247,11 +240,7 @@ pub fn parse_server_version(
     let lowered = version.to_ascii_lowercase();
     if let Some(mode) = mode {
         if lowered != "6" {
-            return Err(ConfigError::Invalid {
-                section: SERVER_SECTION,
-                key: "mode",
-                msg: "mode is only valid when version = 6".to_owned(),
-            });
+            return Err(mode_requires_v6());
         }
         let raw_mode = mode.trim();
         let mode = raw_mode.to_ascii_lowercase();
@@ -289,7 +278,7 @@ pub fn parse_psk_str(value: &str) -> Result<Psk, ConfigError> {
 }
 
 fn parse_psk(section: &'static str, value: &str) -> Result<Psk, ConfigError> {
-    Psk::new(value.as_bytes().to_vec()).map_err(|_| ConfigError::Invalid {
+    Psk::new(value.as_bytes()).map_err(|_| ConfigError::Invalid {
         section,
         key: "psk",
         msg: format!(
@@ -360,9 +349,9 @@ impl Section {
 
 impl IniFile {
     fn parse(raw: &str) -> Result<Self, ConfigError> {
-        let mut sections = Vec::new();
-        let mut current: Option<(String, Section)> = None;
-        let mut seen = BTreeSet::new();
+        let mut file = Self {
+            sections: Vec::new(),
+        };
         for line in raw.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -376,13 +365,11 @@ impl IniFile {
                 if name.is_empty() {
                     return Err(ConfigError::Ini("empty section name"));
                 }
-                if !seen.insert(name.to_ascii_lowercase()) {
+                if file.section(name).is_some() {
                     return Err(ConfigError::Ini("duplicate section"));
                 }
-                if let Some(prev) = current.take() {
-                    sections.push(prev);
-                }
-                current = Some((name.to_owned(), Section { pairs: Vec::new() }));
+                file.sections
+                    .push((name.to_owned(), Section { pairs: Vec::new() }));
                 continue;
             }
             let Some((key, value)) = line.split_once('=') else {
@@ -393,7 +380,7 @@ impl IniFile {
             if key.is_empty() {
                 return Err(ConfigError::Ini("empty key"));
             }
-            let Some((_, section)) = current.as_mut() else {
+            let Some((_, section)) = file.sections.last_mut() else {
                 return Err(ConfigError::Ini("key outside section"));
             };
             if section.get(key).is_some() {
@@ -401,10 +388,7 @@ impl IniFile {
             }
             section.pairs.push((key.to_owned(), value.to_owned()));
         }
-        if let Some(prev) = current.take() {
-            sections.push(prev);
-        }
-        Ok(Self { sections })
+        Ok(file)
     }
 
     fn section(&self, name: &str) -> Option<&Section> {

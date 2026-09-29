@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use snell_config::{ClientConfig as FileClientConfig, ServerConfig as FileServerConfig};
 use snell_runtime::{
-    ClientConfig, Outbound, ProtocolSelection, ServerConfig, TcpBrutal, UdpOptions, run_client,
-    run_server,
+    ClientConfig, Outbound, ServerConfig, TcpBrutal, UdpOptions, run_client, run_server,
 };
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -113,25 +112,22 @@ fn init_logging(log_level: Option<&str>) {
 }
 
 fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
-    if let Some(path) = args.config {
-        let cfg = FileClientConfig::load(path)?;
-        return Ok(ClientConfig {
-            listen: cfg.listen,
-            server: cfg.server,
-            psk: cfg.psk,
-            version: cfg.version,
-            reuse: cfg.reuse,
-            pool: None,
-            buffers: Default::default(),
-            udp: UdpOptions::new()?,
-        });
-    }
+    let file = match args.config {
+        Some(path) => FileClientConfig::load(path)?,
+        None => FileClientConfig {
+            listen: args.listen.expect("required by clap"),
+            server: args.server.expect("required by clap"),
+            psk: snell_config::parse_psk_str(&args.psk.expect("required by clap"))?,
+            version: snell_config::parse_client_version(&args.version.expect("required by clap"))?,
+            reuse: args.reuse,
+        },
+    };
     Ok(ClientConfig {
-        listen: args.listen.expect("required by clap"),
-        server: args.server.expect("required by clap"),
-        psk: snell_config::parse_psk_str(&args.psk.expect("required by clap"))?,
-        version: snell_config::parse_client_version(&args.version.expect("required by clap"))?,
-        reuse: args.reuse,
+        listen: file.listen,
+        server: file.server,
+        psk: file.psk,
+        version: file.version,
+        reuse: file.reuse,
         pool: None,
         buffers: Default::default(),
         udp: UdpOptions::new()?,
@@ -139,48 +135,36 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
 }
 
 fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
-    if let Some(path) = args.config {
-        let cfg = FileServerConfig::load(path)?;
-        return Ok(ServerConfig {
-            listen: cfg.listen,
-            psk: cfg.psk,
-            selection: cfg.selection,
-            outbound: map_outbound(cfg.outbound),
-            buffers: Default::default(),
-            udp: UdpOptions::new()?,
-            tcp_brutal: cfg.tcp_brutal.map(|brutal| TcpBrutal {
-                send_mbps: brutal.send_mbps,
-                cwnd_gain: brutal.cwnd_gain,
-            }),
-        });
-    }
-    if args.version.is_none() && args.mode.is_some() {
-        anyhow::bail!("mode is only valid when version = 6");
-    }
-    let selection = match args.version.as_deref() {
-        None => ProtocolSelection::Auto,
-        Some(version) => ProtocolSelection::Exact(snell_config::parse_server_version(
-            version,
-            args.mode.as_deref(),
-        )?),
+    let file = match args.config {
+        Some(path) => FileServerConfig::load(path)?,
+        None => FileServerConfig {
+            listen: args.listen.expect("required by clap"),
+            psk: snell_config::parse_psk_str(&args.psk.expect("required by clap"))?,
+            selection: snell_config::parse_server_selection(
+                args.version.as_deref(),
+                args.mode.as_deref(),
+            )?,
+            outbound: args
+                .socks5_outbound
+                .map_or(snell_config::Outbound::Direct, |server| {
+                    snell_config::Outbound::Socks5 { server }
+                }),
+            tcp_brutal: None,
+        },
     };
     Ok(ServerConfig {
-        listen: args.listen.expect("required by clap"),
-        psk: snell_config::parse_psk_str(&args.psk.expect("required by clap"))?,
-        selection,
-        outbound: match args.socks5_outbound {
-            Some(server) => Outbound::Socks5 { server },
-            None => Outbound::Direct,
+        listen: file.listen,
+        psk: file.psk,
+        selection: file.selection,
+        outbound: match file.outbound {
+            snell_config::Outbound::Direct => Outbound::Direct,
+            snell_config::Outbound::Socks5 { server } => Outbound::Socks5 { server },
         },
         buffers: Default::default(),
         udp: UdpOptions::new()?,
-        tcp_brutal: None,
+        tcp_brutal: file.tcp_brutal.map(|brutal| TcpBrutal {
+            send_mbps: brutal.send_mbps,
+            cwnd_gain: brutal.cwnd_gain,
+        }),
     })
-}
-
-fn map_outbound(outbound: snell_config::Outbound) -> Outbound {
-    match outbound {
-        snell_config::Outbound::Direct => Outbound::Direct,
-        snell_config::Outbound::Socks5 { server } => Outbound::Socks5 { server },
-    }
 }

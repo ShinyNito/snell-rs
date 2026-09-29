@@ -25,19 +25,19 @@ async fn run() {
     let salt = [7u8; 16];
 
     for _ in 0..2 {
-        let _ = aead_key(psk.as_bytes(), &salt).unwrap();
+        let _ = aead_key(&psk, &salt).unwrap();
     }
 
     let inline_started = Instant::now();
     for i in 0..ROUNDS {
         let mut s = salt;
         s[0] = i as u8;
-        let _ = aead_key(psk.as_bytes(), &s).unwrap();
+        let _ = aead_key(&psk, &s).unwrap();
     }
     let inline_elapsed = inline_started.elapsed();
 
     for _ in 0..2 {
-        let psk_bytes = psk.as_bytes().to_vec();
+        let psk_bytes = psk.clone();
         let _ = tokio::task::spawn_blocking(move || aead_key(&psk_bytes, &salt))
             .await
             .unwrap()
@@ -48,7 +48,7 @@ async fn run() {
     for i in 0..ROUNDS {
         let mut s = salt;
         s[0] = i as u8;
-        let psk_bytes = psk.as_bytes().to_vec();
+        let psk_bytes = psk.clone();
         let _ = tokio::task::spawn_blocking(move || aead_key(&psk_bytes, &s))
             .await
             .unwrap()
@@ -76,7 +76,7 @@ async fn run() {
 }
 
 fn dedicated_serial(psk: &Psk, salt: [u8; 16]) -> std::time::Duration {
-    let psk_bytes = psk.as_bytes().to_vec();
+    let psk_bytes = psk.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel::<([u8; 16], std::sync::mpsc::SyncSender<()>)>(32);
     let worker = thread::spawn(move || {
         while let Ok((s, done)) = rx.recv() {
@@ -98,7 +98,7 @@ fn dedicated_serial(psk: &Psk, salt: [u8; 16]) -> std::time::Duration {
 }
 
 fn dedicated_pool(threads: usize, tasks: usize, psk: &Psk, salt: [u8; 16]) -> std::time::Duration {
-    let psk_bytes = Arc::new(psk.as_bytes().to_vec());
+    let psk_bytes = Arc::new(psk.clone());
     let (tx, rx) = std::sync::mpsc::sync_channel::<([u8; 16], std::sync::mpsc::SyncSender<()>)>(32);
     let rx = Arc::new(Mutex::new(rx));
     let mut joins = Vec::with_capacity(threads);
@@ -148,7 +148,7 @@ async fn concurrent_spawn(
     let mut joins = Vec::with_capacity(tasks);
     for i in 0..tasks {
         let sem = sem.clone();
-        let psk_bytes = psk.as_bytes().to_vec();
+        let psk_bytes = psk.clone();
         let mut s = salt;
         s[0] = i as u8;
         joins.push(tokio::spawn(async move {

@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use snell_protocol::socks5::{self, Command, METHOD_NO_ACCEPTABLE, METHOD_NO_AUTH, Reply};
-use snell_protocol::{Address, AddressRef, ParseState};
+use snell_protocol::{Address, AddressRef, Error, ParseState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -18,12 +18,10 @@ pub(crate) async fn accept_socks5(stream: &mut TcpStream) -> Result<Socks5Comman
     loop {
         match socks5::greeting_need(&buf[..filled])? {
             ParseState::Need(total) => {
-                if total > buf.len() {
-                    return Err(SessionError::Protocol(snell_protocol::Error::Malformed(
-                        "oversized socks5 greeting",
-                    )));
-                }
-                stream.read_exact(&mut buf[filled..total]).await?;
+                let missing = buf
+                    .get_mut(filled..total)
+                    .ok_or(Error::Malformed("oversized socks5 greeting"))?;
+                stream.read_exact(missing).await?;
                 filled = total;
             }
             ParseState::Done(greeting) => {
@@ -42,12 +40,10 @@ pub(crate) async fn accept_socks5(stream: &mut TcpStream) -> Result<Socks5Comman
     loop {
         match socks5::request_need(&buf[..filled])? {
             ParseState::Need(total) => {
-                if total > buf.len() {
-                    return Err(SessionError::Protocol(snell_protocol::Error::Malformed(
-                        "oversized socks5 request",
-                    )));
-                }
-                stream.read_exact(&mut buf[filled..total]).await?;
+                let missing = buf
+                    .get_mut(filled..total)
+                    .ok_or(Error::Malformed("oversized socks5 request"))?;
+                stream.read_exact(missing).await?;
                 filled = total;
             }
             ParseState::Done(request) => {

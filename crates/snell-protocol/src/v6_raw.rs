@@ -2,8 +2,8 @@
 
 use core::fmt;
 
-use crate::header::{parse_v6_plain_header, write_v6_plain_header};
-use crate::record::{DecodeStatus, DecodedRecord, RecordKind};
+use crate::header::{RecordHeader, parse_v6_plain_header, write_v6_plain_header};
+use crate::record::{DecodeStatus, DecodedRecord, Pending};
 use crate::{Buffer, Error, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, Result};
 
 pub struct V6UnsafeRawEncoder {
@@ -70,11 +70,6 @@ impl V6UnsafeRawEncoder {
     }
 
     fn finish(&mut self, buf: &mut Buffer, payload_len: usize) -> Result<()> {
-        if payload_len > self.max_payload {
-            self.reserving = false;
-            buf.truncate(self.record_start)?;
-            return Err(Error::PayloadTooLarge);
-        }
         buf.truncate(self.payload_start + payload_len)?;
         write_v6_plain_header(
             buf.range_mut(self.header_start, self.header_start + HEADER_PLAIN_LEN),
@@ -108,10 +103,8 @@ impl V6UnsafeRawReservation<'_> {
             .encoder
             .prefix_len
             .checked_add(written)
+            .filter(|&total| total <= self.encoder.max_payload)
             .ok_or(Error::PayloadTooLarge)?;
-        if total > self.encoder.max_payload {
-            return Err(Error::PayloadTooLarge);
-        }
         self.sealed = true;
         self.encoder.finish(self.buf, total)
     }
@@ -137,22 +130,19 @@ impl fmt::Debug for V6UnsafeRawEncoder {
 #[derive(Clone, Copy, Debug)]
 enum ReadStep {
     Header,
-    Body(crate::RecordHeader),
+    Body(RecordHeader),
 }
 
 pub struct V6UnsafeRawDecoder {
     step: ReadStep,
-    /// Bytes of returned-but-unconsumed records at the front of `filled()`.
-    /// Decode-ahead parses the next record at this offset; [`Self::consume`]
-    /// drains records FIFO.
-    pending: usize,
+    pending: Pending,
 }
 
 impl V6UnsafeRawDecoder {
     pub fn new() -> Self {
         Self {
             step: ReadStep::Header,
-            pending: 0,
+            pending: Pending::default(),
         }
     }
 
@@ -164,64 +154,32 @@ impl V6UnsafeRawDecoder {
         loop {
             match self.step {
                 ReadStep::Header => {
-                    let off = self.pending;
+                    let off = self.pending.offset();
                     let header_end = off + HEADER_PLAIN_LEN;
-                    if let Some(need) = self.decode_need(buf, header_end)? {
+                    if let Some(need) = self.pending.need(buf, header_end)? {
                         return Ok(need);
                     }
                     let header = parse_v6_plain_header(&buf.filled()[off..header_end])?;
-                    let body_len = header.body_len_v6_raw()?;
-                    if body_len == 0 {
-                        self.step = ReadStep::Header;
-                        self.pending = header_end;
-                        return Ok(DecodeStatus::Record(DecodedRecord {
-                            consumed: HEADER_PLAIN_LEN,
-                            plaintext: 0..0,
-                            kind: RecordKind::ZeroChunk,
-                        }));
+                    if header.body_len_v6_raw()? == 0 {
+                        return Ok(self.pending.zero_chunk(header_end));
                     }
                     self.step = ReadStep::Body(header);
                 }
                 ReadStep::Body(header) => {
-                    let body_off = self.pending + HEADER_PLAIN_LEN;
-                    let body_len = header.body_len_v6_raw()?;
-                    let needed = body_off + body_len;
-                    if let Some(need) = self.decode_need(buf, needed)? {
+                    let body_off = self.pending.offset() + HEADER_PLAIN_LEN;
+                    let body_end = body_off + header.body_len_v6_raw()?;
+                    if let Some(need) = self.pending.need(buf, body_end)? {
                         return Ok(need);
                     }
                     self.step = ReadStep::Header;
-                    let consumed = needed - self.pending;
-                    self.pending = needed;
-                    return Ok(DecodeStatus::Record(DecodedRecord {
-                        consumed,
-                        plaintext: body_off..needed,
-                        kind: RecordKind::Data,
-                    }));
+                    return Ok(self.pending.data(body_end, body_off..body_end));
                 }
             }
         }
     }
 
     pub fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
-        self.pending = self
-            .pending
-            .checked_sub(record.consumed)
-            .ok_or(Error::PlaintextNotDrained)?;
-        buf.consume(record.consumed)?;
-        Ok(())
-    }
-
-    /// `minimum` is measured from the start of `filled()` and includes
-    /// `pending`. A record must fit the buffer on its own; when outstanding
-    /// records crowd it out, report `NeedMore` so the caller drains first.
-    fn decode_need(&self, buf: &Buffer, minimum: usize) -> Result<Option<DecodeStatus>> {
-        if minimum - self.pending > buf.max() {
-            Err(Error::PayloadTooLarge)
-        } else if buf.len() < minimum {
-            Ok(Some(DecodeStatus::NeedMore { minimum }))
-        } else {
-            Ok(None)
-        }
+        self.pending.consume(buf, record)
     }
 }
 
@@ -234,7 +192,7 @@ impl Default for V6UnsafeRawDecoder {
 impl fmt::Debug for V6UnsafeRawDecoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("V6UnsafeRawDecoder")
-            .field("pending", &self.pending)
+            .field("pending", &self.pending.offset())
             .finish()
     }
 }
@@ -242,7 +200,7 @@ impl fmt::Debug for V6UnsafeRawDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Buffer;
+    use crate::RecordKind;
 
     fn collect(buf: &Buffer) -> Vec<u8> {
         buf.filled().to_vec()

@@ -1,5 +1,5 @@
 use std::mem::size_of;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -54,11 +54,14 @@ pub struct UdpPacket<'a> {
 }
 
 pub fn connect_request_len(destination: AddressRef<'_>) -> Result<usize> {
-    let host = destination.host();
-    if host.is_empty() || host.len() > u8::MAX as usize {
+    connect_len(destination.host().len())
+}
+
+fn connect_len(host_len: usize) -> Result<usize> {
+    if host_len == 0 || host_len > usize::from(u8::MAX) {
         return Err(Error::HostTooLong);
     }
-    Ok(4 + host.len() + 2)
+    Ok(size_of::<WireControlPrefix>() + host_len + 2)
 }
 
 pub fn encode_connect_request(
@@ -66,16 +69,12 @@ pub fn encode_connect_request(
     destination: AddressRef<'_>,
     reuse: bool,
 ) -> Result<usize> {
-    let needed = connect_request_len(destination)?;
-    if dst.len() < needed {
-        return Err(Error::BufferTooSmall {
-            needed,
-            available: dst.len(),
-        });
-    }
     let host = destination.host();
-    let host = host.as_bytes();
+    let needed = connect_len(host.len())?;
     let available = dst.len();
+    let dst = dst
+        .get_mut(..needed)
+        .ok_or(Error::BufferTooSmall { needed, available })?;
     let (wire, rest) = WireControlPrefix::mut_from_prefix(dst)
         .map_err(|_| Error::BufferTooSmall { needed, available })?;
     wire.version = PROTOCOL_VERSION;
@@ -86,8 +85,9 @@ pub fn encode_connect_request(
     };
     wire.client_id_len = 0;
     wire.host_len = host.len() as u8;
-    rest[..host.len()].copy_from_slice(host);
-    rest[host.len()..host.len() + 2].copy_from_slice(&destination.port().to_be_bytes());
+    let (host_dst, port_dst) = rest.split_at_mut(host.len());
+    host_dst.copy_from_slice(host.as_bytes());
+    port_dst.copy_from_slice(&destination.port().to_be_bytes());
     Ok(needed)
 }
 
@@ -109,33 +109,21 @@ pub fn decode_connect_request_prefix(src: &[u8]) -> Result<(ConnectRequest, usiz
         COMMAND_CONNECT_V2 => true,
         other => return Err(Error::UnknownCommand(other)),
     };
-    let client_id_len = head.client_id_len as usize;
-    if after.len() <= client_id_len {
-        return Err(Error::Truncated);
+    let client_id_len = usize::from(head.client_id_len);
+    let host_port = after.get(client_id_len..).ok_or(Error::Truncated)?;
+    match host_port.first() {
+        None => return Err(Error::Truncated),
+        Some(0) => return Err(Error::EmptyHost),
+        Some(_) => {}
     }
-    let host_len = after[client_id_len] as usize;
-    if host_len == 0 {
-        return Err(Error::EmptyHost);
-    }
-    let host_offset = client_id_len + 1;
-    let needed_after = host_offset + host_len + 2;
-    if after.len() < needed_after {
-        return Err(Error::Truncated);
-    }
-    let host = std::str::from_utf8(&after[host_offset..host_offset + host_len])
-        .map_err(|_| Error::InvalidHostUtf8)?;
-    let port = u16::from_be_bytes([
-        after[host_offset + host_len],
-        after[host_offset + host_len + 1],
-    ]);
-    let destination = if let Ok(ip) = host.parse::<IpAddr>() {
-        Address::Ip(SocketAddr::new(ip, port))
-    } else {
-        Address::domain(host, port)?
+    let (host, port, host_port_len) = split_host_port(host_port)?;
+    let destination = match host.parse::<IpAddr>() {
+        Ok(ip) => Address::Ip(SocketAddr::new(ip, port)),
+        Err(_) => Address::domain(host, port)?,
     };
     Ok((
         ConnectRequest { destination, reuse },
-        size_of::<WireControlHead>() + needed_after,
+        size_of::<WireControlHead>() + client_id_len + host_port_len,
     ))
 }
 
@@ -159,7 +147,7 @@ pub fn decode_udp_setup_prefix(src: &[u8]) -> Result<usize> {
     if wire.command != COMMAND_UDP {
         return Err(Error::UnknownCommand(wire.command));
     }
-    let client_id_len = wire.client_id_len as usize;
+    let client_id_len = usize::from(wire.client_id_len);
     if after.len() < client_id_len {
         return Err(Error::Truncated);
     }
@@ -167,30 +155,23 @@ pub fn decode_udp_setup_prefix(src: &[u8]) -> Result<usize> {
 }
 
 pub fn encode_tunnel_reply(dst: &mut [u8]) -> Result<usize> {
-    if dst.is_empty() {
-        return Err(Error::BufferTooSmall {
-            needed: 1,
-            available: 0,
-        });
-    }
-    dst[0] = COMMAND_TUNNEL;
+    let slot = dst.first_mut().ok_or(Error::BufferTooSmall {
+        needed: 1,
+        available: 0,
+    })?;
+    *slot = COMMAND_TUNNEL;
     Ok(1)
 }
 
 pub(crate) fn encode_error_reply(dst: &mut [u8], code: u8, message: &str) -> Result<usize> {
-    let msg = message.as_bytes();
-    let msg_len = msg.len().min(255);
-    let needed = 3 + msg_len;
-    if dst.len() < needed {
-        return Err(Error::BufferTooSmall {
-            needed,
-            available: dst.len(),
-        });
-    }
-    dst[0] = COMMAND_ERROR;
-    dst[1] = code;
-    dst[2] = msg_len as u8;
-    dst[3..needed].copy_from_slice(&msg[..msg_len]);
+    let msg = &message.as_bytes()[..message.len().min(usize::from(u8::MAX))];
+    let needed = 3 + msg.len();
+    let available = dst.len();
+    let dst = dst
+        .get_mut(..needed)
+        .ok_or(Error::BufferTooSmall { needed, available })?;
+    dst[..3].copy_from_slice(&[COMMAND_ERROR, code, msg.len() as u8]);
+    dst[3..].copy_from_slice(msg);
     Ok(needed)
 }
 
@@ -205,31 +186,30 @@ pub enum ServerReply<'a> {
 }
 
 pub fn decode_server_reply(src: &[u8]) -> Result<ParseState<(ServerReply<'_>, usize)>> {
-    if src.is_empty() {
-        return Ok(ParseState::Need(1));
-    }
-    match src[0] {
-        COMMAND_TUNNEL => Ok(ParseState::Done((ServerReply::Tunnel, 1))),
-        COMMAND_ERROR => {
-            if src.len() < 3 {
-                return Ok(ParseState::Need(3));
+    match *src {
+        [] => Ok(ParseState::Need(1)),
+        [COMMAND_TUNNEL, ..] => Ok(ParseState::Done((ServerReply::Tunnel, 1))),
+        [COMMAND_ERROR, code, msg_len, ref rest @ ..] => {
+            let needed = 3 + usize::from(msg_len);
+            match rest.get(..usize::from(msg_len)) {
+                Some(message) => Ok(ParseState::Done((
+                    ServerReply::Error { code, message },
+                    needed,
+                ))),
+                None => Ok(ParseState::Need(needed)),
             }
-            let msg_len = src[2] as usize;
-            let needed = 3 + msg_len;
-            if src.len() < needed {
-                return Ok(ParseState::Need(needed));
-            }
-            Ok(ParseState::Done((
-                ServerReply::Error {
-                    code: src[1],
-                    message: &src[3..needed],
-                },
-                needed,
-            )))
         }
-        other => Err(Error::UnknownCommand(other)),
+        [COMMAND_ERROR, ..] => Ok(ParseState::Need(3)),
+        [other, ..] => Err(Error::UnknownCommand(other)),
     }
 }
+
+// UDP datagram headers share one address tail:
+// IP     `ATYP(1) ADDR(4|16) PORT(2)`
+// domain `LEN(1)  HOST(LEN)  PORT(2)`
+//
+// Request  `COMMAND_UDP_FORWARD`, then `UDP_REQUEST_IP_LEN` before an IP tail.
+// Response `ATYP_DOMAIN` before a domain tail; an IP tail stands alone.
 
 pub fn encode_udp_request(
     dst: &mut [u8],
@@ -237,71 +217,25 @@ pub fn encode_udp_request(
     payload: &[u8],
 ) -> Result<usize> {
     let header_len = udp_request_header_len(address)?;
-    let needed = header_len + payload.len();
-    if dst.len() < needed {
-        return Err(Error::BufferTooSmall {
-            needed,
-            available: dst.len(),
-        });
-    }
-    write_udp_request_header(&mut dst[..header_len], address)?;
-    dst[header_len..needed].copy_from_slice(payload);
-    Ok(needed)
+    let marker: &[u8] = match address {
+        AddressRef::Ip(_) => &[COMMAND_UDP_FORWARD, UDP_REQUEST_IP_LEN],
+        AddressRef::Domain { .. } => &[COMMAND_UDP_FORWARD],
+    };
+    encode_udp_datagram(dst, header_len, marker, address, payload)
 }
 
 pub fn decode_udp_request(src: &[u8]) -> Result<UdpPacket<'_>> {
-    if src.len() < 2 {
+    let [command, host_len, ..] = *src else {
         return Err(Error::Truncated);
+    };
+    if command != COMMAND_UDP_FORWARD {
+        return Err(Error::UnknownCommand(command));
     }
-    if src[0] != COMMAND_UDP_FORWARD {
-        return Err(Error::UnknownCommand(src[0]));
+    if host_len == UDP_REQUEST_IP_LEN {
+        decode_udp_datagram(src, 2, parse_ip_tail)
+    } else {
+        decode_udp_datagram(src, 1, parse_domain_tail)
     }
-    if src[1] == UDP_REQUEST_IP_LEN {
-        if src.len() < 3 {
-            return Err(Error::Truncated);
-        }
-        return match src[2] {
-            ATYP_IPV4 => {
-                if src.len() < 9 {
-                    return Err(Error::Truncated);
-                }
-                let ip = Ipv4Addr::new(src[3], src[4], src[5], src[6]);
-                let port = u16::from_be_bytes([src[7], src[8]]);
-                Ok(UdpPacket {
-                    address: AddressRef::Ip(SocketAddr::new(IpAddr::V4(ip), port)),
-                    payload: &src[9..],
-                    header_len: 9,
-                })
-            }
-            ATYP_IPV6 => {
-                if src.len() < 21 {
-                    return Err(Error::Truncated);
-                }
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&src[3..19]);
-                let port = u16::from_be_bytes([src[19], src[20]]);
-                Ok(UdpPacket {
-                    address: AddressRef::Ip(SocketAddr::new(IpAddr::V6(octets.into()), port)),
-                    payload: &src[21..],
-                    header_len: 21,
-                })
-            }
-            other => Err(Error::InvalidAddressType(other)),
-        };
-    }
-    let host_len = src[1] as usize;
-    let needed = 2 + host_len + 2;
-    if src.len() < needed {
-        return Err(Error::Truncated);
-    }
-    let host = std::str::from_utf8(&src[2..2 + host_len]).map_err(|_| Error::InvalidHostUtf8)?;
-    validate_domain(host)?;
-    let port = u16::from_be_bytes([src[2 + host_len], src[2 + host_len + 1]]);
-    Ok(UdpPacket {
-        address: AddressRef::Domain { host, port },
-        payload: &src[needed..],
-        header_len: needed,
-    })
 }
 
 pub fn encode_udp_response(
@@ -310,68 +244,18 @@ pub fn encode_udp_response(
     payload: &[u8],
 ) -> Result<usize> {
     let header_len = udp_response_header_len(address)?;
-    let needed = header_len + payload.len();
-    if dst.len() < needed {
-        return Err(Error::BufferTooSmall {
-            needed,
-            available: dst.len(),
-        });
-    }
-    write_udp_response_header(&mut dst[..header_len], address)?;
-    dst[header_len..needed].copy_from_slice(payload);
-    Ok(needed)
+    let marker: &[u8] = match address {
+        AddressRef::Ip(_) => &[],
+        AddressRef::Domain { .. } => &[ATYP_DOMAIN],
+    };
+    encode_udp_datagram(dst, header_len, marker, address, payload)
 }
 
 pub fn decode_udp_response(src: &[u8]) -> Result<UdpPacket<'_>> {
-    if src.is_empty() {
-        return Err(Error::Truncated);
-    }
-    match src[0] {
-        ATYP_DOMAIN => {
-            if src.len() < 2 {
-                return Err(Error::Truncated);
-            }
-            let host_len = src[1] as usize;
-            let needed = 2 + host_len + 2;
-            if src.len() < needed {
-                return Err(Error::Truncated);
-            }
-            let host =
-                std::str::from_utf8(&src[2..2 + host_len]).map_err(|_| Error::InvalidHostUtf8)?;
-            validate_domain(host)?;
-            let port = u16::from_be_bytes([src[2 + host_len], src[2 + host_len + 1]]);
-            Ok(UdpPacket {
-                address: AddressRef::Domain { host, port },
-                payload: &src[needed..],
-                header_len: needed,
-            })
-        }
-        ATYP_IPV4 => {
-            if src.len() < 7 {
-                return Err(Error::Truncated);
-            }
-            let ip = Ipv4Addr::new(src[1], src[2], src[3], src[4]);
-            let port = u16::from_be_bytes([src[5], src[6]]);
-            Ok(UdpPacket {
-                address: AddressRef::Ip(SocketAddr::new(IpAddr::V4(ip), port)),
-                payload: &src[7..],
-                header_len: 7,
-            })
-        }
-        ATYP_IPV6 => {
-            if src.len() < 19 {
-                return Err(Error::Truncated);
-            }
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&src[1..17]);
-            let port = u16::from_be_bytes([src[17], src[18]]);
-            Ok(UdpPacket {
-                address: AddressRef::Ip(SocketAddr::new(IpAddr::V6(octets.into()), port)),
-                payload: &src[19..],
-                header_len: 19,
-            })
-        }
-        other => Err(Error::InvalidAddressType(other)),
+    match src.first() {
+        None => Err(Error::Truncated),
+        Some(&ATYP_DOMAIN) => decode_udp_datagram(src, 1, parse_domain_tail),
+        Some(_) => decode_udp_datagram(src, 0, parse_ip_tail),
     }
 }
 
@@ -384,75 +268,113 @@ pub fn udp_response_len(address: AddressRef<'_>, payload_len: usize) -> Result<u
 }
 
 fn udp_request_header_len(address: AddressRef<'_>) -> Result<usize> {
-    match address {
-        AddressRef::Domain { host, .. } => {
-            validate_domain(host)?;
-            Ok(1 + 1 + host.len() + 2)
-        }
-        AddressRef::Ip(SocketAddr::V4(_)) => Ok(9),
-        AddressRef::Ip(SocketAddr::V6(_)) => Ok(21),
-    }
-}
-
-fn write_udp_request_header(dst: &mut [u8], address: AddressRef<'_>) -> Result<()> {
-    match address {
-        AddressRef::Domain { host, port } => {
-            let host = host.as_bytes();
-            dst[0] = COMMAND_UDP_FORWARD;
-            dst[1] = host.len() as u8;
-            dst[2..2 + host.len()].copy_from_slice(host);
-            dst[2 + host.len()..].copy_from_slice(&port.to_be_bytes());
-        }
-        AddressRef::Ip(SocketAddr::V4(addr)) => {
-            dst[0] = COMMAND_UDP_FORWARD;
-            dst[1] = UDP_REQUEST_IP_LEN;
-            dst[2] = ATYP_IPV4;
-            dst[3..7].copy_from_slice(&addr.ip().octets());
-            dst[7..9].copy_from_slice(&addr.port().to_be_bytes());
-        }
-        AddressRef::Ip(SocketAddr::V6(addr)) => {
-            dst[0] = COMMAND_UDP_FORWARD;
-            dst[1] = UDP_REQUEST_IP_LEN;
-            dst[2] = ATYP_IPV6;
-            dst[3..19].copy_from_slice(&addr.ip().octets());
-            dst[19..21].copy_from_slice(&addr.port().to_be_bytes());
-        }
-    }
-    Ok(())
+    let marker = if matches!(address, AddressRef::Ip(_)) {
+        2
+    } else {
+        1
+    };
+    Ok(marker + udp_tail_len(address)?)
 }
 
 fn udp_response_header_len(address: AddressRef<'_>) -> Result<usize> {
-    match address {
-        AddressRef::Domain { host, .. } => {
-            validate_domain(host)?;
-            Ok(1 + 1 + host.len() + 2)
-        }
-        AddressRef::Ip(SocketAddr::V4(_)) => Ok(7),
-        AddressRef::Ip(SocketAddr::V6(_)) => Ok(19),
-    }
+    let marker = usize::from(matches!(address, AddressRef::Domain { .. }));
+    Ok(marker + udp_tail_len(address)?)
 }
 
-fn write_udp_response_header(dst: &mut [u8], address: AddressRef<'_>) -> Result<()> {
-    match address {
-        AddressRef::Domain { host, port } => {
-            let host = host.as_bytes();
-            dst[0] = ATYP_DOMAIN;
-            dst[1] = host.len() as u8;
-            dst[2..2 + host.len()].copy_from_slice(host);
-            dst[2 + host.len()..].copy_from_slice(&port.to_be_bytes());
+fn udp_tail_len(address: AddressRef<'_>) -> Result<usize> {
+    let addr_len = match address {
+        AddressRef::Domain { host, .. } => {
+            validate_domain(host)?;
+            host.len()
         }
-        AddressRef::Ip(SocketAddr::V4(addr)) => {
-            dst[0] = ATYP_IPV4;
-            dst[1..5].copy_from_slice(&addr.ip().octets());
-            dst[5..7].copy_from_slice(&addr.port().to_be_bytes());
+        AddressRef::Ip(SocketAddr::V4(_)) => 4,
+        AddressRef::Ip(SocketAddr::V6(_)) => 16,
+    };
+    Ok(1 + addr_len + 2)
+}
+
+fn encode_udp_datagram(
+    dst: &mut [u8],
+    header_len: usize,
+    marker: &[u8],
+    address: AddressRef<'_>,
+    payload: &[u8],
+) -> Result<usize> {
+    let needed = header_len + payload.len();
+    let available = dst.len();
+    let dst = dst
+        .get_mut(..needed)
+        .ok_or(Error::BufferTooSmall { needed, available })?;
+    let (header, payload_dst) = dst.split_at_mut(header_len);
+    let (marker_dst, tail) = header.split_at_mut(marker.len());
+    marker_dst.copy_from_slice(marker);
+    let (v4, v6);
+    let (tag, addr): (u8, &[u8]) = match address {
+        AddressRef::Domain { host, .. } => (host.len() as u8, host.as_bytes()),
+        AddressRef::Ip(SocketAddr::V4(ip)) => {
+            v4 = ip.ip().octets();
+            (ATYP_IPV4, &v4)
         }
-        AddressRef::Ip(SocketAddr::V6(addr)) => {
-            dst[0] = ATYP_IPV6;
-            dst[1..17].copy_from_slice(&addr.ip().octets());
-            dst[17..19].copy_from_slice(&addr.port().to_be_bytes());
+        AddressRef::Ip(SocketAddr::V6(ip)) => {
+            v6 = ip.ip().octets();
+            (ATYP_IPV6, &v6)
         }
-    }
-    Ok(())
+    };
+    let (tag_dst, rest) = tail.split_at_mut(1);
+    tag_dst[0] = tag;
+    let (addr_dst, port_dst) = rest.split_at_mut(addr.len());
+    addr_dst.copy_from_slice(addr);
+    port_dst.copy_from_slice(&address.port().to_be_bytes());
+    payload_dst.copy_from_slice(payload);
+    Ok(needed)
+}
+
+fn decode_udp_datagram<'a>(
+    src: &'a [u8],
+    marker_len: usize,
+    parse_tail: fn(&'a [u8]) -> Result<(AddressRef<'a>, usize)>,
+) -> Result<UdpPacket<'a>> {
+    let (address, tail_len) = parse_tail(&src[marker_len..])?;
+    let header_len = marker_len + tail_len;
+    Ok(UdpPacket {
+        address,
+        payload: &src[header_len..],
+        header_len,
+    })
+}
+
+fn parse_ip_tail(src: &[u8]) -> Result<(AddressRef<'_>, usize)> {
+    let (&atyp, rest) = src.split_first().ok_or(Error::Truncated)?;
+    let (ip, ip_len) = match atyp {
+        ATYP_IPV4 => (
+            IpAddr::from(*rest.first_chunk::<4>().ok_or(Error::Truncated)?),
+            4,
+        ),
+        ATYP_IPV6 => (
+            IpAddr::from(*rest.first_chunk::<16>().ok_or(Error::Truncated)?),
+            16,
+        ),
+        other => return Err(Error::InvalidAddressType(other)),
+    };
+    let port = rest[ip_len..].first_chunk().ok_or(Error::Truncated)?;
+    let addr = SocketAddr::new(ip, u16::from_be_bytes(*port));
+    Ok((AddressRef::Ip(addr), 1 + ip_len + 2))
+}
+
+fn parse_domain_tail(src: &[u8]) -> Result<(AddressRef<'_>, usize)> {
+    let (host, port, len) = split_host_port(src)?;
+    Ok((AddressRef::domain(host, port)?, len))
+}
+
+/// `LEN(1) HOST(LEN) PORT(2)` without host validation.
+fn split_host_port(src: &[u8]) -> Result<(&str, u16, usize)> {
+    let (&host_len, rest) = src.split_first().ok_or(Error::Truncated)?;
+    let (host, rest) = rest
+        .split_at_checked(usize::from(host_len))
+        .ok_or(Error::Truncated)?;
+    let port = rest.first_chunk().ok_or(Error::Truncated)?;
+    let host = std::str::from_utf8(host).map_err(|_| Error::InvalidHostUtf8)?;
+    Ok((host, u16::from_be_bytes(*port), 1 + host.len() + 2))
 }
 
 #[cfg(test)]
@@ -501,32 +423,5 @@ mod tests {
         let packet = decode_udp_request(b"\x01\x00\x04\x7f\x00\x00\x01\x1f\x90payload").unwrap();
         assert_eq!(packet.header_len, 9);
         assert_eq!(packet.payload, b"payload");
-    }
-
-    #[test]
-    fn encode_matches_workspace_connect_golden() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/golden/connect-example-com-443.json");
-        let raw = std::fs::read_to_string(path).unwrap();
-        let hex = raw
-            .split("\"hex\"")
-            .nth(1)
-            .unwrap()
-            .split('"')
-            .nth(1)
-            .unwrap();
-        let expected = decode_hex(hex);
-        let address = Address::domain("example.com", 443).unwrap();
-        let mut out = [0; 32];
-        let n = encode_connect_request(&mut out, address.as_view(), false).unwrap();
-        assert_eq!(&out[..n], expected);
-    }
-
-    fn decode_hex(hex: &str) -> Vec<u8> {
-        let hex: String = hex.chars().filter(|ch| !ch.is_whitespace()).collect();
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect()
     }
 }

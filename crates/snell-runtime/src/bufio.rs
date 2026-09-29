@@ -4,15 +4,18 @@
 use std::future::poll_fn;
 use std::io;
 use std::mem::MaybeUninit;
+use std::net::SocketAddr;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::task::{Context, Poll, ready};
 
+use bytes::Buf;
 use snell_protocol::{Result, V4Reservation, V6ShapedReservation, V6UnshapedReservation};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::UdpSocket;
 
 use crate::buffer::{BufferPool, PooledBuffer};
 use crate::error::SessionError;
-use std::sync::Arc;
 
 /// Socket readiness avoids leasing/preparing a record only to discover Pending.
 /// Both owned handshake streams and borrowed relay halves use Tokio's readiness.
@@ -41,38 +44,26 @@ pub(crate) fn poll_read_into<R: ReadReady + Unpin>(
     window: usize,
     cx: &mut Context<'_>,
 ) -> Poll<std::result::Result<usize, SessionError>> {
-    match reader.poll_ready(cx) {
-        Poll::Ready(Ok(())) => {}
-        Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
-        Poll::Pending => {
-            recv.release_empty();
-            return Poll::Pending;
-        }
-    }
+    let Poll::Ready(ready) = reader.poll_ready(cx) else {
+        recv.release_empty();
+        return Poll::Pending;
+    };
+    ready?;
     let needed = minimum
         .max(recv.len().saturating_add(1))
         .max(window.min(recv.max()));
-    if let Err(e) = recv.ensure(needed) {
-        return Poll::Ready(Err(e));
-    }
+    recv.ensure(needed)?;
     let missing = minimum.saturating_sub(recv.len()).max(1);
-    let spare = match recv.spare_capacity_mut(missing) {
-        Ok(spare) => spare,
-        Err(e) => return Poll::Ready(Err(e.into())),
+    let mut buf = ReadBuf::uninit(recv.spare_capacity_mut(missing)?);
+    let Poll::Ready(read) = Pin::new(reader).poll_read(cx, &mut buf) else {
+        recv.release_empty();
+        return Poll::Pending;
     };
-    let mut buf = ReadBuf::uninit(spare);
-    match Pin::new(reader).poll_read(cx, &mut buf) {
-        Poll::Ready(Ok(())) => {
-            let n = buf.filled().len();
-            // SAFETY: ReadBuf exposes only the bytes initialized by poll_read.
-            Poll::Ready(unsafe { recv.commit(n) }.map(|()| n).map_err(Into::into))
-        }
-        Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-        Poll::Pending => {
-            recv.release_empty();
-            Poll::Pending
-        }
-    }
+    read?;
+    let n = buf.filled().len();
+    // SAFETY: ReadBuf exposes only the bytes initialized by poll_read.
+    unsafe { recv.commit(n) }?;
+    Poll::Ready(Ok(n))
 }
 
 pub(crate) async fn read_into_recv<R: ReadReady + Unpin>(
@@ -89,65 +80,32 @@ pub(crate) fn poll_read_record<R: ReadReady + Unpin, T: TcpReservation>(
     cx: &mut Context<'_>,
 ) -> Poll<std::result::Result<(usize, usize), SessionError>> {
     let mut buf = ReadBuf::uninit(reservation.payload_uninit());
-    match Pin::new(reader).poll_read(cx, &mut buf) {
-        Poll::Ready(Ok(())) => {
-            let n = buf.filled().len();
-            let split = if n != 0 {
-                // SAFETY: this reservation supplied the slot just filled by ReadBuf.
-                match unsafe { reservation.seal_init(n) } {
-                    Ok(split) => split,
-                    Err(e) => return Poll::Ready(Err(e.into())),
-                }
-            } else {
-                0
-            };
-            Poll::Ready(Ok((n, split)))
-        }
-        Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-        Poll::Pending => Poll::Pending,
-    }
+    ready!(Pin::new(reader).poll_read(cx, &mut buf))?;
+    let n = buf.filled().len();
+    let split = if n == 0 {
+        0
+    } else {
+        // SAFETY: this reservation supplied the slot just filled by ReadBuf.
+        unsafe { reservation.seal_init(n) }?
+    };
+    Poll::Ready(Ok((n, split)))
 }
 
+/// Write the whole encode batch in wire order, `[split..]` then `[..split]`
+/// (vectored where the writer supports it), then return the lease.
 pub(crate) async fn drain_encode<W: AsyncWrite + Unpin>(
     writer: &mut W,
     encode: &mut PooledBuffer,
     split: usize,
 ) -> std::result::Result<(), SessionError> {
+    let (head, tail) = encode.filled().split_at(split);
+    writer.write_all_buf(&mut tail.chain(head)).await?;
     let len = encode.len();
-    let ranges = [split..len, 0..split];
-    let mut written = 0;
-    while written < len {
-        let mut slices = [io::IoSlice::new(&[]); 2];
-        let mut count = 0;
-        let mut skip = written;
-        for range in &ranges {
-            if skip >= range.len() {
-                skip -= range.len();
-                continue;
-            }
-            slices[count] = io::IoSlice::new(&encode.filled()[range.start + skip..range.end]);
-            count += 1;
-            skip = 0;
-        }
-        let n = poll_fn(|cx| {
-            if count == 1 {
-                Pin::new(&mut *writer).poll_write(cx, &slices[0])
-            } else {
-                Pin::new(&mut *writer).poll_write_vectored(cx, &slices[..count])
-            }
-        })
-        .await?;
-        if n == 0 {
-            return Err(
-                io::Error::new(io::ErrorKind::WriteZero, "encode write returned zero").into(),
-            );
-        }
-        written += n;
-    }
     encode.consume(len)?;
     encode.release_empty();
     Ok(())
 }
+
 pub(crate) trait TcpReservation {
     fn payload_mut(&mut self) -> &mut [u8];
     /// Uninitialized payload slot; pair with [`Self::seal_init`] after filling
@@ -159,96 +117,62 @@ pub(crate) trait TcpReservation {
     unsafe fn seal_init(self, written: usize) -> Result<usize>;
 }
 
-impl TcpReservation for V4Reservation<'_> {
-    fn payload_mut(&mut self) -> &mut [u8] {
-        V4Reservation::payload_mut(self)
-    }
+// Every codec seals in place; only v6-shaped records are split (payload first).
+macro_rules! impl_tcp_reservation {
+    ($ty:ident, $seal:ident, $seal_init:ident, $split:expr) => {
+        impl TcpReservation for $ty<'_> {
+            fn payload_mut(&mut self) -> &mut [u8] {
+                $ty::payload_mut(self)
+            }
 
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        V4Reservation::payload_uninit(self)
-    }
+            fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
+                $ty::payload_uninit(self)
+            }
 
-    fn seal(self, written: usize) -> Result<usize> {
-        V4Reservation::seal(self, written).map(|()| 0)
-    }
+            fn seal(self, written: usize) -> Result<usize> {
+                $ty::$seal(self, written).map($split)
+            }
 
-    unsafe fn seal_init(self, written: usize) -> Result<usize> {
-        unsafe { V4Reservation::seal_init(self, written) }.map(|()| 0)
-    }
+            unsafe fn seal_init(self, written: usize) -> Result<usize> {
+                unsafe { $ty::$seal_init(self, written) }.map($split)
+            }
+        }
+    };
 }
 
-impl TcpReservation for V6ShapedReservation<'_> {
-    fn payload_mut(&mut self) -> &mut [u8] {
-        V6ShapedReservation::payload_mut(self)
-    }
+impl_tcp_reservation!(V4Reservation, seal, seal_init, |()| 0);
+impl_tcp_reservation!(V6UnshapedReservation, seal, seal_init, |()| 0);
+impl_tcp_reservation!(
+    V6ShapedReservation,
+    seal_scattered,
+    seal_init_scattered,
+    |split| split
+);
 
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        V6ShapedReservation::payload_uninit(self)
-    }
-
-    fn seal(self, written: usize) -> Result<usize> {
-        V6ShapedReservation::seal_scattered(self, written)
-    }
-
-    unsafe fn seal_init(self, written: usize) -> Result<usize> {
-        unsafe { V6ShapedReservation::seal_init_scattered(self, written) }
-    }
-}
-
-impl TcpReservation for V6UnshapedReservation<'_> {
-    fn payload_mut(&mut self) -> &mut [u8] {
-        V6UnshapedReservation::payload_mut(self)
-    }
-
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        V6UnshapedReservation::payload_uninit(self)
-    }
-
-    fn seal(self, written: usize) -> Result<usize> {
-        V6UnshapedReservation::seal(self, written).map(|()| 0)
-    }
-
-    unsafe fn seal_init(self, written: usize) -> Result<usize> {
-        unsafe { V6UnshapedReservation::seal_init(self, written) }.map(|()| 0)
-    }
-}
-
+/// Lease a datagram buffer only once the socket is readable.
 pub(crate) async fn recv_datagram(
-    socket: &tokio::net::UdpSocket,
+    socket: &UdpSocket,
     buffers: &Arc<BufferPool>,
-) -> std::result::Result<(PooledBuffer, std::net::SocketAddr), SessionError> {
+) -> std::result::Result<(PooledBuffer, SocketAddr), SessionError> {
     poll_fn(|cx| {
-        match socket.poll_recv_ready(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(socket.poll_recv_ready(cx))?;
         let mut buffer = buffers.get(snell_protocol::UDP_DATAGRAM_MAX);
-        if let Err(error) = buffer.ensure(snell_protocol::UDP_DATAGRAM_MAX) {
-            return Poll::Ready(Err(error));
-        }
-        poll_recv_datagram(socket, &mut buffer, cx).map(|result| result.map(|peer| (buffer, peer)))
+        buffer.ensure(snell_protocol::UDP_DATAGRAM_MAX)?;
+        let peer = ready!(poll_recv_datagram(socket, &mut buffer, cx))?;
+        Poll::Ready(Ok((buffer, peer)))
     })
     .await
 }
 
 pub(crate) fn poll_recv_datagram(
-    socket: &tokio::net::UdpSocket,
+    socket: &UdpSocket,
     recv: &mut PooledBuffer,
     cx: &mut Context<'_>,
-) -> Poll<std::result::Result<std::net::SocketAddr, SessionError>> {
-    let spare = match recv.spare_capacity_mut(1) {
-        Ok(s) => s,
-        Err(e) => return Poll::Ready(Err(e.into())),
-    };
-    let mut read = ReadBuf::uninit(spare);
-    match socket.poll_recv_from(cx, &mut read) {
-        Poll::Ready(Ok(peer)) => {
-            let n = read.filled().len();
-            // SAFETY: the datagram was written into this exact spare slice.
-            Poll::Ready(unsafe { recv.commit(n) }.map(|()| peer).map_err(Into::into))
-        }
-        Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-        Poll::Pending => Poll::Pending,
-    }
+) -> Poll<std::result::Result<SocketAddr, SessionError>> {
+    let mut read = ReadBuf::uninit(recv.spare_capacity_mut(1)?);
+    let peer = ready!(socket.poll_recv_from(cx, &mut read))?;
+    let n = read.filled().len();
+    // SAFETY: the datagram was written into this exact spare slice.
+    unsafe { recv.commit(n) }?;
+    Poll::Ready(Ok(peer))
 }

@@ -3,7 +3,7 @@
 use crate::kdf::profile_secret;
 use crate::prf::{GOLDEN_GAMMA, expand_stream, prf32, prf32_seq, splitmix64};
 use crate::salt::{MIX_HANDSHAKE_DOMAIN, extract as salt_extract, write as salt_write};
-use crate::{Error, HEADER_CIPHER_LEN, MAX_SALT_BLOCK_LEN, Result, SALT_LEN, TAG_LEN};
+use crate::{Error, HEADER_CIPHER_LEN, Psk, Result, SALT_LEN, TAG_LEN, V6_MAX_PREFIX_LEN};
 
 const HANDSHAKE_DOMAIN: u32 = 0x7053;
 const CHUNK_INITIAL_DOMAIN: u32 = 0xf17c;
@@ -97,11 +97,13 @@ impl Namespaces {
 
     const fn for_label(self, label: u32) -> u64 {
         match label {
-            0 | 1 | 14 | 15 | 33 | 34 => self.prefix,
-            2 => self.motif,
-            3 | 16..=20 => self.mix,
-            21..=26 | 38 | 39 => self.chunk,
-            28..=32 | 35..=37 => self.write,
+            PADDING | BIT_PERCENT | PREFIX_MIN | PREFIX_MAX | RECORD_PREFIX | PAYLOAD_PADDING => {
+                self.prefix
+            }
+            MOTIF => self.motif,
+            MIX_OFFSET | MIX_MODE..=MIX_BLOCK => self.mix,
+            CHUNK_POLICY..=CHUNK_BUCKET | CHUNK_SIZE | CHUNK_JITTER_VALUE => self.chunk,
+            WRITE_POLICY..=WRITE_JITTER | WRITE_TARGET..=WRITE_NEXT => self.write,
             _ => self.profile,
         }
     }
@@ -114,7 +116,7 @@ impl Namespaces {
         prf32(self.for_label(label), label, domain)
     }
 
-    fn expand_slice(self, label: u32, seq: u32, out: &mut [u8]) {
+    fn expand(self, label: u32, seq: u32, out: &mut [u8]) {
         expand_stream(
             self.for_label(label),
             label,
@@ -122,18 +124,6 @@ impl Namespaces {
             out.len() as u64,
             out,
         );
-    }
-
-    fn expand_array<const N: usize>(self, label: u32, seq: u32) -> [u8; N] {
-        let mut out = [0; N];
-        expand_stream(
-            self.for_label(label),
-            label,
-            u64::from(seq),
-            N as u64,
-            &mut out,
-        );
-        out
     }
 }
 
@@ -182,8 +172,8 @@ pub struct Profile {
 }
 
 impl Profile {
-    pub fn derive(psk: &[u8]) -> Result<Self> {
-        let secret = profile_secret(psk)?;
+    pub fn derive(psk: &Psk) -> Self {
+        let secret = profile_secret(psk);
         let namespaces = Namespaces::derive(&secret);
 
         let generator = namespaces.prf_static(GENERATOR, 0) & 3;
@@ -201,14 +191,14 @@ impl Profile {
             0x10,
             0x60,
         );
-        let mut prefix_max_handshake = prefix_min_handshake
+        // prefix_min + 0x10 <= 0x70 stays below the cap, so min <= max.
+        let prefix_max_handshake = (prefix_min_handshake
             + pick_usize(
                 namespaces.prf_static(PREFIX_MAX, HANDSHAKE_DOMAIN),
                 0x10,
                 0xa0,
-            );
-        prefix_max_handshake = prefix_max_handshake.min(0x80);
-        let prefix_min_handshake = prefix_min_handshake.min(prefix_max_handshake);
+            ))
+        .min(V6_MAX_PREFIX_LEN);
         let salt_prefix_len = pick_usize(
             namespaces.prf_static(RECORD_PREFIX, HANDSHAKE_DOMAIN),
             prefix_min_handshake,
@@ -227,10 +217,9 @@ impl Profile {
         );
 
         let prefix_min_record = pick_usize(namespaces.prf_static(PREFIX_MIN, 0), 0x08, 0x50);
-        let mut prefix_max_record =
-            prefix_min_record + pick_usize(namespaces.prf_static(PREFIX_MAX, 0), 0x10, 0xa0);
-        prefix_max_record = prefix_max_record.min(0x80);
-        let prefix_min_record = prefix_min_record.min(prefix_max_record);
+        let prefix_max_record = (prefix_min_record
+            + pick_usize(namespaces.prf_static(PREFIX_MAX, 0), 0x10, 0xa0))
+        .min(V6_MAX_PREFIX_LEN);
 
         let mix_mode = namespaces.prf_static(MIX_MODE, 0) % 3;
         let mix_rounds = pick_u32(namespaces.prf_static(MIX_ROUNDS, 0), 1, 3);
@@ -243,20 +232,19 @@ impl Profile {
             namespaces.prf_static(CHUNK_INITIAL, 0),
             0x200,
             PROFILE_TRAFFIC_SHAPING_MTU_CAP,
-        )
-        .clamp(0x60, PROFILE_TRAFFIC_SHAPING_MTU_CAP);
+        );
         let first_record_cap = pick_usize(
             namespaces.prf_static(CHUNK_FIRST_CAP, CHUNK_INITIAL_DOMAIN),
             0x100,
             0x300,
         )
         .clamp(0x100, chunk_initial.min(0x300));
+        // At least 0x2000, so it already exceeds chunk_initial (<= MTU cap).
         let chunk_max = pick_usize(
             namespaces.prf_static(CHUNK_MAX, 0),
             0x2000,
             PROFILE_CHUNK_MAX_RAW_BOUND,
-        )
-        .max(chunk_initial);
+        );
         let chunk_step =
             pick_usize(namespaces.prf_static(CHUNK_STEP, 0), 0x400, 0x1000).min(0x0b68);
         let chunk_jitter =
@@ -265,35 +253,13 @@ impl Profile {
         let write_policy = namespaces.prf_static(WRITE_POLICY, 0) % 3;
         let write_first = pick_u32(namespaces.prf_static(WRITE_FIRST, 0), 4, 8);
 
-        let mut chunk_buckets = [0; 8];
-        let mut write_buckets = [0; 8];
-        let mut write_seq = [0; 8];
-        for i in 0..8 {
-            let chunk_bucket = pick_usize(
-                namespaces.prf_static(CHUNK_BUCKET, i as u32),
-                0x1000,
-                chunk_max,
-            );
-            chunk_buckets[i] = if chunk_bucket > chunk_max {
-                chunk_max
-            } else if chunk_bucket <= 0x0fff {
-                0x1000
-            } else {
-                chunk_bucket
-            };
-            write_buckets[i] = pick_usize(
-                namespaces.prf_static(WRITE_BUCKET, i as u32),
-                0x140,
-                PROFILE_TRAFFIC_SHAPING_MTU_CAP,
-            )
-            .clamp(0x100, PROFILE_TRAFFIC_SHAPING_MTU_CAP);
-            write_seq[i] = pick_usize(
-                namespaces.prf_static(WRITE_SEQ, i as u32),
-                0x168,
-                PROFILE_TRAFFIC_SHAPING_MTU_CAP,
-            )
-            .clamp(0x100, PROFILE_TRAFFIC_SHAPING_MTU_CAP);
-        }
+        // `pick_usize` already bounds every bucket to `lo..=hi`.
+        let buckets = |label, lo, hi| -> [usize; 8] {
+            core::array::from_fn(|i| pick_usize(namespaces.prf_static(label, i as u32), lo, hi))
+        };
+        let chunk_buckets = buckets(CHUNK_BUCKET, 0x1000, chunk_max);
+        let write_buckets = buckets(WRITE_BUCKET, 0x140, PROFILE_TRAFFIC_SHAPING_MTU_CAP);
+        let write_seq = buckets(WRITE_SEQ, 0x168, PROFILE_TRAFFIC_SHAPING_MTU_CAP);
 
         let write_jitter = pick_usize(namespaces.prf_static(WRITE_JITTER, 0), 0x08, 0x60);
         let write_jitter_percent = pick_usize(namespaces.prf_static(WRITE_POLICY, 0x504c), 8, 0x30);
@@ -305,7 +271,7 @@ impl Profile {
         let g5 = pick_usize(namespaces.prf_static(GENERATOR, 5), 0x01, 0x08);
         let g6 = pick_usize(namespaces.prf_static(GENERATOR, 6), 0x07, 0x17);
 
-        Ok(Self {
+        Self {
             namespaces,
             generator,
             pad_min,
@@ -345,7 +311,7 @@ impl Profile {
             salt_block_len,
             mix_stride_handshake,
             mix_rounds_handshake,
-        })
+        }
     }
 
     pub(crate) const fn salt_block_len(&self) -> usize {
@@ -383,7 +349,7 @@ impl Profile {
         salt_bytes: &[u8; SALT_LEN],
         block: &mut [u8],
     ) -> Result<()> {
-        if block.len() != self.salt_block_len || block.len() > MAX_SALT_BLOCK_LEN {
+        if block.len() != self.salt_block_len {
             return Err(Error::Malformed("salt block length"));
         }
         self.fill_official(u32::MAX, block);
@@ -393,28 +359,24 @@ impl Profile {
             self.mix_rounds_handshake as u8,
             block,
             salt_bytes,
-        )
-        .map_err(|()| Error::Malformed("salt block"))
+        );
+        Ok(())
     }
 
     pub(crate) fn extract_salt(&self, block: &[u8]) -> Result<[u8; SALT_LEN]> {
         if block.len() != self.salt_block_len {
             return Err(Error::Malformed("salt block length"));
         }
-        let mut salt_bytes = [0; SALT_LEN];
-        salt_extract(
+        Ok(salt_extract(
             self.namespaces.salt,
             self.mix_stride_handshake as u8,
             self.mix_rounds_handshake as u8,
             block,
-            &mut salt_bytes,
-        )
-        .map_err(|()| Error::Malformed("salt block"))?;
-        Ok(salt_bytes)
+        ))
     }
 
     pub(crate) fn fill_official(&self, seq: u32, out: &mut [u8]) {
-        self.namespaces.expand_slice(PADDING, seq, out);
+        self.namespaces.expand(PADDING, seq, out);
         match self.generator {
             1 => self.apply_generator_1(out),
             2 => self.apply_generator_2(out),
@@ -574,10 +536,8 @@ impl Profile {
     }
 
     fn apply_generator_1(&self, out: &mut [u8]) {
+        // g1 >= 0x18, so the modulus is never zero.
         let total = self.g1 + self.g2 + self.g3;
-        if total == 0 {
-            return;
-        }
         for (i, byte) in out.iter_mut().enumerate() {
             let b = *byte;
             let r = usize::from(b) % total;
@@ -601,15 +561,16 @@ impl Profile {
     }
 
     fn apply_generator_3(&self, seq: u32, out: &mut [u8]) {
-        let motif = self.namespaces.expand_array::<32>(MOTIF, seq);
-        let motif_len = (self.g5 * 4).min(motif.len()).max(1);
-        let interval = self.g6.max(1);
+        let mut motif = [0u8; 32];
+        self.namespaces.expand(MOTIF, seq, &mut motif);
+        // g5 is 1..=8 and g6 is 7..=23: the motif length fits and the interval is non-zero.
+        let motif_len = self.g5 * 4;
         for (i, byte) in out.iter_mut().enumerate() {
             let b = *byte;
-            let r = i % interval;
-            *byte = if r + 3 < interval {
+            let r = i % self.g6;
+            *byte = if r + 3 < self.g6 {
                 (((self.g5 + 3) * i) as u8) ^ motif[i % motif_len]
-            } else if r + 1 < interval {
+            } else if r + 1 < self.g6 {
                 0x30 + b % 10
             } else {
                 b
@@ -625,71 +586,39 @@ pub(crate) fn mix_padding_payload(
     payload_cipher: &mut [u8],
 ) {
     let n = padding.len().min(payload_cipher.len());
-    if n == 0 {
-        return;
-    }
+    let (padding, payload_cipher) = (&mut padding[..n], &mut payload_cipher[..n]);
     for round in 0..profile.mix_rounds {
+        // mix_stride is 2..=13 and mix_block is 8..=64, so neither step is zero.
+        let stride = profile.mix_stride + (round % 3) as usize;
         match profile.mix_mode {
-            1 => mix_alternating_block(profile, round, padding, payload_cipher, n),
-            2 => mix_prf_stride(profile, seq, round, padding, payload_cipher, n),
-            _ => mix_fixed_stride(profile, round, padding, payload_cipher, n),
+            1 => {
+                let blocks = padding
+                    .chunks_exact_mut(profile.mix_block)
+                    .zip(payload_cipher.chunks_exact_mut(profile.mix_block));
+                for (p, c) in blocks.skip(round as usize & 1).step_by(2) {
+                    p.swap_with_slice(c);
+                }
+            }
+            2 => {
+                let offset =
+                    profile.prf32(MIX_OFFSET, seq, round) as usize + profile.mix_offset_base;
+                swap_strided(padding, payload_cipher, offset % stride, stride);
+            }
+            _ => swap_strided(
+                padding,
+                payload_cipher,
+                profile.mix_offset_base % stride,
+                stride,
+            ),
         }
     }
 }
 
-fn mix_fixed_stride(
-    profile: &Profile,
-    round: u32,
-    padding: &mut [u8],
-    payload_cipher: &mut [u8],
-    n: usize,
-) {
-    let stride = (profile.mix_stride + (round % 3) as usize).max(1);
-    if stride == 1 {
-        padding[..n].swap_with_slice(&mut payload_cipher[..n]);
-        return;
-    }
-    let mut off = profile.mix_offset_base % stride;
-    while off < n {
-        core::mem::swap(&mut padding[off], &mut payload_cipher[off]);
-        off += stride;
-    }
-}
-
-fn mix_alternating_block(
-    profile: &Profile,
-    round: u32,
-    padding: &mut [u8],
-    payload_cipher: &mut [u8],
-    n: usize,
-) {
-    let block = profile.mix_block.max(1);
-    let mut off = (round as usize & 1) * block;
-    while off + block <= n {
-        let end = off + block;
-        padding[off..end].swap_with_slice(&mut payload_cipher[off..end]);
-        off += block * 2;
-    }
-}
-
-fn mix_prf_stride(
-    profile: &Profile,
-    seq: u32,
-    round: u32,
-    padding: &mut [u8],
-    payload_cipher: &mut [u8],
-    n: usize,
-) {
-    let stride = (profile.mix_stride + (round % 3) as usize).max(1);
-    let mut off =
-        (profile.prf32(MIX_OFFSET, seq, round) as usize + profile.mix_offset_base) % stride;
-    if stride == 1 {
-        padding[..n].swap_with_slice(&mut payload_cipher[..n]);
-        return;
-    }
-    while off < n {
-        core::mem::swap(&mut padding[off], &mut payload_cipher[off]);
-        off += stride;
+fn swap_strided(padding: &mut [u8], payload_cipher: &mut [u8], offset: usize, stride: usize) {
+    let padding = padding.iter_mut().skip(offset).step_by(stride);
+    let payload_cipher = payload_cipher.iter_mut().skip(offset).step_by(stride);
+    for (p, c) in padding.zip(payload_cipher) {
+        core::mem::swap(p, c);
     }
 }
 
@@ -745,10 +674,8 @@ const fn generator0_transform(orig: u8, index_mod: usize, target_bits: u32) -> u
 }
 
 fn derive_namespace(secret: &[u8; 32], label: u32, seed_const: u64) -> u64 {
-    let s0 = read_le_u64(secret, 0);
-    let s1 = read_le_u64(secret, 8);
-    let s2 = read_le_u64(secret, 16);
-    let s3 = read_le_u64(secret, 24);
+    let (words, _) = secret.as_chunks::<8>();
+    let [s0, s1, s2, s3] = [0, 1, 2, 3].map(|i| u64::from_le_bytes(words[i]));
     let mixed = u64::from(label).wrapping_mul(DOMAIN_MUL)
         ^ seed_const.wrapping_add(NAMESPACE_SEED_ADD)
         ^ s0
@@ -758,18 +685,8 @@ fn derive_namespace(secret: &[u8; 32], label: u32, seed_const: u64) -> u64 {
     splitmix64(mixed)
 }
 
-fn read_le_u64(input: &[u8; 32], offset: usize) -> u64 {
-    let mut bytes = [0; 8];
-    bytes.copy_from_slice(&input[offset..offset + 8]);
-    u64::from_le_bytes(bytes)
-}
-
 const fn pick_u32(raw: u32, lo: u32, hi: u32) -> u32 {
-    if hi <= lo {
-        lo
-    } else {
-        lo + raw % (hi - lo + 1)
-    }
+    pick_usize(raw, lo as usize, hi as usize) as u32
 }
 
 const fn pick_usize(raw: u32, lo: usize, hi: usize) -> usize {
@@ -784,7 +701,9 @@ const fn pick_usize(raw: u32, lo: usize, hi: usize) -> usize {
 mod tests {
     use super::*;
 
-    const TEST_PSK: &[u8] = b"test psk 16 byte";
+    fn test_psk() -> Psk {
+        Psk::new(b"test psk 16 byte").unwrap()
+    }
 
     #[test]
     fn generator0_matches_canonical_bit_order_exhaustively() {
@@ -815,7 +734,7 @@ mod tests {
 
     #[test]
     fn profile_derivation_matches_canonical_constants() {
-        let profile = Profile::derive(TEST_PSK).unwrap();
+        let profile = Profile::derive(&test_psk());
         assert_eq!(profile.namespaces.profile, 0xb69d_2dab_f942_0ee1);
         assert_eq!(profile.namespaces.prefix, 0x33bd_41e0_6ce7_0796);
         assert_eq!(profile.namespaces.motif, 0xddf9_dcc5_ba13_ef14);
@@ -839,7 +758,7 @@ mod tests {
 
     #[test]
     fn official_psk_chunk_profile() {
-        let profile = Profile::derive(b"0123456789abcdef").unwrap();
+        let profile = Profile::derive(&Psk::new(b"0123456789abcdef").unwrap());
         assert_eq!(profile.chunk_policy, 1);
         assert_eq!(profile.chunk_initial, 876);
         assert_eq!(profile.first_record_cap, 299);
@@ -855,7 +774,7 @@ mod tests {
 
     #[test]
     fn fill_and_prefix_match_canonical() {
-        let profile = Profile::derive(TEST_PSK).unwrap();
+        let profile = Profile::derive(&test_psk());
         let mut fill = vec![0; 32];
         let mut salt_fill = vec![0; 32];
         profile.fill_official(7, &mut fill);
@@ -908,7 +827,7 @@ mod tests {
 
     #[test]
     fn salt_block_round_trips_salt() {
-        let profile = Profile::derive(TEST_PSK).unwrap();
+        let profile = Profile::derive(&test_psk());
         let salt = [0x5a; SALT_LEN];
         let mut block = vec![0; profile.salt_block_len()];
         profile.write_salt_block(&salt, &mut block).unwrap();
@@ -917,7 +836,7 @@ mod tests {
 
     #[test]
     fn mixing_is_self_inverse() {
-        let profile = Profile::derive(TEST_PSK).unwrap();
+        let profile = Profile::derive(&test_psk());
         let mut padding = (0..128u8).collect::<Vec<_>>();
         let mut payload = (128..=255u8).collect::<Vec<_>>();
         let original_padding = padding.clone();

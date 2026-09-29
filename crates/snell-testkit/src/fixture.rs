@@ -102,32 +102,22 @@ fn optional_field(raw: &str, key: &str) -> Option<String> {
 }
 
 fn decode_hex(hex: &str) -> Result<Vec<u8>, FixtureError> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(FixtureError::Invalid {
-            path: PathBuf::from("<hex>"),
-            message: "odd hex length".to_owned(),
-        });
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    for chunk in bytes.chunks(2) {
-        let hi = from_hex_digit(chunk[0])?;
-        let lo = from_hex_digit(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-
-fn from_hex_digit(digit: u8) -> Result<u8, FixtureError> {
-    match digit {
-        b'0'..=b'9' => Ok(digit - b'0'),
-        b'a'..=b'f' => Ok(digit - b'a' + 10),
-        b'A'..=b'F' => Ok(digit - b'A' + 10),
-        _ => Err(FixtureError::Invalid {
-            path: PathBuf::from("<hex>"),
-            message: format!("invalid hex digit {}", char::from(digit)),
-        }),
-    }
+    let invalid = |message: String| FixtureError::Invalid {
+        path: PathBuf::from("<hex>"),
+        message,
+    };
+    let (pairs, []) = hex.as_bytes().as_chunks::<2>() else {
+        return Err(invalid("odd hex length".to_owned()));
+    };
+    pairs
+        .iter()
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| invalid(format!("invalid hex pair {}", pair.escape_ascii())))
+        })
+        .collect()
 }
 
 #[cfg(test)]

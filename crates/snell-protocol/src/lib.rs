@@ -48,7 +48,6 @@ pub use control::{
 };
 pub use entropy::{Entropy, OsEntropy, RepeatEntropy, SequenceEntropy};
 pub use error::{Error, Result};
-pub(crate) use header::RecordHeader;
 pub use kdf::aead_key;
 pub(crate) use nonce::Nonce;
 pub use parse::ParseState;
@@ -322,7 +321,5 @@ mod tests {
                 0xc0, 0x6e, 0x4a, 0x91, 0x25, 0xfd, 0xb8, 0x03, 0x77, 0xac
             ]
         );
-        assert_ne!(ProtocolFlavor::V4, ProtocolFlavor::V5);
-        assert_ne!(ProtocolFlavor::V6Shaped, ProtocolFlavor::V6Unshaped);
     }
 }

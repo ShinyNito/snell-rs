@@ -1,19 +1,21 @@
 use crate::buffer::{BufferPool, PooledBuffer};
 use snell_protocol::{
-    AUTO_DETECT_PREFIX_MAX, AUTO_DETECT_TIMEOUT_SECS, COMMAND_UDP, DecodeStatus, Error, ParseState,
-    PlainStream, Psk, RecordKind, SERVER_EARLY_PAYLOAD_MAX, V4Decoder, V4Encoder, V6ShapedDecoder,
-    V6ShapedEncoder,
+    AUTO_DETECT_PREFIX_MAX, AUTO_DETECT_TIMEOUT_SECS, DecodeStatus, ParseState, PlainStream, Psk,
+    RecordKind, SERVER_EARLY_PAYLOAD_MAX, V4Decoder, V4Encoder, V6ShapedDecoder, V6ShapedEncoder,
 };
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
 
 use crate::bufio::read_into_recv;
 use crate::codec::TcpDecoder;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
+use crate::pool::PooledCodec;
 use crate::replay::ReplayCache;
-use crate::session::{HANDSHAKE_PLAIN_MAX, ServerConnect, ServerFirst, maybe_install_kdf};
+use crate::session::{
+    FirstRequest, HANDSHAKE_PLAIN_MAX, ServerConnect, ServerFirst, maybe_install_kdf,
+    parse_first_request, with_timeout,
+};
 
 enum Cand {
     NeedMore,
@@ -21,231 +23,161 @@ enum Cand {
     Invalid,
 }
 
-/// Incremental auto-detect: v4 and v6-shaped only. One prefix buffer. No peek/sleep.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum Detected {
-    V4 {
-        encoder: V4Encoder,
-        decoder: V4Decoder,
-        recv: PooledBuffer,
-        first: ServerFirst,
-    },
-    V6Shaped {
-        encoder: V6ShapedEncoder,
-        decoder: V6ShapedDecoder,
-        recv: PooledBuffer,
-        first: ServerFirst,
-    },
+/// One protocol candidate fed from the shared prefix buffer.
+struct Candidate<D> {
+    decoder: D,
+    recv: PooledBuffer,
+    fed: usize,
+    plain: PlainStream,
+    state: Cand,
 }
 
+impl<D: TcpDecoder> Candidate<D> {
+    fn new(decoder: D, buffers: &Arc<BufferPool>) -> Self {
+        Self {
+            decoder,
+            recv: buffers.get_empty(snell_protocol::V6_WIRE_CAP),
+            fed: 0,
+            plain: PlainStream::new(HANDSHAKE_PLAIN_MAX),
+            state: Cand::NeedMore,
+        }
+    }
+
+    /// Copy prefix bytes this candidate has not seen yet, then decode them.
+    async fn advance(
+        &mut self,
+        prefix: &PooledBuffer,
+        kdf: &KdfLimiter,
+        psk: &Psk,
+    ) -> Result<(), SessionError> {
+        if self.fed < prefix.len() {
+            self.recv.extend(&prefix.filled()[self.fed..])?;
+            self.fed = prefix.len();
+        }
+        if matches!(self.state, Cand::NeedMore) {
+            self.state = self.decode(kdf, psk).await?;
+        }
+        Ok(())
+    }
+
+    async fn decode(&mut self, kdf: &KdfLimiter, psk: &Psk) -> Result<Cand, SessionError> {
+        let (decoder, recv) = (&mut self.decoder, &mut self.recv);
+        loop {
+            maybe_install_kdf(decoder, recv, kdf, psk).await?;
+            let record = match decoder.decode(recv) {
+                Ok(DecodeStatus::NeedMore { minimum }) => {
+                    recv.release_empty();
+                    return Ok(if recv.len() >= minimum {
+                        Cand::Invalid
+                    } else {
+                        Cand::NeedMore
+                    });
+                }
+                Ok(DecodeStatus::Record(record)) => record,
+                Err(_) => return Ok(Cand::Invalid),
+            };
+            if record.kind == RecordKind::ZeroChunk {
+                decoder.consume(recv, &record)?;
+                return Ok(Cand::Invalid);
+            }
+            let pushed = self.plain.push(record.plaintext(recv.filled()));
+            decoder.consume(recv, &record)?;
+            if pushed.is_err() {
+                return Ok(Cand::Invalid);
+            }
+            match parse_first_request(&self.plain) {
+                Ok(ParseState::Need(_)) => {}
+                Ok(ParseState::Done(FirstRequest::Connect(request, n))) => {
+                    let leftover = &self.plain.filled()[n..];
+                    if leftover.len() > SERVER_EARLY_PAYLOAD_MAX {
+                        return Err(SessionError::EarlyPayloadTooLarge);
+                    }
+                    let connect = ServerConnect::new(request, leftover.to_vec());
+                    return Ok(Cand::Match(ServerFirst::Connect(connect)));
+                }
+                Ok(ParseState::Done(FirstRequest::Udp)) => {
+                    return Ok(Cand::Match(ServerFirst::Udp));
+                }
+                Err(_) => return Ok(Cand::Invalid),
+            }
+        }
+    }
+
+    fn take_match(&mut self) -> Option<ServerFirst> {
+        match std::mem::replace(&mut self.state, Cand::Invalid) {
+            Cand::Match(first) => Some(first),
+            other => {
+                self.state = other;
+                None
+            }
+        }
+    }
+}
+
+/// Incremental auto-detect: v4 and v6-shaped only. One prefix buffer. No peek/sleep.
 pub(crate) async fn detect_protocol(
     stream: &mut TcpStream,
-    psk: Psk,
+    psk: &Psk,
     kdf: &KdfLimiter,
     replay: &ReplayCache,
     buffers: &Arc<BufferPool>,
-) -> Result<Detected, SessionError> {
-    match timeout(
-        Duration::from_secs(AUTO_DETECT_TIMEOUT_SECS),
-        detect_inner(stream, psk, kdf, replay, buffers),
+) -> Result<(PooledCodec, PooledBuffer, ServerFirst), SessionError> {
+    let detect = detect_inner(stream, psk, kdf, replay, buffers);
+    with_timeout(
+        AUTO_DETECT_TIMEOUT_SECS,
+        SessionError::HandshakeTimeout,
+        detect,
     )
     .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(SessionError::HandshakeTimeout),
-    }
 }
 
 async fn detect_inner(
     stream: &mut TcpStream,
-    psk: Psk,
+    psk: &Psk,
     kdf: &KdfLimiter,
     replay: &ReplayCache,
     buffers: &Arc<BufferPool>,
-) -> Result<Detected, SessionError> {
+) -> Result<(PooledCodec, PooledBuffer, ServerFirst), SessionError> {
     let mut prefix = buffers.get(AUTO_DETECT_PREFIX_MAX);
-    let mut v4 = V4Decoder::new(psk.clone());
-    let mut v4_recv = buffers.get_empty(snell_protocol::V6_WIRE_CAP);
-    let mut v4_fed = 0usize;
-    let mut v4_plain = PlainStream::new(HANDSHAKE_PLAIN_MAX);
-    let mut v4_state = Cand::NeedMore;
-
-    let mut v6 = V6ShapedDecoder::new(psk.clone())?;
-    let mut v6_recv = buffers.get_empty(snell_protocol::V6_WIRE_CAP);
-    let mut v6_fed = 0usize;
-    let mut v6_plain = PlainStream::new(HANDSHAKE_PLAIN_MAX);
-    let mut v6_state = Cand::NeedMore;
-
+    let mut v4 = Candidate::new(V4Decoder::new(psk.clone()), buffers);
+    let mut v6 = Candidate::new(V6ShapedDecoder::new(psk.clone()), buffers);
     loop {
-        feed(&mut v4_recv, &mut v4_fed, &prefix)?;
-        feed(&mut v6_recv, &mut v6_fed, &prefix)?;
-        advance(
-            &mut v4,
-            &mut v4_recv,
-            &mut v4_plain,
-            &mut v4_state,
-            kdf,
-            &psk,
-        )
-        .await?;
-        advance(
-            &mut v6,
-            &mut v6_recv,
-            &mut v6_plain,
-            &mut v6_state,
-            kdf,
-            &psk,
-        )
-        .await?;
+        v4.advance(&prefix, kdf, psk).await?;
+        v6.advance(&prefix, kdf, psk).await?;
 
-        match (&v4_state, &v6_state) {
+        match (&v4.state, &v6.state) {
             (Cand::Match(_), Cand::Match(_)) => return Err(SessionError::AmbiguousProtocol),
-            (Cand::Match(_), _) => {
-                let Cand::Match(first) = std::mem::replace(&mut v4_state, Cand::Invalid) else {
-                    unreachable!();
-                };
-                let psk_enc = psk.clone();
-                let encoder = kdf.run(move || V4Encoder::os(&psk_enc)).await??;
-                return Ok(Detected::V4 {
-                    encoder,
-                    decoder: v4,
-                    recv: v4_recv,
-                    first,
-                });
-            }
-            (_, Cand::Match(_)) => {
-                let Cand::Match(first) = std::mem::replace(&mut v6_state, Cand::Invalid) else {
-                    unreachable!();
-                };
-                if let Some(id) = v6.replay_identity() {
-                    replay.insert(id)?;
-                }
-                let psk_enc = psk.clone();
-                let encoder = kdf.run(move || V6ShapedEncoder::os(&psk_enc)).await??;
-                return Ok(Detected::V6Shaped {
-                    encoder,
-                    decoder: v6,
-                    recv: v6_recv,
-                    first,
-                });
-            }
             (Cand::Invalid, Cand::Invalid) => return Err(SessionError::Aead),
-            _ => {
-                if prefix.len() >= prefix.max() {
-                    return Err(SessionError::Aead);
-                }
-                let n = read_into_recv(stream, &mut prefix, 1).await?;
-                if n == 0 {
-                    return Err(SessionError::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "eof during auto-detect",
-                    )));
-                }
-            }
+            _ => {}
         }
-    }
-}
-
-fn feed(
-    dst: &mut PooledBuffer,
-    fed: &mut usize,
-    prefix: &PooledBuffer,
-) -> Result<(), SessionError> {
-    if *fed >= prefix.len() {
-        return Ok(());
-    }
-    dst.extend(&prefix.filled()[*fed..])?;
-    *fed = prefix.len();
-    Ok(())
-}
-
-async fn advance<D: TcpDecoder>(
-    decoder: &mut D,
-    recv: &mut PooledBuffer,
-    plain: &mut PlainStream,
-    state: &mut Cand,
-    kdf: &KdfLimiter,
-    psk: &Psk,
-) -> Result<(), SessionError> {
-    if !matches!(state, Cand::NeedMore) {
-        return Ok(());
-    }
-    loop {
-        maybe_install_kdf(decoder, recv, kdf, psk).await?;
-        match decoder.decode(recv) {
-            Ok(DecodeStatus::NeedMore { minimum }) => {
-                recv.release_empty();
-                if recv.len() >= minimum {
-                    *state = Cand::Invalid;
-                }
-                return Ok(());
-            }
-            Ok(DecodeStatus::Record(record)) => {
-                if record.kind == RecordKind::ZeroChunk {
-                    decoder.consume(recv, &record)?;
-                    *state = Cand::Invalid;
-                    return Ok(());
-                }
-                let pushed = plain.push(record.plaintext(recv.filled()));
-                decoder.consume(recv, &record)?;
-                if pushed.is_err() {
-                    *state = Cand::Invalid;
-                    return Ok(());
-                }
-                match interpret_plain(plain) {
-                    Interpret::Need => {}
-                    Interpret::Match(first) => {
-                        *state = Cand::Match(first);
-                        return Ok(());
-                    }
-                    Interpret::Invalid => {
-                        *state = Cand::Invalid;
-                        return Ok(());
-                    }
-                    Interpret::EarlyPayload => return Err(SessionError::EarlyPayloadTooLarge),
-                }
-            }
-            Err(_) => {
-                *state = Cand::Invalid;
-                return Ok(());
-            }
+        if let Some(first) = v4.take_match() {
+            let encoder = kdf.derive(psk, V4Encoder::os).await?;
+            let codec = PooledCodec::V4 {
+                encoder,
+                decoder: v4.decoder,
+            };
+            return Ok((codec, v4.recv, first));
         }
-    }
-}
-
-enum Interpret {
-    Need,
-    Match(ServerFirst),
-    Invalid,
-    EarlyPayload,
-}
-
-fn interpret_plain(plain: &PlainStream) -> Interpret {
-    match plain.connect() {
-        Ok(ParseState::Need(_)) => Interpret::Need,
-        Ok(ParseState::Done((request, n))) => {
-            let leftover = plain.filled()[n..].to_vec();
-            if leftover.len() > SERVER_EARLY_PAYLOAD_MAX {
-                return Interpret::EarlyPayload;
+        if let Some(first) = v6.take_match() {
+            if let Some(id) = v6.decoder.replay_identity() {
+                replay.insert(id)?;
             }
-            Interpret::Match(ServerFirst::Connect(ServerConnect {
-                destination: request.destination,
-                leftover,
-                reuse: request.reuse,
-            }))
+            let encoder = kdf.derive(psk, V6ShapedEncoder::os).await?;
+            let codec = PooledCodec::V6Shaped {
+                encoder,
+                decoder: v6.decoder,
+            };
+            return Ok((codec, v6.recv, first));
         }
-        Err(Error::UnknownCommand(COMMAND_UDP)) => match plain.udp_setup() {
-            Ok(ParseState::Need(_)) => Interpret::Need,
-            Ok(ParseState::Done(n)) => {
-                if plain.filled().len() != n {
-                    Interpret::Invalid
-                } else {
-                    Interpret::Match(ServerFirst::Udp)
-                }
-            }
-            Err(_) => Interpret::Invalid,
-        },
-        Err(_) => Interpret::Invalid,
+        if prefix.len() >= prefix.max() {
+            return Err(SessionError::Aead);
+        }
+        if read_into_recv(stream, &mut prefix, 1).await? == 0 {
+            return Err(SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "eof during auto-detect",
+            )));
+        }
     }
 }
 

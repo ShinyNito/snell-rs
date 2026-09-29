@@ -28,10 +28,6 @@ pub(crate) struct AcceptBackoff {
 }
 
 impl AcceptBackoff {
-    pub(crate) fn new() -> Self {
-        Self { consecutive: 0 }
-    }
-
     pub(crate) fn reset(&mut self) {
         self.consecutive = 0;
     }
@@ -39,8 +35,9 @@ impl AcceptBackoff {
     pub(crate) fn next_delay(&mut self) -> Duration {
         let shift = self.consecutive.min(8);
         self.consecutive = self.consecutive.saturating_add(1);
-        let millis = ACCEPT_BACKOFF_MIN.as_millis() << shift;
-        Duration::from_millis(u64::try_from(millis.min(ACCEPT_BACKOFF_MAX.as_millis())).unwrap())
+        ACCEPT_BACKOFF_MIN
+            .saturating_mul(1 << shift)
+            .min(ACCEPT_BACKOFF_MAX)
     }
 }
 
@@ -106,7 +103,7 @@ impl<'a> AcceptLoop<'a> {
     pub(crate) fn new(listener: &'a TcpListener) -> Self {
         Self {
             listener,
-            backoff: AcceptBackoff::new(),
+            backoff: AcceptBackoff::default(),
             #[cfg(test)]
             inject: std::collections::VecDeque::new(),
         }
@@ -142,23 +139,17 @@ pub(crate) fn enfile_error() -> io::Error {
 }
 
 fn is_resource_limit(error: &io::Error) -> bool {
-    if matches!(
+    matches!(
         error.kind(),
         io::ErrorKind::OutOfMemory | io::ErrorKind::QuotaExceeded
-    ) {
-        return true;
-    }
-    match error.raw_os_error() {
-        Some(code) => resource_codes().contains(&code),
-        None => false,
-    }
+    ) || error
+        .raw_os_error()
+        .is_some_and(|code| resource_codes().contains(&code))
 }
 
 fn is_ignorable_accept(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::ConnectionAborted {
-        return true;
-    }
-    error.raw_os_error() == Some(conn_aborted_code())
+    error.kind() == io::ErrorKind::ConnectionAborted
+        || error.raw_os_error() == Some(conn_aborted_code())
 }
 
 #[cfg(test)]
@@ -226,14 +217,14 @@ mod tests {
     fn other_accept_errors_are_fatal() {
         let error = io::Error::other("listener broken");
         assert_eq!(classify_accept_error(&error), AcceptClass::Fatal);
-        let mut backoff = AcceptBackoff::new();
+        let mut backoff = AcceptBackoff::default();
         let err = on_accept_result(Err(error), &mut backoff).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 
     #[test]
     fn resource_backoff_is_bounded() {
-        let mut backoff = AcceptBackoff::new();
+        let mut backoff = AcceptBackoff::default();
         let mut last = Duration::ZERO;
         for _ in 0..16 {
             let OnAccept::RetryAfter(delay) =

@@ -32,22 +32,22 @@ impl Entropy for RepeatEntropy {
 /// Deterministic entropy for tests. Exhausts after the supplied bytes.
 pub struct SequenceEntropy<'a> {
     bytes: &'a [u8],
-    offset: usize,
 }
 
 impl<'a> SequenceEntropy<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+        Self { bytes }
     }
 }
 
 impl Entropy for SequenceEntropy<'_> {
     fn fill(&mut self, buf: &mut [u8]) -> Result<()> {
-        if self.offset + buf.len() > self.bytes.len() {
-            return Err(Error::EntropyExhausted);
-        }
-        buf.copy_from_slice(&self.bytes[self.offset..self.offset + buf.len()]);
-        self.offset += buf.len();
+        let (head, rest) = self
+            .bytes
+            .split_at_checked(buf.len())
+            .ok_or(Error::EntropyExhausted)?;
+        buf.copy_from_slice(head);
+        self.bytes = rest;
         Ok(())
     }
 }
