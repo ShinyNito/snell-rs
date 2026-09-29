@@ -3,7 +3,7 @@
 
 use std::mem::MaybeUninit;
 
-use crate::{Error, Result};
+use crate::{Error, Result, TAG_LEN};
 
 /// Fixed backing allocation and a live byte range; never grows implicitly.
 pub struct Buffer {
@@ -243,31 +243,66 @@ impl Buffer {
     }
 }
 
-/// Shared reservation `seal_init` bookkeeping: validate the payload slot is
-/// still uninitialized spare, then commit `written` caller-initialized bytes.
-/// Returns the total payload length including the prefix.
-pub(crate) fn commit_init_payload(
-    buf: &mut Buffer,
-    payload_start: usize,
-    prefix_len: usize,
-    max_payload: usize,
-    written: usize,
-) -> Result<usize> {
-    let total = prefix_len
-        .checked_add(written)
-        .ok_or(Error::PayloadTooLarge)?;
-    if total > max_payload {
-        return Err(Error::PayloadTooLarge);
+/// Payload slot of one reserved record, shared by the record encoders.
+///
+/// Offsets are absolute in [`Buffer`] storage. [`Buffer::reserve_record`]
+/// guarantees they stay valid until the record is sealed or cancelled.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Slot {
+    pub(crate) record_start: usize,
+    pub(crate) payload_start: usize,
+    pub(crate) prefix_len: usize,
+    pub(crate) max_payload: usize,
+}
+
+impl Slot {
+    pub(crate) const fn capacity(&self) -> usize {
+        self.max_payload - self.prefix_len
     }
-    if buf.end() != payload_start + prefix_len {
-        return Err(Error::PendingWire);
+
+    /// Payload after the prefix, materializing the rest of the record
+    /// (payload and tag) for in-place writers.
+    pub(crate) fn payload_mut<'b>(&self, buf: &'b mut Buffer) -> &'b mut [u8] {
+        let end = self.payload_start + self.max_payload;
+        let record_end = end + TAG_LEN;
+        if buf.end() < record_end {
+            // Capacity was reserved by `reserve_record`; this cannot fail.
+            buf.reserve_zeroed(record_end - buf.end())
+                .expect("record capacity reserved");
+        }
+        buf.range_mut(self.payload_start + self.prefix_len, end)
     }
-    // SAFETY: the public reservation entry point is unsafe and requires these
-    // exact payload bytes to have been initialized. This helper is crate-private.
-    unsafe {
-        buf.commit(written)?;
+
+    /// Uninitialized payload after the prefix; empty once materialized.
+    pub(crate) fn payload_uninit<'b>(&self, buf: &'b mut Buffer) -> &'b mut [MaybeUninit<u8>] {
+        if buf.end() != self.payload_start + self.prefix_len {
+            return &mut [];
+        }
+        &mut buf.spare_uninit()[..self.capacity()]
     }
-    Ok(total)
+
+    /// Total payload length for `written` bytes after the prefix.
+    pub(crate) fn total(&self, written: usize) -> Result<usize> {
+        self.prefix_len
+            .checked_add(written)
+            .filter(|&total| total <= self.max_payload)
+            .ok_or(Error::PayloadTooLarge)
+    }
+
+    /// Commit `written` caller-initialized bytes of [`Self::payload_uninit`].
+    /// Returns the total payload length including the prefix.
+    pub(crate) fn commit_init(&self, buf: &mut Buffer, written: usize) -> Result<usize> {
+        let total = self.total(written)?;
+        if buf.end() != self.payload_start + self.prefix_len {
+            return Err(Error::PendingWire);
+        }
+        // SAFETY: the public reservation entry points are unsafe and require
+        // these exact payload bytes to have been initialized.
+        unsafe {
+            buf.commit(written)?;
+        }
+        Ok(total)
+    }
 }
 
 // Unsafe entry points live here, alongside the storage initialization boundary.

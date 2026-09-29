@@ -32,35 +32,22 @@ pub struct RecordHeader {
 
 impl RecordHeader {
     pub fn body_len_v4(self) -> Result<usize> {
-        if self.payload_len == 0 {
-            if self.padding_len != 0 {
-                return Err(Error::ZeroChunkWithPadding);
-            }
-            return Ok(0);
+        if self.payload_len == 0 && self.padding_len != 0 {
+            return Err(Error::ZeroChunkWithPadding);
         }
-        Ok(self.padding_len + self.payload_len + TAG_LEN)
+        Ok(self.padding_len + self.payload_body_len())
     }
 
     pub fn body_len_v6_unshaped(self) -> Result<usize> {
         if self.padding_len != 0 {
             return Err(Error::InvalidHeader);
         }
-        if self.payload_len == 0 {
-            return Ok(0);
-        }
-        Ok(self.payload_len + TAG_LEN)
+        Ok(self.payload_body_len())
     }
 
-    pub fn body_len_v6_shaped(self) -> Result<usize> {
-        if self.padding_len > MAX_PACKET_SIZE_V6 || self.payload_len > MAX_PACKET_SIZE_V6 {
-            return Err(Error::PayloadTooLarge);
-        }
-        Ok(self.padding_len
-            + if self.payload_len == 0 {
-                0
-            } else {
-                self.payload_len + TAG_LEN
-            })
+    /// Both lengths come from `u16` wire fields, so no range check applies.
+    pub fn body_len_v6_shaped(self) -> usize {
+        self.padding_len + self.payload_body_len()
     }
 
     #[cfg(feature = "unsafe-raw")]
@@ -70,37 +57,49 @@ impl RecordHeader {
         }
         Ok(self.payload_len)
     }
+
+    /// Payload plus its tag; a zero-length payload carries no tag.
+    const fn payload_body_len(self) -> usize {
+        if self.payload_len == 0 {
+            0
+        } else {
+            self.payload_len + TAG_LEN
+        }
+    }
+}
+
+fn parse_plain_header(header: &[u8]) -> Result<&WirePlainHeader> {
+    let (wire, _) = WirePlainHeader::ref_from_prefix(header).map_err(|_| Error::Truncated)?;
+    if wire.marker != HEADER_VERSION_MARKER {
+        return Err(Error::InvalidHeader);
+    }
+    Ok(wire)
+}
+
+impl From<&WirePlainHeader> for RecordHeader {
+    fn from(wire: &WirePlainHeader) -> Self {
+        Self {
+            padding_len: usize::from(wire.padding_len.get()),
+            payload_len: usize::from(wire.payload_len.get()),
+        }
+    }
 }
 
 pub fn parse_v4_plain_header(header: &[u8]) -> Result<RecordHeader> {
-    let (wire, _) = WirePlainHeader::ref_from_prefix(header).map_err(|_| Error::Truncated)?;
-    if wire.marker != HEADER_VERSION_MARKER {
-        return Err(Error::InvalidHeader);
-    }
-    let padding_len = wire.padding_len.get() as usize;
-    let payload_len = wire.payload_len.get() as usize;
-    if padding_len > MAX_PACKET_SIZE || payload_len > MAX_PACKET_SIZE {
+    let header = RecordHeader::from(parse_plain_header(header)?);
+    if header.padding_len > MAX_PACKET_SIZE || header.payload_len > MAX_PACKET_SIZE {
         return Err(Error::PayloadTooLarge);
     }
-    Ok(RecordHeader {
-        padding_len,
-        payload_len,
-    })
+    Ok(header)
 }
 
 pub fn parse_v6_plain_header(header: &[u8]) -> Result<RecordHeader> {
-    let (wire, _) = WirePlainHeader::ref_from_prefix(header).map_err(|_| Error::Truncated)?;
-    if wire.marker != HEADER_VERSION_MARKER {
-        return Err(Error::InvalidHeader);
+    let wire = parse_plain_header(header)?;
+    let [a, b] = wire.reserved;
+    if a | b != 0 {
+        return Err(Error::InvalidReserved(a | b));
     }
-    let reserved = wire.reserved;
-    if reserved != [0, 0] {
-        return Err(Error::InvalidReserved(reserved[0] | reserved[1]));
-    }
-    Ok(RecordHeader {
-        padding_len: wire.padding_len.get() as usize,
-        payload_len: wire.payload_len.get() as usize,
-    })
+    Ok(wire.into())
 }
 
 pub fn write_v4_plain_header(
@@ -108,7 +107,7 @@ pub fn write_v4_plain_header(
     padding_len: usize,
     payload_len: usize,
 ) -> Result<()> {
-    write_plain_header(header, padding_len, payload_len, false)
+    write_plain_header(header, padding_len, payload_len, MAX_PACKET_SIZE)
 }
 
 pub fn write_v6_plain_header(
@@ -116,14 +115,14 @@ pub fn write_v6_plain_header(
     padding_len: usize,
     payload_len: usize,
 ) -> Result<()> {
-    write_plain_header(header, padding_len, payload_len, true)
+    write_plain_header(header, padding_len, payload_len, MAX_PACKET_SIZE_V6)
 }
 
 fn write_plain_header(
     header: &mut [u8],
     padding_len: usize,
     payload_len: usize,
-    reserved_zero: bool,
+    max: usize,
 ) -> Result<()> {
     let available = header.len();
     let (wire, _) =
@@ -131,11 +130,6 @@ fn write_plain_header(
             needed: HEADER_PLAIN_LEN,
             available,
         })?;
-    let max = if reserved_zero {
-        MAX_PACKET_SIZE_V6
-    } else {
-        MAX_PACKET_SIZE
-    };
     if padding_len > max || payload_len > max {
         return Err(Error::PayloadTooLarge);
     }

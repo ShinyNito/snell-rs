@@ -3,11 +3,11 @@ use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use snell_protocol::{
-    Address, AddressRef, COMMAND_UDP, DecodeStatus, Error, MAX_CONNECT_REQUEST_LEN,
+    Address, AddressRef, COMMAND_UDP, ConnectRequest, DecodeStatus, Error, MAX_CONNECT_REQUEST_LEN,
     MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk, REUSE_IDLE_TIMEOUT_SECS, RecordKind,
     SERVER_EARLY_PAYLOAD_MAX, ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS, aead_key,
     encode_connect_request, encode_reject, encode_tunnel_reply, encode_udp_request,
@@ -27,24 +27,26 @@ use crate::replay::ReplayCache;
 const RECORD_HINT: usize = MAX_PACKET_SIZE_V6;
 pub(crate) const HANDSHAKE_PLAIN_MAX: usize = MAX_CONNECT_REQUEST_LEN + MAX_PACKET_SIZE_V6;
 
-pub(crate) async fn with_handshake_timeout<F, T>(fut: F) -> Result<T, SessionError>
-where
-    F: Future<Output = Result<T, SessionError>>,
-{
-    match timeout(Duration::from_secs(TCP_HANDSHAKE_TIMEOUT_SECS), fut).await {
-        Ok(result) => result,
-        Err(_) => Err(SessionError::HandshakeTimeout),
-    }
+/// Bound `fut` by `secs`, reporting expiry as `expired`.
+pub(crate) async fn with_timeout<T>(
+    secs: u64,
+    expired: SessionError,
+    fut: impl Future<Output = Result<T, SessionError>>,
+) -> Result<T, SessionError> {
+    timeout(Duration::from_secs(secs), fut)
+        .await
+        .unwrap_or(Err(expired))
 }
 
-pub(crate) async fn with_reuse_idle_timeout<F, T>(fut: F) -> Result<T, SessionError>
-where
-    F: Future<Output = Result<T, SessionError>>,
-{
-    match timeout(Duration::from_secs(REUSE_IDLE_TIMEOUT_SECS), fut).await {
-        Ok(result) => result,
-        Err(_) => Err(SessionError::ReuseIdleTimeout),
-    }
+pub(crate) async fn with_handshake_timeout<T>(
+    fut: impl Future<Output = Result<T, SessionError>>,
+) -> Result<T, SessionError> {
+    with_timeout(
+        TCP_HANDSHAKE_TIMEOUT_SECS,
+        SessionError::HandshakeTimeout,
+        fut,
+    )
+    .await
 }
 
 pub(crate) async fn write_udp_setup<E: TcpEncoder, W: AsyncWrite + Unpin>(
@@ -223,9 +225,47 @@ pub(crate) struct ServerConnect {
     pub reuse: bool,
 }
 
+impl ServerConnect {
+    pub(crate) fn new(request: ConnectRequest, leftover: Vec<u8>) -> Self {
+        Self {
+            destination: request.destination,
+            leftover,
+            reuse: request.reuse,
+        }
+    }
+}
+
 pub(crate) enum ServerFirst {
     Connect(ServerConnect),
     Udp,
+}
+
+/// A complete first request in handshake plaintext. `Connect` carries the
+/// length of the CONNECT header; any bytes after it are early payload.
+pub(crate) enum FirstRequest {
+    Connect(ConnectRequest, usize),
+    Udp,
+}
+
+pub(crate) fn parse_first_request(
+    plain: &PlainStream,
+) -> Result<ParseState<FirstRequest>, SessionError> {
+    match plain.connect() {
+        Ok(ParseState::Need(n)) => Ok(ParseState::Need(n)),
+        Ok(ParseState::Done((request, n))) => {
+            Ok(ParseState::Done(FirstRequest::Connect(request, n)))
+        }
+        Err(Error::UnknownCommand(COMMAND_UDP)) => match plain.udp_setup()? {
+            ParseState::Need(n) => Ok(ParseState::Need(n)),
+            ParseState::Done(n) if plain.filled().len() == n => {
+                Ok(ParseState::Done(FirstRequest::Udp))
+            }
+            ParseState::Done(_) => {
+                Err(Error::Malformed("udp setup must occupy the whole record").into())
+            }
+        },
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(crate) async fn read_server_connect<D: TcpDecoder, R: ReadReady + Unpin>(
@@ -255,32 +295,14 @@ pub(crate) async fn read_server_connect<D: TcpDecoder, R: ReadReady + Unpin>(
                 }
                 plain.push(record.plaintext(recv.filled()))?;
                 decoder.consume(recv, &record)?;
-                match plain.connect() {
-                    Ok(ParseState::Need(_)) => {}
-                    Ok(ParseState::Done((request, n))) => {
+                match parse_first_request(&plain)? {
+                    ParseState::Need(_) => {}
+                    ParseState::Done(FirstRequest::Connect(request, n)) => {
                         let mut leftover = plain.filled()[n..].to_vec();
                         drain_early_payload(decoder, recv, reader, kdf, psk, &mut leftover).await?;
-                        if leftover.len() > SERVER_EARLY_PAYLOAD_MAX {
-                            return Err(SessionError::EarlyPayloadTooLarge);
-                        }
-                        return Ok(ServerFirst::Connect(ServerConnect {
-                            destination: request.destination,
-                            leftover,
-                            reuse: request.reuse,
-                        }));
+                        return Ok(ServerFirst::Connect(ServerConnect::new(request, leftover)));
                     }
-                    Err(Error::UnknownCommand(COMMAND_UDP)) => match plain.udp_setup()? {
-                        ParseState::Need(_) => {}
-                        ParseState::Done(n) => {
-                            if plain.filled().len() != n {
-                                return Err(SessionError::Protocol(Error::Malformed(
-                                    "udp setup must occupy the whole record",
-                                )));
-                            }
-                            return Ok(ServerFirst::Udp);
-                        }
-                    },
-                    Err(error) => return Err(error.into()),
+                    ParseState::Done(FirstRequest::Udp) => return Ok(ServerFirst::Udp),
                 }
             }
         }
@@ -304,10 +326,10 @@ async fn drain_early_payload<D: TcpDecoder, R: ReadReady + Unpin>(
     psk: &Psk,
     leftover: &mut Vec<u8>,
 ) -> Result<(), SessionError> {
+    if leftover.len() > SERVER_EARLY_PAYLOAD_MAX {
+        return Err(SessionError::EarlyPayloadTooLarge);
+    }
     loop {
-        if leftover.len() > SERVER_EARLY_PAYLOAD_MAX {
-            return Err(SessionError::EarlyPayloadTooLarge);
-        }
         maybe_install_kdf(decoder, recv, kdf, psk).await?;
         match decoder.decode(recv) {
             Ok(DecodeStatus::NeedMore { minimum }) => {
@@ -374,8 +396,7 @@ pub(crate) async fn maybe_install_kdf<D: TcpDecoder>(
         return Ok(());
     }
     let salt = decoder.kdf_salt(recv)?;
-    let psk_bytes = psk.as_bytes().to_vec();
-    let key = kdf.run(move || aead_key(&psk_bytes, &salt)).await??;
+    let key = kdf.derive(psk, move |psk| aead_key(psk, &salt)).await?;
     decoder.install_aead(salt, key)?;
     Ok(())
 }
@@ -387,14 +408,19 @@ pub(crate) async fn wait_reuse_idle<R: ReadReady + Unpin>(
     if !recv.is_empty() {
         return Ok(());
     }
-    with_reuse_idle_timeout(async {
+    let read = async {
         if read_into_recv(reader, recv, 1).await? == 0 {
             return Err(
                 io::Error::new(io::ErrorKind::UnexpectedEof, "eof during reuse idle").into(),
             );
         }
         Ok(())
-    })
+    };
+    with_timeout(
+        REUSE_IDLE_TIMEOUT_SECS,
+        SessionError::ReuseIdleTimeout,
+        read,
+    )
     .await
 }
 
@@ -423,7 +449,6 @@ async fn fill_until<R: ReadReady + Unpin>(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn relay<E: TcpEncoder, D: TcpDecoder>(
     snell: &mut TcpStream,
     plain: &mut TcpStream,
@@ -478,11 +503,7 @@ where
     poll_fn(|cx| {
         loop {
             if shutting_down {
-                return match Pin::new(&mut *writer).poll_shutdown(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-                    Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
-                    Poll::Pending => Poll::Pending,
-                };
+                return Pin::new(&mut *writer).poll_shutdown(cx).map_err(Into::into);
             }
 
             if !local_eof && encode.is_empty() {
@@ -493,19 +514,14 @@ where
                     let start = encode.len();
                     let had_pending = !encode.is_empty();
                     match reader.poll_ready(cx) {
-                        Poll::Ready(Ok(())) => {}
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                        Poll::Ready(ready) => ready?,
+                        Poll::Pending if had_pending => break,
                         Poll::Pending => {
-                            if !had_pending {
-                                encode.release_empty();
-                                return Poll::Pending;
-                            }
-                            break;
+                            encode.release_empty();
+                            return Poll::Pending;
                         }
                     }
-                    if let Err(e) = encode.ensure(encode.max()) {
-                        return Poll::Ready(Err(e));
-                    }
+                    encode.ensure(encode.max())?;
                     let hint = RECORD_HINT;
                     let read = loop {
                         let needed = match encoder.reserve(&mut encode, &[], hint) {
@@ -535,12 +551,10 @@ where
                             break;
                         }
                         Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Pending if had_pending => break,
                         Poll::Pending => {
-                            if !had_pending {
-                                encode.release_empty();
-                                return Poll::Pending;
-                            }
-                            break;
+                            encode.release_empty();
+                            return Poll::Pending;
                         }
                     }
                 }
@@ -554,56 +568,24 @@ where
                         append_encode_ranges(&mut ranges, &mut count, start, encode.len(), split);
                         zero_sent = true;
                     }
-                    Err(SessionError::Protocol(Error::PayloadTooLarge)) => {
-                        if !had_pending {
-                            return Poll::Ready(Err(Error::PayloadTooLarge.into()));
-                        }
-                    }
+                    Err(SessionError::Protocol(Error::PayloadTooLarge)) if had_pending => {}
                     Err(error) => return Poll::Ready(Err(error)),
                 }
             }
 
             if !encode.is_empty() {
+                let filled = encode.filled();
                 let mut slices = [io::IoSlice::new(&[]); ENCODE_SLICES_MAX];
-                let mut slice_count = 0;
-                let mut skip = write_off;
-                for range in &ranges[..count] {
-                    if skip >= range.len() {
-                        skip -= range.len();
-                        continue;
-                    }
-                    slices[slice_count] =
-                        io::IoSlice::new(&encode.filled()[range.start + skip..range.end]);
-                    slice_count += 1;
-                    skip = 0;
-                }
+                let parts = ranges[..count].iter().map(|range| &filled[range.clone()]);
+                let slice_count = unwritten_slices(parts, write_off, &mut slices);
                 if slice_count == 0 {
                     let consumed = encode.len();
-                    if let Err(error) = encode.consume(consumed) {
-                        return Poll::Ready(Err(error.into()));
-                    }
+                    encode.consume(consumed)?;
                     count = 0;
                     write_off = 0;
                     continue;
                 }
-                let written = if slice_count == 1 {
-                    Pin::new(&mut *writer).poll_write(cx, &slices[0])
-                } else {
-                    Pin::new(&mut *writer).poll_write_vectored(cx, &slices[..slice_count])
-                };
-                match written {
-                    Poll::Ready(Ok(0)) => {
-                        return Poll::Ready(Err(SessionError::Io(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "snell write returned zero",
-                        ))));
-                    }
-                    Poll::Ready(Ok(n)) => {
-                        write_off += n;
-                    }
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-                    Poll::Pending => return Poll::Pending,
-                }
+                write_off += ready!(poll_write_slices(writer, cx, &slices[..slice_count]))?;
                 continue;
             }
 
@@ -644,6 +626,42 @@ fn append_encode_ranges(
     }
 }
 
+/// Fill `slices` with the parts not yet written, skipping the first
+/// `written` bytes. Returns the number of slices filled.
+fn unwritten_slices<'a>(
+    parts: impl Iterator<Item = &'a [u8]>,
+    mut written: usize,
+    slices: &mut [io::IoSlice<'a>],
+) -> usize {
+    let mut count = 0;
+    for part in parts {
+        if written >= part.len() {
+            written -= part.len();
+            continue;
+        }
+        slices[count] = io::IoSlice::new(&part[written..]);
+        written = 0;
+        count += 1;
+    }
+    count
+}
+
+/// One (vectored) write; a zero-length write is an error, never progress.
+fn poll_write_slices<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    cx: &mut Context<'_>,
+    slices: &[io::IoSlice<'_>],
+) -> Poll<io::Result<usize>> {
+    let written = match slices {
+        [single] => ready!(Pin::new(writer).poll_write(cx, single))?,
+        _ => ready!(Pin::new(writer).poll_write_vectored(cx, slices))?,
+    };
+    if written == 0 {
+        return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+    }
+    Poll::Ready(Ok(written))
+}
+
 /// Vectored-write fan-in limit: at most this many decoded records are
 /// flushed per `writev`. Sized so max-size v4 records can fill the batch
 /// without exceeding the receive buffer.
@@ -676,50 +694,23 @@ where
         loop {
             if shutting_down {
                 recv.release_empty();
-                return match Pin::new(&mut *writer).poll_shutdown(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-                    Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
-                    Poll::Pending => Poll::Pending,
-                };
+                return Pin::new(&mut *writer).poll_shutdown(cx).map_err(Into::into);
             }
 
             if batch_count > 0 {
                 if write_off < batch_len {
                     let filled = recv.filled();
                     let mut slices = [io::IoSlice::new(&[]); WRITE_BATCH_MAX];
-                    let mut count = 0usize;
-                    let mut skip = write_off;
-                    for record in batch[..batch_count].iter().flatten() {
-                        let plain = record.plaintext(filled);
-                        if skip >= plain.len() {
-                            skip -= plain.len();
-                            continue;
-                        }
-                        slices[count] = io::IoSlice::new(&plain[skip..]);
-                        skip = 0;
-                        count += 1;
-                    }
-                    match Pin::new(&mut *writer).poll_write_vectored(cx, &slices[..count]) {
-                        Poll::Ready(Ok(0)) => {
-                            return Poll::Ready(Err(SessionError::Io(io::Error::new(
-                                io::ErrorKind::WriteZero,
-                                "plain write returned zero",
-                            ))));
-                        }
-                        Poll::Ready(Ok(n)) => {
-                            write_off += n;
-                        }
-                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-                        Poll::Pending => return Poll::Pending,
-                    }
+                    let parts = batch[..batch_count]
+                        .iter()
+                        .flatten()
+                        .map(|record| record.plaintext(filled));
+                    let count = unwritten_slices(parts, write_off, &mut slices);
+                    write_off += ready!(poll_write_slices(writer, cx, &slices[..count]))?;
                     continue;
                 }
-                for slot in batch[..batch_count].iter_mut() {
-                    if let Some(record) = slot.take()
-                        && let Err(error) = decoder.consume(recv, &record)
-                    {
-                        return Poll::Ready(Err(error.into()));
-                    }
+                for record in batch[..batch_count].iter_mut().filter_map(Option::take) {
+                    decoder.consume(recv, &record)?;
                 }
                 batch_count = 0;
                 batch_len = 0;
@@ -747,14 +738,13 @@ where
                             // Flush what is ready before reading more.
                             break;
                         }
-                        let n = match poll_read_into(reader, recv, minimum, READ_WINDOW, cx) {
-                            Poll::Ready(Ok(n)) => n,
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => {
-                                recv.release_empty();
-                                return Poll::Pending;
-                            }
+                        let Poll::Ready(read) =
+                            poll_read_into(reader, recv, minimum, READ_WINDOW, cx)
+                        else {
+                            recv.release_empty();
+                            return Poll::Pending;
                         };
+                        let n = read?;
                         if n == 0 {
                             if recv.is_empty() {
                                 protocol_end = false;
@@ -770,9 +760,7 @@ where
                     Ok(DecodeStatus::Record(record)) => {
                         if record.kind == RecordKind::ZeroChunk {
                             if batch_count == 0 {
-                                if let Err(error) = decoder.consume(recv, &record) {
-                                    return Poll::Ready(Err(error.into()));
-                                }
+                                decoder.consume(recv, &record)?;
                                 protocol_end = true;
                             } else {
                                 // Consumed FIFO with the batch, then end.
@@ -1066,7 +1054,7 @@ mod buffer_tests {
                 output.bytes
             };
             assert_eq!(pool.leased_bytes(), 0);
-            let mut decoder = snell_protocol::V6ShapedDecoder::new(psk.clone()).unwrap();
+            let mut decoder = snell_protocol::V6ShapedDecoder::new(psk.clone());
             let mut wire = snell_protocol::Buffer::new(bytes.len());
             wire.extend_from_slice(&bytes).unwrap();
             let mut actual = Vec::new();
@@ -1108,7 +1096,7 @@ mod buffer_tests {
         .await
         .unwrap();
         assert_eq!(pool.leased_bytes(), 0);
-        let mut decoder = snell_protocol::V6ShapedDecoder::new(psk).unwrap();
+        let mut decoder = snell_protocol::V6ShapedDecoder::new(psk);
         let mut wire = snell_protocol::Buffer::new(output.bytes.len());
         wire.extend_from_slice(&output.bytes).unwrap();
         let mut actual = Vec::new();

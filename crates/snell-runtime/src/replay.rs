@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -13,8 +13,9 @@ pub(crate) struct ReplayCache {
     ttl: Duration,
 }
 
+/// `order` holds every live salt once, oldest first; `seen` indexes it.
 struct Inner {
-    by_salt: HashMap<[u8; SALT_LEN], Instant>,
+    seen: HashSet<[u8; SALT_LEN]>,
     order: VecDeque<([u8; SALT_LEN], Instant)>,
 }
 
@@ -29,8 +30,8 @@ impl ReplayCache {
     pub(crate) fn with_limits(cap: usize, ttl: Duration) -> Self {
         Self {
             inner: Mutex::new(Inner {
-                by_salt: HashMap::new(),
-                order: VecDeque::new(),
+                seen: HashSet::with_capacity(cap),
+                order: VecDeque::with_capacity(cap),
             }),
             cap,
             ttl,
@@ -38,54 +39,39 @@ impl ReplayCache {
     }
 
     pub(crate) fn insert(&self, salt: [u8; SALT_LEN]) -> Result<(), SessionError> {
-        let now = Instant::now();
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        expire(&mut inner, now, self.ttl);
-        if inner
-            .by_salt
-            .get(&salt)
-            .is_some_and(|seen| now.duration_since(*seen) < self.ttl)
-        {
-            return Err(SessionError::ReplayDuplicate);
-        }
-        while inner.by_salt.len() >= self.cap && self.cap > 0 {
-            if let Some((old, _)) = inner.order.pop_front() {
-                inner.by_salt.remove(&old);
-            } else {
-                break;
-            }
-        }
         if self.cap == 0 {
             return Ok(());
         }
-        inner.by_salt.insert(salt, now);
+        let now = Instant::now();
+        let mut inner = self.lock();
+        // Expire first: every salt still indexed afterwards is within the TTL.
+        while let Some(&(old, seen)) = inner.order.front()
+            && now.duration_since(seen) >= self.ttl
+        {
+            inner.order.pop_front();
+            inner.seen.remove(&old);
+        }
+        if !inner.seen.insert(salt) {
+            return Err(SessionError::ReplayDuplicate);
+        }
+        if inner.order.len() == self.cap
+            && let Some((oldest, _)) = inner.order.pop_front()
+        {
+            inner.seen.remove(&oldest);
+        }
         inner.order.push_back((salt, now));
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .by_salt
-            .len()
     }
-}
 
-fn expire(inner: &mut Inner, now: Instant, ttl: Duration) {
-    while let Some((salt, seen)) = inner.order.front().copied() {
-        if now.duration_since(seen) >= ttl {
-            inner.order.pop_front();
-            if inner.by_salt.get(&salt).copied() == Some(seen) {
-                inner.by_salt.remove(&salt);
-            }
-        } else {
-            break;
-        }
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().seen.len()
     }
 }
 

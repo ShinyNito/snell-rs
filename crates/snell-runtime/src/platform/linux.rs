@@ -7,9 +7,9 @@ use tokio::net::{TcpSocket, TcpStream};
 use super::{PlatformError, TcpBrutal};
 
 const TCP_FASTOPEN_QUEUE: i32 = 256;
+/// Private sockopt of the out-of-tree tcp-brutal module; not in `libc`.
 const TCP_BRUTAL_PARAMS: i32 = 23301;
 const BRUTAL_PARAMS_LEN: usize = 12;
-const IPPROTO_TCP: i32 = 6;
 
 pub(super) fn set_tcp_fastopen_listener(socket: &TcpSocket) -> Result<(), PlatformError> {
     super::tfo::set_tcp_fastopen(socket, TCP_FASTOPEN_QUEUE).map_err(tfo_error)
@@ -72,7 +72,7 @@ fn set_brutal_params<Fd: AsFd>(fd: Fd, params: TcpBrutal) -> Result<(), Errno> {
     let ret = unsafe {
         libc::setsockopt(
             raw,
-            IPPROTO_TCP,
+            libc::IPPROTO_TCP,
             TCP_BRUTAL_PARAMS,
             bytes.as_ptr().cast(),
             BRUTAL_PARAMS_LEN as libc::socklen_t,
@@ -81,7 +81,7 @@ fn set_brutal_params<Fd: AsFd>(fd: Fd, params: TcpBrutal) -> Result<(), Errno> {
     if ret == 0 {
         Ok(())
     } else {
-        Err(Errno::from_io_error(&std::io::Error::last_os_error()).unwrap_or(Errno::IO))
+        Err(super::tfo::last_errno())
     }
 }
 

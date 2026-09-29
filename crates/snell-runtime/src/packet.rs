@@ -2,6 +2,7 @@
 use crate::SessionError;
 use crate::buffer::{BufferPool, PooledBuffer};
 use std::sync::{Arc, Mutex};
+use std::task::{Poll, ready};
 
 pub(crate) struct PacketBuf {
     data: PooledBuffer,
@@ -61,17 +62,16 @@ impl PacketQuota {
         socket: &tokio::net::UdpSocket,
     ) -> Result<Option<(PacketBuf, std::net::SocketAddr)>, SessionError> {
         std::future::poll_fn(|cx| {
-            use std::task::Poll;
-            match socket.poll_recv_ready(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-                Poll::Pending => return Poll::Pending,
-            }
+            ready!(socket.poll_recv_ready(cx))?;
             let Some(mut packet) = self.acquire(snell_protocol::UDP_DATAGRAM_MAX) else {
                 return Poll::Ready(Ok(None));
             };
-            crate::bufio::poll_recv_datagram(socket, &mut packet.data, cx)
-                .map(|result| result.map(|peer| Some((packet, peer))))
+            let peer = ready!(crate::bufio::poll_recv_datagram(
+                socket,
+                &mut packet.data,
+                cx
+            ))?;
+            Poll::Ready(Ok(Some((packet, peer))))
         })
         .await
     }

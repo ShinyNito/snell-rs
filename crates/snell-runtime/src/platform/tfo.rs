@@ -1,23 +1,18 @@
 //! TCP Fast Open sockopts in rustix's AsFd style.
 //!
 //! rustix 0.38 has no `set_tcp_fastopen` / `set_tcp_fastopen_connect`. These
-//! typed i32 helpers are the real sockopt API on `AsFd`.
+//! typed i32 helpers are the real sockopt API on `AsFd`; option numbers come
+//! from `libc`.
 
 use std::mem;
 #[cfg(test)]
 use std::mem::MaybeUninit;
 
+#[cfg(target_os = "linux")]
+use libc::TCP_FASTOPEN_CONNECT;
+use libc::{IPPROTO_TCP, TCP_FASTOPEN};
 use rustix::fd::{AsFd, AsRawFd};
 use rustix::io::Errno;
-
-const IPPROTO_TCP: i32 = 6;
-
-#[cfg(target_os = "linux")]
-const TCP_FASTOPEN: i32 = 23;
-#[cfg(target_os = "linux")]
-const TCP_FASTOPEN_CONNECT: i32 = 30;
-#[cfg(target_os = "macos")]
-const TCP_FASTOPEN: i32 = 0x105;
 
 pub(super) fn set_tcp_fastopen<Fd: AsFd>(fd: Fd, value: i32) -> Result<(), Errno> {
     set_tcp_i32(fd, TCP_FASTOPEN, value)
@@ -79,6 +74,6 @@ fn get_tcp_i32<Fd: AsFd>(fd: Fd, optname: i32) -> Result<i32, Errno> {
     Ok(unsafe { value.assume_init() })
 }
 
-fn last_errno() -> Errno {
+pub(super) fn last_errno() -> Errno {
     Errno::from_io_error(&std::io::Error::last_os_error()).unwrap_or(Errno::IO)
 }

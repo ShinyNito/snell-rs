@@ -1,230 +1,152 @@
 use std::path::PathBuf;
 
 use snell_protocol::{
-    ATYP_IPV4, Buffer, COMMAND_CONNECT, COMMAND_CONNECT_V2, COMMAND_ERROR, COMMAND_TUNNEL,
-    COMMAND_UDP, COMMAND_UDP_FORWARD, DecodeStatus, ERROR_REJECT, FixedClock, PROTOCOL_VERSION,
-    Psk, RepeatEntropy, SALT_LEN, V4_WIRE_CAP, V4Decoder, V4Encoder, V6_WIRE_CAP, V6ShapedDecoder,
-    V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
+    Address, Buffer, DecodeStatus, FixedClock, Psk, RepeatEntropy, SALT_LEN, V4_WIRE_CAP,
+    V4Decoder, V4Encoder, V6_WIRE_CAP, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder,
+    V6UnshapedEncoder, decode_connect_request, decode_udp_request, decode_udp_response,
+    decode_udp_setup_prefix, encode_connect_request, encode_reject, encode_tunnel_reply,
+    encode_udp_request, encode_udp_response, encode_udp_setup,
 };
-use snell_testkit::load_golden_dir;
+use snell_testkit::{GoldenFixture, load_golden_dir};
 
-fn golden_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden")
-}
-
-#[test]
-fn loads_phase1_plaintext_fixtures() {
-    let fixtures = load_golden_dir(golden_dir()).unwrap();
-    assert!(
-        fixtures.len() >= 5,
-        "expected plaintext control fixtures, got {}",
-        fixtures.len()
-    );
-
-    let with_id = fixture(&fixtures, "connect-with-client-id");
-    assert_eq!(with_id.bytes().unwrap()[0], PROTOCOL_VERSION);
-    assert_eq!(with_id.bytes().unwrap()[1], COMMAND_CONNECT);
-    assert_eq!(with_id.bytes().unwrap()[2], 3);
-
-    let connect = fixture(&fixtures, "connect-example-com-443");
-    assert_eq!(connect.kind, "plaintext-control");
-    let bytes = connect.bytes().unwrap();
-    assert_eq!(bytes[0], PROTOCOL_VERSION);
-    assert_eq!(bytes[1], COMMAND_CONNECT);
-
-    let reuse = fixture(&fixtures, "connect-v2-example-com-443");
-    assert_eq!(reuse.bytes().unwrap()[1], COMMAND_CONNECT_V2);
-
-    let udp = fixture(&fixtures, "udp-setup");
-    assert_eq!(udp.bytes().unwrap(), [PROTOCOL_VERSION, COMMAND_UDP, 0]);
-
-    let udp_req = fixture(&fixtures, "udp-request-ipv4-127-0-0-1-8080");
-    assert_eq!(udp_req.bytes().unwrap()[0], COMMAND_UDP_FORWARD);
-
-    let tunnel = fixture(&fixtures, "server-tunnel");
-    assert_eq!(tunnel.bytes().unwrap(), [COMMAND_TUNNEL]);
-
-    let error = fixture(&fixtures, "server-error-code-1");
-    assert_eq!(error.bytes().unwrap()[0], COMMAND_ERROR);
-    assert_eq!(error.bytes().unwrap()[1], ERROR_REJECT);
-
-    let udp_req_domain = fixture(&fixtures, "udp-request-domain-example-com-53");
-    assert_eq!(udp_req_domain.bytes().unwrap()[0], COMMAND_UDP_FORWARD);
-
-    let udp_resp = fixture(&fixtures, "udp-response-ipv4-8-8-8-8-53");
-    assert_eq!(udp_resp.bytes().unwrap()[0], ATYP_IPV4);
-}
-
-#[test]
-fn connect_fixture_matches_empty_client_id_layout() {
-    let bytes = fixture(
-        &load_golden_dir(golden_dir()).unwrap(),
-        "connect-example-com-443",
-    )
-    .bytes()
-    .unwrap();
-    assert_eq!(bytes[0], PROTOCOL_VERSION);
-    assert_eq!(bytes[1], COMMAND_CONNECT);
-    assert_eq!(bytes[2], 0);
-    assert_eq!(bytes[3], 11);
-    assert_eq!(&bytes[4..15], b"example.com");
-    assert_eq!(&bytes[15..17], 443u16.to_be_bytes());
-}
-
-#[test]
-fn v4_record_fixture_round_trips() {
-    let expected = fixture(
-        &load_golden_dir(golden_dir()).unwrap(),
-        "v4-record-hello-salt-07-no-padding",
-    )
-    .bytes()
-    .unwrap();
-    let psk = Psk::new(b"0123456789abcdef").unwrap();
-    let mut encoder = V4Encoder::with_salt(
-        &psk,
-        [7; SALT_LEN],
-        0,
-        RepeatEntropy { byte: 0x3c },
-        FixedClock::new(0),
-    )
-    .unwrap();
-    let mut out = Buffer::new(V4_WIRE_CAP);
-    {
-        let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
-        rec.payload_mut()[..5].copy_from_slice(b"hello");
-        rec.seal(5).unwrap();
-    }
-    let wire = out.filled().to_vec();
-    assert_eq!(wire, expected);
-
-    let mut decoder = V4Decoder::new(psk);
-    let mut buf = Buffer::new(4096);
-    buf.extend_from_slice(&wire).unwrap();
-    match decoder.decode(&mut buf).unwrap() {
-        DecodeStatus::Record(record) => {
-            assert_eq!(record.plaintext(buf.filled()), b"hello");
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
-#[test]
-fn v4_padded_record_fixture_matches_hex() {
-    let expected = fixture(
-        &load_golden_dir(golden_dir()).unwrap(),
-        "v4-record-hello-salt-07-padding-8",
-    )
-    .bytes()
-    .unwrap();
-    let psk = Psk::new(b"0123456789abcdef").unwrap();
-    let mut encoder = V4Encoder::with_salt(
-        &psk,
-        [7; SALT_LEN],
-        8,
-        RepeatEntropy { byte: 0x3c },
-        FixedClock::new(0),
-    )
-    .unwrap();
-    let mut out = Buffer::new(V4_WIRE_CAP);
-    {
-        let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
-        rec.payload_mut()[..5].copy_from_slice(b"hello");
-        rec.seal(5).unwrap();
-    }
-    let wire = out.filled().to_vec();
-    assert_eq!(wire, expected);
-
-    let mut decoder = V4Decoder::new(psk);
-    let mut buf = Buffer::new(4096);
-    buf.extend_from_slice(&wire).unwrap();
-    match decoder.decode(&mut buf).unwrap() {
-        DecodeStatus::Record(record) => {
-            assert_eq!(record.plaintext(buf.filled()), b"hello");
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
-#[test]
-fn v6_unshaped_record_matches_v4_no_padding_hex() {
-    let expected = fixture(
-        &load_golden_dir(golden_dir()).unwrap(),
-        "v6-unshaped-hello-salt-07",
-    )
-    .bytes()
-    .unwrap();
-    let psk = Psk::new(b"0123456789abcdef").unwrap();
-    let mut encoder = V6UnshapedEncoder::with_salt(
-        &psk,
-        [7; SALT_LEN],
-        RepeatEntropy { byte: 0x3c },
-        FixedClock::new(0),
-    )
-    .unwrap();
-    let mut out = Buffer::new(V4_WIRE_CAP);
-    {
-        let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
-        rec.payload_mut()[..5].copy_from_slice(b"hello");
-        rec.seal(5).unwrap();
-    }
-    let wire = out.filled().to_vec();
-    assert_eq!(wire, expected);
-
-    let mut decoder = V6UnshapedDecoder::new(psk);
-    let mut buf = Buffer::new(4096);
-    buf.extend_from_slice(&wire).unwrap();
-    match decoder.decode(&mut buf).unwrap() {
-        DecodeStatus::Record(record) => {
-            assert_eq!(record.plaintext(buf.filled()), b"hello");
-        }
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(decoder.replay_identity(), Some([7u8; SALT_LEN]));
-}
-
-#[test]
-fn v6_shaped_record_fixture_matches_hex() {
-    let expected = fixture(
-        &load_golden_dir(golden_dir()).unwrap(),
-        "v6-shaped-hello-salt-07",
-    )
-    .bytes()
-    .unwrap();
-    let psk = Psk::new(b"0123456789abcdef").unwrap();
-    let mut encoder = V6ShapedEncoder::with_salt(
-        &psk,
-        [7; SALT_LEN],
-        RepeatEntropy { byte: 0x3c },
-        FixedClock::new(0),
-    )
-    .unwrap();
-    let mut out = Buffer::new(V6_WIRE_CAP);
-    {
-        let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
-        rec.payload_mut()[..5].copy_from_slice(b"hello");
-        rec.seal(5).unwrap();
-    }
-    let wire = out.filled().to_vec();
-    assert_eq!(wire, expected);
-
-    let mut decoder = V6ShapedDecoder::new(psk).unwrap();
-    let mut buf = Buffer::new(V6_WIRE_CAP);
-    buf.extend_from_slice(&wire).unwrap();
-    match decoder.decode(&mut buf).unwrap() {
-        DecodeStatus::Record(record) => {
-            assert_eq!(record.plaintext(buf.filled()), b"hello");
-        }
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(decoder.replay_identity(), Some([7u8; SALT_LEN]));
-}
-
-fn fixture<'a>(
-    fixtures: &'a [snell_testkit::GoldenFixture],
-    name: &str,
-) -> &'a snell_testkit::GoldenFixture {
-    fixtures
-        .iter()
+fn fixture(name: &str) -> Vec<u8> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden");
+    load_golden_dir(dir)
+        .unwrap()
+        .into_iter()
         .find(|fixture| fixture.name == name)
+        .as_ref()
+        .map(GoldenFixture::bytes)
         .unwrap_or_else(|| panic!("missing fixture {name}"))
+        .unwrap()
+}
+
+fn psk() -> Psk {
+    Psk::new(b"0123456789abcdef").unwrap()
+}
+
+/// Encode through `write`, and return the written prefix of a scratch buffer.
+fn encoded(write: impl FnOnce(&mut [u8]) -> snell_protocol::Result<usize>) -> Vec<u8> {
+    let mut out = [0u8; 64];
+    let n = write(&mut out).unwrap();
+    out[..n].to_vec()
+}
+
+#[test]
+fn connect_fixtures_match_codec() {
+    let example = Address::domain("example.com", 443).unwrap();
+    for (name, reuse) in [
+        ("connect-example-com-443", false),
+        ("connect-v2-example-com-443", true),
+    ] {
+        let wire = fixture(name);
+        assert_eq!(
+            encoded(|dst| encode_connect_request(dst, example.as_view(), reuse)),
+            wire,
+            "{name}"
+        );
+        let request = decode_connect_request(&wire).unwrap();
+        assert_eq!(
+            (request.destination, request.reuse),
+            (example.clone(), reuse)
+        );
+    }
+
+    // Readers skip a client id; this encoder never writes one.
+    let request = decode_connect_request(&fixture("connect-with-client-id")).unwrap();
+    assert_eq!(request.destination, Address::domain("dns", 53).unwrap());
+    assert!(!request.reuse);
+}
+
+#[test]
+fn control_reply_fixtures_match_codec() {
+    let setup = fixture("udp-setup");
+    assert_eq!(encoded(encode_udp_setup), setup);
+    assert_eq!(decode_udp_setup_prefix(&setup), Ok(setup.len()));
+    assert_eq!(encoded(encode_tunnel_reply), fixture("server-tunnel"));
+    assert_eq!(
+        encoded(|dst| encode_reject(dst, "connect failed")),
+        fixture("server-error-code-1")
+    );
+}
+
+#[test]
+fn udp_datagram_fixtures_round_trip() {
+    for name in [
+        "udp-request-ipv4-127-0-0-1-8080",
+        "udp-request-domain-example-com-53",
+    ] {
+        let wire = fixture(name);
+        let packet = decode_udp_request(&wire).unwrap();
+        assert_eq!(
+            encoded(|dst| encode_udp_request(dst, packet.address, packet.payload)),
+            wire,
+            "{name}"
+        );
+    }
+    let wire = fixture("udp-response-ipv4-8-8-8-8-53");
+    let packet = decode_udp_response(&wire).unwrap();
+    assert_eq!(packet.address.to_string(), "8.8.8.8:53");
+    assert_eq!(packet.payload, b"dns");
+    assert_eq!(
+        encoded(|dst| encode_udp_response(dst, packet.address, packet.payload)),
+        wire
+    );
+}
+
+/// Seal `hello` as the first record, compare it with the fixture, and decode
+/// it back. Each codec contributes its encoder, capacity, and decoder.
+macro_rules! assert_hello_record {
+    ($name:expr, $encoder:expr, $wire_cap:expr, $decoder:expr) => {{
+        let name = $name;
+        let expected = fixture(name);
+        let mut encoder = $encoder;
+        let mut out = Buffer::new($wire_cap);
+        let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
+        rec.payload_mut()[..5].copy_from_slice(b"hello");
+        rec.seal(5).unwrap();
+        assert_eq!(out.filled(), expected, "{name}");
+
+        let mut decoder = $decoder;
+        let mut buf = Buffer::new($wire_cap);
+        buf.extend_from_slice(&expected).unwrap();
+        let DecodeStatus::Record(record) = decoder.decode(&mut buf).unwrap() else {
+            panic!("{name}: record not decoded");
+        };
+        assert_eq!(record.plaintext(buf.filled()), b"hello", "{name}");
+        decoder
+    }};
+}
+
+#[test]
+fn record_fixtures_match_codecs() {
+    let entropy = RepeatEntropy { byte: 0x3c };
+    let clock = FixedClock::new(0);
+    for (name, padding) in [
+        ("v4-record-hello-salt-07-no-padding", 0),
+        ("v4-record-hello-salt-07-padding-8", 8),
+    ] {
+        assert_hello_record!(
+            name,
+            V4Encoder::with_salt(&psk(), [7; SALT_LEN], padding, entropy, clock).unwrap(),
+            V4_WIRE_CAP,
+            V4Decoder::new(psk())
+        );
+    }
+
+    let decoder = assert_hello_record!(
+        "v6-unshaped-hello-salt-07",
+        V6UnshapedEncoder::with_salt(&psk(), [7; SALT_LEN], entropy, clock).unwrap(),
+        V4_WIRE_CAP,
+        V6UnshapedDecoder::new(psk())
+    );
+    assert_eq!(decoder.replay_identity(), Some([7u8; SALT_LEN]));
+
+    let decoder = assert_hello_record!(
+        "v6-shaped-hello-salt-07",
+        V6ShapedEncoder::with_salt(&psk(), [7; SALT_LEN], entropy, clock).unwrap(),
+        V6_WIRE_CAP,
+        V6ShapedDecoder::new(psk())
+    );
+    assert_eq!(decoder.replay_identity(), Some([7u8; SALT_LEN]));
 }

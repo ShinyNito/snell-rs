@@ -48,14 +48,8 @@ fn check() -> anyhow::Result<()> {
         "-D",
         "warnings",
     ]))?;
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("target"));
-    let target = if target.is_absolute() {
-        target
-    } else {
-        root.join(target)
-    };
+    // `join` keeps an absolute CARGO_TARGET_DIR and anchors a relative one at the root.
+    let target = root.join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()));
     run(Command::new("cargo")
         .args(["build", "-p", "snell", "--all-features", "--target-dir"])
         .arg(&target))?;

@@ -31,23 +31,23 @@ impl PlainStream {
     }
 
     pub fn connect(&self) -> Result<ParseState<(ConnectRequest, usize)>> {
-        match decode_connect_request_prefix(self.buf.filled()) {
-            Err(Error::Truncated) => Ok(ParseState::Need(self.buf.len().saturating_add(1))),
-            Ok((request, n)) => Ok(ParseState::Done((request, n))),
-            Err(error) => Err(error),
-        }
+        self.need_more_on_truncated(decode_connect_request_prefix(self.buf.filled()))
     }
 
     pub fn udp_setup(&self) -> Result<ParseState<usize>> {
-        match decode_udp_setup_prefix(self.buf.filled()) {
-            Err(Error::Truncated) => Ok(ParseState::Need(self.buf.len().saturating_add(1))),
-            Ok(n) => Ok(ParseState::Done(n)),
-            Err(error) => Err(error),
-        }
+        self.need_more_on_truncated(decode_udp_setup_prefix(self.buf.filled()))
     }
 
     pub fn server_reply(&self) -> Result<ParseState<(ServerReply<'_>, usize)>> {
         decode_server_reply(self.buf.filled())
+    }
+
+    /// Control prefixes are variable length: a truncated parse needs one more byte.
+    fn need_more_on_truncated<T>(&self, parsed: Result<T>) -> Result<ParseState<T>> {
+        match parsed {
+            Err(Error::Truncated) => Ok(ParseState::Need(self.buf.len().saturating_add(1))),
+            other => other.map(ParseState::Done),
+        }
     }
 }
 

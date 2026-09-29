@@ -67,7 +67,7 @@ fn tfo_connect_supported_path_sets_option_or_unsupported() {
 
 #[tokio::test]
 async fn accept_emfile_retries_with_bounded_delay() {
-    let mut backoff = AcceptBackoff::new();
+    let mut backoff = AcceptBackoff::default();
     let started = Instant::now();
     let outcome = apply_accept_result(Err(emfile_error()), &mut backoff)
         .await

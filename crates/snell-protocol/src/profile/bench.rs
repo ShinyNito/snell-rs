@@ -41,7 +41,7 @@ fn profile_cases_match_baseline() {
         0x717144ff964870fe,
     ];
     for (generator, key) in profile_cases::CASES {
-        let profile = Profile::derive(key).unwrap();
+        let profile = Profile::derive(&Psk::new(key).unwrap());
         assert_eq!(profile.generator, generator);
         assert_eq!(corpus_hash(&profile), expected[generator as usize]);
     }
@@ -70,7 +70,7 @@ fn fill_baseline() {
         cfg!(debug_assertions)
     );
     let profiles = profile_cases::CASES.map(|(generator, key)| {
-        let profile = Profile::derive(key).unwrap();
+        let profile = Profile::derive(&Psk::new(key).unwrap());
         assert_eq!(profile.generator, generator);
         profile
     });

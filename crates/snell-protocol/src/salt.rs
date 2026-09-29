@@ -1,7 +1,10 @@
 //! Hide the 16-byte AEAD salt inside a v6 shaped salt block.
+//!
+//! Callers pass blocks of the profile's salt-block length, which is always in
+//! `SALT_LEN + 0x10..=SALT_LEN + 0x80`, so every permuted index is in bounds.
 
-use crate::MAX_SALT_BLOCK_LEN;
 use crate::prf::{PRF_ADD_A, PRF_ADD_B, PRF_COEF_A, PRF_COEF_B, prf32_fold, splitmix64};
+use crate::{MAX_SALT_BLOCK_LEN, SALT_LEN};
 
 /// Domain mixed into the handshake salt shuffle and mask.
 pub(crate) const MIX_HANDSHAKE_DOMAIN: u32 = 0x51a7;
@@ -21,22 +24,17 @@ fn salt_shuffle_prf(ns_salt: u64, domain: u32, i: u32) -> u32 {
     (y ^ (y >> 32)) as u32
 }
 
-pub(crate) fn shuffle_perm(ns_salt: u64, rounds: u8, len: usize, out: &mut [u8]) {
-    debug_assert_eq!(out.len(), len);
-    if len == 0 {
-        return;
-    }
+pub(crate) fn shuffle_perm(ns_salt: u64, rounds: u8, out: &mut [u8]) {
+    let len = out.len();
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = i as u8;
     }
-    let rounds = rounds.max(1);
-    for round in 0..u32::from(rounds) {
+    for round in 0..u32::from(rounds.max(1)) {
         let domain = MIX_HANDSHAKE_DOMAIN.wrapping_add(round);
         for i in 0..len {
             let span = (len - i) as u64;
             let raw = u64::from(salt_shuffle_prf(ns_salt, domain, i as u32));
-            let j = i + (raw % span) as usize;
-            out.swap(i, j);
+            out.swap(i, i + (raw % span) as usize);
         }
     }
 }
@@ -46,27 +44,21 @@ fn mask(ns_salt: u64, mix_stride: u8, i: u32) -> u8 {
     (i as u8).wrapping_mul(mix_stride) ^ (prf as u8)
 }
 
-pub(crate) fn extract(
-    ns_salt: u64,
-    mix_stride: u8,
-    rounds: u8,
-    block: &[u8],
-    out: &mut [u8; 16],
-) -> Result<(), ()> {
-    let len = block.len();
-    if len > MAX_SALT_BLOCK_LEN {
-        return Err(());
-    }
+/// Block positions holding salt bytes `0..SALT_LEN`, in order.
+fn salt_positions(ns_salt: u64, rounds: u8, len: usize) -> [u8; SALT_LEN] {
+    debug_assert!((SALT_LEN..=MAX_SALT_BLOCK_LEN).contains(&len));
     let mut perm = [0u8; MAX_SALT_BLOCK_LEN];
-    shuffle_perm(ns_salt, rounds, len, &mut perm[..len]);
-    for i in 0..16 {
-        let p = usize::from(perm[i]);
-        if p >= len {
-            return Err(());
-        }
-        out[i] = mask(ns_salt, mix_stride, i as u32) ^ block[p];
+    shuffle_perm(ns_salt, rounds, &mut perm[..len]);
+    *perm.first_chunk().expect("salt block holds the salt")
+}
+
+pub(crate) fn extract(ns_salt: u64, mix_stride: u8, rounds: u8, block: &[u8]) -> [u8; SALT_LEN] {
+    let positions = salt_positions(ns_salt, rounds, block.len());
+    let mut salt = [0u8; SALT_LEN];
+    for (i, (byte, position)) in salt.iter_mut().zip(positions).enumerate() {
+        *byte = mask(ns_salt, mix_stride, i as u32) ^ block[usize::from(position)];
     }
-    Ok(())
+    salt
 }
 
 pub(crate) fn write(
@@ -74,22 +66,12 @@ pub(crate) fn write(
     mix_stride: u8,
     rounds: u8,
     block: &mut [u8],
-    salt: &[u8; 16],
-) -> Result<(), ()> {
-    let len = block.len();
-    if len > MAX_SALT_BLOCK_LEN {
-        return Err(());
+    salt: &[u8; SALT_LEN],
+) {
+    let positions = salt_positions(ns_salt, rounds, block.len());
+    for (i, (byte, position)) in salt.iter().zip(positions).enumerate() {
+        block[usize::from(position)] = mask(ns_salt, mix_stride, i as u32) ^ byte;
     }
-    let mut perm = [0u8; MAX_SALT_BLOCK_LEN];
-    shuffle_perm(ns_salt, rounds, len, &mut perm[..len]);
-    for i in 0..16 {
-        let p = usize::from(perm[i]);
-        if p >= len {
-            return Err(());
-        }
-        block[p] = mask(ns_salt, mix_stride, i as u32) ^ salt[i];
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -107,28 +89,19 @@ mod tests {
             0x32, 0x10,
         ];
         let mut block = vec![0xaa; 36];
-        write(ns(), 0x37, 3, &mut block, &salt).unwrap();
-        let mut extracted = [0u8; 16];
-        extract(ns(), 0x37, 3, &block, &mut extracted).unwrap();
-        assert_eq!(extracted, salt);
+        write(ns(), 0x37, 3, &mut block, &salt);
+        assert_eq!(extract(ns(), 0x37, 3, &block), salt);
     }
 
     #[test]
     fn shuffle_is_a_permutation() {
-        let len = 32;
-        let mut perm = [0u8; MAX_SALT_BLOCK_LEN];
-        shuffle_perm(ns(), 3, len, &mut perm[..len]);
+        let mut perm = [0u8; 32];
+        shuffle_perm(ns(), 3, &mut perm);
         let mut seen = [false; 32];
-        for &v in &perm[..len] {
+        for &v in &perm {
             assert!(!seen[usize::from(v)]);
             seen[usize::from(v)] = true;
         }
         assert!(seen.iter().all(|&s| s));
-    }
-
-    #[test]
-    fn oversize_block_rejected() {
-        let mut block = vec![0u8; MAX_SALT_BLOCK_LEN + 1];
-        assert!(write(ns(), 0x55, 2, &mut block, &[0; 16]).is_err());
     }
 }

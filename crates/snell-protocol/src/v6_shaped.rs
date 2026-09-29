@@ -1,17 +1,17 @@
 //! v6 shaped record codec: profile salt-block, prefix, padding mix, AAD.
 
 use core::fmt;
-
-use zeroize::Zeroize;
+use core::marker::PhantomData;
 
 use crate::aead::Aes128Gcm;
-use crate::header::{parse_v6_plain_header, write_v6_plain_header};
-use crate::kdf::aead_key;
+use crate::buffer::Slot;
+use crate::header::{RecordHeader, parse_v6_plain_header, write_v6_plain_header};
 use crate::profile::{Profile, mix_padding_payload};
-use crate::record::{DecodeStatus, DecodedRecord, RecordKind};
+use crate::record::{DecodeStatus, DecodedRecord, Pending};
 use crate::{
-    Buffer, Clock, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, Nonce,
-    OsEntropy, Psk, Result, SALT_LEN, TAG_LEN, UnixClock,
+    AES_128_KEY_LEN, Buffer, Clock, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN,
+    MAX_PACKET_SIZE_V6, Nonce, OsEntropy, Psk, Result, SALT_LEN, TAG_LEN, UnixClock,
+    V6_MAX_PREFIX_LEN,
 };
 
 pub struct V6ShapedEncoder<E = OsEntropy, C = UnixClock> {
@@ -23,26 +23,39 @@ pub struct V6ShapedEncoder<E = OsEntropy, C = UnixClock> {
     profile: Profile,
     chunk_size: usize,
     last_write_secs: Option<u64>,
-    _entropy: core::marker::PhantomData<E>,
+    _entropy: PhantomData<E>,
     clock: C,
+    /// Set while a reservation is outstanding, including one leaked with
+    /// `mem::forget`, so a half-written record is never followed by another.
     reserving: bool,
     poisoned: bool,
-    plain_prefix_len: usize,
-    max_payload: usize,
-    record_prefix_len: usize,
-    max_padding_len: usize,
-    payload_start: usize,
-    header_start: usize,
-    padding_start: usize,
-    prefix_start: usize,
-    record_start: usize,
+}
+
+/// Per-record layout decided by [`V6ShapedEncoder::reserve`].
+///
+/// Contiguous layout: `[salt block][prefix][header][padding][payload+tag]`.
+/// Scattered layout keeps the payload in place at the record start:
+/// `[payload+tag][salt block][prefix][header][padding]`.
+#[derive(Clone, Copy, Debug)]
+struct ShapedRecord {
+    slot: Slot,
+    salt_block_len: usize,
+    prefix_len: usize,
     scattered: bool,
+}
+
+impl ShapedRecord {
+    /// Padding start of the contiguous layout.
+    const fn contiguous_padding_start(&self) -> usize {
+        self.slot.record_start + self.salt_block_len + self.prefix_len + HEADER_CIPHER_LEN
+    }
 }
 
 #[must_use = "unsealed reservations are cancelled on drop"]
 pub struct V6ShapedReservation<'a, E: Entropy = OsEntropy, C: Clock = UnixClock> {
     encoder: &'a mut V6ShapedEncoder<E, C>,
     buf: &'a mut Buffer,
+    record: ShapedRecord,
     sealed: bool,
 }
 
@@ -54,33 +67,19 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
     }
 
     pub fn with_salt(psk: &Psk, salt: [u8; SALT_LEN], _entropy: E, clock: C) -> Result<Self> {
-        let profile = Profile::derive(psk.as_bytes())?;
-        let mut key = aead_key(psk.as_bytes(), &salt)?;
-        let aead = Aes128Gcm::new(&key)?;
-        key.zeroize();
         Ok(Self {
-            aead,
+            aead: Aes128Gcm::derive(psk, &salt)?,
             nonce: Nonce::new(),
             salt,
             salt_sent: false,
             seq: 0,
-            profile,
+            profile: Profile::derive(psk),
             chunk_size: 0,
             last_write_secs: None,
-            _entropy: core::marker::PhantomData,
+            _entropy: PhantomData,
             clock,
             reserving: false,
             poisoned: false,
-            plain_prefix_len: 0,
-            max_payload: 0,
-            record_prefix_len: 0,
-            max_padding_len: 0,
-            payload_start: 0,
-            header_start: 0,
-            padding_start: 0,
-            prefix_start: 0,
-            record_start: 0,
-            scattered: false,
         })
     }
 
@@ -132,46 +131,37 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         } else {
             0
         };
-        let record_prefix_len = self.profile.record_prefix_len(self.seq);
-        let max_padding_len = self.profile.max_padding_len();
-        let fixed = salt_block_len + record_prefix_len + HEADER_CIPHER_LEN + max_padding_len;
-        let record_cap = fixed + max_payload + TAG_LEN;
-        let reserved_padding = if scattered {
-            0
+        let prefix_len = self.profile.record_prefix_len(self.seq);
+        let fixed =
+            salt_block_len + prefix_len + HEADER_CIPHER_LEN + self.profile.max_padding_len();
+        // A contiguous record pads for the hint up front; a short write may
+        // need more padding, which `seal_record` handles by moving the payload.
+        let (initialized, payload_offset) = if scattered {
+            (0, 0)
         } else {
-            self.profile
-                .final_padding_len(self.seq, record_prefix_len, max_payload, first)
+            let padding = self
+                .profile
+                .final_padding_len(self.seq, prefix_len, max_payload, first);
+            let offset = salt_block_len + prefix_len + HEADER_CIPHER_LEN + padding;
+            (offset, offset)
         };
-        let initialized = if scattered {
-            0
-        } else {
-            salt_block_len + record_prefix_len + HEADER_CIPHER_LEN + reserved_padding
-        };
-        let record_start = buf.reserve_record(record_cap, initialized)?;
-        let prefix_start = record_start + salt_block_len;
-        let header_start = prefix_start + record_prefix_len;
-        let padding_start = header_start + HEADER_CIPHER_LEN;
-        let payload_start = if scattered {
-            record_start
-        } else {
-            padding_start + reserved_padding
-        };
+        let record_start = buf.reserve_record(fixed + max_payload + TAG_LEN, initialized)?;
         buf.extend_from_slice(prefix)?;
-
-        self.plain_prefix_len = prefix.len();
-        self.max_payload = max_payload;
-        self.record_prefix_len = record_prefix_len;
-        self.max_padding_len = max_padding_len;
-        self.payload_start = payload_start;
-        self.header_start = header_start;
-        self.padding_start = padding_start;
-        self.prefix_start = prefix_start;
-        self.record_start = record_start;
-        self.scattered = scattered;
         self.reserving = true;
         Ok(V6ShapedReservation {
             encoder: self,
             buf,
+            record: ShapedRecord {
+                slot: Slot {
+                    record_start,
+                    payload_start: record_start + payload_offset,
+                    prefix_len: prefix.len(),
+                    max_payload,
+                },
+                salt_block_len,
+                prefix_len,
+                scattered,
+            },
             sealed: false,
         })
     }
@@ -184,50 +174,50 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         {
             self.chunk_size = self.profile.chunk_initial();
         }
-        let mut limit = self
+        let limit = self
             .profile
             .chunk_limit(self.seq, self.chunk_size)
             .min(MAX_PACKET_SIZE_V6);
         if self.seq == 0 {
-            limit = limit.min(self.profile.first_record_cap());
+            limit.min(self.profile.first_record_cap())
+        } else {
+            limit
         }
-        limit
     }
 
-    fn finish(&mut self, buf: &mut Buffer, payload_len: usize, scattered: bool) -> Result<usize> {
-        if payload_len > self.max_payload {
-            self.reserving = false;
-            buf.truncate(self.record_start)?;
-            return Err(Error::PayloadTooLarge);
-        }
-        let first = !self.salt_sent;
-        let padding_len =
-            if payload_len == self.max_payload && self.payload_start != self.record_start {
-                // The hint was exact; reuse the padding decision made by reserve.
-                self.payload_start - self.padding_start
-            } else {
-                self.profile
-                    .final_padding_len(self.seq, self.record_prefix_len, payload_len, first)
-            };
-        if padding_len > self.max_padding_len {
-            self.reserving = false;
-            buf.truncate(self.record_start)?;
-            return Err(Error::PayloadTooLarge);
-        }
+    fn finish(
+        &mut self,
+        buf: &mut Buffer,
+        record: &ShapedRecord,
+        payload_len: usize,
+    ) -> Result<usize> {
+        self.reserving = false;
+        let padding_len = if !record.scattered && payload_len == record.slot.max_payload {
+            // The hint was exact; reuse the padding decision made by reserve.
+            record.slot.payload_start - record.contiguous_padding_start()
+        } else {
+            self.profile.final_padding_len(
+                self.seq,
+                record.prefix_len,
+                payload_len,
+                !self.salt_sent,
+            )
+        };
+        debug_assert!(padding_len <= self.profile.max_padding_len());
 
         let nonce_before = self.nonce;
-        let result = self.seal_record(buf, padding_len, payload_len, scattered);
-        self.reserving = false;
-        if result.is_err() {
-            if self.nonce != nonce_before {
-                self.poisoned = true;
+        let result = self.seal_record(buf, record, padding_len, payload_len);
+        match result {
+            Ok(_) => {
+                self.salt_sent = true;
+                self.chunk_size = self.profile.advance_chunk_size(self.chunk_size);
+                self.seq = self.seq.wrapping_add(1);
+                self.last_write_secs = Some(self.clock.monotonic_secs());
             }
-            buf.truncate(self.record_start)?;
-        } else {
-            self.salt_sent = true;
-            self.chunk_size = self.profile.advance_chunk_size(self.chunk_size);
-            self.seq = self.seq.wrapping_add(1);
-            self.last_write_secs = Some(self.clock.monotonic_secs());
+            Err(_) => {
+                self.poisoned |= self.nonce != nonce_before;
+                buf.truncate(record.slot.record_start)?;
+            }
         }
         result
     }
@@ -235,102 +225,86 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
     fn seal_record(
         &mut self,
         buf: &mut Buffer,
+        record: &ShapedRecord,
         padding_len: usize,
         payload_len: usize,
-        scattered: bool,
     ) -> Result<usize> {
+        let slot = &record.slot;
         let body_len = if payload_len == 0 {
             0
         } else {
             payload_len + TAG_LEN
         };
-        let record_end;
-        if scattered {
-            let salt_len = if self.salt_sent {
-                0
-            } else {
-                self.profile.salt_block_len()
-            };
-            self.prefix_start = self.record_start + body_len + salt_len;
-            self.header_start = self.prefix_start + self.record_prefix_len;
-            self.padding_start = self.header_start + HEADER_CIPHER_LEN;
-            record_end = self.padding_start + padding_len;
+        let prefix_start = if record.scattered {
+            slot.record_start + body_len + record.salt_block_len
+        } else {
+            slot.record_start + record.salt_block_len
+        };
+        let header_start = prefix_start + record.prefix_len;
+        let padding_start = header_start + HEADER_CIPHER_LEN;
+        let record_end = if record.scattered {
             // Discard unused materialized payload capacity. Commit only the tag
             // and actual header/padding: records pack tightly with no holes.
-            buf.truncate(self.payload_start + payload_len)?;
+            let record_end = padding_start + padding_len;
+            buf.truncate(slot.payload_start + payload_len)?;
             buf.reserve_zeroed(record_end - buf.end())?;
+            record_end
         } else {
-            let payload_start = self.padding_start + padding_len;
-            if payload_len > 0 && payload_start != self.payload_start {
+            let payload_start = padding_start + padding_len;
+            if payload_len > 0 && payload_start != slot.payload_start {
                 // A short read may need more padding than the hint predicted.
                 let payload_end = payload_start + payload_len;
                 if buf.end() < payload_end {
                     buf.reserve_zeroed(payload_end - buf.end())?;
                 }
-                buf.copy_within(self.payload_start, payload_start, payload_len);
+                buf.copy_within(slot.payload_start, payload_start, payload_len);
             }
-            record_end = payload_start + body_len;
+            let record_end = payload_start + body_len;
             if buf.end() < record_end {
                 buf.reserve_zeroed(record_end - buf.end())?;
             } else {
                 buf.truncate(record_end)?;
             }
-        }
+            record_end
+        };
 
         // Generate salt, prefix and header directly at their final addresses.
-        if !self.salt_sent {
+        if record.salt_block_len > 0 {
             self.profile.write_salt_block(
                 &self.salt,
-                buf.range_mut(
-                    self.prefix_start - self.profile.salt_block_len(),
-                    self.prefix_start,
-                ),
+                buf.range_mut(prefix_start - record.salt_block_len, prefix_start),
             )?;
         }
+        let (prefix, header) = buf
+            .range_mut(prefix_start, padding_start)
+            .split_at_mut(record.prefix_len);
+        self.profile.fill_official(self.seq, prefix);
+        write_v6_plain_header(header, padding_len, payload_len)?;
+        self.aead.seal(&mut self.nonce, prefix, header)?;
         self.profile.fill_official(
             self.seq,
-            buf.range_mut(self.prefix_start, self.header_start),
-        );
-        write_v6_plain_header(
-            buf.range_mut(self.header_start, self.header_start + HEADER_PLAIN_LEN),
-            padding_len,
-            payload_len,
-        )?;
-        {
-            let block = buf.range_mut(self.prefix_start, self.header_start + HEADER_CIPHER_LEN);
-            let (prefix, hdr) = block.split_at_mut(self.record_prefix_len);
-            let (plain, tag_dst) = hdr.split_at_mut(HEADER_PLAIN_LEN);
-            let tag = self.aead.seal(&self.nonce, prefix, plain)?;
-            tag_dst.copy_from_slice(&tag);
-        }
-        self.nonce.increment();
-        self.profile.fill_official(
-            self.seq,
-            buf.range_mut(self.padding_start, self.padding_start + padding_len),
+            buf.range_mut(padding_start, padding_start + padding_len),
         );
 
         if payload_len > 0 {
-            let (padding, cipher_and_tag) = if scattered {
+            let (padding, cipher_and_tag) = if record.scattered {
                 let (body, header) = buf
-                    .range_mut(self.record_start, record_end)
+                    .range_mut(slot.record_start, record_end)
                     .split_at_mut(body_len);
                 (
-                    &mut header[self.padding_start - self.record_start - body_len..],
+                    &mut header[padding_start - slot.record_start - body_len..],
                     body,
                 )
             } else {
-                buf.range_mut(self.padding_start, record_end)
+                buf.range_mut(padding_start, record_end)
                     .split_at_mut(padding_len)
             };
-            let (payload, tag_dst) = cipher_and_tag.split_at_mut(payload_len);
-            let tag = self.aead.seal(&self.nonce, padding, payload)?;
-            tag_dst.copy_from_slice(&tag);
-            self.nonce.increment();
+            self.aead.seal(&mut self.nonce, padding, cipher_and_tag)?;
             mix_padding_payload(&self.profile, self.seq, padding, cipher_and_tag);
         }
         // Physical layout is [payload+tag][salt+prefix+header+padding]. Send
         // [split..end] followed by [start..split] to preserve the wire layout.
-        Ok(if scattered { body_len } else { 0 })
+        Ok(if record.scattered { body_len } else { 0 })
     }
 }
 
@@ -342,36 +316,22 @@ impl V6ShapedEncoder<OsEntropy, UnixClock> {
 
 impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
     pub fn payload_mut(&mut self) -> &mut [u8] {
-        let start = self.encoder.payload_start + self.encoder.plain_prefix_len;
-        let end = self.encoder.payload_start + self.encoder.max_payload;
-        let record_end = end + TAG_LEN;
-        if self.buf.end() < record_end {
-            // Materialize the rest of the record for in-place writers.
-            // Capacity was reserved by `reserve_record`; this cannot fail.
-            self.buf
-                .reserve_zeroed(record_end - self.buf.end())
-                .expect("record capacity reserved");
-        }
-        self.buf.range_mut(start, end)
+        self.record.slot.payload_mut(self.buf)
     }
 
     /// Uninitialized payload slot after the prefix. Fill a prefix of it (for
     /// example through Tokio `ReadBuf::uninit`), then call [`Self::seal_init`].
     /// Do not mix with [`Self::payload_mut`]. Empty once materialized.
     pub fn payload_uninit(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
-        let cap = self.encoder.max_payload - self.encoder.plain_prefix_len;
-        if self.buf.end() != self.encoder.payload_start + self.encoder.plain_prefix_len {
-            return &mut [];
-        }
-        &mut self.buf.spare_uninit()[..cap]
+        self.record.slot.payload_uninit(self.buf)
     }
 
     pub fn capacity(&self) -> usize {
-        self.encoder.max_payload - self.encoder.plain_prefix_len
+        self.record.slot.capacity()
     }
 
     pub fn padding_len(&self) -> usize {
-        self.encoder.max_padding_len
+        self.encoder.profile.max_padding_len()
     }
 
     pub fn seal(self, written: usize) -> Result<()> {
@@ -387,22 +347,15 @@ impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
     }
 
     fn seal_mode(mut self, written: usize, scattered: bool) -> Result<usize> {
-        if scattered != self.encoder.scattered {
+        if scattered != self.record.scattered {
             return Err(Error::PendingWire);
         }
-        let total = self
-            .encoder
-            .plain_prefix_len
-            .checked_add(written)
-            .ok_or(Error::PayloadTooLarge)?;
-        if total > self.encoder.max_payload {
-            return Err(Error::PayloadTooLarge);
-        }
-        if self.buf.end() < self.encoder.payload_start + total {
+        let total = self.record.slot.total(written)?;
+        if self.buf.end() < self.record.slot.payload_start + total {
             return Err(Error::PendingWire);
         }
         self.sealed = true;
-        self.encoder.finish(self.buf, total, scattered)
+        self.encoder.finish(self.buf, &self.record, total)
     }
 
     /// Seal after the caller initialized `written` bytes of
@@ -416,25 +369,19 @@ impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
     }
 
     fn seal_init_mode(mut self, written: usize, scattered: bool) -> Result<usize> {
-        if scattered != self.encoder.scattered {
+        if scattered != self.record.scattered {
             return Err(Error::PendingWire);
         }
-        let total = crate::buffer::commit_init_payload(
-            self.buf,
-            self.encoder.payload_start,
-            self.encoder.plain_prefix_len,
-            self.encoder.max_payload,
-            written,
-        )?;
+        let total = self.record.slot.commit_init(self.buf, written)?;
         self.sealed = true;
-        self.encoder.finish(self.buf, total, scattered)
+        self.encoder.finish(self.buf, &self.record, total)
     }
 }
 
 impl<E: Entropy, C: Clock> Drop for V6ShapedReservation<'_, E, C> {
     fn drop(&mut self) {
         if !self.sealed {
-            let _ = self.buf.truncate(self.encoder.record_start);
+            let _ = self.buf.truncate(self.record.slot.record_start);
             self.encoder.reserving = false;
         }
     }
@@ -457,7 +404,7 @@ enum ReadStep {
         prefix_len: usize,
     },
     Body {
-        header: crate::RecordHeader,
+        header: RecordHeader,
         prefix_len: usize,
     },
 }
@@ -471,26 +418,22 @@ pub struct V6ShapedDecoder {
     include_salt: bool,
     replay: Option<[u8; SALT_LEN]>,
     step: ReadStep,
-    /// Bytes of returned-but-unconsumed records at the front of `filled()`.
-    /// Decode-ahead parses the next record at this offset; [`Self::consume`]
-    /// drains records FIFO.
-    pending: usize,
+    pending: Pending,
 }
 
 impl V6ShapedDecoder {
-    pub fn new(psk: Psk) -> Result<Self> {
-        let profile = Profile::derive(psk.as_bytes())?;
-        Ok(Self {
+    pub fn new(psk: Psk) -> Self {
+        Self {
+            profile: Profile::derive(&psk),
             psk,
-            profile,
             aead: None,
             nonce: Nonce::new(),
             seq: 0,
             include_salt: true,
             replay: None,
             step: ReadStep::Salt,
-            pending: 0,
-        })
+            pending: Pending::default(),
+        }
     }
 
     /// 16-byte AEAD salt extracted from the first-record salt block.
@@ -499,7 +442,7 @@ impl V6ShapedDecoder {
     }
 
     pub fn has_unconsumed_plaintext(&self) -> bool {
-        self.pending != 0
+        !self.pending.is_empty()
     }
 
     pub fn kdf_need(&self) -> usize {
@@ -511,18 +454,14 @@ impl V6ShapedDecoder {
     }
 
     pub fn kdf_salt(&self, buf: &Buffer) -> Result<[u8; SALT_LEN]> {
-        let salt_len = self.profile.salt_block_len();
-        if buf.len() < salt_len {
-            return Err(Error::Truncated);
-        }
-        self.profile.extract_salt(&buf.filled()[..salt_len])
+        let block = buf
+            .filled()
+            .get(..self.profile.salt_block_len())
+            .ok_or(Error::Truncated)?;
+        self.profile.extract_salt(block)
     }
 
-    pub fn install_aead(
-        &mut self,
-        salt: [u8; SALT_LEN],
-        key: [u8; crate::AES_128_KEY_LEN],
-    ) -> Result<()> {
+    pub fn install_aead(&mut self, salt: [u8; SALT_LEN], key: [u8; AES_128_KEY_LEN]) -> Result<()> {
         self.aead = Some(Aes128Gcm::new(&key)?);
         self.replay = Some(salt);
         Ok(())
@@ -532,145 +471,85 @@ impl V6ShapedDecoder {
         loop {
             match self.step {
                 ReadStep::Salt => {
-                    let salt_len = self.profile.salt_block_len();
-                    if let Some(need) = self.decode_need(buf, salt_len)? {
+                    if let Some(need) = self.pending.need(buf, self.profile.salt_block_len())? {
                         return Ok(need);
                     }
                     if self.aead.is_none() {
-                        let salt = self.profile.extract_salt(&buf.filled()[..salt_len])?;
-                        let mut key = aead_key(self.psk.as_bytes(), &salt)?;
-                        self.aead = Some(Aes128Gcm::new(&key)?);
-                        key.zeroize();
+                        let salt = self.kdf_salt(buf)?;
+                        self.aead = Some(Aes128Gcm::derive(&self.psk, &salt)?);
                         self.replay = Some(salt);
                     }
-                    self.step = ReadStep::Header {
-                        prefix_len: self.profile.record_prefix_len(self.seq),
-                    };
+                    self.step = self.header_step();
                 }
                 ReadStep::Header { prefix_len } => {
                     let off = self.header_offset();
                     let header_end = off + prefix_len + HEADER_CIPHER_LEN;
-                    if let Some(need) = self.decode_need(buf, header_end)? {
+                    if let Some(need) = self.pending.need(buf, header_end)? {
                         return Ok(need);
                     }
-                    let mut scratch = [0u8; 128 + HEADER_CIPHER_LEN];
-                    if prefix_len + HEADER_CIPHER_LEN > scratch.len() {
-                        return Err(Error::PayloadTooLarge);
-                    }
-                    scratch[..prefix_len + HEADER_CIPHER_LEN]
-                        .copy_from_slice(&buf.filled()[off..header_end]);
-                    let (prefix, hdr) =
-                        scratch[..prefix_len + HEADER_CIPHER_LEN].split_at_mut(prefix_len);
-                    let (cipher, tag_bytes) = hdr.split_at_mut(HEADER_PLAIN_LEN);
-                    let mut tag = [0u8; TAG_LEN];
-                    tag.copy_from_slice(tag_bytes);
-                    self.aead.as_ref().ok_or(Error::Aead)?.open(
-                        &self.nonce,
-                        prefix,
-                        cipher,
-                        &tag,
-                    )?;
-                    self.nonce.increment();
-                    let header = parse_v6_plain_header(cipher)?;
-                    let body_len = header.body_len_v6_shaped()?;
-                    if body_len == 0 {
-                        self.include_salt = false;
-                        self.seq = self.seq.wrapping_add(1);
-                        self.step = ReadStep::Header {
-                            prefix_len: self.profile.record_prefix_len(self.seq),
-                        };
-                        let consumed = header_end - self.pending;
-                        self.pending = header_end;
-                        return Ok(DecodeStatus::Record(DecodedRecord {
-                            consumed,
-                            plaintext: 0..0,
-                            kind: RecordKind::ZeroChunk,
-                        }));
+                    let mut scratch = [0u8; V6_MAX_PREFIX_LEN + HEADER_CIPHER_LEN];
+                    let scratch = scratch
+                        .get_mut(..header_end - off)
+                        .ok_or(Error::PayloadTooLarge)?;
+                    scratch.copy_from_slice(&buf.filled()[off..header_end]);
+                    let (prefix, hdr) = scratch.split_at_mut(prefix_len);
+                    let aead = self.aead.as_ref().ok_or(Error::Aead)?;
+                    aead.open(&mut self.nonce, prefix, hdr)?;
+                    let header = parse_v6_plain_header(&hdr[..HEADER_PLAIN_LEN])?;
+                    if header.body_len_v6_shaped() == 0 {
+                        self.next_record();
+                        return Ok(self.pending.zero_chunk(header_end));
                     }
                     self.step = ReadStep::Body { header, prefix_len };
                 }
                 ReadStep::Body { header, prefix_len } => {
-                    let off = self.header_offset();
-                    let body_off = off + prefix_len + HEADER_CIPHER_LEN;
-                    let body_len = header.body_len_v6_shaped()?;
-                    let needed = body_off + body_len;
-                    if let Some(need) = self.decode_need(buf, needed)? {
+                    let body_off = self.header_offset() + prefix_len + HEADER_CIPHER_LEN;
+                    let body_end = body_off + header.body_len_v6_shaped();
+                    if let Some(need) = self.pending.need(buf, body_end)? {
                         return Ok(need);
                     }
                     if header.payload_len == 0 {
-                        self.include_salt = false;
-                        self.seq = self.seq.wrapping_add(1);
-                        self.step = ReadStep::Header {
-                            prefix_len: self.profile.record_prefix_len(self.seq),
-                        };
-                        let consumed = needed - self.pending;
-                        self.pending = needed;
-                        return Ok(DecodeStatus::Record(DecodedRecord {
-                            consumed,
-                            plaintext: 0..0,
-                            kind: RecordKind::ZeroChunk,
-                        }));
+                        self.next_record();
+                        return Ok(self.pending.zero_chunk(body_end));
                     }
-                    let body = &mut buf.filled_mut()[body_off..needed];
-                    let (padding, rest) = body.split_at_mut(header.padding_len);
-                    mix_padding_payload(&self.profile, self.seq, padding, rest);
-                    let (payload, tag_bytes) = rest.split_at_mut(header.payload_len);
-                    let mut tag = [0u8; TAG_LEN];
-                    tag.copy_from_slice(tag_bytes);
-                    self.aead.as_ref().ok_or(Error::Aead)?.open(
-                        &self.nonce,
-                        padding,
-                        payload,
-                        &tag,
-                    )?;
-                    self.nonce.increment();
+                    let body = &mut buf.filled_mut()[body_off..body_end];
+                    let (padding, cipher_and_tag) = body.split_at_mut(header.padding_len);
+                    mix_padding_payload(&self.profile, self.seq, padding, cipher_and_tag);
+                    let aead = self.aead.as_ref().ok_or(Error::Aead)?;
+                    aead.open(&mut self.nonce, padding, cipher_and_tag)?;
+                    self.next_record();
                     let start = body_off + header.padding_len;
-                    self.include_salt = false;
-                    self.seq = self.seq.wrapping_add(1);
-                    self.step = ReadStep::Header {
-                        prefix_len: self.profile.record_prefix_len(self.seq),
-                    };
-                    let consumed = needed - self.pending;
-                    self.pending = needed;
-                    return Ok(DecodeStatus::Record(DecodedRecord {
-                        consumed,
-                        plaintext: start..start + header.payload_len,
-                        kind: RecordKind::Data,
-                    }));
+                    return Ok(self
+                        .pending
+                        .data(body_end, start..start + header.payload_len));
                 }
             }
         }
     }
 
     pub fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
-        self.pending = self
-            .pending
-            .checked_sub(record.consumed)
-            .ok_or(Error::PlaintextNotDrained)?;
-        buf.consume(record.consumed)?;
-        Ok(())
+        self.pending.consume(buf, record)
+    }
+
+    fn header_step(&self) -> ReadStep {
+        ReadStep::Header {
+            prefix_len: self.profile.record_prefix_len(self.seq),
+        }
+    }
+
+    fn next_record(&mut self) {
+        self.include_salt = false;
+        self.seq = self.seq.wrapping_add(1);
+        self.step = self.header_step();
     }
 
     fn header_offset(&self) -> usize {
-        self.pending
-            + if self.include_salt {
-                self.profile.salt_block_len()
-            } else {
-                0
-            }
-    }
-
-    /// `minimum` is measured from the start of `filled()` and includes
-    /// `pending`. A record must fit the buffer on its own; when outstanding
-    /// records crowd it out, report `NeedMore` so the caller drains first.
-    fn decode_need(&self, buf: &Buffer, minimum: usize) -> Result<Option<DecodeStatus>> {
-        if minimum - self.pending > buf.max() {
-            Err(Error::PayloadTooLarge)
-        } else if buf.len() < minimum {
-            Ok(Some(DecodeStatus::NeedMore { minimum }))
+        let salt = if self.include_salt {
+            self.profile.salt_block_len()
         } else {
-            Ok(None)
-        }
+            0
+        };
+        self.pending.offset() + salt
     }
 }
 
@@ -679,7 +558,7 @@ impl fmt::Debug for V6ShapedDecoder {
         f.debug_struct("V6ShapedDecoder")
             .field("include_salt", &self.include_salt)
             .field("seq", &self.seq)
-            .field("pending", &self.pending)
+            .field("pending", &self.pending.offset())
             .finish_non_exhaustive()
     }
 }
@@ -687,7 +566,7 @@ impl fmt::Debug for V6ShapedDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Buffer, FixedClock, RepeatEntropy, V6_WIRE_CAP};
+    use crate::{FixedClock, RecordKind, RepeatEntropy, V6_WIRE_CAP};
 
     fn psk() -> Psk {
         Psk::new(b"0123456789abcdef").unwrap()
@@ -735,7 +614,7 @@ mod tests {
         }
         let wire = collect(&out);
         assert!(wire.len() > SALT_LEN + HEADER_CIPHER_LEN + 5);
-        let mut decoder = V6ShapedDecoder::new(psk()).unwrap();
+        let mut decoder = V6ShapedDecoder::new(psk());
         let mut buf = Buffer::new(V6_WIRE_CAP);
         assert_eq!(decode_plain(&mut decoder, &mut buf, &wire), b"hello");
         assert_eq!(decoder.replay_identity(), Some([7u8; SALT_LEN]));
@@ -783,8 +662,8 @@ mod tests {
                 };
                 a.payload_mut()[..n].fill(seq as u8);
                 a.seal(n).unwrap();
-                let payload_start = b.encoder.payload_start;
-                let record_start = b.encoder.record_start;
+                let payload_start = b.record.slot.payload_start;
+                let record_start = b.record.slot.record_start;
                 let payload_ptr = b.payload_uninit().as_ptr();
                 let split = if seq % 2 == 0 {
                     b.payload_uninit()[..n].fill(core::mem::MaybeUninit::new(seq as u8));
@@ -847,7 +726,7 @@ mod tests {
         let mut wire = Buffer::new(V6_WIRE_CAP);
         wire.extend_from_slice(&out.filled()[split..]).unwrap();
         wire.extend_from_slice(&out.filled()[..split]).unwrap();
-        let mut decoder = V6ShapedDecoder::new(psk()).unwrap();
+        let mut decoder = V6ShapedDecoder::new(psk());
         let DecodeStatus::Record(record) = decoder.decode(&mut wire).unwrap() else {
             panic!("missing record");
         };
@@ -894,34 +773,9 @@ mod tests {
         assert_ne!(first.len(), second.len());
         let mut both = first;
         both.extend_from_slice(&second);
-        let mut decoder = V6ShapedDecoder::new(psk()).unwrap();
+        let mut decoder = V6ShapedDecoder::new(psk());
         let mut buf = Buffer::new(V6_WIRE_CAP);
         assert_eq!(decode_plain(&mut decoder, &mut buf, &both), b"helloworld");
-    }
-
-    #[test]
-    fn two_records_share_pending_without_advance() {
-        let mut enc = encoder();
-        let mut out = Buffer::new(V6_WIRE_CAP);
-        {
-            let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
-            rec.payload_mut()[..5].copy_from_slice(b"hello");
-            rec.seal(5).unwrap();
-        }
-        let first_len = out.len();
-        {
-            let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
-            rec.payload_mut()[..5].copy_from_slice(b"world");
-            rec.seal(5).unwrap();
-        }
-        let pending = collect(&out);
-        let mut decoder = V6ShapedDecoder::new(psk()).unwrap();
-        let mut buf = Buffer::new(V6_WIRE_CAP);
-        assert_eq!(
-            decode_plain(&mut decoder, &mut buf, &pending),
-            b"helloworld"
-        );
-        assert!(first_len < pending.len());
     }
 
     #[test]
@@ -934,7 +788,7 @@ mod tests {
             rec.seal(msg.len()).unwrap();
         }
         let wire = collect(&out);
-        let mut decoder = V6ShapedDecoder::new(psk()).unwrap();
+        let mut decoder = V6ShapedDecoder::new(psk());
         let mut buf = Buffer::new(V6_WIRE_CAP);
         buf.extend_from_slice(&wire).unwrap();
         let DecodeStatus::Record(first) = decoder.decode(&mut buf).unwrap() else {
@@ -967,7 +821,7 @@ mod tests {
             rec.seal(5).unwrap();
         }
         let wire = collect(&out);
-        let profile = Profile::derive(psk().as_bytes()).unwrap();
+        let profile = Profile::derive(&psk());
         assert_ne!(&wire[..SALT_LEN], &[7u8; SALT_LEN]);
         assert_eq!(
             profile
@@ -983,7 +837,7 @@ mod tests {
         let mut out = Buffer::new(V6_WIRE_CAP);
         enc.reserve(&mut out, &[], 0).unwrap().seal(0).unwrap();
         let wire = collect(&out);
-        let mut decoder = V6ShapedDecoder::new(psk()).unwrap();
+        let mut decoder = V6ShapedDecoder::new(psk());
         let mut buf = Buffer::new(V6_WIRE_CAP);
         buf.extend_from_slice(&wire).unwrap();
         match decoder.decode(&mut buf).unwrap() {
@@ -1007,7 +861,7 @@ mod tests {
         let mut wire = collect(&out);
         let last = wire.len() - 1;
         wire[last] ^= 1;
-        let mut decoder = V6ShapedDecoder::new(psk()).unwrap();
+        let mut decoder = V6ShapedDecoder::new(psk());
         let mut buf = Buffer::new(V6_WIRE_CAP);
         buf.extend_from_slice(&wire).unwrap();
         assert_eq!(decoder.decode(&mut buf), Err(Error::Aead));
@@ -1017,7 +871,7 @@ mod tests {
     fn debug_hides_psk() {
         let enc = encoder();
         assert!(!format!("{enc:?}").contains("0123456789abcdef"));
-        let dec = V6ShapedDecoder::new(psk()).unwrap();
+        let dec = V6ShapedDecoder::new(psk());
         assert!(!format!("{dec:?}").contains("0123456789abcdef"));
     }
 
@@ -1033,39 +887,11 @@ mod tests {
     }
 
     #[test]
-    fn hello_byte_at_a_time() {
-        let mut enc = encoder();
-        let mut out = Buffer::new(V6_WIRE_CAP);
-        {
-            let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
-            rec.payload_mut()[..5].copy_from_slice(b"hello");
-            rec.seal(5).unwrap();
-        }
-        let wire = collect(&out);
-        let mut decoder = V6ShapedDecoder::new(psk()).unwrap();
-        let mut buf = Buffer::new(V6_WIRE_CAP);
-        for (i, byte) in wire.iter().enumerate() {
-            buf.extend_from_slice(&[*byte]).unwrap();
-            match decoder.decode(&mut buf).unwrap() {
-                DecodeStatus::NeedMore { minimum } => {
-                    assert!(i + 1 < wire.len());
-                    assert!(minimum > i + 1);
-                }
-                DecodeStatus::Record(record) => {
-                    assert_eq!(i + 1, wire.len());
-                    assert_eq!(record.plaintext(buf.filled()), b"hello");
-                    decoder.consume(&mut buf, &record).unwrap();
-                }
-            }
-        }
-    }
-
-    #[test]
     fn first_record_respects_cap() {
         let mut enc = encoder();
         let mut out = Buffer::new(V6_WIRE_CAP);
         let rec = enc.reserve(&mut out, &[], MAX_PACKET_SIZE_V6).unwrap();
-        let profile = Profile::derive(psk().as_bytes()).unwrap();
+        let profile = Profile::derive(&psk());
         assert!(rec.capacity() <= profile.first_record_cap());
     }
 }

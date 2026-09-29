@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use snell_protocol::{KDF_MAX_INFLIGHT, KDF_MAX_QUEUED};
+use snell_protocol::{KDF_MAX_INFLIGHT, KDF_MAX_QUEUED, Psk};
 use tokio::sync::Semaphore;
 
 use crate::error::SessionError;
@@ -63,13 +63,26 @@ impl KdfLimiter {
                 permit
             }
         };
-        let out = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _permit = permit;
             f()
         })
         .await
-        .map_err(|_| SessionError::Cancelled)?;
-        Ok(out)
+        .map_err(|_| SessionError::Cancelled)
+    }
+
+    /// Run one Argon2id-bound derivation (a key or a record encoder) over a
+    /// clone of `psk`; the clone is zeroized when the blocking task drops it.
+    pub(crate) async fn derive<T>(
+        &self,
+        psk: &Psk,
+        derive: impl FnOnce(&Psk) -> snell_protocol::Result<T> + Send + 'static,
+    ) -> Result<T, SessionError>
+    where
+        T: Send + 'static,
+    {
+        let psk = psk.clone();
+        Ok(self.run(move || derive(&psk)).await??)
     }
 }
 
@@ -83,19 +96,17 @@ impl Drop for Waiting<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snell_protocol::{Psk, aead_key};
+    use snell_protocol::aead_key;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn kdf_run_matches_inline() {
+    async fn kdf_derive_matches_inline() {
         let limiter = KdfLimiter::new();
         let psk = Psk::new(b"0123456789abcdef").unwrap();
         let salt = [7u8; 16];
-        let inline = aead_key(psk.as_bytes(), &salt).unwrap();
-        let psk_bytes = psk.as_bytes().to_vec();
+        let inline = aead_key(&psk, &salt).unwrap();
         let spawned = limiter
-            .run(move || aead_key(&psk_bytes, &salt))
+            .derive(&psk, move |psk| aead_key(psk, &salt))
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(inline, spawned);
     }

@@ -1,5 +1,5 @@
 use crate::buffer::{BufferPool, PooledBuffer};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -178,13 +178,62 @@ impl UdpFlow {
 }
 
 fn rewrite_unspecified(bind: SocketAddr, server: SocketAddr) -> SocketAddr {
-    if match bind.ip() {
-        IpAddr::V4(ip) => ip.is_unspecified(),
-        IpAddr::V6(ip) => ip.is_unspecified(),
-    } {
+    if bind.ip().is_unspecified() {
         SocketAddr::new(server.ip(), bind.port())
     } else {
         bind
+    }
+}
+
+/// Greeting, no-auth method selection, one request, and a succeeded reply.
+/// Returns the reply's bind address.
+async fn socks5_request(
+    stream: &mut TcpStream,
+    command: Command,
+    destination: AddressRef<'_>,
+) -> Result<Address, SessionError> {
+    let mut buf = [0u8; 3 + 1 + 1 + 255 + 2];
+    let n = socks5::encode_greeting(&mut buf, &[METHOD_NO_AUTH])?;
+    stream.write_all(&buf[..n]).await?;
+    stream.read_exact(&mut buf[..2]).await?;
+    match socks5::method_selection_need(&buf[..2])? {
+        ParseState::Done(METHOD_NO_AUTH) => {}
+        ParseState::Done(_) => return Err(SessionError::NoAcceptableMethod),
+        ParseState::Need(_) => {
+            return Err(SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "socks5 method selection truncated",
+            )));
+        }
+    }
+
+    let n = socks5::encode_request(&mut buf, command, destination)?;
+    stream.write_all(&buf[..n]).await?;
+
+    let mut filled = 0;
+    loop {
+        match socks5::reply_need(&buf[..filled])? {
+            ParseState::Need(total) => {
+                let missing = buf
+                    .get_mut(filled..total)
+                    .ok_or(Error::Malformed("oversized socks5 reply"))?;
+                stream.read_exact(missing).await?;
+                filled = total;
+            }
+            ParseState::Done(reply) if reply.reply == Reply::Succeeded => {
+                return Ok(reply.bind.into_owned());
+            }
+            ParseState::Done(reply) => {
+                let action = match command {
+                    Command::UdpAssociate => "udp associate",
+                    _ => "connect",
+                };
+                return Err(SessionError::Io(std::io::Error::other(format!(
+                    "socks5 outbound {action} failed: {:?}",
+                    reply.reply
+                ))));
+            }
+        }
     }
 }
 
@@ -192,50 +241,10 @@ async fn socks5_udp_associate(
     stream: &mut TcpStream,
     dns: &DnsResolver,
 ) -> Result<SocketAddr, SessionError> {
-    let mut buf = [0u8; 3 + 1 + 1 + 255 + 2];
-    let n = socks5::encode_greeting(&mut buf, &[METHOD_NO_AUTH])?;
-    stream.write_all(&buf[..n]).await?;
-    stream.read_exact(&mut buf[..2]).await?;
-    match socks5::method_selection_need(&buf[..2])? {
-        ParseState::Need(_) => {
-            return Err(SessionError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "socks5 method selection truncated",
-            )));
-        }
-        ParseState::Done(method) if method == METHOD_NO_AUTH => {}
-        ParseState::Done(_) => return Err(SessionError::NoAcceptableMethod),
-    }
-
-    let dest = AddressRef::Ip(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
-    let n = socks5::encode_request(&mut buf, Command::UdpAssociate, dest)?;
-    stream.write_all(&buf[..n]).await?;
-
-    let mut filled = 0;
-    loop {
-        match socks5::reply_need(&buf[..filled])? {
-            ParseState::Need(total) => {
-                if total > buf.len() {
-                    return Err(SessionError::Protocol(snell_protocol::Error::Malformed(
-                        "oversized socks5 udp associate reply",
-                    )));
-                }
-                stream.read_exact(&mut buf[filled..total]).await?;
-                filled = total;
-            }
-            ParseState::Done(reply) => {
-                if reply.reply != Reply::Succeeded {
-                    return Err(SessionError::Io(std::io::Error::other(format!(
-                        "socks5 outbound udp associate failed: {:?}",
-                        reply.reply
-                    ))));
-                }
-                return match reply.bind {
-                    AddressRef::Ip(addr) => Ok(addr),
-                    AddressRef::Domain { host, port } => dns.resolve(host, port).await,
-                };
-            }
-        }
+    let unspecified = AddressRef::Ip(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
+    match socks5_request(stream, Command::UdpAssociate, unspecified).await? {
+        Address::Ip(addr) => Ok(addr),
+        Address::Domain { host, port } => dns.resolve(&host, port).await,
     }
 }
 
@@ -244,14 +253,11 @@ async fn connect_direct(destination: &Address) -> Result<TcpStream, SessionError
         Address::Ip(addr) => connect_tcp(*addr).await,
         Address::Domain { host, port } => {
             let connect = TcpStream::connect((host.as_str(), *port));
-            match timeout(Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS), connect).await {
-                Ok(Ok(stream)) => {
-                    prepare_session_stream(&stream)?;
-                    Ok(stream)
-                }
-                Ok(Err(error)) => Err(error.into()),
-                Err(_) => Err(SessionError::ConnectTimeout),
-            }
+            let stream = timeout(Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS), connect)
+                .await
+                .map_err(|_| SessionError::ConnectTimeout)??;
+            prepare_session_stream(&stream)?;
+            Ok(stream)
         }
     }
 }
@@ -260,50 +266,9 @@ async fn connect_socks5(
     server: SocketAddr,
     destination: &Address,
 ) -> Result<TcpStream, SessionError> {
-    let stream = connect_tcp(server).await?;
-    socks5_connect_handshake(stream, destination.as_view()).await
-}
-
-async fn socks5_connect_handshake(
-    mut stream: TcpStream,
-    destination: AddressRef<'_>,
-) -> Result<TcpStream, SessionError> {
-    let mut buf = [0u8; 3 + 1 + 1 + 255 + 2];
-    let n = socks5::encode_greeting(&mut buf, &[METHOD_NO_AUTH])?;
-    stream.write_all(&buf[..n]).await?;
-    stream.read_exact(&mut buf[..2]).await?;
-    match socks5::method_selection_need(&buf[..2])? {
-        ParseState::Need(_) => {
-            return Err(SessionError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "socks5 method selection truncated",
-            )));
-        }
-        ParseState::Done(method) if method == METHOD_NO_AUTH => {}
-        ParseState::Done(_) => return Err(SessionError::NoAcceptableMethod),
-    }
-
-    let n = socks5::encode_request(&mut buf, Command::Connect, destination)?;
-    stream.write_all(&buf[..n]).await?;
-
-    let mut filled = 0;
-    loop {
-        match socks5::reply_need(&buf[..filled])? {
-            ParseState::Need(total) => {
-                stream.read_exact(&mut buf[filled..total]).await?;
-                filled = total;
-            }
-            ParseState::Done(reply) => {
-                if reply.reply != Reply::Succeeded {
-                    return Err(SessionError::Io(std::io::Error::other(format!(
-                        "socks5 outbound connect failed: {:?}",
-                        reply.reply
-                    ))));
-                }
-                return Ok(stream);
-            }
-        }
-    }
+    let mut stream = connect_tcp(server).await?;
+    socks5_request(&mut stream, Command::Connect, destination.as_view()).await?;
+    Ok(stream)
 }
 
 #[cfg(test)]

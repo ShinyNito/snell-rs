@@ -6,7 +6,6 @@
 
 use crate::buffer::{BufferPool, PooledBuffer};
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,7 +70,8 @@ impl Default for UdpLimits {
     }
 }
 
-#[derive(Default)]
+/// Relaxed counters; `Debug` prints their current values.
+#[derive(Debug, Default)]
 pub struct UdpMetrics {
     pub queue_full: AtomicU64,
     pub no_buffer: AtomicU64,
@@ -81,21 +81,6 @@ pub struct UdpMetrics {
     pub invalid: AtomicU64,
     pub idle_expired: AtomicU64,
     pub associations: AtomicU64,
-}
-
-impl fmt::Debug for UdpMetrics {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UdpMetrics")
-            .field("queue_full", &self.queue_full.load(Ordering::Relaxed))
-            .field("no_buffer", &self.no_buffer.load(Ordering::Relaxed))
-            .field("frag_dropped", &self.frag_dropped.load(Ordering::Relaxed))
-            .field("oversize", &self.oversize.load(Ordering::Relaxed))
-            .field("map_full", &self.map_full.load(Ordering::Relaxed))
-            .field("invalid", &self.invalid.load(Ordering::Relaxed))
-            .field("idle_expired", &self.idle_expired.load(Ordering::Relaxed))
-            .field("associations", &self.associations.load(Ordering::Relaxed))
-            .finish()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -262,14 +247,8 @@ impl UdpHub {
             .await
             .map_err(|_| SessionError::Cancelled)?;
         write_socks5_reply_bind(&mut local, Reply::Succeeded, self.bind_addr()).await?;
-        let mut buf = [0u8; 1];
-        loop {
-            match local.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
+        // The association lives until the SOCKS5 control connection closes.
+        while local.read(&mut [0u8; 1]).await.is_ok_and(|n| n > 0) {}
         Ok(())
     }
 }
