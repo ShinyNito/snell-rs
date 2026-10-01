@@ -1,7 +1,8 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 
-use crate::address::AddressRef;
-use crate::{Error, ParseState, Result};
+use crate::address::{AddressRef, ip_port, split_host_port};
+use crate::error::dst_prefix;
+use crate::{Error, MAX_DOMAIN_LEN, ParseState, Result};
 
 pub const VERSION: u8 = 0x05;
 pub const METHOD_NO_AUTH: u8 = 0x00;
@@ -12,6 +13,12 @@ pub const CMD_UDP_ASSOCIATE: u8 = 0x03;
 pub const ATYP_IPV4: u8 = 0x01;
 pub const ATYP_DOMAIN: u8 = 0x03;
 pub const ATYP_IPV6: u8 = 0x04;
+
+/// Largest greeting: `VER NMETHODS METHODS(255)`.
+pub const MAX_GREETING_LEN: usize = 2 + 255;
+
+/// Largest request or reply: `VER CMD RSV ATYP LEN HOST(255) PORT(2)`.
+pub const MAX_REQUEST_LEN: usize = 3 + 1 + 1 + MAX_DOMAIN_LEN + 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -135,24 +142,23 @@ pub struct UdpPacketRef<'a> {
 }
 
 pub fn greeting_need(buf: &[u8]) -> Result<ParseState<GreetingRef<'_>>> {
-    if buf.len() < 2 {
+    let [version, nmethods, ref methods @ ..] = *buf else {
         return Ok(ParseState::Need(2));
+    };
+    if version != VERSION {
+        return Err(Error::InvalidVersion(version));
     }
-    if buf[0] != VERSION {
-        return Err(Error::InvalidVersion(buf[0]));
-    }
-    let nmethods = usize::from(buf[1]);
     if nmethods == 0 {
         return Err(Error::Malformed("empty method list"));
     }
-    let total = 2 + nmethods;
-    if buf.len() < total {
-        return Ok(ParseState::Need(total));
-    }
-    Ok(ParseState::Done(GreetingRef {
-        methods: &buf[2..total],
-        consumed_len: total,
-    }))
+    let total = 2 + usize::from(nmethods);
+    Ok(match methods.get(..usize::from(nmethods)) {
+        Some(methods) => ParseState::Done(GreetingRef {
+            methods,
+            consumed_len: total,
+        }),
+        None => ParseState::Need(total),
+    })
 }
 
 pub fn encode_greeting(dst: &mut [u8], methods: &[u8]) -> Result<usize> {
@@ -160,28 +166,23 @@ pub fn encode_greeting(dst: &mut [u8], methods: &[u8]) -> Result<usize> {
         return Err(Error::Malformed("empty method list"));
     }
     let needed = 2 + methods.len();
-    ensure_capacity(dst, needed)?;
-    dst[0] = VERSION;
-    dst[1] = methods.len() as u8;
-    dst[2..needed].copy_from_slice(methods);
+    let (head, tail) = dst_prefix(dst, needed)?.split_at_mut(2);
+    head.copy_from_slice(&[VERSION, methods.len() as u8]);
+    tail.copy_from_slice(methods);
     Ok(needed)
 }
 
 pub fn encode_method_selection(dst: &mut [u8], method: u8) -> Result<usize> {
-    ensure_capacity(dst, 2)?;
-    dst[0] = VERSION;
-    dst[1] = method;
+    dst_prefix(dst, 2)?.copy_from_slice(&[VERSION, method]);
     Ok(2)
 }
 
 pub fn method_selection_need(buf: &[u8]) -> Result<ParseState<u8>> {
-    if buf.len() < 2 {
-        return Ok(ParseState::Need(2));
+    match *buf {
+        [VERSION, method, ..] => Ok(ParseState::Done(method)),
+        [version, _, ..] => Err(Error::InvalidVersion(version)),
+        _ => Ok(ParseState::Need(2)),
     }
-    if buf[0] != VERSION {
-        return Err(Error::InvalidVersion(buf[0]));
-    }
-    Ok(ParseState::Done(buf[1]))
 }
 
 pub fn request_need(buf: &[u8]) -> Result<ParseState<RequestRef<'_>>> {
@@ -219,11 +220,10 @@ pub fn parse_udp_packet(buf: &[u8]) -> Result<UdpPacketRef<'_>> {
     if buf[0] != 0 || buf[1] != 0 {
         return Err(Error::InvalidReserved(buf[0] | buf[1]));
     }
-    let (destination, addr_len) = parse_addr_field(&buf[3..])?;
-    let header_len = 3 + addr_len;
-    if buf.len() < header_len {
+    let ParseState::Done((destination, addr_len)) = parse_addr(&buf[3..])? else {
         return Err(Error::Truncated);
-    }
+    };
+    let header_len = 3 + addr_len;
     Ok(UdpPacketRef {
         frag: buf[2],
         destination,
@@ -233,14 +233,7 @@ pub fn parse_udp_packet(buf: &[u8]) -> Result<UdpPacketRef<'_>> {
 }
 
 pub fn encode_udp_header(dst: &mut [u8], frag: u8, destination: AddressRef<'_>) -> Result<usize> {
-    let addr_len = encoded_addr_len(destination)?;
-    let needed = 3 + addr_len;
-    ensure_capacity(dst, needed)?;
-    dst[0] = 0;
-    dst[1] = 0;
-    dst[2] = frag;
-    encode_addr_field(&mut dst[3..], destination)?;
-    Ok(needed)
+    encode_three_addr(dst, [0, 0, frag], destination)
 }
 
 pub fn encode_udp_packet(
@@ -249,10 +242,11 @@ pub fn encode_udp_packet(
     destination: AddressRef<'_>,
     payload: &[u8],
 ) -> Result<usize> {
-    let header_len = encode_udp_header(dst, frag, destination)?;
+    let header_len = 3 + encoded_addr_len(destination)?;
     let needed = header_len + payload.len();
-    ensure_capacity(dst, needed)?;
-    dst[header_len..needed].copy_from_slice(payload);
+    let (header, payload_dst) = dst_prefix(dst, needed)?.split_at_mut(header_len);
+    write_three_addr(header, [0, 0, frag], destination);
+    payload_dst.copy_from_slice(payload);
     Ok(needed)
 }
 
@@ -269,60 +263,48 @@ fn parse_cmd_addr<'a, T>(
     if buf[2] != 0 {
         return Err(Error::InvalidReserved(buf[2]));
     }
-    match addr_len_need(&buf[3..])? {
-        None => Ok(ParseState::Need(if buf[3] == ATYP_DOMAIN { 5 } else { 4 })),
-        Some(addr_len) => {
-            let total = 3 + addr_len;
-            if buf.len() < total {
-                return Ok(ParseState::Need(total));
-            }
-            let (destination, _) = parse_addr_field(&buf[3..])?;
-            Ok(ParseState::Done(build(buf[1], destination, total)))
-        }
-    }
+    Ok(match parse_addr(&buf[3..])? {
+        ParseState::Need(n) => ParseState::Need(3 + n),
+        ParseState::Done((address, len)) => ParseState::Done(build(buf[1], address, 3 + len)),
+    })
 }
 
 fn encode_cmd_addr(dst: &mut [u8], cmd: u8, address: AddressRef<'_>) -> Result<usize> {
-    let addr_len = encoded_addr_len(address)?;
-    let needed = 3 + addr_len;
-    ensure_capacity(dst, needed)?;
-    dst[0] = VERSION;
-    dst[1] = cmd;
-    dst[2] = 0;
-    encode_addr_field(&mut dst[3..], address)?;
+    encode_three_addr(dst, [VERSION, cmd, 0], address)
+}
+
+/// `head(3) ATYP ADDR PORT`, the shape shared by requests, replies and UDP headers.
+fn encode_three_addr(dst: &mut [u8], head: [u8; 3], address: AddressRef<'_>) -> Result<usize> {
+    let needed = 3 + encoded_addr_len(address)?;
+    write_three_addr(dst_prefix(dst, needed)?, head, address);
     Ok(needed)
 }
 
-fn addr_len_need(buf: &[u8]) -> Result<Option<usize>> {
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    match buf[0] {
-        ATYP_IPV4 => Ok(Some(1 + 4 + 2)),
-        ATYP_IPV6 => Ok(Some(1 + 16 + 2)),
-        ATYP_DOMAIN => {
-            if buf.len() < 2 {
-                return Ok(None);
-            }
-            let len = usize::from(buf[1]);
-            if len == 0 {
-                return Err(Error::EmptyHost);
-            }
-            Ok(Some(1 + 1 + len + 2))
-        }
-        other => Err(Error::InvalidAddressType(other)),
-    }
+/// `dst` is exactly `3 + encoded_addr_len(address)` bytes.
+fn write_three_addr(dst: &mut [u8], head: [u8; 3], address: AddressRef<'_>) {
+    let (head_dst, field) = dst.split_at_mut(3);
+    head_dst.copy_from_slice(&head);
+    let (tag, addr): (&[u8], &[u8]) = match &address {
+        AddressRef::Ip(SocketAddr::V4(v4)) => (&[ATYP_IPV4], &v4.ip().octets()),
+        AddressRef::Ip(SocketAddr::V6(v6)) => (&[ATYP_IPV6], &v6.ip().octets()),
+        AddressRef::Domain { host, .. } => (&[ATYP_DOMAIN, host.len() as u8], host.as_bytes()),
+    };
+    let (tag_dst, rest) = field.split_at_mut(tag.len());
+    tag_dst.copy_from_slice(tag);
+    let (addr_dst, port_dst) = rest.split_at_mut(addr.len());
+    addr_dst.copy_from_slice(addr);
+    port_dst.copy_from_slice(&address.port().to_be_bytes());
 }
 
 fn encoded_addr_len(address: AddressRef<'_>) -> Result<usize> {
     match address {
-        AddressRef::Ip(SocketAddr::V4(_)) => Ok(7),
-        AddressRef::Ip(SocketAddr::V6(_)) => Ok(19),
+        AddressRef::Ip(SocketAddr::V4(_)) => Ok(1 + 4 + 2),
+        AddressRef::Ip(SocketAddr::V6(_)) => Ok(1 + 16 + 2),
         AddressRef::Domain { host, .. } => {
             if host.is_empty() {
                 return Err(Error::EmptyHost);
             }
-            if host.len() > 255 {
+            if host.len() > MAX_DOMAIN_LEN {
                 return Err(Error::HostTooLong);
             }
             Ok(1 + 1 + host.len() + 2)
@@ -330,86 +312,31 @@ fn encoded_addr_len(address: AddressRef<'_>) -> Result<usize> {
     }
 }
 
-fn encode_addr_field(dst: &mut [u8], address: AddressRef<'_>) -> Result<usize> {
-    match address {
-        AddressRef::Ip(SocketAddr::V4(v4)) => {
-            dst[0] = ATYP_IPV4;
-            dst[1..5].copy_from_slice(&v4.ip().octets());
-            dst[5..7].copy_from_slice(&v4.port().to_be_bytes());
-            Ok(7)
-        }
-        AddressRef::Ip(SocketAddr::V6(v6)) => {
-            dst[0] = ATYP_IPV6;
-            dst[1..17].copy_from_slice(&v6.ip().octets());
-            dst[17..19].copy_from_slice(&v6.port().to_be_bytes());
-            Ok(19)
-        }
-        AddressRef::Domain { host, port } => {
-            let host = host.as_bytes();
-            dst[0] = ATYP_DOMAIN;
-            dst[1] = host.len() as u8;
-            dst[2..2 + host.len()].copy_from_slice(host);
-            dst[2 + host.len()..2 + host.len() + 2].copy_from_slice(&port.to_be_bytes());
-            Ok(1 + 1 + host.len() + 2)
-        }
+/// `ATYP ADDR PORT` at the start of `buf`, validated in one pass. `Need`
+/// counts from `buf[0]`.
+fn parse_addr(buf: &[u8]) -> Result<ParseState<(AddressRef<'_>, usize)>> {
+    let len = match *buf {
+        [] => return Ok(ParseState::Need(1)),
+        [ATYP_IPV4, ..] => 1 + 4 + 2,
+        [ATYP_IPV6, ..] => 1 + 16 + 2,
+        [ATYP_DOMAIN] => return Ok(ParseState::Need(2)),
+        [ATYP_DOMAIN, 0, ..] => return Err(Error::EmptyHost),
+        [ATYP_DOMAIN, host_len, ..] => 1 + 1 + usize::from(host_len) + 2,
+        [other, ..] => return Err(Error::InvalidAddressType(other)),
+    };
+    if buf.len() < len {
+        return Ok(ParseState::Need(len));
     }
-}
-
-fn parse_addr_field(buf: &[u8]) -> Result<(AddressRef<'_>, usize)> {
-    if buf.is_empty() {
-        return Err(Error::Truncated);
-    }
-    match buf[0] {
-        ATYP_IPV4 => {
-            if buf.len() < 7 {
-                return Err(Error::Truncated);
-            }
-            let ip = Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
-            let port = u16::from_be_bytes([buf[5], buf[6]]);
-            Ok((AddressRef::Ip(SocketAddr::new(IpAddr::V4(ip), port)), 7))
+    let tail = &buf[1..];
+    let address = match buf[0] {
+        ATYP_IPV4 => AddressRef::Ip(ip_port::<4>(tail).ok_or(Error::Truncated)?),
+        ATYP_IPV6 => AddressRef::Ip(ip_port::<16>(tail).ok_or(Error::Truncated)?),
+        _ => {
+            let (host, port, _) = split_host_port(tail)?;
+            AddressRef::Domain { host, port }
         }
-        ATYP_IPV6 => {
-            if buf.len() < 19 {
-                return Err(Error::Truncated);
-            }
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&buf[1..17]);
-            let port = u16::from_be_bytes([buf[17], buf[18]]);
-            Ok((
-                AddressRef::Ip(SocketAddr::new(IpAddr::V6(octets.into()), port)),
-                19,
-            ))
-        }
-        ATYP_DOMAIN => {
-            if buf.len() < 2 {
-                return Err(Error::Truncated);
-            }
-            let host_len = usize::from(buf[1]);
-            if host_len == 0 {
-                return Err(Error::EmptyHost);
-            }
-            let needed = 2 + host_len + 2;
-            if buf.len() < needed {
-                return Err(Error::Truncated);
-            }
-            let host =
-                std::str::from_utf8(&buf[2..2 + host_len]).map_err(|_| Error::InvalidHostUtf8)?;
-            let port = u16::from_be_bytes([buf[2 + host_len], buf[2 + host_len + 1]]);
-            Ok((AddressRef::Domain { host, port }, needed))
-        }
-        other => Err(Error::InvalidAddressType(other)),
-    }
-}
-
-fn ensure_capacity(dst: &[u8], needed: usize) -> Result<()> {
-    if dst.len() < needed {
-        Err(Error::BufferTooSmall {
-            needed,
-            available: dst.len(),
-        })
-    } else {
-        Ok(())
-    }
+    };
+    Ok(ParseState::Done((address, len)))
 }
 
 #[cfg(test)]

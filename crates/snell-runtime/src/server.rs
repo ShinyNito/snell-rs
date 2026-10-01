@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use snell_protocol::{
-    Error as ProtocolError, ProtocolFlavor, ProtocolSelection, Psk, V4Decoder, V4Encoder,
-    V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
+    ConnectRequest, Error as ProtocolError, ProtocolFlavor, ProtocolSelection, Psk, V4Decoder,
+    V4Encoder, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -21,7 +21,7 @@ use crate::outbound::Outbound;
 use crate::platform::{self, AcceptLoop, TcpBrutal, prepare_session_stream};
 use crate::replay::ReplayCache;
 use crate::session::{
-    ServerConnect, ServerFirst, read_server_connect, relay, server_may_reuse, wait_reuse_idle,
+    ServerFirst, read_server_connect, relay, server_may_reuse, wait_reuse_idle,
     with_handshake_timeout, write_reject, write_tunnel,
 };
 use crate::udp::{UdpOptions, run_server_udp};
@@ -224,18 +224,13 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
     let buffers = Arc::clone(recv.pool());
     let mut reused = false;
     loop {
-        let connect = match command {
-            ServerFirst::Connect(connect) => connect,
+        let (ConnectRequest { destination, reuse }, leftover) = match command {
+            ServerFirst::Connect { request, leftover } => (request, leftover),
             ServerFirst::Udp => {
                 return run_server_udp(snell, encoder, decoder, outbound, kdf, psk, recv, udp)
                     .await;
             }
         };
-        let ServerConnect {
-            destination,
-            leftover,
-            reuse,
-        } = connect;
 
         let mut remote = match with_handshake_timeout(async {
             let remote = outbound.connect(&destination).await?;

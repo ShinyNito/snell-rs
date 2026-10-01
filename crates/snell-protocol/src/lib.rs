@@ -39,7 +39,7 @@ mod fragment;
 pub use address::{Address, AddressRef};
 pub use buffer::Buffer;
 pub use chunk::next_v4_chunk_limit;
-pub use clock::{Clock, FixedClock, UnixClock};
+pub use clock::{Clock, FixedClock, MonotonicClock};
 pub use control::{
     ConnectRequest, ServerReply, UdpPacket, connect_request_len, decode_connect_request,
     decode_connect_request_prefix, decode_server_reply, decode_udp_request, decode_udp_response,

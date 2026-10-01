@@ -30,7 +30,7 @@ pub struct ClientConfig {
     pub server: SocketAddr,
     pub psk: Psk,
     pub version: ProtocolFlavor,
-    pub reuse: bool,
+    /// CONNECT_V2 reuse through this pool; `None` opens one-shot sessions.
     pub pool: Option<ReusePool>,
     pub udp: UdpOptions,
     pub buffers: Arc<BufferPool>,
@@ -53,9 +53,7 @@ pub async fn serve_client(
 ) -> Result<(), SessionError> {
     tokio::pin!(shutdown);
     let kdf = Arc::new(KdfLimiter::new());
-    let pool = config
-        .reuse
-        .then(|| config.pool.clone().unwrap_or_default());
+    let pool = config.pool.clone();
     let hub = UdpHub::start(listener.local_addr()?, config.clone(), kdf.clone()).await?;
     let mut reuse_maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut accept = AcceptLoop::new(&listener);

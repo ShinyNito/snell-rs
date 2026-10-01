@@ -1,5 +1,7 @@
 use snell_testkit::load;
-use snell_testkit::oracle::{ClientOptions, ProcessPair, SnellBinary, socks5_echo_roundtrip};
+use snell_testkit::oracle::{
+    ClientOptions, ProcessPair, ServerOptions, SnellBinary, socks5_echo_roundtrip,
+};
 use tokio::sync::Mutex;
 
 const PSK: &str = "0123456789abcdef";
@@ -11,9 +13,14 @@ async fn v4_socks5_echo_roundtrip() {
     let binary = process_bin();
     let _lock = ORACLE_LOCK.lock().await;
 
-    let pair = ProcessPair::spawn_v4(&binary, PSK)
-        .await
-        .expect("client/server must start");
+    let pair = ProcessPair::spawn(
+        &binary,
+        PSK,
+        ServerOptions::default(),
+        ClientOptions::default(),
+    )
+    .await
+    .expect("client/server must start");
     let payload = b"phase-1-oracle-ping";
     let echoed = socks5_echo_roundtrip(pair.socks, payload)
         .await
@@ -30,7 +37,7 @@ async fn v4_reuse_two_echoes() {
     let pair = ProcessPair::spawn(
         &binary,
         PSK,
-        None,
+        ServerOptions::default(),
         ClientOptions {
             version: "v4",
             reuse: true,
@@ -53,9 +60,14 @@ async fn v4_throughput_64kib_x16() {
     let binary = process_bin();
     let _lock = ORACLE_LOCK.lock().await;
 
-    let pair = ProcessPair::spawn_v4(&binary, PSK)
-        .await
-        .expect("pair must start");
+    let pair = ProcessPair::spawn(
+        &binary,
+        PSK,
+        ServerOptions::default(),
+        ClientOptions::default(),
+    )
+    .await
+    .expect("pair must start");
     let payload = vec![0xA5; 64 * 1024];
     let report = load::tcp_echo_throughput(&pair, &payload, 16)
         .await

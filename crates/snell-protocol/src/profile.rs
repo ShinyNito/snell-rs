@@ -1,9 +1,9 @@
 //! v6 shaped profile: namespace PRF, salt block, prefix, padding, mix, chunk.
 
 use crate::kdf::profile_secret;
-use crate::prf::{GOLDEN_GAMMA, expand_stream, prf32, prf32_seq, splitmix64};
+use crate::prf::{GOLDEN_GAMMA, expand_stream, prf32, splitmix64};
 use crate::salt::{MIX_HANDSHAKE_DOMAIN, extract as salt_extract, write as salt_write};
-use crate::{Error, HEADER_CIPHER_LEN, Psk, Result, SALT_LEN, TAG_LEN, V6_MAX_PREFIX_LEN};
+use crate::{HEADER_CIPHER_LEN, Psk, SALT_LEN, TAG_LEN, V6_MAX_PREFIX_LEN};
 
 const HANDSHAKE_DOMAIN: u32 = 0x7053;
 const CHUNK_INITIAL_DOMAIN: u32 = 0xf17c;
@@ -109,21 +109,15 @@ impl Namespaces {
     }
 
     fn prf32(self, label: u32, a: u32, b: u32) -> u32 {
-        prf32_seq(self.for_label(label), label, u64::from(a), b)
+        prf32(self.for_label(label), label, u64::from(a), u64::from(b))
     }
 
     fn prf_static(self, label: u32, domain: u32) -> u32 {
-        prf32(self.for_label(label), label, domain)
+        self.prf32(label, 0, domain)
     }
 
     fn expand(self, label: u32, seq: u32, out: &mut [u8]) {
-        expand_stream(
-            self.for_label(label),
-            label,
-            u64::from(seq),
-            out.len() as u64,
-            out,
-        );
+        expand_stream(self.for_label(label), label, u64::from(seq), out);
     }
 }
 
@@ -167,8 +161,8 @@ pub struct Profile {
     g5: usize,
     g6: usize,
     salt_block_len: usize,
-    mix_stride_handshake: usize,
-    mix_rounds_handshake: u32,
+    mix_stride_handshake: u8,
+    mix_rounds_handshake: u8,
 }
 
 impl Profile {
@@ -205,16 +199,17 @@ impl Profile {
             prefix_max_handshake,
         );
         let salt_block_len = SALT_LEN + salt_prefix_len;
+        // Both bounds fit the salt shuffle's byte-wide parameters.
         let mix_rounds_handshake = pick_u32(
             namespaces.prf_static(MIX_ROUNDS, MIX_HANDSHAKE_DOMAIN),
             1,
             4,
-        );
+        ) as u8;
         let mix_stride_handshake = pick_usize(
             namespaces.prf_static(MIX_STRIDE, MIX_HANDSHAKE_DOMAIN),
             0x11,
             0xfb,
-        );
+        ) as u8;
 
         let prefix_min_record = pick_usize(namespaces.prf_static(PREFIX_MIN, 0), 0x08, 0x50);
         let prefix_max_record = (prefix_min_record
@@ -344,35 +339,28 @@ impl Profile {
         )
     }
 
-    pub(crate) fn write_salt_block(
-        &self,
-        salt_bytes: &[u8; SALT_LEN],
-        block: &mut [u8],
-    ) -> Result<()> {
-        if block.len() != self.salt_block_len {
-            return Err(Error::Malformed("salt block length"));
-        }
+    /// `block` is exactly [`Self::salt_block_len`] bytes; callers slice it so.
+    pub(crate) fn write_salt_block(&self, salt_bytes: &[u8; SALT_LEN], block: &mut [u8]) {
+        debug_assert_eq!(block.len(), self.salt_block_len);
         self.fill_official(u32::MAX, block);
         salt_write(
             self.namespaces.salt,
-            self.mix_stride_handshake as u8,
-            self.mix_rounds_handshake as u8,
+            self.mix_stride_handshake,
+            self.mix_rounds_handshake,
             block,
             salt_bytes,
         );
-        Ok(())
     }
 
-    pub(crate) fn extract_salt(&self, block: &[u8]) -> Result<[u8; SALT_LEN]> {
-        if block.len() != self.salt_block_len {
-            return Err(Error::Malformed("salt block length"));
-        }
-        Ok(salt_extract(
+    /// `block` is exactly [`Self::salt_block_len`] bytes; callers slice it so.
+    pub(crate) fn extract_salt(&self, block: &[u8]) -> [u8; SALT_LEN] {
+        debug_assert_eq!(block.len(), self.salt_block_len);
+        salt_extract(
             self.namespaces.salt,
-            self.mix_stride_handshake as u8,
-            self.mix_rounds_handshake as u8,
+            self.mix_stride_handshake,
+            self.mix_rounds_handshake,
             block,
-        ))
+        )
     }
 
     pub(crate) fn fill_official(&self, seq: u32, out: &mut [u8]) {
@@ -530,32 +518,41 @@ impl Profile {
         } else {
             ((scaled + 50) / 100) as u32
         };
+        let table = &GENERATOR0_TABLE[target_bits as usize - 1];
         for (i, byte) in out.iter_mut().enumerate() {
-            *byte = generator0_byte(*byte, i & 7, target_bits);
+            *byte = table[i & 7][usize::from(*byte)];
         }
     }
 
     fn apply_generator_1(&self, out: &mut [u8]) {
         // g1 >= 0x18, so the modulus is never zero.
-        let total = self.g1 + self.g2 + self.g3;
+        let reciprocal = ByteRemainder::new(self.g1 + self.g2 + self.g3);
+        let (low, mid) = (self.g1 as u32, (self.g1 + self.g2) as u32);
         for (i, byte) in out.iter_mut().enumerate() {
-            let b = *byte;
-            let r = usize::from(b) % total;
-            *byte = if r < self.g1 {
-                0x20 + b.wrapping_add(i as u8) % 0x5f
-            } else if r < self.g1 + self.g2 {
-                0x80 + ((b ^ (i as u8)) % 0x40)
+            let (b, i) = (*byte, i as u8);
+            let r = reciprocal.of(b);
+            // A pseudo-random byte's class is unpredictable: compute every
+            // candidate so the choice is a select, not a mispredicted branch.
+            let printable = 0x20 + b.wrapping_add(i) % 0x5f;
+            let high = 0x80 + (b ^ i) % 0x40;
+            let top = 0xc0 + b.wrapping_add(i.wrapping_mul(7)) % 0x40;
+            *byte = if r < low {
+                printable
+            } else if r < mid {
+                high
             } else {
-                0xc0 + b.wrapping_add((7 * i) as u8) % 0x40
+                top
             };
         }
     }
 
     fn apply_generator_2(&self, out: &mut [u8]) {
+        // g4 is 0..=9, so the low digit's operands stay within a byte.
+        let g4 = self.g4 as u8;
         for (i, byte) in out.iter_mut().enumerate() {
-            let b = *byte;
-            let hi = (((b >> 4).wrapping_add((i & 3) as u8).wrapping_add(3)) << 4) & 0xf0;
-            let lo = ((usize::from(b & 0x0f) + self.g4 + (i & 1)) % 10) as u8;
+            let (b, i) = (*byte, i as u8);
+            let hi = (b >> 4).wrapping_add(i & 3).wrapping_add(3) << 4;
+            let lo = ((b & 0x0f) + g4 + (i & 1)) % 10;
             *byte = hi | lo;
         }
     }
@@ -563,13 +560,15 @@ impl Profile {
     fn apply_generator_3(&self, seq: u32, out: &mut [u8]) {
         let mut motif = [0u8; 32];
         self.namespaces.expand(MOTIF, seq, &mut motif);
-        // g5 is 1..=8 and g6 is 7..=23: the motif length fits and the interval is non-zero.
-        let motif_len = self.g5 * 4;
-        for (i, byte) in out.iter_mut().enumerate() {
+        // g5 is 1..=8 and g6 is 7..=23: the motif length fits and the interval
+        // is non-zero. Cycling iterators track `i % g6` and `i % motif_len`.
+        let motif = motif[..self.g5 * 4].iter().cycle();
+        let phases = (0..self.g6).cycle();
+        let stride = (self.g5 + 3) as u8;
+        for (i, ((byte, r), &m)) in out.iter_mut().zip(phases).zip(motif).enumerate() {
             let b = *byte;
-            let r = i % self.g6;
             *byte = if r + 3 < self.g6 {
-                (((self.g5 + 3) * i) as u8) ^ motif[i % motif_len]
+                stride.wrapping_mul(i as u8) ^ m
             } else if r + 1 < self.g6 {
                 0x30 + b % 10
             } else {
@@ -645,8 +644,29 @@ const fn build_generator0_table() -> [[[u8; 256]; 8]; 7] {
     table
 }
 
-fn generator0_byte(orig: u8, index_mod: usize, target_bits: u32) -> u8 {
-    GENERATOR0_TABLE[target_bits as usize - 1][index_mod][orig as usize]
+/// `b % divisor` for a byte `b` without a per-byte divide: the quotient is
+/// `b * (2^24 / divisor + 1) >> 24`, exact for 8-bit `b` and any divisor
+/// below 2^16. All-`u32` arithmetic keeps the generator loop vectorizable.
+#[derive(Clone, Copy)]
+struct ByteRemainder {
+    magic: u32,
+    divisor: u32,
+}
+
+impl ByteRemainder {
+    fn new(divisor: usize) -> Self {
+        debug_assert!((1..1 << 16).contains(&divisor));
+        let divisor = divisor as u32;
+        Self {
+            magic: (1 << 24) / divisor + 1,
+            divisor,
+        }
+    }
+
+    fn of(self, b: u8) -> u32 {
+        let b = u32::from(b);
+        b - ((b * self.magic) >> 24) * self.divisor
+    }
 }
 
 const fn generator0_transform(orig: u8, index_mod: usize, target_bits: u32) -> u8 {
@@ -707,8 +727,8 @@ mod tests {
 
     #[test]
     fn generator0_matches_canonical_bit_order_exhaustively() {
-        for target in 1..=7 {
-            for index in 0..8 {
+        for (target, rows) in (1..=7).zip(&GENERATOR0_TABLE) {
+            for (index, row) in rows.iter().enumerate() {
                 for orig in 0..=255u8 {
                     let mut expected = orig;
                     // Canonical order visits each bit once, starting from
@@ -721,13 +741,24 @@ mod tests {
                             core::cmp::Ordering::Equal => break,
                         }
                     }
-                    let actual = generator0_byte(orig, index, target);
+                    let actual = row[usize::from(orig)];
                     assert_eq!(
                         actual, expected,
                         "orig={orig} index={index} target={target}"
                     );
                     assert_eq!(actual.count_ones(), target);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn byte_remainder_matches_division() {
+        // Generator 1 divides by g1 + g2 + g3, at most 0x80 + 0x60 + 0x60.
+        for divisor in 1..=0x400 {
+            let remainder = ByteRemainder::new(divisor);
+            for b in 0..=u8::MAX {
+                assert_eq!(remainder.of(b), u32::from(b) % divisor as u32);
             }
         }
     }
@@ -830,8 +861,8 @@ mod tests {
         let profile = Profile::derive(&test_psk());
         let salt = [0x5a; SALT_LEN];
         let mut block = vec![0; profile.salt_block_len()];
-        profile.write_salt_block(&salt, &mut block).unwrap();
-        assert_eq!(profile.extract_salt(&block).unwrap(), salt);
+        profile.write_salt_block(&salt, &mut block);
+        assert_eq!(profile.extract_salt(&block), salt);
     }
 
     #[test]

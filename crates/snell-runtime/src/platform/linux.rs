@@ -1,4 +1,3 @@
-use rustix::fd::{AsFd, AsRawFd};
 use rustix::io::Errno;
 use rustix::net::sockopt;
 use socket2::SockRef;
@@ -57,32 +56,18 @@ fn brutal_error(error: Errno) -> PlatformError {
     }
 }
 
-/// Sets the tcp-brutal private sockopt `TCP_BRUTAL_PARAMS = 23301`.
-///
-/// Non-standard kernel module ABI (packed `u64` rate + `u32` cwnd_gain).
-/// Not in rustix. Isolated from keepalive and rustix `TCP_CONGESTION`.
-#[allow(unsafe_code)]
-fn set_brutal_params<Fd: AsFd>(fd: Fd, params: TcpBrutal) -> Result<(), Errno> {
+fn set_brutal_params(sock: &socket2::Socket, params: TcpBrutal) -> Result<(), Errno> {
+    super::tfo::set_tcp_opt(sock, TCP_BRUTAL_PARAMS, &brutal_params(params))
+}
+
+/// The tcp-brutal module ABI at `TCP_BRUTAL_PARAMS`: packed native-endian
+/// `u64` rate in bytes per second, then `u32` cwnd_gain (`QI`).
+fn brutal_params(params: TcpBrutal) -> [u8; BRUTAL_PARAMS_LEN] {
     let mut bytes = [0u8; BRUTAL_PARAMS_LEN];
-    bytes[..8].copy_from_slice(&params.rate_bytes_per_sec().to_ne_bytes());
-    bytes[8..].copy_from_slice(&params.cwnd_gain.to_ne_bytes());
-    let raw = fd.as_fd().as_raw_fd();
-    // SAFETY: `raw` is a live TCP socket. The brutal module reads exactly 12
-    // bytes (`QI`) at `TCP_BRUTAL_PARAMS`. We do not close `raw`.
-    let ret = unsafe {
-        libc::setsockopt(
-            raw,
-            libc::IPPROTO_TCP,
-            TCP_BRUTAL_PARAMS,
-            bytes.as_ptr().cast(),
-            BRUTAL_PARAMS_LEN as libc::socklen_t,
-        )
-    };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(super::tfo::last_errno())
-    }
+    let (rate, gain) = bytes.split_at_mut(8);
+    rate.copy_from_slice(&params.rate_bytes_per_sec().to_ne_bytes());
+    gain.copy_from_slice(&params.cwnd_gain.to_ne_bytes());
+    bytes
 }
 
 #[cfg(test)]
@@ -91,15 +76,11 @@ mod tests {
 
     #[test]
     fn brutal_params_are_12_byte_qi() {
-        let params = TcpBrutal {
+        let bytes = brutal_params(TcpBrutal {
             send_mbps: 16,
             cwnd_gain: 15,
-        };
-        let mut bytes = [0u8; BRUTAL_PARAMS_LEN];
-        bytes[..8].copy_from_slice(&params.rate_bytes_per_sec().to_ne_bytes());
-        bytes[8..].copy_from_slice(&params.cwnd_gain.to_ne_bytes());
-        assert_eq!(bytes.len(), 12);
-        assert_eq!(&bytes[..8], &(2_000_000u64).to_ne_bytes());
+        });
+        assert_eq!(&bytes[..8], &2_000_000u64.to_ne_bytes());
         assert_eq!(&bytes[8..], &15u32.to_ne_bytes());
     }
 }

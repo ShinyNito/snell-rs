@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::{Error, MAX_DOMAIN_LEN, Result};
 
@@ -78,6 +78,30 @@ pub(crate) fn validate_domain(host: &str) -> Result<()> {
         return Err(Error::HostTooLong);
     }
     Ok(())
+}
+
+/// `ADDR(N) PORT(2)` for an IPv4 (`N = 4`) or IPv6 (`N = 16`) address.
+pub(crate) fn ip_port<const N: usize>(src: &[u8]) -> Option<SocketAddr>
+where
+    IpAddr: From<[u8; N]>,
+{
+    let (ip, rest) = src.split_first_chunk::<N>()?;
+    let port = rest.first_chunk()?;
+    Some(SocketAddr::new(
+        IpAddr::from(*ip),
+        u16::from_be_bytes(*port),
+    ))
+}
+
+/// `LEN(1) HOST(LEN) PORT(2)` without host validation. Returns the encoded length.
+pub(crate) fn split_host_port(src: &[u8]) -> Result<(&str, u16, usize)> {
+    let (&host_len, rest) = src.split_first().ok_or(Error::Truncated)?;
+    let (host, rest) = rest
+        .split_at_checked(usize::from(host_len))
+        .ok_or(Error::Truncated)?;
+    let port = rest.first_chunk().ok_or(Error::Truncated)?;
+    let host = std::str::from_utf8(host).map_err(|_| Error::InvalidHostUtf8)?;
+    Ok((host, u16::from_be_bytes(*port), 1 + host.len() + 2))
 }
 
 impl From<SocketAddr> for Address {

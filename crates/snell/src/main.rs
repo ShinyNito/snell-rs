@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use snell_config::{ClientConfig as FileClientConfig, ServerConfig as FileServerConfig};
 use snell_runtime::{
-    ClientConfig, Outbound, ServerConfig, TcpBrutal, UdpOptions, run_client, run_server,
+    ClientConfig, Outbound, ReusePool, ServerConfig, UdpOptions, run_client, run_server,
 };
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -127,8 +127,7 @@ fn client_config(args: ClientArgs) -> anyhow::Result<ClientConfig> {
         server: file.server,
         psk: file.psk,
         version: file.version,
-        reuse: file.reuse,
-        pool: None,
+        pool: file.reuse.then(ReusePool::new),
         buffers: Default::default(),
         udp: UdpOptions::new()?,
     })
@@ -146,9 +145,7 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
             )?,
             outbound: args
                 .socks5_outbound
-                .map_or(snell_config::Outbound::Direct, |server| {
-                    snell_config::Outbound::Socks5 { server }
-                }),
+                .map_or(Outbound::Direct, |server| Outbound::Socks5 { server }),
             tcp_brutal: None,
         },
     };
@@ -156,15 +153,9 @@ fn server_config(args: ServerArgs) -> anyhow::Result<ServerConfig> {
         listen: file.listen,
         psk: file.psk,
         selection: file.selection,
-        outbound: match file.outbound {
-            snell_config::Outbound::Direct => Outbound::Direct,
-            snell_config::Outbound::Socks5 { server } => Outbound::Socks5 { server },
-        },
+        outbound: file.outbound,
         buffers: Default::default(),
         udp: UdpOptions::new()?,
-        tcp_brutal: file.tcp_brutal.map(|brutal| TcpBrutal {
-            send_mbps: brutal.send_mbps,
-            cwnd_gain: brutal.cwnd_gain,
-        }),
+        tcp_brutal: file.tcp_brutal,
     })
 }

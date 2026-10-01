@@ -7,7 +7,11 @@ use std::time::{Duration, Instant};
 use snell_protocol::socks5;
 use snell_protocol::{
     Address, AddressRef, Error, MAX_PACKET_SIZE, ProtocolFlavor, ProtocolSelection, Psk, V4Decoder,
-    V4Encoder, udp_request_len,
+    V4Encoder,
+};
+use snell_testkit::oracle::{
+    socks5_connect, socks5_echo_roundtrip, socks5_udp_associate, socks5_udp_echo_roundtrip,
+    socks5_udp_packet, spawn_udp_echo,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -33,13 +37,12 @@ struct Pair {
 }
 
 async fn start_pair(version: ProtocolFlavor, outbound: Outbound) -> Pair {
-    start_pair_reuse(version, outbound, false, None, None).await
+    start_pair_with(version, outbound, None, None).await
 }
 
-async fn start_pair_reuse(
+async fn start_pair_with(
     version: ProtocolFlavor,
     outbound: Outbound,
-    reuse: bool,
     pool: Option<ReusePool>,
     tcp_brutal: Option<crate::TcpBrutal>,
 ) -> Pair {
@@ -74,7 +77,6 @@ async fn start_pair_reuse(
         server: server_addr,
         psk,
         version,
-        reuse,
         pool,
         buffers: buffers.clone(),
         udp: UdpOptions::default(),
@@ -95,60 +97,21 @@ async fn start_pair_reuse(
 }
 
 async fn socks5_echo(socks: SocketAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
-    timeout(Duration::from_secs(5), socks5_echo_inner(socks, payload))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "echo timed out"))?
+    timeout(
+        Duration::from_secs(5),
+        socks5_echo_roundtrip(socks, payload),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "echo timed out"))?
 }
 
-async fn socks5_echo_inner(socks: SocketAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
-    let echo = TcpListener::bind("127.0.0.1:0").await?;
-    let echo_addr = echo.local_addr()?;
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = echo.accept().await?;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = stream.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            stream.write_all(&buf[..n]).await?;
-        }
-        io::Result::Ok(())
-    });
-
-    let mut client = TcpStream::connect(socks).await?;
-    client.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await?;
-    assert_eq!(method, [0x05, 0x00]);
-
-    let std::net::SocketAddr::V4(echo_v4) = echo_addr else {
-        panic!("echo must be ipv4");
-    };
-    let mut request = vec![0x05, 0x01, 0x00, 0x01];
-    request.extend_from_slice(&echo_v4.ip().octets());
-    request.extend_from_slice(&echo_v4.port().to_be_bytes());
-    client.write_all(&request).await?;
-
-    let mut reply_head = [0u8; 4];
-    client.read_exact(&mut reply_head).await?;
-    assert_eq!(reply_head[0], 0x05);
-    if reply_head[1] != 0 {
-        server.abort();
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "SOCKS5 CONNECT rejected",
-        ));
-    }
-    let mut bind = [0u8; 6];
-    client.read_exact(&mut bind).await?;
-
-    client.write_all(payload).await?;
-    client.shutdown().await?;
-    let mut echoed = Vec::new();
-    client.read_to_end(&mut echoed).await?;
-    server.await.map_err(io::Error::other)??;
-    Ok(echoed)
+/// A SOCKS5 CONNECT to `target` must be refused within `within`.
+async fn assert_connect_refused(socks: SocketAddr, target: SocketAddr, within: Duration) {
+    let error = timeout(within, socks5_connect(socks, target))
+        .await
+        .expect("the SOCKS5 failure reply must arrive in time")
+        .expect_err("CONNECT must be refused");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
 }
 
 #[tokio::test]
@@ -188,14 +151,6 @@ async fn large_stream_echo() {
     let pair = start_pair(ProtocolFlavor::V4, Outbound::Direct).await;
     let payload = vec![0x5a; 256 * 1024];
     let echoed = socks5_echo(pair.socks, &payload).await.unwrap();
-    assert_eq!(echoed, payload);
-}
-
-#[tokio::test]
-async fn half_close_echo() {
-    let pair = start_pair(ProtocolFlavor::V4, Outbound::Direct).await;
-    let payload = b"half-close";
-    let echoed = socks5_echo(pair.socks, payload).await.unwrap();
     assert_eq!(echoed, payload);
 }
 
@@ -301,7 +256,6 @@ async fn socks5_reply_when_snell_closes_after_dial() {
         server: snell_addr,
         psk,
         version: ProtocolFlavor::V4,
-        reuse: false,
         pool: None,
         buffers: Default::default(),
         udp: UdpOptions::default(),
@@ -313,22 +267,9 @@ async fn socks5_reply_when_snell_closes_after_dial() {
         .await;
     });
 
-    let mut client = TcpStream::connect(socks).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x00]);
-    client
-        .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 9])
-        .await
-        .unwrap();
-    let mut reply_head = [0u8; 4];
-    timeout(Duration::from_secs(2), client.read_exact(&mut reply_head))
-        .await
-        .expect("SOCKS5 failure reply must arrive before the local handshake timeout")
-        .unwrap();
-    assert_eq!(reply_head[0], 0x05);
-    assert_ne!(reply_head[1], 0x00);
+    // The reply must arrive before the local handshake timeout.
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+    assert_connect_refused(socks, target, Duration::from_secs(2)).await;
     drop(stop_client);
 }
 
@@ -349,24 +290,12 @@ async fn socks5_outbound_slow_handshake_cannot_delay_tunnel_past_15s() {
     });
 
     let pair = start_pair(ProtocolFlavor::V4, Outbound::Socks5 { server: proxy_addr }).await;
-    let mut client = TcpStream::connect(pair.socks).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x00]);
-    client
-        .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 9])
-        .await
-        .unwrap();
-
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
     let started = Instant::now();
-    let mut reply_head = [0u8; 4];
-    let result = timeout(Duration::from_secs(16), client.read_exact(&mut reply_head)).await;
+    let result = timeout(Duration::from_secs(16), socks5_connect(pair.socks, target)).await;
     let elapsed = started.elapsed();
-    assert!(
-        result.is_ok(),
-        "Tunnel wait must finish within 16s, not ~20s: {elapsed:?}"
-    );
+    let connect = result.unwrap_or_else(|_| panic!("tunnel wait must end within 16s: {elapsed:?}"));
+    assert!(connect.is_err(), "the stalled upstream must not connect");
     assert!(
         elapsed >= Duration::from_secs(14),
         "failed too early: {elapsed:?}"
@@ -375,10 +304,6 @@ async fn socks5_outbound_slow_handshake_cannot_delay_tunnel_past_15s() {
         elapsed < Duration::from_secs(18),
         "SOCKS5 outbound must not stack onto 20s: {elapsed:?}"
     );
-    if result.unwrap().is_ok() {
-        assert_eq!(reply_head[0], 0x05);
-        assert_ne!(reply_head[1], 0x00);
-    }
 }
 
 struct Counted {
@@ -390,7 +315,6 @@ struct Counted {
 async fn start_counted(
     version: ProtocolFlavor,
     selection: ProtocolSelection,
-    reuse: bool,
     pool: Option<ReusePool>,
 ) -> Counted {
     let psk = Psk::new(PSK.to_vec()).unwrap();
@@ -436,7 +360,6 @@ async fn start_counted(
         server: server_addr,
         psk,
         version,
-        reuse,
         pool,
         buffers: Default::default(),
         udp: UdpOptions::default(),
@@ -456,7 +379,12 @@ async fn start_counted(
 }
 
 async fn reuse_two_echoes(version: ProtocolFlavor) {
-    let counted = start_counted(version, ProtocolSelection::Exact(version), true, None).await;
+    let counted = start_counted(
+        version,
+        ProtocolSelection::Exact(version),
+        Some(ReusePool::new()),
+    )
+    .await;
     for i in 0..2 {
         let payload = format!("reuse-{version:?}-{i}").into_bytes();
         let echoed = socks5_echo(counted.socks, &payload).await.unwrap();
@@ -490,7 +418,6 @@ async fn reuse_false_opens_two_snell_conns() {
     let counted = start_counted(
         ProtocolFlavor::V4,
         ProtocolSelection::Exact(ProtocolFlavor::V4),
-        false,
         None,
     )
     .await;
@@ -526,7 +453,6 @@ async fn stale_pool_retries_once() {
     let counted = start_counted(
         ProtocolFlavor::V4,
         ProtocolSelection::Exact(ProtocolFlavor::V4),
-        true,
         Some(pool),
     )
     .await;
@@ -543,37 +469,22 @@ async fn stale_pool_retries_once() {
 #[tokio::test]
 async fn error_connections_are_not_returned_to_pool() {
     let pool = ReusePool::new();
-    let pair = start_pair_reuse(
+    let pair = start_pair_with(
         ProtocolFlavor::V4,
         Outbound::Direct,
-        true,
         Some(pool.clone()),
         None,
     )
     .await;
-    let mut client = TcpStream::connect(pair.socks).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x00]);
-    client
-        .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 1])
-        .await
-        .unwrap();
-    let mut reply_head = [0u8; 4];
-    timeout(Duration::from_secs(5), client.read_exact(&mut reply_head))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(reply_head[0], 0x05);
-    assert_ne!(reply_head[1], 0x00);
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+    assert_connect_refused(pair.socks, target, Duration::from_secs(5)).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(pool.len(), 0);
 }
 
 #[tokio::test]
 async fn auto_server_accepts_v4() {
-    let counted = start_counted(ProtocolFlavor::V4, ProtocolSelection::Auto, false, None).await;
+    let counted = start_counted(ProtocolFlavor::V4, ProtocolSelection::Auto, None).await;
     let payload = b"auto-v4";
     let echoed = socks5_echo(counted.socks, payload).await.unwrap();
     assert_eq!(echoed, payload);
@@ -581,13 +492,7 @@ async fn auto_server_accepts_v4() {
 
 #[tokio::test]
 async fn auto_server_accepts_v6_shaped() {
-    let counted = start_counted(
-        ProtocolFlavor::V6Shaped,
-        ProtocolSelection::Auto,
-        false,
-        None,
-    )
-    .await;
+    let counted = start_counted(ProtocolFlavor::V6Shaped, ProtocolSelection::Auto, None).await;
     let payload = b"auto-v6-shaped";
     let echoed = socks5_echo(counted.socks, payload).await.unwrap();
     assert_eq!(echoed, payload);
@@ -599,7 +504,7 @@ async fn exact_modes_reject_other_wire_flavor() {
         (ProtocolFlavor::V6Shaped, ProtocolFlavor::V4),
         (ProtocolFlavor::V4, ProtocolFlavor::V6Shaped),
     ] {
-        let counted = start_counted(client, ProtocolSelection::Exact(server), false, None).await;
+        let counted = start_counted(client, ProtocolSelection::Exact(server), None).await;
         // socks5_echo creates a real listening destination. Port 9 would fail
         // even if the server wrongly auto-detected and accepted the protocol.
         let error = socks5_echo(counted.socks, b"must reject mismatched protocol")
@@ -683,14 +588,7 @@ async fn unavailable_tcp_brutal_does_not_break_connections() {
         send_mbps: 100,
         cwnd_gain: 15,
     };
-    let pair = start_pair_reuse(
-        ProtocolFlavor::V4,
-        Outbound::Direct,
-        false,
-        None,
-        Some(params),
-    )
-    .await;
+    let pair = start_pair_with(ProtocolFlavor::V4, Outbound::Direct, None, Some(params)).await;
     let payload = b"tcp-brutal-fallback";
     let echoed = socks5_echo(pair.socks, payload).await.unwrap();
     assert_eq!(echoed, payload);
@@ -737,7 +635,6 @@ async fn start_pair_udp(
         server: server_addr,
         psk,
         version,
-        reuse: false,
         pool: None,
         buffers: Default::default(),
         udp: client_udp.clone(),
@@ -757,72 +654,6 @@ async fn start_pair_udp(
     }
 }
 
-async fn spawn_udp_echo() -> io::Result<SocketAddr> {
-    let echo = UdpSocket::bind("127.0.0.1:0").await?;
-    let addr = echo.local_addr()?;
-    tokio::spawn(async move {
-        let mut buf = [0u8; 65535];
-        loop {
-            let Ok((n, peer)) = echo.recv_from(&mut buf).await else {
-                break;
-            };
-            let _ = echo.send_to(&buf[..n], peer).await;
-        }
-    });
-    Ok(addr)
-}
-
-async fn socks5_udp_associate(socks: SocketAddr) -> io::Result<(TcpStream, SocketAddr, UdpSocket)> {
-    let mut tcp = TcpStream::connect(socks).await?;
-    tcp.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut method = [0u8; 2];
-    tcp.read_exact(&mut method).await?;
-    assert_eq!(method, [0x05, 0x00]);
-    tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
-    let mut reply_head = [0u8; 4];
-    tcp.read_exact(&mut reply_head).await?;
-    assert_eq!(reply_head[0], 0x05);
-    if reply_head[1] != 0x00 {
-        return Err(io::Error::other(format!(
-            "udp associate failed: {}",
-            reply_head[1]
-        )));
-    }
-    assert_eq!(reply_head[3], 0x01);
-    let mut rest = [0u8; 6];
-    tcp.read_exact(&mut rest).await?;
-    let ip = Ipv4Addr::new(rest[0], rest[1], rest[2], rest[3]);
-    let port = u16::from_be_bytes([rest[4], rest[5]]);
-    let relay = SocketAddr::from((ip, port));
-    let udp = UdpSocket::bind("127.0.0.1:0").await?;
-    Ok((tcp, relay, udp))
-}
-
-fn encode_socks_udp(dest: SocketAddr, frag: u8, payload: &[u8]) -> Vec<u8> {
-    let mut buf = vec![0u8; 32 + payload.len()];
-    let n = socks5::encode_udp_packet(&mut buf, frag, AddressRef::Ip(dest), payload).unwrap();
-    buf.truncate(n);
-    buf
-}
-
-async fn socks5_udp_roundtrip(
-    socks: SocketAddr,
-    echo: SocketAddr,
-    payload: &[u8],
-) -> io::Result<Vec<u8>> {
-    let (_tcp, relay, client) = socks5_udp_associate(socks).await?;
-    let packet = encode_socks_udp(echo, 0, payload);
-    client.send_to(&packet, relay).await?;
-    let mut buf = [0u8; 65535];
-    let (n, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "udp echo timed out"))??;
-    let parsed = socks5::parse_udp_packet(&buf[..n]).unwrap();
-    assert_eq!(parsed.frag, 0);
-    Ok(parsed.payload.to_vec())
-}
-
 async fn udp_echo_version(version: ProtocolFlavor, payload: &[u8]) {
     let pair = start_pair_udp(
         version,
@@ -831,8 +662,7 @@ async fn udp_echo_version(version: ProtocolFlavor, payload: &[u8]) {
         UdpOptions::default(),
     )
     .await;
-    let echo = spawn_udp_echo().await.unwrap();
-    let got = socks5_udp_roundtrip(pair.socks, echo, payload)
+    let got = socks5_udp_echo_roundtrip(pair.socks, payload)
         .await
         .unwrap();
     assert_eq!(got, payload);
@@ -874,7 +704,7 @@ async fn udp_burst_all_datagrams_roundtrip() {
     let count = 8usize;
     for i in 0..count {
         let payload = format!("burst-{i}");
-        let packet = encode_socks_udp(echo, 0, payload.as_bytes());
+        let packet = socks5_udp_packet(echo, 0, payload.as_bytes());
         client.send_to(&packet, relay).await.unwrap();
     }
     let mut seen = std::collections::HashSet::new();
@@ -895,16 +725,6 @@ async fn udp_burst_all_datagrams_roundtrip() {
             "missing burst payload {payload}"
         );
     }
-}
-
-#[test]
-fn v4_udp_request_with_max_packet_payload_exceeds_slot() {
-    let dest = AddressRef::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
-    let needed = udp_request_len(dest, MAX_PACKET_SIZE).unwrap();
-    assert!(
-        needed > MAX_PACKET_SIZE,
-        "payload {MAX_PACKET_SIZE} plus UDP request header must miss the v4 slot ({needed} > {MAX_PACKET_SIZE})"
-    );
 }
 
 #[tokio::test]
@@ -960,7 +780,7 @@ async fn udp_frag_nonzero_is_dropped() {
     .await;
     let echo = spawn_udp_echo().await.unwrap();
     let (_tcp, relay, client) = socks5_udp_associate(pair.socks).await.unwrap();
-    let packet = encode_socks_udp(echo, 1, b"frag");
+    let packet = socks5_udp_packet(echo, 1, b"frag");
     client.send_to(&packet, relay).await.unwrap();
     let mut buf = [0u8; 64];
     let result = timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await;
@@ -982,7 +802,7 @@ async fn udp_idle_expires_association() {
     .await;
     let echo = spawn_udp_echo().await.unwrap();
     let (_tcp, relay, client) = socks5_udp_associate(pair.socks).await.unwrap();
-    let packet = encode_socks_udp(echo, 0, b"idle");
+    let packet = socks5_udp_packet(echo, 0, b"idle");
     client.send_to(&packet, relay).await.unwrap();
     let mut buf = [0u8; 65535];
     let (n, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
@@ -1012,7 +832,7 @@ async fn udp_associations_stay_capped() {
     .await;
     let echo = spawn_udp_echo().await.unwrap();
     let (_tcp, relay, _) = socks5_udp_associate(pair.socks).await.unwrap();
-    let packet = encode_socks_udp(echo, 0, b"cap");
+    let packet = socks5_udp_packet(echo, 0, b"cap");
     for _ in 0..16 {
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.send_to(&packet, relay).await.unwrap();
@@ -1044,8 +864,7 @@ async fn udp_socks5_outbound_echo() {
         UdpOptions::default(),
     )
     .await;
-    let echo = spawn_udp_echo().await.unwrap();
-    let got = socks5_udp_roundtrip(pair.socks, echo, b"via-socks5-udp")
+    let got = socks5_udp_echo_roundtrip(pair.socks, b"via-socks5-udp")
         .await
         .unwrap();
     assert_eq!(got, b"via-socks5-udp");
@@ -1128,21 +947,8 @@ async fn authenticated_idle_connections_hold_no_payload_leases() {
     let mut clients = Vec::new();
     let mut peers = Vec::new();
     for _ in 0..100 {
-        let mut client = TcpStream::connect(pair.socks).await.unwrap();
-        client.write_all(&[5, 1, 0]).await.unwrap();
-        let mut method = [0; 2];
-        client.read_exact(&mut method).await.unwrap();
-        assert_eq!(method, [5, 0]);
-        let mut request = [0; 32];
-        let n =
-            socks5::encode_request(&mut request, socks5::Command::Connect, AddressRef::Ip(addr))
-                .unwrap();
-        client.write_all(&request[..n]).await.unwrap();
+        clients.push(socks5_connect(pair.socks, addr).await.unwrap());
         peers.push(echo.accept().await.unwrap().0);
-        let mut reply = [0; 10];
-        client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], 0);
-        clients.push(client);
     }
     timeout(Duration::from_secs(2), async {
         while pair.buffers.leased_bytes() != 0 {

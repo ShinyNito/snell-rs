@@ -2,14 +2,17 @@
 //!
 //! The binary is located via `SNELL_RS_TEST_BIN`.
 
-use std::net::SocketAddr;
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use snell_protocol::socks5::{self, Command, Reply};
+use snell_protocol::{AddressRef, MAX_UDP_PACKET_ADDR_LEN, ParseState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{Child, Command};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::process::{self, Child};
 use tokio::time::{sleep, timeout};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,7 +25,7 @@ pub enum OracleError {
     #[error("binary not found: {0}")]
     BinaryNotFound(PathBuf),
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("process exited early ({role}): {status}")]
     ExitedEarly { role: &'static str, status: String },
     #[error("timed out waiting for {0} to listen")]
@@ -70,6 +73,13 @@ impl Default for ClientOptions {
     }
 }
 
+/// Server `version` and `mode` keys; the default omits both (auto-detect).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServerOptions {
+    pub version: Option<&'static str>,
+    pub mode: Option<&'static str>,
+}
+
 pub struct ProcessPair {
     _dir: tempfile_dir::TempDir,
     _server: Child,
@@ -79,58 +89,26 @@ pub struct ProcessPair {
 }
 
 impl ProcessPair {
-    pub async fn spawn_v4(binary: &SnellBinary, psk: &str) -> Result<Self, OracleError> {
-        Self::spawn(
-            binary,
-            psk,
-            None,
-            ClientOptions {
-                version: "v4",
-                reuse: false,
-            },
-        )
-        .await
-    }
-
     pub async fn spawn(
         binary: &SnellBinary,
         psk: &str,
-        server_version: Option<&str>,
+        server: ServerOptions,
         client: ClientOptions,
     ) -> Result<Self, OracleError> {
-        Self::spawn_with_mode(binary, psk, server_version, None, client).await
+        Self::spawn_binaries(binary, binary, psk, server, client).await
     }
 
-    pub async fn spawn_with_mode(
-        binary: &SnellBinary,
-        psk: &str,
-        server_version: Option<&str>,
-        server_mode: Option<&str>,
-        client: ClientOptions,
-    ) -> Result<Self, OracleError> {
-        Self::spawn_binaries(binary, binary, psk, server_version, server_mode, client).await
-    }
-
+    /// Server and client from different binaries, for differential runs.
     pub async fn spawn_binaries(
         server_bin: &SnellBinary,
         client_bin: &SnellBinary,
         psk: &str,
-        server_version: Option<&str>,
-        server_mode: Option<&str>,
+        server: ServerOptions,
         client: ClientOptions,
     ) -> Result<Self, OracleError> {
         let mut last_error = None;
         for _ in 0..8 {
-            match spawn_once(
-                server_bin,
-                client_bin,
-                psk,
-                server_version,
-                server_mode,
-                client,
-            )
-            .await
-            {
+            match spawn_once(server_bin, client_bin, psk, server, client).await {
                 Ok(pair) => return Ok(pair),
                 Err(error @ (OracleError::ExitedEarly { .. } | OracleError::ReadyTimeout(_))) => {
                     last_error = Some(error);
@@ -146,8 +124,7 @@ async fn spawn_once(
     server_bin: &SnellBinary,
     client_bin: &SnellBinary,
     psk: &str,
-    server_version: Option<&str>,
-    server_mode: Option<&str>,
+    server_options: ServerOptions,
     client: ClientOptions,
 ) -> Result<ProcessPair, OracleError> {
     let dir = tempfile_dir::TempDir::new()?;
@@ -156,10 +133,7 @@ async fn spawn_once(
 
     let server_conf = dir.path().join("snell-server.conf");
     let client_conf = dir.path().join("snell-client.conf");
-    std::fs::write(
-        &server_conf,
-        server_ini(snell, psk, server_version, server_mode),
-    )?;
+    std::fs::write(&server_conf, server_ini(snell, psk, server_options))?;
     std::fs::write(&client_conf, client_ini(socks, snell, psk, client))?;
 
     let mut server = spawn_role(server_bin, "server", &server_conf)?;
@@ -178,7 +152,7 @@ async fn spawn_once(
 }
 
 fn spawn_role(binary: &SnellBinary, role: &str, config: &Path) -> Result<Child, OracleError> {
-    Ok(Command::new(binary.path())
+    Ok(process::Command::new(binary.path())
         .arg(role)
         .arg("--config")
         .arg(config)
@@ -196,16 +170,14 @@ async fn free_listen_addr() -> Result<SocketAddr, OracleError> {
     Ok(addr)
 }
 
-fn server_ini(listen: SocketAddr, psk: &str, version: Option<&str>, mode: Option<&str>) -> String {
-    match (version, mode) {
-        (Some(version), Some(mode)) => format!(
-            "[snell-server]\nlisten = {listen}\npsk = {psk}\nversion = {version}\nmode = {mode}\n"
-        ),
-        (Some(version), None) => {
-            format!("[snell-server]\nlisten = {listen}\npsk = {psk}\nversion = {version}\n")
+fn server_ini(listen: SocketAddr, psk: &str, options: ServerOptions) -> String {
+    let mut ini = format!("[snell-server]\nlisten = {listen}\npsk = {psk}\n");
+    for (key, value) in [("version", options.version), ("mode", options.mode)] {
+        if let Some(value) = value {
+            ini.push_str(&format!("{key} = {value}\n"));
         }
-        (None, _) => format!("[snell-server]\nlisten = {listen}\npsk = {psk}\n"),
     }
+    ini
 }
 
 fn client_ini(listen: SocketAddr, server: SocketAddr, psk: &str, options: ClientOptions) -> String {
@@ -243,82 +215,138 @@ async fn wait_listening(
     }
 }
 
-/// SOCKS5 CONNECT through the client, then copy `payload` and read it back
-/// from a local echo server reached via the server.
-pub async fn socks5_echo_roundtrip(
-    socks: SocketAddr,
-    payload: &[u8],
-) -> Result<Vec<u8>, OracleError> {
+/// SOCKS5 no-auth handshake, then `CONNECT target`. A refused CONNECT is
+/// `PermissionDenied`.
+pub async fn socks5_connect(socks: SocketAddr, target: SocketAddr) -> io::Result<TcpStream> {
+    let mut stream = socks5_handshake(socks).await?;
+    socks5_command(&mut stream, Command::Connect, target).await?;
+    Ok(stream)
+}
+
+/// CONNECT through `socks` to a fresh local echo server, send `payload`,
+/// half-close, and read the echo back.
+pub async fn socks5_echo_roundtrip(socks: SocketAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
     let echo = TcpListener::bind("127.0.0.1:0").await?;
     let echo_addr = echo.local_addr()?;
     let server = tokio::spawn(async move {
         let (mut stream, _) = echo.accept().await?;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = stream.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            stream.write_all(&buf[..n]).await?;
-        }
-        std::io::Result::Ok(())
+        let (mut reader, mut writer) = stream.split();
+        tokio::io::copy(&mut reader, &mut writer).await
     });
-
-    let mut client = TcpStream::connect(socks).await?;
-    client.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await?;
-    if method != [0x05, 0x00] {
-        return Err(std::io::Error::other("socks5 method negotiation failed").into());
+    let echoed = async {
+        let mut client = socks5_connect(socks, echo_addr).await?;
+        client.write_all(payload).await?;
+        client.shutdown().await?;
+        let mut echoed = Vec::new();
+        timeout(READY_TIMEOUT, client.read_to_end(&mut echoed))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "echo read timed out"))??;
+        io::Result::Ok(echoed)
     }
-
-    let SocketAddr::V4(echo_v4) = echo_addr else {
-        return Err(std::io::Error::other("echo server must be ipv4").into());
-    };
-    let mut request = vec![0x05, 0x01, 0x00, 0x01];
-    request.extend_from_slice(&echo_v4.ip().octets());
-    request.extend_from_slice(&echo_v4.port().to_be_bytes());
-    client.write_all(&request).await?;
-
-    let mut reply_head = [0u8; 4];
-    client.read_exact(&mut reply_head).await?;
-    if reply_head[0] != 0x05 || reply_head[1] != 0x00 {
-        return Err(std::io::Error::other(format!("socks5 connect failed: {reply_head:?}")).into());
+    .await;
+    if echoed.is_err() {
+        server.abort();
+        return echoed;
     }
-    drain_socks5_bind(&mut client, reply_head[3]).await?;
-
-    client.write_all(payload).await?;
-    client.shutdown().await?;
-
-    let mut echoed = Vec::new();
-    timeout(READY_TIMEOUT, client.read_to_end(&mut echoed))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "echo read timed out"))??;
-    server.await.map_err(std::io::Error::other)??;
-    Ok(echoed)
+    server.await.map_err(io::Error::other)??;
+    echoed
 }
 
-async fn drain_socks5_bind(stream: &mut TcpStream, atyp: u8) -> Result<(), OracleError> {
-    match atyp {
-        0x01 => {
-            let mut rest = [0u8; 6];
-            stream.read_exact(&mut rest).await?;
+/// SOCKS5 UDP ASSOCIATE. Returns the control stream, which must stay open
+/// for the association's lifetime, the relay address, and a local socket.
+pub async fn socks5_udp_associate(
+    socks: SocketAddr,
+) -> io::Result<(TcpStream, SocketAddr, UdpSocket)> {
+    let mut control = socks5_handshake(socks).await?;
+    let unspecified = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+    let relay = socks5_command(&mut control, Command::UdpAssociate, unspecified).await?;
+    let udp = UdpSocket::bind("127.0.0.1:0").await?;
+    Ok((control, relay, udp))
+}
+
+/// One SOCKS5 UDP datagram for `dest`.
+pub fn socks5_udp_packet(dest: SocketAddr, frag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = vec![0u8; 3 + MAX_UDP_PACKET_ADDR_LEN + payload.len()];
+    let n = socks5::encode_udp_packet(&mut packet, frag, AddressRef::Ip(dest), payload)
+        .expect("buffer sized for the header");
+    packet.truncate(n);
+    packet
+}
+
+/// A local UDP server that echoes every datagram to its sender.
+pub async fn spawn_udp_echo() -> io::Result<SocketAddr> {
+    let echo = UdpSocket::bind("127.0.0.1:0").await?;
+    let addr = echo.local_addr()?;
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+            let _ = echo.send_to(&buf[..n], peer).await;
         }
-        0x04 => {
-            let mut rest = [0u8; 18];
-            stream.read_exact(&mut rest).await?;
-        }
-        0x03 => {
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await?;
-            let mut rest = vec![0u8; usize::from(len[0]) + 2];
-            stream.read_exact(&mut rest).await?;
-        }
-        other => {
-            return Err(std::io::Error::other(format!("unexpected socks5 atyp {other}")).into());
+    });
+    Ok(addr)
+}
+
+/// Echo `payload` through a fresh SOCKS5 UDP association to a local echo server.
+pub async fn socks5_udp_echo_roundtrip(socks: SocketAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let echo = spawn_udp_echo().await?;
+    let (_control, relay, udp) = socks5_udp_associate(socks).await?;
+    udp.send_to(&socks5_udp_packet(echo, 0, payload), relay)
+        .await?;
+    let mut buf = vec![0u8; 65535];
+    let (n, _) = timeout(READY_TIMEOUT, udp.recv_from(&mut buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "udp echo timed out"))??;
+    let packet = socks5::parse_udp_packet(&buf[..n]).map_err(io::Error::other)?;
+    if packet.frag != 0 {
+        return Err(io::Error::other("fragmented udp reply"));
+    }
+    Ok(packet.payload.to_vec())
+}
+
+async fn socks5_handshake(socks: SocketAddr) -> io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(socks).await?;
+    stream
+        .write_all(&[socks5::VERSION, 1, socks5::METHOD_NO_AUTH])
+        .await?;
+    let mut method = [0u8; 2];
+    stream.read_exact(&mut method).await?;
+    if method != [socks5::VERSION, socks5::METHOD_NO_AUTH] {
+        return Err(io::Error::other("socks5 method negotiation failed"));
+    }
+    Ok(stream)
+}
+
+/// Send one request and return the bind address of a succeeded reply.
+async fn socks5_command(
+    stream: &mut TcpStream,
+    command: Command,
+    target: SocketAddr,
+) -> io::Result<SocketAddr> {
+    let mut buf = [0u8; socks5::MAX_REQUEST_LEN];
+    let n = socks5::encode_request(&mut buf, command, AddressRef::Ip(target))
+        .map_err(io::Error::other)?;
+    stream.write_all(&buf[..n]).await?;
+    let mut filled = 0;
+    loop {
+        match socks5::reply_need(&buf[..filled]).map_err(io::Error::other)? {
+            ParseState::Need(total) => {
+                stream.read_exact(&mut buf[filled..total]).await?;
+                filled = total;
+            }
+            ParseState::Done(reply) => {
+                return match (reply.reply, reply.bind) {
+                    (Reply::Succeeded, AddressRef::Ip(bind)) => Ok(bind),
+                    (Reply::Succeeded, bind) => {
+                        Err(io::Error::other(format!("unexpected bind {bind}")))
+                    }
+                    (refused, _) => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("socks5 {command:?} refused: {refused:?}"),
+                    )),
+                };
+            }
         }
     }
-    Ok(())
 }
 
 /// Minimal temp directory helper so the crate does not take `tempfile` as a
@@ -359,7 +387,6 @@ mod tempfile_dir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snell_protocol::PSK_MIN_LEN;
 
     #[test]
     fn missing_file_is_not_found() {
@@ -367,10 +394,5 @@ mod tests {
             SnellBinary::from_path("/no/such/snell-rs"),
             Err(OracleError::BinaryNotFound(_))
         ));
-    }
-
-    #[test]
-    fn psk_used_by_oracle_meets_minimum() {
-        assert!(b"0123456789abcdef".len() >= PSK_MIN_LEN);
     }
 }

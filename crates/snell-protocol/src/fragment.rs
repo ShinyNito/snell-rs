@@ -54,8 +54,10 @@ fn random_peer_input_does_not_panic() {
         let _ = crate::decode_udp_request(&buf);
         let _ = socks5::greeting_need(&buf);
         let _ = socks5::request_need(&buf);
-        let _ = crate::header::parse_v4_plain_header(&buf);
-        let _ = crate::header::parse_v6_plain_header(&buf);
+        if let Some(header) = buf.first_chunk() {
+            let _ = crate::header::parse_v4_plain_header(header);
+            let _ = crate::header::parse_v6_plain_header(header);
+        }
         let _ = crate::decode_connect_request_prefix(&buf);
         let _ = crate::decode_server_reply(&buf);
         let psk = Psk::new(b"0123456789abcdef").unwrap();

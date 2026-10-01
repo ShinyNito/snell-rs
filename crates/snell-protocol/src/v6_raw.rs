@@ -2,36 +2,26 @@
 
 use core::fmt;
 
-use crate::header::{RecordHeader, parse_v6_plain_header, write_v6_plain_header};
-use crate::record::{DecodeStatus, DecodedRecord, Pending};
+use crate::buffer::Slot;
+use crate::header::{parse_v6_plain_header, plain_header};
+use crate::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::{Buffer, Error, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, Result};
 
+#[derive(Default)]
 pub struct V6UnsafeRawEncoder {
-    reserving: bool,
-    prefix_len: usize,
-    max_payload: usize,
-    payload_start: usize,
-    header_start: usize,
-    record_start: usize,
+    state: EncoderState,
 }
 
 #[must_use = "unsealed reservations are cancelled on drop"]
 pub struct V6UnsafeRawReservation<'a> {
     encoder: &'a mut V6UnsafeRawEncoder,
     buf: &'a mut Buffer,
-    sealed: bool,
+    slot: Slot,
 }
 
 impl V6UnsafeRawEncoder {
     pub fn new() -> Self {
-        Self {
-            reserving: false,
-            prefix_len: 0,
-            max_payload: 0,
-            payload_start: 0,
-            header_start: 0,
-            record_start: 0,
-        }
+        Self::default()
     }
 
     pub fn reserve<'buf>(
@@ -40,81 +30,58 @@ impl V6UnsafeRawEncoder {
         prefix: &[u8],
         hint: usize,
     ) -> Result<V6UnsafeRawReservation<'buf>> {
-        if self.reserving {
-            return Err(Error::PendingWire);
-        }
-        let needed = prefix.len().saturating_add(hint);
-        let max_payload = needed.min(MAX_PACKET_SIZE_V6);
+        self.state.ensure_ready()?;
+        let max_payload = prefix.len().saturating_add(hint).min(MAX_PACKET_SIZE_V6);
         if prefix.len() > max_payload {
             return Err(Error::PayloadTooLarge);
         }
-        let record_cap = HEADER_PLAIN_LEN + max_payload;
-        let record_start = buf.reserve_zeroed(record_cap)?;
-        let header_start = record_start;
-        let payload_start = header_start + HEADER_PLAIN_LEN;
-        if !prefix.is_empty() {
-            buf.range_mut(payload_start, payload_start + prefix.len())
-                .copy_from_slice(prefix);
-        }
-        self.prefix_len = prefix.len();
-        self.max_payload = max_payload;
-        self.payload_start = payload_start;
-        self.header_start = header_start;
-        self.record_start = record_start;
-        self.reserving = true;
+        let record_start = buf.reserve_zeroed(HEADER_PLAIN_LEN + max_payload)?;
+        let payload_start = record_start + HEADER_PLAIN_LEN;
+        buf.range_mut(payload_start, payload_start + prefix.len())
+            .copy_from_slice(prefix);
+        self.state = EncoderState::Reserving;
         Ok(V6UnsafeRawReservation {
             encoder: self,
             buf,
-            sealed: false,
+            slot: Slot {
+                record_start,
+                payload_start,
+                prefix_len: prefix.len(),
+                max_payload,
+            },
         })
-    }
-
-    fn finish(&mut self, buf: &mut Buffer, payload_len: usize) -> Result<()> {
-        buf.truncate(self.payload_start + payload_len)?;
-        write_v6_plain_header(
-            buf.range_mut(self.header_start, self.header_start + HEADER_PLAIN_LEN),
-            0,
-            payload_len,
-        )?;
-        self.reserving = false;
-        Ok(())
-    }
-}
-
-impl Default for V6UnsafeRawEncoder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 impl V6UnsafeRawReservation<'_> {
     pub fn payload_mut(&mut self) -> &mut [u8] {
-        let start = self.encoder.payload_start + self.encoder.prefix_len;
-        let end = self.encoder.payload_start + self.encoder.max_payload;
-        self.buf.range_mut(start, end)
+        let slot = &self.slot;
+        self.buf.range_mut(
+            slot.payload_start + slot.prefix_len,
+            slot.payload_start + slot.max_payload,
+        )
     }
 
     pub fn capacity(&self) -> usize {
-        self.encoder.max_payload - self.encoder.prefix_len
+        self.slot.capacity()
     }
 
-    pub fn seal(mut self, written: usize) -> Result<()> {
-        let total = self
-            .encoder
-            .prefix_len
-            .checked_add(written)
-            .filter(|&total| total <= self.encoder.max_payload)
-            .ok_or(Error::PayloadTooLarge)?;
-        self.sealed = true;
-        self.encoder.finish(self.buf, total)
+    pub fn seal(self, written: usize) -> Result<()> {
+        let total = self.slot.total(written)?;
+        self.buf.set_record_end(self.slot.payload_start + total);
+        self.buf
+            .range_mut(self.slot.record_start, self.slot.payload_start)
+            .copy_from_slice(&plain_header(0, total));
+        self.encoder.state = EncoderState::Ready;
+        Ok(())
     }
 }
 
 impl Drop for V6UnsafeRawReservation<'_> {
     fn drop(&mut self) {
-        if !self.sealed {
-            let _ = self.buf.truncate(self.encoder.record_start);
-            self.encoder.reserving = false;
+        if self.encoder.state == EncoderState::Reserving {
+            let _ = self.buf.truncate(self.slot.record_start);
+            self.encoder.state = EncoderState::Ready;
         }
     }
 }
@@ -122,7 +89,7 @@ impl Drop for V6UnsafeRawReservation<'_> {
 impl fmt::Debug for V6UnsafeRawEncoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("V6UnsafeRawEncoder")
-            .field("reserving", &self.reserving)
+            .field("state", &self.state)
             .finish()
     }
 }
@@ -130,7 +97,7 @@ impl fmt::Debug for V6UnsafeRawEncoder {
 #[derive(Clone, Copy, Debug)]
 enum ReadStep {
     Header,
-    Body(RecordHeader),
+    Body { len: usize },
 }
 
 pub struct V6UnsafeRawDecoder {
@@ -159,15 +126,16 @@ impl V6UnsafeRawDecoder {
                     if let Some(need) = self.pending.need(buf, header_end)? {
                         return Ok(need);
                     }
-                    let header = parse_v6_plain_header(&buf.filled()[off..header_end])?;
-                    if header.body_len_v6_raw()? == 0 {
+                    let header = buf.filled()[off..].first_chunk().ok_or(Error::Truncated)?;
+                    let len = parse_v6_plain_header(header)?.body_len_v6_raw()?;
+                    if len == 0 {
                         return Ok(self.pending.zero_chunk(header_end));
                     }
-                    self.step = ReadStep::Body(header);
+                    self.step = ReadStep::Body { len };
                 }
-                ReadStep::Body(header) => {
+                ReadStep::Body { len } => {
                     let body_off = self.pending.offset() + HEADER_PLAIN_LEN;
-                    let body_end = body_off + header.body_len_v6_raw()?;
+                    let body_end = body_off + len;
                     if let Some(need) = self.pending.need(buf, body_end)? {
                         return Ok(need);
                     }
@@ -200,83 +168,23 @@ impl fmt::Debug for V6UnsafeRawDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RecordKind;
+    use crate::header::RecordHeader;
 
-    fn collect(buf: &Buffer) -> Vec<u8> {
-        buf.filled().to_vec()
+    fn seal(encoder: &mut V6UnsafeRawEncoder, out: &mut Buffer, payload: &[u8]) {
+        let mut rec = encoder.reserve(out, &[], payload.len()).unwrap();
+        rec.payload_mut()[..payload.len()].copy_from_slice(payload);
+        rec.seal(payload.len()).unwrap();
     }
 
     #[test]
-    fn hello_is_plain_header_plus_payload() {
+    fn records_are_plain_header_plus_payload_and_decode_ahead() {
         let mut enc = V6UnsafeRawEncoder::new();
         let mut out = Buffer::new(64);
-        {
-            let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
-            rec.payload_mut()[..5].copy_from_slice(b"hello");
-            rec.seal(5).unwrap();
-        }
-        let wire = collect(&out);
-        assert_eq!(wire[0], 4);
-        assert_eq!(&wire[1..5], &[0, 0, 0, 0]);
-        assert_eq!(&wire[5..7], &5u16.to_be_bytes());
-        assert_eq!(&wire[7..], b"hello");
-
-        let mut decoder = V6UnsafeRawDecoder::new();
-        let mut buf = Buffer::new(64);
-        buf.extend_from_slice(&wire).unwrap();
-        match decoder.decode(&mut buf).unwrap() {
-            DecodeStatus::Record(record) => {
-                assert_eq!(record.plaintext(buf.filled()), b"hello");
-                decoder.consume(&mut buf, &record).unwrap();
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(decoder.replay_identity().is_none());
-    }
-
-    #[test]
-    fn two_records_concat() {
-        let mut enc = V6UnsafeRawEncoder::new();
-        let mut out = Buffer::new(64);
-        {
-            let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
-            rec.payload_mut()[..5].copy_from_slice(b"hello");
-            rec.seal(5).unwrap();
-        }
-        {
-            let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
-            rec.payload_mut()[..5].copy_from_slice(b"world");
-            rec.seal(5).unwrap();
-        }
-        let wire = collect(&out);
-        let mut decoder = V6UnsafeRawDecoder::new();
-        let mut buf = Buffer::new(64);
-        buf.extend_from_slice(&wire).unwrap();
-        let mut plain = Vec::new();
-        loop {
-            match decoder.decode(&mut buf).unwrap() {
-                DecodeStatus::NeedMore { .. } => break,
-                DecodeStatus::Record(record) => {
-                    if record.kind == RecordKind::Data {
-                        plain.extend_from_slice(record.plaintext(buf.filled()));
-                    }
-                    decoder.consume(&mut buf, &record).unwrap();
-                }
-            }
-        }
-        assert_eq!(plain, b"helloworld");
-    }
-
-    #[test]
-    fn decode_ahead_batches_records_before_consume() {
-        let mut enc = V6UnsafeRawEncoder::new();
-        let mut out = Buffer::new(64);
-        for msg in [&b"hello"[..], b"world"] {
-            let mut rec = enc.reserve(&mut out, &[], msg.len()).unwrap();
-            rec.payload_mut()[..msg.len()].copy_from_slice(msg);
-            rec.seal(msg.len()).unwrap();
-        }
+        seal(&mut enc, &mut out, b"hello");
+        assert_eq!(out.filled(), b"\x04\x00\x00\x00\x00\x00\x05hello");
+        seal(&mut enc, &mut out, b"world");
         let wire = out.filled().to_vec();
+
         let mut decoder = V6UnsafeRawDecoder::new();
         let mut buf = Buffer::new(64);
         buf.extend_from_slice(&wire).unwrap();
@@ -296,14 +204,22 @@ mod tests {
             decoder.consume(&mut buf, &second),
             Err(Error::PlaintextNotDrained)
         );
+        assert!(decoder.replay_identity().is_none());
     }
 
     #[test]
-    fn padding_nonzero_rejected() {
-        let mut header = [4, 0, 0, 0, 1, 0, 1];
-        header[3] = 0;
-        header[4] = 1;
-        let parsed = parse_v6_plain_header(&header).unwrap();
-        assert!(parsed.body_len_v6_raw().is_err());
+    fn dropped_reservation_cancels_and_padding_is_rejected() {
+        let mut enc = V6UnsafeRawEncoder::new();
+        let mut out = Buffer::new(64);
+        drop(enc.reserve(&mut out, b"pfx", 8).unwrap());
+        assert!(out.is_empty());
+        seal(&mut enc, &mut out, b"x");
+        assert_eq!(out.len(), HEADER_PLAIN_LEN + 1);
+
+        let padded = RecordHeader {
+            padding_len: 1,
+            payload_len: 1,
+        };
+        assert_eq!(padded.body_len_v6_raw(), Err(Error::InvalidHeader));
     }
 }

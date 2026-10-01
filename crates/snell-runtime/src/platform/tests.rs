@@ -4,10 +4,8 @@ use snell_protocol::{TCP_KEEPALIVE_IDLE_SECS, TCP_KEEPALIVE_INTERVAL_SECS};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::time;
 
-use super::accept::{
-    ACCEPT_BACKOFF_MAX, ACCEPT_BACKOFF_MIN, AcceptBackoff, AcceptClass, AcceptLoop,
-    apply_accept_result, classify_accept_error, emfile_error,
-};
+#[cfg(not(miri))]
+use super::accept::{ACCEPT_BACKOFF_MIN, AcceptLoop, emfile_error};
 use super::{
     PlatformError, apply_keepalive, read_keepalive, read_tcp_fastopen_connect,
     read_tcp_fastopen_listener, set_tcp_fastopen_connect, set_tcp_fastopen_listener,
@@ -66,41 +64,29 @@ fn tfo_connect_supported_path_sets_option_or_unsupported() {
 }
 
 #[tokio::test]
-async fn accept_emfile_retries_with_bounded_delay() {
-    let mut backoff = AcceptBackoff::default();
-    let started = Instant::now();
-    let outcome = apply_accept_result(Err(emfile_error()), &mut backoff)
-        .await
-        .unwrap();
-    assert!(outcome.is_none(), "EMFILE must not tear down accept");
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed >= ACCEPT_BACKOFF_MIN,
-        "backoff sleep missing: {elapsed:?}"
-    );
-    assert!(
-        elapsed <= ACCEPT_BACKOFF_MAX + Duration::from_millis(100),
-        "backoff unbounded: {elapsed:?}"
-    );
-}
-
-#[tokio::test]
 #[cfg(not(miri))]
-async fn accept_emfile_keeps_serving() {
+async fn accept_backs_off_on_emfile_and_keeps_serving() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut accept = AcceptLoop::new(&listener);
     accept.inject.push_back(emfile_error());
     accept.inject.push_back(emfile_error());
     let connector = tokio::spawn(async move { TcpStream::connect(addr).await });
+    let started = Instant::now();
     let (stream, _) = time::timeout(Duration::from_secs(2), accept.next())
         .await
         .expect("accept loop must stay up")
         .expect("accept after EMFILE");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= ACCEPT_BACKOFF_MIN * 3,
+        "backoff sleeps missing: {elapsed:?}"
+    );
     assert!(stream.peer_addr().is_ok());
     connector.await.unwrap().unwrap();
-    assert_eq!(
-        classify_accept_error(&emfile_error()),
-        AcceptClass::Resource
-    );
+
+    accept
+        .inject
+        .push_back(std::io::Error::other("listener broken"));
+    assert!(accept.next().await.is_err(), "fatal errors end the loop");
 }

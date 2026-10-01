@@ -1,10 +1,7 @@
-//! TCP Fast Open sockopts in rustix's AsFd style.
-//!
-//! rustix 0.38 has no `set_tcp_fastopen` / `set_tcp_fastopen_connect`. These
-//! typed i32 helpers are the real sockopt API on `AsFd`; option numbers come
-//! from `libc`.
+//! `IPPROTO_TCP` sockopts that neither rustix 0.38 nor socket2 0.6 expose:
+//! TCP Fast Open, and (on Linux) the tcp-brutal module's parameters. Option
+//! numbers come from `libc`; every write goes through [`set_tcp_opt`].
 
-use std::mem;
 #[cfg(test)]
 use std::mem::MaybeUninit;
 
@@ -15,7 +12,7 @@ use rustix::fd::{AsFd, AsRawFd};
 use rustix::io::Errno;
 
 pub(super) fn set_tcp_fastopen<Fd: AsFd>(fd: Fd, value: i32) -> Result<(), Errno> {
-    set_tcp_i32(fd, TCP_FASTOPEN, value)
+    set_tcp_opt(fd, TCP_FASTOPEN, &value.to_ne_bytes())
 }
 
 #[cfg(test)]
@@ -25,7 +22,7 @@ pub(super) fn get_tcp_fastopen<Fd: AsFd>(fd: Fd) -> Result<i32, Errno> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn set_tcp_fastopen_connect<Fd: AsFd>(fd: Fd, value: bool) -> Result<(), Errno> {
-    set_tcp_i32(fd, TCP_FASTOPEN_CONNECT, i32::from(value))
+    set_tcp_opt(fd, TCP_FASTOPEN_CONNECT, &i32::from(value).to_ne_bytes())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -33,18 +30,21 @@ pub(super) fn get_tcp_fastopen_connect<Fd: AsFd>(fd: Fd) -> Result<i32, Errno> {
     get_tcp_i32(fd, TCP_FASTOPEN_CONNECT)
 }
 
+/// Set `IPPROTO_TCP` option `optname` to the raw bytes of its value.
 #[allow(unsafe_code)]
-fn set_tcp_i32<Fd: AsFd>(fd: Fd, optname: i32, value: i32) -> Result<(), Errno> {
+pub(super) fn set_tcp_opt<Fd: AsFd>(fd: Fd, optname: i32, value: &[u8]) -> Result<(), Errno> {
     let raw = fd.as_fd().as_raw_fd();
-    // SAFETY: `raw` is a live TCP socket borrowed via `AsFd`. `TCP_FASTOPEN`
-    // and `TCP_FASTOPEN_CONNECT` take a `c_int`; we pass that type and size.
+    // SAFETY: `raw` is a live TCP socket borrowed via `AsFd`, and the kernel
+    // reads at most `value.len()` bytes from a pointer valid for that length.
+    // Callers pass each option's native layout: a `c_int`, or tcp-brutal's
+    // packed 12-byte parameters.
     let ret = unsafe {
         libc::setsockopt(
             raw,
             IPPROTO_TCP,
             optname,
-            (&value as *const i32).cast(),
-            mem::size_of::<i32>() as libc::socklen_t,
+            value.as_ptr().cast(),
+            value.len() as libc::socklen_t,
         )
     };
     if ret == 0 { Ok(()) } else { Err(last_errno()) }
@@ -55,7 +55,7 @@ fn set_tcp_i32<Fd: AsFd>(fd: Fd, optname: i32, value: i32) -> Result<(), Errno> 
 fn get_tcp_i32<Fd: AsFd>(fd: Fd, optname: i32) -> Result<i32, Errno> {
     let raw = fd.as_fd().as_raw_fd();
     let mut value = MaybeUninit::<i32>::zeroed();
-    let mut len = mem::size_of::<i32>() as libc::socklen_t;
+    let mut len = size_of::<i32>() as libc::socklen_t;
     // SAFETY: `raw` is a live TCP socket. `value` is zeroed; the kernel writes
     // an i32 (or a prefix) for these options.
     let ret = unsafe {
@@ -74,6 +74,6 @@ fn get_tcp_i32<Fd: AsFd>(fd: Fd, optname: i32) -> Result<i32, Errno> {
     Ok(unsafe { value.assume_init() })
 }
 
-pub(super) fn last_errno() -> Errno {
+fn last_errno() -> Errno {
     Errno::from_io_error(&std::io::Error::last_os_error()).unwrap_or(Errno::IO)
 }

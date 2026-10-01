@@ -19,10 +19,6 @@ impl LoadReport {
     }
 }
 
-pub async fn tcp_echo_once(pair: &ProcessPair, payload: &[u8]) -> Result<Vec<u8>, OracleError> {
-    oracle::socks5_echo_roundtrip(pair.socks, payload).await
-}
-
 pub async fn tcp_echo_throughput(
     pair: &ProcessPair,
     payload: &[u8],
@@ -31,7 +27,7 @@ pub async fn tcp_echo_throughput(
     let started = Instant::now();
     let mut bytes = 0u64;
     for _ in 0..rounds {
-        let echoed = tcp_echo_once(pair, payload).await?;
+        let echoed = oracle::socks5_echo_roundtrip(pair.socks, payload).await?;
         if echoed != payload {
             return Err(std::io::Error::other("echo mismatch").into());
         }

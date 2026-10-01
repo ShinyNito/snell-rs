@@ -11,13 +11,8 @@ pub struct GoldenFixture {
     pub kind: String,
     pub notes: String,
     pub psk_utf8: Option<String>,
-    pub hex: String,
-}
-
-impl GoldenFixture {
-    pub fn bytes(&self) -> Result<Vec<u8>, FixtureError> {
-        decode_hex(&self.hex)
-    }
+    /// Wire bytes, decoded from the fixture's `hex` once at load.
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -57,16 +52,16 @@ fn parse_fixture(path: &Path, raw: &str) -> Result<GoldenFixture, FixtureError> 
         .chars()
         .filter(|ch| !ch.is_whitespace())
         .collect();
-    decode_hex(&hex).map_err(|error| FixtureError::Invalid {
+    let bytes = decode_hex(&hex).map_err(|message| FixtureError::Invalid {
         path: path.to_path_buf(),
-        message: error.to_string(),
+        message,
     })?;
     Ok(GoldenFixture {
         name,
         kind,
         notes,
         psk_utf8,
-        hex,
+        bytes,
     })
 }
 
@@ -101,13 +96,9 @@ fn optional_field(raw: &str, key: &str) -> Option<String> {
     None
 }
 
-fn decode_hex(hex: &str) -> Result<Vec<u8>, FixtureError> {
-    let invalid = |message: String| FixtureError::Invalid {
-        path: PathBuf::from("<hex>"),
-        message,
-    };
+fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     let (pairs, []) = hex.as_bytes().as_chunks::<2>() else {
-        return Err(invalid("odd hex length".to_owned()));
+        return Err("odd hex length".to_owned());
     };
     pairs
         .iter()
@@ -115,7 +106,7 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, FixtureError> {
             std::str::from_utf8(pair)
                 .ok()
                 .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-                .ok_or_else(|| invalid(format!("invalid hex pair {}", pair.escape_ascii())))
+                .ok_or_else(|| format!("invalid hex pair {}", pair.escape_ascii()))
         })
         .collect()
 }
@@ -134,6 +125,7 @@ mod tests {
 }"#;
         let fixture = parse_fixture(Path::new("connect-v2.json"), raw).unwrap();
         assert_eq!(fixture.name, "connect-v2");
-        assert_eq!(fixture.bytes().unwrap(), [0x01, 0x05, 0x03]);
+        assert_eq!(fixture.bytes, [0x01, 0x05, 0x03]);
+        assert!(parse_fixture(Path::new("odd.json"), &raw.replace("010503", "01050")).is_err());
     }
 }

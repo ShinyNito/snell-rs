@@ -39,6 +39,38 @@ impl DecodedRecord {
     }
 }
 
+/// Record encoder lifecycle. At most one reservation is outstanding, and a
+/// failed seal that already advanced the nonce poisons the encoder for good.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum EncoderState {
+    #[default]
+    Ready,
+    /// A reservation is outstanding, including one leaked with `mem::forget`,
+    /// so a half-written record is never followed by another. A reservation
+    /// dropped in this state was neither sealed nor failed: it cancels.
+    Reserving,
+    Poisoned,
+}
+
+impl EncoderState {
+    pub(crate) const fn ensure_ready(self) -> Result<()> {
+        match self {
+            Self::Ready => Ok(()),
+            Self::Reserving => Err(Error::PendingWire),
+            Self::Poisoned => Err(Error::Poisoned),
+        }
+    }
+
+    /// State after a seal attempt: a failure that consumed a nonce poisons.
+    pub(crate) const fn after_seal(failed_after_nonce: bool) -> Self {
+        if failed_after_nonce {
+            Self::Poisoned
+        } else {
+            Self::Ready
+        }
+    }
+}
+
 /// Decode-ahead accounting shared by every record decoder: the byte length of
 /// returned-but-unconsumed records at the front of `filled()`. The next record
 /// is parsed at this offset; [`Self::consume`] drains records FIFO.

@@ -12,14 +12,16 @@ use std::path::Path;
 
 use snell_protocol::{PSK_MAX_LEN, PSK_MIN_LEN, Psk};
 
-pub use snell_protocol as protocol;
 pub use snell_protocol::{ProtocolFlavor, ProtocolSelection};
+pub use snell_runtime::{Outbound, TcpBrutal};
 
 const CLIENT_SECTION: &str = "snell-client";
 const SERVER_SECTION: &str = "snell-server";
 const TCP_BRUTAL_CWND_GAIN_MIN: u32 = 5;
 const TCP_BRUTAL_CWND_GAIN_MAX: u32 = 80;
 const TCP_BRUTAL_SEND_MBPS_MAX: u32 = 100_000;
+const UNSAFE_RAW_DISABLED: ConfigError =
+    ConfigError::Unsupported("v6-unsafe-raw is not enabled in this phase");
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -55,19 +57,6 @@ pub struct ClientConfig {
     pub psk: Psk,
     pub version: ProtocolFlavor,
     pub reuse: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Outbound {
-    Direct,
-    Socks5 { server: SocketAddr },
-}
-
-/// Linux tcp-brutal request. Off by default. Runtime fail-closes if the OS cannot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TcpBrutal {
-    pub send_mbps: u32,
-    pub cwnd_gain: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -200,9 +189,7 @@ pub fn parse_client_version(value: &str) -> Result<ProtocolFlavor, ConfigError> 
         "v5" => Ok(ProtocolFlavor::V5),
         "v6-default" => Ok(ProtocolFlavor::V6Shaped),
         "v6-unshaped" => Ok(ProtocolFlavor::V6Unshaped),
-        "v6-unsafe-raw" => Err(ConfigError::Unsupported(
-            "v6-unsafe-raw is not enabled in this phase",
-        )),
+        "v6-unsafe-raw" => Err(UNSAFE_RAW_DISABLED),
         _ => Err(ConfigError::Invalid {
             section: CLIENT_SECTION,
             key: "version",
@@ -247,9 +234,7 @@ pub fn parse_server_version(
         return match mode.as_str() {
             "default" => Ok(ProtocolFlavor::V6Shaped),
             "unshaped" => Ok(ProtocolFlavor::V6Unshaped),
-            "unsafe-raw" => Err(ConfigError::Unsupported(
-                "v6-unsafe-raw is not enabled in this phase",
-            )),
+            "unsafe-raw" => Err(UNSAFE_RAW_DISABLED),
             _ => Err(ConfigError::Invalid {
                 section: SERVER_SECTION,
                 key: "mode",
@@ -262,9 +247,7 @@ pub fn parse_server_version(
         "5" | "v5" => Ok(ProtocolFlavor::V5),
         "6" | "v6-default" => Ok(ProtocolFlavor::V6Shaped),
         "v6-unshaped" => Ok(ProtocolFlavor::V6Unshaped),
-        "v6-unsafe-raw" => Err(ConfigError::Unsupported(
-            "v6-unsafe-raw is not enabled in this phase",
-        )),
+        "v6-unsafe-raw" => Err(UNSAFE_RAW_DISABLED),
         _ => Err(ConfigError::Invalid {
             section: SERVER_SECTION,
             key: "version",
@@ -407,24 +390,16 @@ mod tests {
 
     #[test]
     fn client_ini_parses_exact_v4() {
-        let cfg = ClientConfig::parse(&format!(
-            "[snell-client]\nlisten = 127.0.0.1:1080\nserver = 127.0.0.1:8388\npsk = {PSK}\nversion = v4\nreuse = false\n"
-        ))
-        .unwrap();
-        assert_eq!(cfg.listen, "127.0.0.1:1080".parse().unwrap());
-        assert_eq!(cfg.version, ProtocolFlavor::V4);
-        assert!(!cfg.reuse);
-        assert_eq!(format!("{:?}", cfg.psk), "Psk(redacted)");
-    }
-
-    #[test]
-    fn client_reuse_true_parses() {
-        let cfg = ClientConfig::parse(&format!(
-            "[snell-client]\nlisten = 127.0.0.1:1080\nserver = 127.0.0.1:8388\npsk = {PSK}\nversion = v4\nreuse = true\n"
-        ))
-        .unwrap();
-        assert!(cfg.reuse);
-        assert_eq!(cfg.version, ProtocolFlavor::V4);
+        for reuse in [false, true] {
+            let cfg = ClientConfig::parse(&format!(
+                "[snell-client]\nlisten = 127.0.0.1:1080\nserver = 127.0.0.1:8388\npsk = {PSK}\nversion = v4\nreuse = {reuse}\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.listen, "127.0.0.1:1080".parse().unwrap());
+            assert_eq!(cfg.version, ProtocolFlavor::V4);
+            assert_eq!(cfg.reuse, reuse);
+            assert_eq!(format!("{:?}", cfg.psk), "Psk(redacted)");
+        }
     }
 
     #[test]
@@ -446,36 +421,19 @@ mod tests {
     }
 
     #[test]
-    fn server_v6_unshaped_mode() {
-        let cfg = ServerConfig::parse(&format!(
-            "[snell-server]\nlisten = 127.0.0.1:8388\npsk = {PSK}\nversion = 6\nmode = unshaped\n"
-        ))
-        .unwrap();
-        assert_eq!(
-            cfg.selection,
-            ProtocolSelection::Exact(ProtocolFlavor::V6Unshaped)
-        );
-        assert_eq!(cfg.outbound, Outbound::Direct);
-    }
-
-    #[test]
-    fn server_mode_is_ascii_case_insensitive() {
-        let cfg = ServerConfig::parse(&format!(
-            "[snell-server]\nlisten = 127.0.0.1:8388\npsk = {PSK}\nversion = 6\nmode = Unshaped\n"
-        ))
-        .unwrap();
-        assert_eq!(
-            cfg.selection,
-            ProtocolSelection::Exact(ProtocolFlavor::V6Unshaped)
-        );
-        let cfg = ServerConfig::parse(&format!(
-            "[snell-server]\nlisten = 127.0.0.1:8388\npsk = {PSK}\nversion = 6\nmode = DEFAULT\n"
-        ))
-        .unwrap();
-        assert_eq!(
-            cfg.selection,
-            ProtocolSelection::Exact(ProtocolFlavor::V6Shaped)
-        );
+    fn server_v6_mode_is_ascii_case_insensitive() {
+        for (mode, flavor) in [
+            ("unshaped", ProtocolFlavor::V6Unshaped),
+            ("Unshaped", ProtocolFlavor::V6Unshaped),
+            ("DEFAULT", ProtocolFlavor::V6Shaped),
+        ] {
+            let cfg = ServerConfig::parse(&format!(
+                "[snell-server]\nlisten = 127.0.0.1:8388\npsk = {PSK}\nversion = 6\nmode = {mode}\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.selection, ProtocolSelection::Exact(flavor));
+            assert_eq!(cfg.outbound, Outbound::Direct);
+        }
     }
 
     #[test]

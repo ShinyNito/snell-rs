@@ -3,6 +3,7 @@ use snell_protocol::{ProtocolFlavor, ProtocolSelection, Psk};
 use snell_runtime::{
     BufferPool, ClientConfig, Outbound, ServerConfig, UdpOptions, serve_client, serve_server,
 };
+pub(crate) use snell_testkit::oracle::socks5_connect;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
@@ -82,7 +83,6 @@ async fn role(args: &[String]) -> io::Result<()> {
                 server: args[2].parse().unwrap(),
                 psk,
                 version: flavor,
-                reuse: false,
                 pool: None,
                 buffers,
                 udp: UdpOptions::default(),
@@ -138,33 +138,6 @@ impl Drop for Process {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-pub(crate) async fn socks5_connect(socks: SocketAddr, dest: SocketAddr) -> io::Result<TcpStream> {
-    let mut client = TcpStream::connect(socks).await?;
-    client.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await?;
-    if method != [0x05, 0x00] {
-        return Err(io::Error::other("socks5 method negotiation failed"));
-    }
-    let SocketAddr::V4(dest_v4) = dest else {
-        return Err(io::Error::other("echo must be ipv4"));
-    };
-    let mut request = vec![0x05, 0x01, 0x00, 0x01];
-    request.extend_from_slice(&dest_v4.ip().octets());
-    request.extend_from_slice(&dest_v4.port().to_be_bytes());
-    client.write_all(&request).await?;
-    let mut reply_head = [0u8; 4];
-    client.read_exact(&mut reply_head).await?;
-    if reply_head[0] != 0x05 || reply_head[1] != 0x00 {
-        return Err(io::Error::other(format!(
-            "socks5 connect failed: {reply_head:?}"
-        )));
-    }
-    let mut bind = [0u8; 6];
-    client.read_exact(&mut bind).await?;
-    Ok(client)
 }
 
 pub(crate) async fn pipelined_echo(

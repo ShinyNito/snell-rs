@@ -13,7 +13,7 @@ pub(crate) enum Socks5Command {
 }
 
 pub(crate) async fn accept_socks5(stream: &mut TcpStream) -> Result<Socks5Command, SessionError> {
-    let mut buf = [0u8; 2 + 255];
+    let mut buf = [0u8; socks5::MAX_GREETING_LEN];
     let mut filled = 0;
     loop {
         match socks5::greeting_need(&buf[..filled])? {
@@ -35,7 +35,7 @@ pub(crate) async fn accept_socks5(stream: &mut TcpStream) -> Result<Socks5Comman
     }
     write_method(stream, METHOD_NO_AUTH).await?;
 
-    let mut buf = [0u8; 3 + 1 + 1 + 255 + 2];
+    let mut buf = [0u8; socks5::MAX_REQUEST_LEN];
     let mut filled = 0;
     loop {
         match socks5::request_need(&buf[..filled])? {
@@ -81,7 +81,7 @@ pub(crate) async fn write_socks5_reply_bind(
     reply: Reply,
     bind: SocketAddr,
 ) -> Result<(), SessionError> {
-    let mut buf = [0u8; 3 + 1 + 1 + 255 + 2];
+    let mut buf = [0u8; socks5::MAX_REQUEST_LEN];
     let n = socks5::encode_reply(&mut buf, reply, AddressRef::Ip(bind))?;
     stream.write_all(&buf[..n]).await?;
     Ok(())

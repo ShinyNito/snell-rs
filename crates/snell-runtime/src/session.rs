@@ -7,7 +7,7 @@ use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use snell_protocol::{
-    Address, AddressRef, COMMAND_UDP, ConnectRequest, DecodeStatus, Error, MAX_CONNECT_REQUEST_LEN,
+    AddressRef, COMMAND_UDP, ConnectRequest, DecodeStatus, Error, MAX_CONNECT_REQUEST_LEN,
     MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk, REUSE_IDLE_TIMEOUT_SECS, RecordKind,
     SERVER_EARLY_PAYLOAD_MAX, ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS, aead_key,
     encode_connect_request, encode_reject, encode_tunnel_reply, encode_udp_request,
@@ -196,12 +196,7 @@ pub(crate) async fn read_server_tunnel<D: TcpDecoder, R: ReadReady + Unpin>(
     let mut plain = PlainStream::new(HANDSHAKE_PLAIN_MAX);
     loop {
         match decode_once(decoder, recv, reader, kdf, psk).await? {
-            RecordEvent::Zero => {
-                return Err(SessionError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "zero chunk before tunnel",
-                )));
-            }
+            RecordEvent::Zero => return Err(SessionError::eof("zero chunk before tunnel")),
             RecordEvent::Data(record) => {
                 plain.push(record.plaintext(recv.filled()))?;
                 decoder.consume(recv, &record)?;
@@ -219,24 +214,12 @@ pub(crate) async fn read_server_tunnel<D: TcpDecoder, R: ReadReady + Unpin>(
     }
 }
 
-pub(crate) struct ServerConnect {
-    pub destination: Address,
-    pub leftover: Vec<u8>,
-    pub reuse: bool,
-}
-
-impl ServerConnect {
-    pub(crate) fn new(request: ConnectRequest, leftover: Vec<u8>) -> Self {
-        Self {
-            destination: request.destination,
-            leftover,
-            reuse: request.reuse,
-        }
-    }
-}
-
+/// An authenticated first request. `leftover` is early payload after CONNECT.
 pub(crate) enum ServerFirst {
-    Connect(ServerConnect),
+    Connect {
+        request: ConnectRequest,
+        leftover: Vec<u8>,
+    },
     Udp,
 }
 
@@ -280,12 +263,7 @@ pub(crate) async fn read_server_connect<D: TcpDecoder, R: ReadReady + Unpin>(
     let mut replay_checked = replay.is_none();
     loop {
         match decode_once(decoder, recv, reader, kdf, psk).await? {
-            RecordEvent::Zero => {
-                return Err(SessionError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "zero chunk before CONNECT",
-                )));
-            }
+            RecordEvent::Zero => return Err(SessionError::eof("zero chunk before CONNECT")),
             RecordEvent::Data(record) => {
                 if !replay_checked {
                     replay_checked = true;
@@ -300,7 +278,7 @@ pub(crate) async fn read_server_connect<D: TcpDecoder, R: ReadReady + Unpin>(
                     ParseState::Done(FirstRequest::Connect(request, n)) => {
                         let mut leftover = plain.filled()[n..].to_vec();
                         drain_early_payload(decoder, recv, reader, kdf, psk, &mut leftover).await?;
-                        return Ok(ServerFirst::Connect(ServerConnect::new(request, leftover)));
+                        return Ok(ServerFirst::Connect { request, leftover });
                     }
                     ParseState::Done(FirstRequest::Udp) => return Ok(ServerFirst::Udp),
                 }
@@ -410,9 +388,7 @@ pub(crate) async fn wait_reuse_idle<R: ReadReady + Unpin>(
     }
     let read = async {
         if read_into_recv(reader, recv, 1).await? == 0 {
-            return Err(
-                io::Error::new(io::ErrorKind::UnexpectedEof, "eof during reuse idle").into(),
-            );
+            return Err(SessionError::eof("eof during reuse idle"));
         }
         Ok(())
     };
@@ -440,10 +416,7 @@ async fn fill_until<R: ReadReady + Unpin>(
     while recv.len() < minimum {
         let n = read_into_recv(reader, recv, minimum).await?;
         if n == 0 {
-            return Err(SessionError::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "eof during handshake",
-            )));
+            return Err(SessionError::eof("eof during handshake"));
         }
     }
     Ok(())
@@ -521,17 +494,12 @@ where
                             return Poll::Pending;
                         }
                     }
+                    // A lease grown to its maximum holds any record, so the
+                    // reservation never asks for more capacity.
                     encode.ensure(encode.max())?;
-                    let hint = RECORD_HINT;
-                    let read = loop {
-                        let needed = match encoder.reserve(&mut encode, &[], hint) {
-                            Err(Error::BufferTooSmall { needed, .. }) => needed,
-                            Err(error) => break Poll::Ready(Err(error.into())),
-                            Ok(reservation) => break poll_read_record(reader, reservation, cx),
-                        };
-                        if let Err(error) = encode.ensure(needed) {
-                            break Poll::Ready(Err(error));
-                        }
+                    let read = match encoder.reserve(&mut encode, &[], RECORD_HINT) {
+                        Ok(reservation) => poll_read_record(reader, reservation, cx),
+                        Err(error) => Poll::Ready(Err(error.into())),
                     };
                     match read {
                         Poll::Ready(Ok((0, _))) => {
@@ -686,9 +654,9 @@ where
     let mut batch_count = 0usize;
     let mut batch_len = 0usize;
     let mut write_off = 0usize;
-    let mut end_after_batch = false;
-    let mut deferred: Option<SessionError> = None;
-    let mut protocol_end = false;
+    // How the stream ends once the batch is written: `Ok` after a zero chunk,
+    // `Err` for a decode error deferred behind the records decoded before it.
+    let mut batch_end: Option<Result<(), SessionError>> = None;
     let mut shutting_down = false;
     poll_fn(|cx| {
         loop {
@@ -715,17 +683,11 @@ where
                 batch_count = 0;
                 batch_len = 0;
                 write_off = 0;
-                if let Some(error) = deferred.take() {
-                    return Poll::Ready(Err(error));
+                match batch_end.take() {
+                    Some(Err(error)) => return Poll::Ready(Err(error)),
+                    Some(Ok(())) => shutting_down = true,
+                    None => {}
                 }
-                if end_after_batch {
-                    protocol_end = true;
-                }
-                continue;
-            }
-
-            if protocol_end {
-                shutting_down = true;
                 continue;
             }
 
@@ -747,26 +709,22 @@ where
                         let n = read?;
                         if n == 0 {
                             if recv.is_empty() {
-                                protocol_end = false;
                                 shutting_down = true;
                                 break;
                             }
-                            return Poll::Ready(Err(SessionError::Io(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "eof mid-record",
-                            ))));
+                            return Poll::Ready(Err(SessionError::eof("eof mid-record")));
                         }
                     }
                     Ok(DecodeStatus::Record(record)) => {
                         if record.kind == RecordKind::ZeroChunk {
                             if batch_count == 0 {
                                 decoder.consume(recv, &record)?;
-                                protocol_end = true;
+                                shutting_down = true;
                             } else {
                                 // Consumed FIFO with the batch, then end.
                                 batch[batch_count] = Some(record);
                                 batch_count += 1;
-                                end_after_batch = true;
+                                batch_end = Some(Ok(()));
                             }
                             break;
                         }
@@ -783,7 +741,7 @@ where
                         }
                         // Flush decoded records before surfacing the error,
                         // matching the former write-per-record order.
-                        deferred = Some(error.into());
+                        batch_end = Some(Err(error.into()));
                         break;
                     }
                 }

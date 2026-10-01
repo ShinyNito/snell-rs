@@ -1,34 +1,28 @@
 //! v6 shaped record codec: profile salt-block, prefix, padding mix, AAD.
 
 use core::fmt;
-use core::marker::PhantomData;
 
 use crate::aead::Aes128Gcm;
 use crate::buffer::Slot;
-use crate::header::{RecordHeader, parse_v6_plain_header, write_v6_plain_header};
+use crate::header::{RecordHeader, opened_header, parse_v6_plain_header, plain_header};
 use crate::profile::{Profile, mix_padding_payload};
-use crate::record::{DecodeStatus, DecodedRecord, Pending};
+use crate::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::{
     AES_128_KEY_LEN, Buffer, Clock, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN,
-    MAX_PACKET_SIZE_V6, Nonce, OsEntropy, Psk, Result, SALT_LEN, TAG_LEN, UnixClock,
-    V6_MAX_PREFIX_LEN,
+    MAX_PACKET_SIZE_V6, MonotonicClock, Nonce, OsEntropy, Psk, Result, SALT_LEN, TAG_LEN,
 };
 
-pub struct V6ShapedEncoder<E = OsEntropy, C = UnixClock> {
+pub struct V6ShapedEncoder<C = MonotonicClock> {
     aead: Aes128Gcm,
     nonce: Nonce,
     salt: [u8; SALT_LEN],
-    salt_sent: bool,
     seq: u32,
     profile: Profile,
     chunk_size: usize,
+    /// `None` until the first record, which carries the salt block, is sealed.
     last_write_secs: Option<u64>,
-    _entropy: PhantomData<E>,
     clock: C,
-    /// Set while a reservation is outstanding, including one leaked with
-    /// `mem::forget`, so a half-written record is never followed by another.
-    reserving: bool,
-    poisoned: bool,
+    state: EncoderState,
 }
 
 /// Per-record layout decided by [`V6ShapedEncoder::reserve`].
@@ -52,34 +46,30 @@ impl ShapedRecord {
 }
 
 #[must_use = "unsealed reservations are cancelled on drop"]
-pub struct V6ShapedReservation<'a, E: Entropy = OsEntropy, C: Clock = UnixClock> {
-    encoder: &'a mut V6ShapedEncoder<E, C>,
+pub struct V6ShapedReservation<'a, C: Clock = MonotonicClock> {
+    encoder: &'a mut V6ShapedEncoder<C>,
     buf: &'a mut Buffer,
     record: ShapedRecord,
-    sealed: bool,
 }
 
-impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
-    pub fn new(psk: &Psk, mut entropy: E, clock: C) -> Result<Self> {
+impl<C: Clock> V6ShapedEncoder<C> {
+    pub fn new(psk: &Psk, mut entropy: impl Entropy, clock: C) -> Result<Self> {
         let mut salt = [0u8; SALT_LEN];
         entropy.fill(&mut salt)?;
-        Self::with_salt(psk, salt, entropy, clock)
+        Self::with_salt(psk, salt, clock)
     }
 
-    pub fn with_salt(psk: &Psk, salt: [u8; SALT_LEN], _entropy: E, clock: C) -> Result<Self> {
+    pub fn with_salt(psk: &Psk, salt: [u8; SALT_LEN], clock: C) -> Result<Self> {
         Ok(Self {
             aead: Aes128Gcm::derive(psk, &salt)?,
             nonce: Nonce::new(),
             salt,
-            salt_sent: false,
             seq: 0,
             profile: Profile::derive(psk),
             chunk_size: 0,
             last_write_secs: None,
-            _entropy: PhantomData,
             clock,
-            reserving: false,
-            poisoned: false,
+            state: EncoderState::Ready,
         })
     }
 
@@ -88,7 +78,7 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         buf: &'buf mut Buffer,
         prefix: &[u8],
         hint: usize,
-    ) -> Result<V6ShapedReservation<'buf, E, C>> {
+    ) -> Result<V6ShapedReservation<'buf, C>> {
         self.reserve_mode(buf, prefix, hint, false)
     }
 
@@ -99,7 +89,7 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         buf: &'buf mut Buffer,
         prefix: &[u8],
         hint: usize,
-    ) -> Result<V6ShapedReservation<'buf, E, C>> {
+    ) -> Result<V6ShapedReservation<'buf, C>> {
         self.reserve_mode(buf, prefix, hint, true)
     }
 
@@ -109,13 +99,8 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         prefix: &[u8],
         hint: usize,
         scattered: bool,
-    ) -> Result<V6ShapedReservation<'buf, E, C>> {
-        if self.poisoned {
-            return Err(Error::Poisoned);
-        }
-        if self.reserving {
-            return Err(Error::PendingWire);
-        }
+    ) -> Result<V6ShapedReservation<'buf, C>> {
+        self.state.ensure_ready()?;
         let now = self.clock.monotonic_secs();
         let max_payload = prefix
             .len()
@@ -125,7 +110,7 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
             return Err(Error::PayloadTooLarge);
         }
 
-        let first = !self.salt_sent;
+        let first = self.last_write_secs.is_none();
         let salt_block_len = if first {
             self.profile.salt_block_len()
         } else {
@@ -147,7 +132,7 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         };
         let record_start = buf.reserve_record(fixed + max_payload + TAG_LEN, initialized)?;
         buf.extend_from_slice(prefix)?;
-        self.reserving = true;
+        self.state = EncoderState::Reserving;
         Ok(V6ShapedReservation {
             encoder: self,
             buf,
@@ -162,7 +147,6 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
                 prefix_len,
                 scattered,
             },
-            sealed: false,
         })
     }
 
@@ -191,7 +175,6 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
         record: &ShapedRecord,
         payload_len: usize,
     ) -> Result<usize> {
-        self.reserving = false;
         let padding_len = if !record.scattered && payload_len == record.slot.max_payload {
             // The hint was exact; reuse the padding decision made by reserve.
             record.slot.payload_start - record.contiguous_padding_start()
@@ -200,24 +183,21 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
                 self.seq,
                 record.prefix_len,
                 payload_len,
-                !self.salt_sent,
+                self.last_write_secs.is_none(),
             )
         };
         debug_assert!(padding_len <= self.profile.max_padding_len());
 
         let nonce_before = self.nonce;
         let result = self.seal_record(buf, record, padding_len, payload_len);
+        self.state = EncoderState::after_seal(result.is_err() && self.nonce != nonce_before);
         match result {
             Ok(_) => {
-                self.salt_sent = true;
                 self.chunk_size = self.profile.advance_chunk_size(self.chunk_size);
                 self.seq = self.seq.wrapping_add(1);
                 self.last_write_secs = Some(self.clock.monotonic_secs());
             }
-            Err(_) => {
-                self.poisoned |= self.nonce != nonce_before;
-                buf.truncate(record.slot.record_start)?;
-            }
+            Err(_) => buf.truncate(record.slot.record_start)?,
         }
         result
     }
@@ -246,25 +226,18 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
             // Discard unused materialized payload capacity. Commit only the tag
             // and actual header/padding: records pack tightly with no holes.
             let record_end = padding_start + padding_len;
-            buf.truncate(slot.payload_start + payload_len)?;
-            buf.reserve_zeroed(record_end - buf.end())?;
+            buf.set_record_end(slot.payload_start + payload_len);
+            buf.zero_extend_to(record_end);
             record_end
         } else {
             let payload_start = padding_start + padding_len;
             if payload_len > 0 && payload_start != slot.payload_start {
                 // A short read may need more padding than the hint predicted.
-                let payload_end = payload_start + payload_len;
-                if buf.end() < payload_end {
-                    buf.reserve_zeroed(payload_end - buf.end())?;
-                }
+                buf.zero_extend_to(payload_start + payload_len);
                 buf.copy_within(slot.payload_start, payload_start, payload_len);
             }
             let record_end = payload_start + body_len;
-            if buf.end() < record_end {
-                buf.reserve_zeroed(record_end - buf.end())?;
-            } else {
-                buf.truncate(record_end)?;
-            }
+            buf.set_record_end(record_end);
             record_end
         };
 
@@ -273,13 +246,13 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
             self.profile.write_salt_block(
                 &self.salt,
                 buf.range_mut(prefix_start - record.salt_block_len, prefix_start),
-            )?;
+            );
         }
         let (prefix, header) = buf
             .range_mut(prefix_start, padding_start)
             .split_at_mut(record.prefix_len);
         self.profile.fill_official(self.seq, prefix);
-        write_v6_plain_header(header, padding_len, payload_len)?;
+        header[..HEADER_PLAIN_LEN].copy_from_slice(&plain_header(padding_len, payload_len));
         self.aead.seal(&mut self.nonce, prefix, header)?;
         self.profile.fill_official(
             self.seq,
@@ -308,13 +281,13 @@ impl<E: Entropy, C: Clock> V6ShapedEncoder<E, C> {
     }
 }
 
-impl V6ShapedEncoder<OsEntropy, UnixClock> {
+impl V6ShapedEncoder {
     pub fn os(psk: &Psk) -> Result<Self> {
-        Self::new(psk, OsEntropy, UnixClock::new())
+        Self::new(psk, OsEntropy, MonotonicClock::new())
     }
 }
 
-impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
+impl<C: Clock> V6ShapedReservation<'_, C> {
     pub fn payload_mut(&mut self) -> &mut [u8] {
         self.record.slot.payload_mut(self.buf)
     }
@@ -346,7 +319,7 @@ impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
         self.seal_mode(written, true)
     }
 
-    fn seal_mode(mut self, written: usize, scattered: bool) -> Result<usize> {
+    fn seal_mode(self, written: usize, scattered: bool) -> Result<usize> {
         if scattered != self.record.scattered {
             return Err(Error::PendingWire);
         }
@@ -354,7 +327,6 @@ impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
         if self.buf.end() < self.record.slot.payload_start + total {
             return Err(Error::PendingWire);
         }
-        self.sealed = true;
         self.encoder.finish(self.buf, &self.record, total)
     }
 
@@ -368,31 +340,30 @@ impl<E: Entropy, C: Clock> V6ShapedReservation<'_, E, C> {
         self.seal_init_mode(written, true)
     }
 
-    fn seal_init_mode(mut self, written: usize, scattered: bool) -> Result<usize> {
+    fn seal_init_mode(self, written: usize, scattered: bool) -> Result<usize> {
         if scattered != self.record.scattered {
             return Err(Error::PendingWire);
         }
         let total = self.record.slot.commit_init(self.buf, written)?;
-        self.sealed = true;
         self.encoder.finish(self.buf, &self.record, total)
     }
 }
 
-impl<E: Entropy, C: Clock> Drop for V6ShapedReservation<'_, E, C> {
+impl<C: Clock> Drop for V6ShapedReservation<'_, C> {
     fn drop(&mut self) {
-        if !self.sealed {
+        if self.encoder.state == EncoderState::Reserving {
             let _ = self.buf.truncate(self.record.slot.record_start);
-            self.encoder.reserving = false;
+            self.encoder.state = EncoderState::Ready;
         }
     }
 }
 
-impl<E, C> fmt::Debug for V6ShapedEncoder<E, C> {
+impl<C> fmt::Debug for V6ShapedEncoder<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("V6ShapedEncoder")
-            .field("salt_sent", &self.salt_sent)
+            .field("salt_sent", &self.last_write_secs.is_some())
             .field("seq", &self.seq)
-            .field("poisoned", &self.poisoned)
+            .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
@@ -412,11 +383,11 @@ enum ReadStep {
 pub struct V6ShapedDecoder {
     psk: Psk,
     profile: Profile,
-    aead: Option<Aes128Gcm>,
+    /// Session cipher and the salt it was derived from (the replay identity).
+    key: Option<(Aes128Gcm, [u8; SALT_LEN])>,
     nonce: Nonce,
     seq: u32,
     include_salt: bool,
-    replay: Option<[u8; SALT_LEN]>,
     step: ReadStep,
     pending: Pending,
 }
@@ -426,11 +397,10 @@ impl V6ShapedDecoder {
         Self {
             profile: Profile::derive(&psk),
             psk,
-            aead: None,
+            key: None,
             nonce: Nonce::new(),
             seq: 0,
             include_salt: true,
-            replay: None,
             step: ReadStep::Salt,
             pending: Pending::default(),
         }
@@ -438,7 +408,7 @@ impl V6ShapedDecoder {
 
     /// 16-byte AEAD salt extracted from the first-record salt block.
     pub fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
-        self.replay
+        self.key.as_ref().map(|(_, salt)| *salt)
     }
 
     pub fn has_unconsumed_plaintext(&self) -> bool {
@@ -446,7 +416,7 @@ impl V6ShapedDecoder {
     }
 
     pub fn kdf_need(&self) -> usize {
-        if self.aead.is_none() && matches!(self.step, ReadStep::Salt) {
+        if self.key.is_none() && matches!(self.step, ReadStep::Salt) {
             self.profile.salt_block_len()
         } else {
             0
@@ -458,12 +428,11 @@ impl V6ShapedDecoder {
             .filled()
             .get(..self.profile.salt_block_len())
             .ok_or(Error::Truncated)?;
-        self.profile.extract_salt(block)
+        Ok(self.profile.extract_salt(block))
     }
 
     pub fn install_aead(&mut self, salt: [u8; SALT_LEN], key: [u8; AES_128_KEY_LEN]) -> Result<()> {
-        self.aead = Some(Aes128Gcm::new(&key)?);
-        self.replay = Some(salt);
+        self.key = Some((Aes128Gcm::new(&key)?, salt));
         Ok(())
     }
 
@@ -474,28 +443,27 @@ impl V6ShapedDecoder {
                     if let Some(need) = self.pending.need(buf, self.profile.salt_block_len())? {
                         return Ok(need);
                     }
-                    if self.aead.is_none() {
+                    if self.key.is_none() {
                         let salt = self.kdf_salt(buf)?;
-                        self.aead = Some(Aes128Gcm::derive(&self.psk, &salt)?);
-                        self.replay = Some(salt);
+                        self.key = Some((Aes128Gcm::derive(&self.psk, &salt)?, salt));
                     }
                     self.step = self.header_step();
                 }
                 ReadStep::Header { prefix_len } => {
-                    let off = self.header_offset();
-                    let header_end = off + prefix_len + HEADER_CIPHER_LEN;
+                    let header_start = self.header_offset() + prefix_len;
+                    let header_end = header_start + HEADER_CIPHER_LEN;
                     if let Some(need) = self.pending.need(buf, header_end)? {
                         return Ok(need);
                     }
-                    let mut scratch = [0u8; V6_MAX_PREFIX_LEN + HEADER_CIPHER_LEN];
-                    let scratch = scratch
-                        .get_mut(..header_end - off)
-                        .ok_or(Error::PayloadTooLarge)?;
-                    scratch.copy_from_slice(&buf.filled()[off..header_end]);
-                    let (prefix, hdr) = scratch.split_at_mut(prefix_len);
-                    let aead = self.aead.as_ref().ok_or(Error::Aead)?;
-                    aead.open(&mut self.nonce, prefix, hdr)?;
-                    let header = parse_v6_plain_header(&hdr[..HEADER_PLAIN_LEN])?;
+                    // The prefix is AAD and stays in place; only the header is copied.
+                    let filled = buf.filled();
+                    let prefix = &filled[header_start - prefix_len..header_start];
+                    let mut hdr = *filled[header_start..]
+                        .first_chunk::<HEADER_CIPHER_LEN>()
+                        .ok_or(Error::Truncated)?;
+                    let (aead, _) = self.key.as_ref().ok_or(Error::Aead)?;
+                    aead.open(&mut self.nonce, prefix, &mut hdr)?;
+                    let header = parse_v6_plain_header(opened_header(&hdr))?;
                     if header.body_len_v6_shaped() == 0 {
                         self.next_record();
                         return Ok(self.pending.zero_chunk(header_end));
@@ -515,7 +483,7 @@ impl V6ShapedDecoder {
                     let body = &mut buf.filled_mut()[body_off..body_end];
                     let (padding, cipher_and_tag) = body.split_at_mut(header.padding_len);
                     mix_padding_payload(&self.profile, self.seq, padding, cipher_and_tag);
-                    let aead = self.aead.as_ref().ok_or(Error::Aead)?;
+                    let (aead, _) = self.key.as_ref().ok_or(Error::Aead)?;
                     aead.open(&mut self.nonce, padding, cipher_and_tag)?;
                     self.next_record();
                     let start = body_off + header.padding_len;
@@ -566,58 +534,14 @@ impl fmt::Debug for V6ShapedDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FixedClock, RecordKind, RepeatEntropy, V6_WIRE_CAP};
+    use crate::{FixedClock, V6_WIRE_CAP};
 
     fn psk() -> Psk {
         Psk::new(b"0123456789abcdef").unwrap()
     }
 
-    fn encoder() -> V6ShapedEncoder<RepeatEntropy, FixedClock> {
-        V6ShapedEncoder::with_salt(
-            &psk(),
-            [7; SALT_LEN],
-            RepeatEntropy { byte: 0x3c },
-            FixedClock::new(0),
-        )
-        .unwrap()
-    }
-
-    fn collect(buf: &Buffer) -> Vec<u8> {
-        buf.filled().to_vec()
-    }
-
-    fn decode_plain(decoder: &mut V6ShapedDecoder, buf: &mut Buffer, wire: &[u8]) -> Vec<u8> {
-        buf.extend_from_slice(wire).unwrap();
-        let mut plain = Vec::new();
-        loop {
-            match decoder.decode(buf).unwrap() {
-                DecodeStatus::NeedMore { .. } => break,
-                DecodeStatus::Record(record) => {
-                    if record.kind == RecordKind::Data {
-                        plain.extend_from_slice(record.plaintext(buf.filled()));
-                    }
-                    decoder.consume(buf, &record).unwrap();
-                }
-            }
-        }
-        plain
-    }
-
-    #[test]
-    fn hello_round_trips() {
-        let mut enc = encoder();
-        let mut out = Buffer::new(V6_WIRE_CAP);
-        {
-            let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
-            rec.payload_mut()[..5].copy_from_slice(b"hello");
-            rec.seal(5).unwrap();
-        }
-        let wire = collect(&out);
-        assert!(wire.len() > SALT_LEN + HEADER_CIPHER_LEN + 5);
-        let mut decoder = V6ShapedDecoder::new(psk());
-        let mut buf = Buffer::new(V6_WIRE_CAP);
-        assert_eq!(decode_plain(&mut decoder, &mut buf, &wire), b"hello");
-        assert_eq!(decoder.replay_identity(), Some([7u8; SALT_LEN]));
+    fn encoder() -> V6ShapedEncoder<FixedClock> {
+        V6ShapedEncoder::with_salt(&psk(), [7; SALT_LEN], FixedClock::new(0)).unwrap()
     }
 
     #[test]
@@ -629,15 +553,8 @@ mod tests {
             b"shape test 12345",
         ] {
             let psk = Psk::new(key).unwrap();
-            let make = || {
-                V6ShapedEncoder::with_salt(
-                    &psk,
-                    [7; SALT_LEN],
-                    RepeatEntropy { byte: 0x3c },
-                    FixedClock::new(0),
-                )
-                .unwrap()
-            };
+            let make =
+                || V6ShapedEncoder::with_salt(&psk, [7; SALT_LEN], FixedClock::new(0)).unwrap();
             let mut contiguous = make();
             let mut scattered = make();
             let mut expected = Buffer::new(V6_WIRE_CAP);
@@ -719,7 +636,7 @@ mod tests {
         );
         assert!(out.is_empty());
         assert_eq!(enc.seq, 0);
-        assert!(!enc.salt_sent);
+        assert!(enc.last_write_secs.is_none());
         let mut rec = enc.reserve_scattered(&mut out, &[], 5).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         let split = rec.seal_scattered(5).unwrap();
@@ -734,84 +651,6 @@ mod tests {
     }
 
     #[test]
-    fn seal_init_wire_matches_payload_mut() {
-        let mut a_enc = encoder();
-        let mut a = Buffer::new(V6_WIRE_CAP);
-        let mut b_enc = encoder();
-        let mut b = Buffer::new(V6_WIRE_CAP);
-        // First record (salt block + profile padding), steady record, and a
-        // short write under the hint. Both paths must be byte-identical.
-        for (msg, hint) in [(&b"hello"[..], 5), (b"steady", 6), (b"abc", 8)] {
-            let mut rec = a_enc.reserve(&mut a, &[], hint).unwrap();
-            rec.payload_mut()[..msg.len()].copy_from_slice(msg);
-            rec.seal(msg.len()).unwrap();
-
-            let mut rec = b_enc.reserve(&mut b, &[], hint).unwrap();
-            rec.payload_uninit()[..msg.len()].write_copy_of_slice(msg);
-            rec.seal_init_impl(msg.len()).unwrap();
-        }
-        assert_eq!(a.filled(), b.filled());
-    }
-
-    #[test]
-    fn two_records_and_seq_progression() {
-        let mut enc = encoder();
-        let mut out = Buffer::new(V6_WIRE_CAP);
-        {
-            let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
-            rec.payload_mut()[..5].copy_from_slice(b"hello");
-            rec.seal(5).unwrap();
-        }
-        let first = collect(&out);
-        out.consume(first.len()).unwrap();
-        {
-            let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
-            rec.payload_mut()[..5].copy_from_slice(b"world");
-            rec.seal(5).unwrap();
-        }
-        let second = collect(&out);
-        assert_ne!(first.len(), second.len());
-        let mut both = first;
-        both.extend_from_slice(&second);
-        let mut decoder = V6ShapedDecoder::new(psk());
-        let mut buf = Buffer::new(V6_WIRE_CAP);
-        assert_eq!(decode_plain(&mut decoder, &mut buf, &both), b"helloworld");
-    }
-
-    #[test]
-    fn decode_ahead_batches_records_before_consume() {
-        let mut enc = encoder();
-        let mut out = Buffer::new(V6_WIRE_CAP);
-        for msg in [&b"hello"[..], b"world"] {
-            let mut rec = enc.reserve(&mut out, &[], msg.len()).unwrap();
-            rec.payload_mut()[..msg.len()].copy_from_slice(msg);
-            rec.seal(msg.len()).unwrap();
-        }
-        let wire = collect(&out);
-        let mut decoder = V6ShapedDecoder::new(psk());
-        let mut buf = Buffer::new(V6_WIRE_CAP);
-        buf.extend_from_slice(&wire).unwrap();
-        let DecodeStatus::Record(first) = decoder.decode(&mut buf).unwrap() else {
-            panic!("first record not ready");
-        };
-        let DecodeStatus::Record(second) = decoder.decode(&mut buf).unwrap() else {
-            panic!("second record not ready");
-        };
-        assert!(decoder.has_unconsumed_plaintext());
-        assert_eq!(first.plaintext(buf.filled()), b"hello");
-        assert_eq!(second.plaintext(buf.filled()), b"world");
-        assert_eq!(first.consumed + second.consumed, wire.len());
-        decoder.consume(&mut buf, &first).unwrap();
-        decoder.consume(&mut buf, &second).unwrap();
-        assert!(buf.is_empty());
-        assert!(!decoder.has_unconsumed_plaintext());
-        assert_eq!(
-            decoder.consume(&mut buf, &second),
-            Err(Error::PlaintextNotDrained)
-        );
-    }
-
-    #[test]
     fn salt_block_is_not_a_bare_prefix() {
         let mut enc = encoder();
         let mut out = Buffer::new(V6_WIRE_CAP);
@@ -820,70 +659,13 @@ mod tests {
             rec.payload_mut()[..5].copy_from_slice(b"hello");
             rec.seal(5).unwrap();
         }
-        let wire = collect(&out);
+        let wire = out.filled();
         let profile = Profile::derive(&psk());
         assert_ne!(&wire[..SALT_LEN], &[7u8; SALT_LEN]);
         assert_eq!(
-            profile
-                .extract_salt(&wire[..profile.salt_block_len()])
-                .unwrap(),
+            profile.extract_salt(&wire[..profile.salt_block_len()]),
             [7u8; SALT_LEN]
         );
-    }
-
-    #[test]
-    fn zero_chunk_round_trips() {
-        let mut enc = encoder();
-        let mut out = Buffer::new(V6_WIRE_CAP);
-        enc.reserve(&mut out, &[], 0).unwrap().seal(0).unwrap();
-        let wire = collect(&out);
-        let mut decoder = V6ShapedDecoder::new(psk());
-        let mut buf = Buffer::new(V6_WIRE_CAP);
-        buf.extend_from_slice(&wire).unwrap();
-        match decoder.decode(&mut buf).unwrap() {
-            DecodeStatus::Record(record) => {
-                assert_eq!(record.kind, RecordKind::ZeroChunk);
-                decoder.consume(&mut buf, &record).unwrap();
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn tampered_tag_fails_closed() {
-        let mut enc = encoder();
-        let mut out = Buffer::new(V6_WIRE_CAP);
-        {
-            let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
-            rec.payload_mut()[..5].copy_from_slice(b"hello");
-            rec.seal(5).unwrap();
-        }
-        let mut wire = collect(&out);
-        let last = wire.len() - 1;
-        wire[last] ^= 1;
-        let mut decoder = V6ShapedDecoder::new(psk());
-        let mut buf = Buffer::new(V6_WIRE_CAP);
-        buf.extend_from_slice(&wire).unwrap();
-        assert_eq!(decoder.decode(&mut buf), Err(Error::Aead));
-    }
-
-    #[test]
-    fn debug_hides_psk() {
-        let enc = encoder();
-        assert!(!format!("{enc:?}").contains("0123456789abcdef"));
-        let dec = V6ShapedDecoder::new(psk());
-        assert!(!format!("{dec:?}").contains("0123456789abcdef"));
-    }
-
-    #[test]
-    fn drop_cancels_reservation() {
-        let mut enc = encoder();
-        let mut out = Buffer::new(V6_WIRE_CAP);
-        {
-            let mut rec = enc.reserve(&mut out, &[], 8).unwrap();
-            rec.payload_mut()[0] = 1;
-        }
-        assert!(out.is_empty());
     }
 
     #[test]

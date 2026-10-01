@@ -49,3 +49,10 @@ pub enum Error {
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
+
+/// The first `needed` bytes of an encode destination.
+pub(crate) fn dst_prefix(dst: &mut [u8], needed: usize) -> Result<&mut [u8]> {
+    let available = dst.len();
+    dst.get_mut(..needed)
+        .ok_or(Error::BufferTooSmall { needed, available })
+}

@@ -7,7 +7,7 @@ use snell_protocol::{
     decode_udp_setup_prefix, encode_connect_request, encode_reject, encode_tunnel_reply,
     encode_udp_request, encode_udp_response, encode_udp_setup,
 };
-use snell_testkit::{GoldenFixture, load_golden_dir};
+use snell_testkit::load_golden_dir;
 
 fn fixture(name: &str) -> Vec<u8> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden");
@@ -15,10 +15,8 @@ fn fixture(name: &str) -> Vec<u8> {
         .unwrap()
         .into_iter()
         .find(|fixture| fixture.name == name)
-        .as_ref()
-        .map(GoldenFixture::bytes)
+        .map(|fixture| fixture.bytes)
         .unwrap_or_else(|| panic!("missing fixture {name}"))
-        .unwrap()
 }
 
 fn psk() -> Psk {
@@ -120,7 +118,6 @@ macro_rules! assert_hello_record {
 
 #[test]
 fn record_fixtures_match_codecs() {
-    let entropy = RepeatEntropy { byte: 0x3c };
     let clock = FixedClock::new(0);
     for (name, padding) in [
         ("v4-record-hello-salt-07-no-padding", 0),
@@ -128,7 +125,14 @@ fn record_fixtures_match_codecs() {
     ] {
         assert_hello_record!(
             name,
-            V4Encoder::with_salt(&psk(), [7; SALT_LEN], padding, entropy, clock).unwrap(),
+            V4Encoder::with_salt(
+                &psk(),
+                [7; SALT_LEN],
+                padding,
+                RepeatEntropy { byte: 0x3c },
+                clock
+            )
+            .unwrap(),
             V4_WIRE_CAP,
             V4Decoder::new(psk())
         );
@@ -136,7 +140,7 @@ fn record_fixtures_match_codecs() {
 
     let decoder = assert_hello_record!(
         "v6-unshaped-hello-salt-07",
-        V6UnshapedEncoder::with_salt(&psk(), [7; SALT_LEN], entropy, clock).unwrap(),
+        V6UnshapedEncoder::with_salt(&psk(), [7; SALT_LEN]).unwrap(),
         V4_WIRE_CAP,
         V6UnshapedDecoder::new(psk())
     );
@@ -144,7 +148,7 @@ fn record_fixtures_match_codecs() {
 
     let decoder = assert_hello_record!(
         "v6-shaped-hello-salt-07",
-        V6ShapedEncoder::with_salt(&psk(), [7; SALT_LEN], entropy, clock).unwrap(),
+        V6ShapedEncoder::with_salt(&psk(), [7; SALT_LEN], clock).unwrap(),
         V6_WIRE_CAP,
         V6ShapedDecoder::new(psk())
     );

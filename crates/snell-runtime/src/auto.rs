@@ -13,8 +13,8 @@ use crate::kdf::KdfLimiter;
 use crate::pool::PooledCodec;
 use crate::replay::ReplayCache;
 use crate::session::{
-    FirstRequest, HANDSHAKE_PLAIN_MAX, ServerConnect, ServerFirst, maybe_install_kdf,
-    parse_first_request, with_timeout,
+    FirstRequest, HANDSHAKE_PLAIN_MAX, ServerFirst, maybe_install_kdf, parse_first_request,
+    with_timeout,
 };
 
 enum Cand {
@@ -92,8 +92,8 @@ impl<D: TcpDecoder> Candidate<D> {
                     if leftover.len() > SERVER_EARLY_PAYLOAD_MAX {
                         return Err(SessionError::EarlyPayloadTooLarge);
                     }
-                    let connect = ServerConnect::new(request, leftover.to_vec());
-                    return Ok(Cand::Match(ServerFirst::Connect(connect)));
+                    let leftover = leftover.to_vec();
+                    return Ok(Cand::Match(ServerFirst::Connect { request, leftover }));
                 }
                 Ok(ParseState::Done(FirstRequest::Udp)) => {
                     return Ok(Cand::Match(ServerFirst::Udp));
@@ -173,10 +173,7 @@ async fn detect_inner(
             return Err(SessionError::Aead);
         }
         if read_into_recv(stream, &mut prefix, 1).await? == 0 {
-            return Err(SessionError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "eof during auto-detect",
-            )));
+            return Err(SessionError::eof("eof during auto-detect"));
         }
     }
 }
@@ -193,10 +190,6 @@ mod tests {
         );
         assert!(
             !prod.contains("time::sleep"),
-            "auto-detect must not sleep-poll"
-        );
-        assert!(
-            !prod.contains("tokio::time::sleep"),
             "auto-detect must not sleep-poll"
         );
     }

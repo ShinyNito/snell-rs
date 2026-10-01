@@ -8,13 +8,13 @@
 //! Run: `cargo bench -p snell-runtime --bench udp_loopback`
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Instant;
 
 use snell_protocol::socks5;
 use snell_protocol::{AddressRef, ProtocolFlavor, ProtocolSelection, Psk};
 use snell_runtime::{ClientConfig, Outbound, ServerConfig, UdpOptions, serve_client, serve_server};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use snell_testkit::oracle::{socks5_udp_associate, spawn_udp_echo};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 
@@ -42,7 +42,7 @@ async fn run() {
         let pair = start_pair(flavor).await;
         let echo = spawn_udp_echo().await.expect("echo");
         let control_started = Instant::now();
-        let session = socks5_udp_associate(pair.socks).await.expect("associate");
+        let session = socks5_udp_session(pair.socks).await.expect("associate");
         let control_elapsed = control_started.elapsed();
         let tunnel_started = Instant::now();
         ping_pong(&session, echo, &PAYLOAD, 1)
@@ -122,7 +122,6 @@ async fn start_pair(flavor: ProtocolFlavor) -> Pair {
         server: server_addr,
         psk,
         version: flavor,
-        reuse: false,
         pool: None,
         buffers: Default::default(),
         udp: UdpOptions::default(),
@@ -140,36 +139,8 @@ async fn start_pair(flavor: ProtocolFlavor) -> Pair {
     }
 }
 
-async fn spawn_udp_echo() -> io::Result<SocketAddr> {
-    let echo = UdpSocket::bind("127.0.0.1:0").await?;
-    let addr = echo.local_addr()?;
-    tokio::spawn(async move {
-        let mut buf = [0u8; 65535];
-        loop {
-            let Ok((n, peer)) = echo.recv_from(&mut buf).await else {
-                break;
-            };
-            let _ = echo.send_to(&buf[..n], peer).await;
-        }
-    });
-    Ok(addr)
-}
-
-async fn socks5_udp_associate(socks: SocketAddr) -> io::Result<UdpSession> {
-    let mut tcp = TcpStream::connect(socks).await?;
-    tcp.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut method = [0u8; 2];
-    tcp.read_exact(&mut method).await?;
-    tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
-    let mut reply_head = [0u8; 4];
-    tcp.read_exact(&mut reply_head).await?;
-    let mut rest = [0u8; 6];
-    tcp.read_exact(&mut rest).await?;
-    let ip = Ipv4Addr::new(rest[0], rest[1], rest[2], rest[3]);
-    let port = u16::from_be_bytes([rest[4], rest[5]]);
-    let relay = SocketAddr::from((ip, port));
-    let client = UdpSocket::bind("127.0.0.1:0").await?;
+async fn socks5_udp_session(socks: SocketAddr) -> io::Result<UdpSession> {
+    let (tcp, relay, client) = socks5_udp_associate(socks).await?;
     Ok(UdpSession {
         _tcp: tcp,
         relay,

@@ -7,8 +7,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use snell_protocol::{
-    Buffer, DecodeStatus, FixedClock, Psk, RepeatEntropy, SALT_LEN, V6_WIRE_CAP, V6ShapedDecoder,
-    V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
+    Buffer, DecodeStatus, FixedClock, Psk, SALT_LEN, V6_WIRE_CAP, V6ShapedDecoder, V6ShapedEncoder,
+    V6UnshapedDecoder, V6UnshapedEncoder,
 };
 
 mod support {
@@ -60,13 +60,7 @@ fn measure(name: &str, payload: &[u8], mut transfer: impl FnMut(&[u8]) -> usize)
 }
 
 fn unshaped(psk: &Psk, payload: &[u8]) {
-    let mut encoder = V6UnshapedEncoder::with_salt(
-        psk,
-        [7; SALT_LEN],
-        RepeatEntropy { byte: 0x3c },
-        FixedClock::new(0),
-    )
-    .unwrap();
+    let mut encoder = V6UnshapedEncoder::with_salt(psk, [7; SALT_LEN]).unwrap();
     let mut decoder = V6UnshapedDecoder::new(psk.clone());
     let mut out = Buffer::new(V6_WIRE_CAP);
     let mut recv = Buffer::new(V6_WIRE_CAP);
@@ -94,13 +88,7 @@ fn unshaped(psk: &Psk, payload: &[u8]) {
 }
 
 fn shaped(psk: &Psk, payload: &[u8], scattered: bool, generator: u32) {
-    let mut encoder = V6ShapedEncoder::with_salt(
-        psk,
-        [7; SALT_LEN],
-        RepeatEntropy { byte: 0x3c },
-        FixedClock::new(0),
-    )
-    .unwrap();
+    let mut encoder = V6ShapedEncoder::with_salt(psk, [7; SALT_LEN], FixedClock::new(0)).unwrap();
     let mut decoder = V6ShapedDecoder::new(psk.clone());
     let mut out = Buffer::new(V6_WIRE_CAP);
     let mut recv = Buffer::new(V6_WIRE_CAP);

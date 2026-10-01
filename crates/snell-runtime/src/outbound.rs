@@ -7,7 +7,6 @@ use std::time::Duration;
 use snell_protocol::socks5::{self, Command, METHOD_NO_AUTH, Reply};
 use snell_protocol::{
     Address, AddressRef, Error, MAX_UDP_PACKET_ADDR_LEN, ParseState, TCP_CONNECT_TIMEOUT_SECS,
-    UDP_DATAGRAM_MAX,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -16,7 +15,7 @@ use tokio::time::timeout;
 use crate::connect_tcp;
 use crate::dns::DnsResolver;
 use crate::error::SessionError;
-use crate::platform::prepare_session_stream;
+use crate::platform::{prepare_session_stream, send_udp_parts};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outbound {
@@ -116,21 +115,12 @@ impl UdpFlow {
                 socket.send_to(payload, addr).await?;
                 Ok(())
             }
-            Self::Socks5 {
-                socket,
-                relay,
-                buffers,
-                ..
-            } => {
-                let mut send = buffers.get(UDP_DATAGRAM_MAX);
+            Self::Socks5 { socket, relay, .. } => {
+                // Header and borrowed payload leave as one vectored datagram;
+                // the kernel rejects one that exceeds the UDP limit.
                 let mut hdr = [0u8; 3 + MAX_UDP_PACKET_ADDR_LEN];
                 let hdr_len = socks5::encode_udp_header(&mut hdr, 0, dest)?;
-                if hdr_len.saturating_add(payload.len()) > UDP_DATAGRAM_MAX {
-                    return Err(Error::PayloadTooLarge.into());
-                }
-                send.extend(&hdr[..hdr_len])?;
-                send.extend(payload)?;
-                socket.send_to(send.filled(), *relay).await?;
+                send_udp_parts(socket, *relay, &hdr[..hdr_len], payload).await?;
                 Ok(())
             }
         }
@@ -192,19 +182,14 @@ async fn socks5_request(
     command: Command,
     destination: AddressRef<'_>,
 ) -> Result<Address, SessionError> {
-    let mut buf = [0u8; 3 + 1 + 1 + 255 + 2];
+    let mut buf = [0u8; socks5::MAX_REQUEST_LEN];
     let n = socks5::encode_greeting(&mut buf, &[METHOD_NO_AUTH])?;
     stream.write_all(&buf[..n]).await?;
     stream.read_exact(&mut buf[..2]).await?;
     match socks5::method_selection_need(&buf[..2])? {
         ParseState::Done(METHOD_NO_AUTH) => {}
         ParseState::Done(_) => return Err(SessionError::NoAcceptableMethod),
-        ParseState::Need(_) => {
-            return Err(SessionError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "socks5 method selection truncated",
-            )));
-        }
+        ParseState::Need(_) => return Err(SessionError::eof("socks5 method selection")),
     }
 
     let n = socks5::encode_request(&mut buf, command, destination)?;

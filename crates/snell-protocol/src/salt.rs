@@ -3,7 +3,7 @@
 //! Callers pass blocks of the profile's salt-block length, which is always in
 //! `SALT_LEN + 0x10..=SALT_LEN + 0x80`, so every permuted index is in bounds.
 
-use crate::prf::{PRF_ADD_A, PRF_ADD_B, PRF_COEF_A, PRF_COEF_B, prf32_fold, splitmix64};
+use crate::prf::{PRF_ADD_A, PRF_ADD_B, PRF_COEF_A, PRF_COEF_B, prf32, splitmix64};
 use crate::{MAX_SALT_BLOCK_LEN, SALT_LEN};
 
 /// Domain mixed into the handshake salt shuffle and mask.
@@ -40,7 +40,7 @@ pub(crate) fn shuffle_perm(ns_salt: u64, rounds: u8, out: &mut [u8]) {
 }
 
 fn mask(ns_salt: u64, mix_stride: u8, i: u32) -> u8 {
-    let prf = prf32_fold(ns_salt, 2, u64::from(MIX_HANDSHAKE_DOMAIN), u64::from(i));
+    let prf = prf32(ns_salt, 2, u64::from(MIX_HANDSHAKE_DOMAIN), u64::from(i));
     (i as u8).wrapping_mul(mix_stride) ^ (prf as u8)
 }
 

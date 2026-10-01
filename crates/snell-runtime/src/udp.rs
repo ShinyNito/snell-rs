@@ -19,7 +19,7 @@ use snell_protocol::{
 
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 
 use crate::client::dial_and_codec;
@@ -126,9 +126,8 @@ struct AssocEntry {
     control: ControlId,
 }
 
-struct Control {
-    peers: HashSet<SocketAddr>,
-}
+/// Client peers routed through each SOCKS5 control connection.
+type Controls = HashMap<ControlId, HashSet<SocketAddr>>;
 
 #[derive(Clone)]
 struct Dial {
@@ -143,8 +142,8 @@ pub(crate) struct UdpHub {
     bind: SocketAddr,
     ctrl: mpsc::Sender<Ctrl>,
     next_control: Arc<AtomicU64>,
-    control_count: Arc<AtomicU64>,
-    limits: UdpLimits,
+    /// One permit per live control connection, up to `max_controls`.
+    controls: Arc<Semaphore>,
     _dispatcher: Arc<StopDispatcher>,
 }
 
@@ -155,17 +154,17 @@ impl Drop for StopDispatcher {
     }
 }
 
+/// Sends the reserved `Remove` for a control, then frees its slot.
 struct ControlGuard {
-    count: Arc<AtomicU64>,
     close: Option<mpsc::OwnedPermit<Ctrl>>,
     id: ControlId,
+    _slot: OwnedSemaphorePermit,
 }
 impl Drop for ControlGuard {
     fn drop(&mut self) {
         if let Some(permit) = self.close.take() {
             permit.send(Ctrl::Remove(self.id));
         }
-        self.count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -211,8 +210,7 @@ impl UdpHub {
             _dispatcher: Arc::new(StopDispatcher(dispatcher.abort_handle())),
             ctrl: ctrl_tx,
             next_control: Arc::new(AtomicU64::new(1)),
-            control_count: Arc::new(AtomicU64::new(0)),
-            limits,
+            controls: Arc::new(Semaphore::new(limits.max_controls)),
         })
     }
 
@@ -221,27 +219,24 @@ impl UdpHub {
     }
 
     pub async fn handle_associate(&self, mut local: TcpStream) -> Result<(), SessionError> {
-        let prev = self.control_count.fetch_add(1, Ordering::Relaxed);
-        if prev >= self.limits.max_controls as u64 {
-            self.control_count.fetch_sub(1, Ordering::Relaxed);
+        let Ok(slot) = Arc::clone(&self.controls).try_acquire_owned() else {
             write_socks5_reply_bind(&mut local, Reply::GeneralFailure, self.bind_addr()).await?;
             return Err(SessionError::UdpLimit);
-        }
-        let id = self.next_control.fetch_add(1, Ordering::Relaxed);
-        let mut guard = ControlGuard {
-            count: self.control_count.clone(),
-            close: None,
-            id,
         };
+        let id = self.next_control.fetch_add(1, Ordering::Relaxed);
         // Reserve the close notification before registering the control. Drop
         // can then notify cancellation without spawning or losing a full-queue send.
-        guard.close = Some(
-            self.ctrl
-                .clone()
-                .reserve_owned()
-                .await
-                .map_err(|_| SessionError::Cancelled)?,
-        );
+        let close = self
+            .ctrl
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| SessionError::Cancelled)?;
+        let _guard = ControlGuard {
+            close: Some(close),
+            id,
+            _slot: slot,
+        };
         self.ctrl
             .send(Ctrl::Add(id))
             .await
@@ -253,12 +248,13 @@ impl UdpHub {
     }
 }
 
-fn pick_control(controls: &HashMap<ControlId, Control>) -> Option<ControlId> {
+/// Prefer a control with no peers yet; `None` when no control is live.
+fn pick_control(controls: &Controls) -> Option<ControlId> {
     controls
         .iter()
-        .find(|(_, control)| control.peers.is_empty())
+        .find(|(_, peers)| peers.is_empty())
+        .or_else(|| controls.iter().next())
         .map(|(id, _)| *id)
-        .or_else(|| controls.keys().copied().next())
 }
 
 fn offer(
@@ -289,7 +285,7 @@ async fn dispatcher(
     dial: Dial,
 ) {
     let mut map: HashMap<SocketAddr, AssocEntry> = HashMap::new();
-    let mut controls: HashMap<ControlId, Control> = HashMap::new();
+    let mut controls = Controls::new();
     loop {
         tokio::select! {
             ctrl = ctrl_rx.recv() => {
@@ -327,21 +323,16 @@ async fn dispatcher(
 fn apply_ctrl(
     ctrl: Ctrl,
     map: &mut HashMap<SocketAddr, AssocEntry>,
-    controls: &mut HashMap<ControlId, Control>,
+    controls: &mut Controls,
     metrics: &UdpMetrics,
 ) {
     match ctrl {
         Ctrl::Add(id) => {
-            controls.insert(
-                id,
-                Control {
-                    peers: HashSet::new(),
-                },
-            );
+            controls.insert(id, HashSet::new());
         }
         Ctrl::Remove(id) => {
-            if let Some(control) = controls.remove(&id) {
-                for peer in control.peers {
+            if let Some(peers) = controls.remove(&id) {
+                for peer in peers {
                     if map.remove(&peer).is_some() {
                         metrics.associations.fetch_sub(1, Ordering::Relaxed);
                     }
@@ -351,8 +342,8 @@ fn apply_ctrl(
         Ctrl::Closed(peer) => {
             if let Some(entry) = map.remove(&peer) {
                 metrics.associations.fetch_sub(1, Ordering::Relaxed);
-                if let Some(control) = controls.get_mut(&entry.control) {
-                    control.peers.remove(&peer);
+                if let Some(peers) = controls.get_mut(&entry.control) {
+                    peers.remove(&peer);
                 }
             }
         }
@@ -364,7 +355,7 @@ fn handle_datagram(
     peer: SocketAddr,
     buf: PacketBuf,
     map: &mut HashMap<SocketAddr, AssocEntry>,
-    controls: &mut HashMap<ControlId, Control>,
+    controls: &mut Controls,
     pool: &Arc<PacketQuota>,
     metrics: &Arc<UdpMetrics>,
     limits: UdpLimits,
@@ -396,24 +387,21 @@ fn handle_datagram(
         return;
     }
 
-    if controls.is_empty() {
+    let Some(control) = pick_control(controls) else {
         metrics.invalid.fetch_add(1, Ordering::Relaxed);
         return;
-    }
+    };
     if map.len() >= limits.max_associations {
         metrics.map_full.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let Some(control) = pick_control(controls) else {
-        return;
-    };
     let (tx, rx) = mpsc::channel(limits.queue_max.max(1));
     if offer(&tx, dgram, metrics).is_err() {
         return;
     }
     map.insert(peer, AssocEntry { tx, control });
-    if let Some(slot) = controls.get_mut(&control) {
-        slot.peers.insert(peer);
+    if let Some(peers) = controls.get_mut(&control) {
+        peers.insert(peer);
     }
     metrics.associations.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(client = %peer, "udp association created");
@@ -617,9 +605,14 @@ pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
     udp: &UdpOptions,
 ) -> Result<(), SessionError> {
     let buffers = Arc::clone(recv.pool());
-    let prev = udp.metrics.associations.fetch_add(1, Ordering::Relaxed);
-    if prev >= udp.limits.max_associations as u64 {
-        udp.metrics.associations.fetch_sub(1, Ordering::Relaxed);
+    let max = udp.limits.max_associations as u64;
+    let admitted = udp
+        .metrics
+        .associations
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n < max).then_some(n + 1)
+        });
+    if admitted.is_err() {
         udp.metrics.map_full.fetch_add(1, Ordering::Relaxed);
         let _ = write_reject(&mut encoder, &buffers, &mut snell, "udp association limit").await;
         return Err(SessionError::UdpLimit);
@@ -939,15 +932,14 @@ mod tests {
     #[tokio::test]
     async fn cancelled_associate_removes_control_once() {
         let (ctrl, mut rx) = mpsc::channel(2);
-        let count = Arc::new(AtomicU64::new(0));
+        let controls = Arc::new(Semaphore::new(1));
         let dispatcher = tokio::spawn(std::future::pending::<()>());
         let hub = UdpHub {
             bind: "127.0.0.1:1234".parse().unwrap(),
             _dispatcher: Arc::new(StopDispatcher(dispatcher.abort_handle())),
             ctrl,
             next_control: Arc::new(AtomicU64::new(1)),
-            control_count: count.clone(),
-            limits: UdpLimits::default(),
+            controls: Arc::clone(&controls),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap())
@@ -959,26 +951,26 @@ mod tests {
         peer.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], 0);
         assert!(matches!(rx.recv().await, Some(Ctrl::Add(1))));
-        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert_eq!(controls.available_permits(), 0);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(matches!(rx.recv().await, Some(Ctrl::Remove(1))));
-        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert_eq!(controls.available_permits(), 1);
         assert!(rx.try_recv().is_err(), "one removal only");
     }
 
     #[tokio::test]
     async fn control_drop_delivers_reserved_close_and_releases_count() {
         let (tx, mut rx) = mpsc::channel(2);
-        let count = Arc::new(AtomicU64::new(1));
+        let controls = Arc::new(Semaphore::new(1));
         let guard = ControlGuard {
-            count: count.clone(),
             close: Some(tx.clone().reserve_owned().await.unwrap()),
             id: 7,
+            _slot: Arc::clone(&controls).try_acquire_owned().unwrap(),
         };
         tx.send(Ctrl::Add(7)).await.unwrap();
         drop(guard);
-        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert_eq!(controls.available_permits(), 1);
         assert!(matches!(rx.recv().await, Some(Ctrl::Add(7))));
         assert!(matches!(rx.recv().await, Some(Ctrl::Remove(7))));
     }

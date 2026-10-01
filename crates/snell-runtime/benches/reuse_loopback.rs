@@ -10,8 +10,9 @@ use snell_protocol::{ProtocolFlavor, ProtocolSelection, Psk};
 use snell_runtime::{
     ClientConfig, Outbound, ReusePool, ServerConfig, UdpOptions, serve_client, serve_server,
 };
+use snell_testkit::oracle::socks5_connect;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 const PSK: &[u8] = b"0123456789abcdef";
@@ -113,7 +114,6 @@ async fn start_pair(flavor: ProtocolFlavor, pool: ReusePool) -> Pair {
         server: server_addr,
         psk,
         version: flavor,
-        reuse: true,
         pool: Some(pool),
         buffers: Default::default(),
         udp: UdpOptions::default(),
@@ -147,31 +147,4 @@ async fn spawn_echo() -> io::Result<Echo> {
         io::Result::Ok(())
     });
     Ok(Echo { addr, join })
-}
-
-async fn socks5_connect(socks: SocketAddr, dest: SocketAddr) -> io::Result<TcpStream> {
-    let mut client = TcpStream::connect(socks).await?;
-    client.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await?;
-    if method != [0x05, 0x00] {
-        return Err(io::Error::other("socks5 method negotiation failed"));
-    }
-    let SocketAddr::V4(dest_v4) = dest else {
-        return Err(io::Error::other("echo must be ipv4"));
-    };
-    let mut request = vec![0x05, 0x01, 0x00, 0x01];
-    request.extend_from_slice(&dest_v4.ip().octets());
-    request.extend_from_slice(&dest_v4.port().to_be_bytes());
-    client.write_all(&request).await?;
-    let mut reply_head = [0u8; 4];
-    client.read_exact(&mut reply_head).await?;
-    if reply_head[0] != 0x05 || reply_head[1] != 0x00 {
-        return Err(io::Error::other(format!(
-            "socks5 connect failed: {reply_head:?}"
-        )));
-    }
-    let mut bind = [0u8; 6];
-    client.read_exact(&mut bind).await?;
-    Ok(client)
 }

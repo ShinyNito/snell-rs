@@ -3,7 +3,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use crate::address::{Address, AddressRef, validate_domain};
+use crate::address::{Address, AddressRef, ip_port, split_host_port, validate_domain};
+use crate::error::dst_prefix;
 use crate::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, COMMAND_CONNECT, COMMAND_CONNECT_V2, COMMAND_ERROR,
     COMMAND_TUNNEL, COMMAND_UDP, COMMAND_UDP_FORWARD, ERROR_REJECT, Error, PROTOCOL_VERSION,
@@ -71,20 +72,18 @@ pub fn encode_connect_request(
 ) -> Result<usize> {
     let host = destination.host();
     let needed = connect_len(host.len())?;
-    let available = dst.len();
-    let dst = dst
-        .get_mut(..needed)
-        .ok_or(Error::BufferTooSmall { needed, available })?;
-    let (wire, rest) = WireControlPrefix::mut_from_prefix(dst)
-        .map_err(|_| Error::BufferTooSmall { needed, available })?;
-    wire.version = PROTOCOL_VERSION;
-    wire.command = if reuse {
-        COMMAND_CONNECT_V2
-    } else {
-        COMMAND_CONNECT
+    let wire = WireControlPrefix {
+        version: PROTOCOL_VERSION,
+        command: if reuse {
+            COMMAND_CONNECT_V2
+        } else {
+            COMMAND_CONNECT
+        },
+        client_id_len: 0,
+        host_len: host.len() as u8,
     };
-    wire.client_id_len = 0;
-    wire.host_len = host.len() as u8;
+    let (head, rest) = dst_prefix(dst, needed)?.split_at_mut(size_of::<WireControlPrefix>());
+    head.copy_from_slice(wire.as_bytes());
     let (host_dst, port_dst) = rest.split_at_mut(host.len());
     host_dst.copy_from_slice(host.as_bytes());
     port_dst.copy_from_slice(&destination.port().to_be_bytes());
@@ -128,14 +127,12 @@ pub fn decode_connect_request_prefix(src: &[u8]) -> Result<(ConnectRequest, usiz
 }
 
 pub fn encode_udp_setup(dst: &mut [u8]) -> Result<usize> {
-    let available = dst.len();
-    let (wire, _) = WireControlHead::mut_from_prefix(dst).map_err(|_| Error::BufferTooSmall {
-        needed: size_of::<WireControlHead>(),
-        available,
-    })?;
-    wire.version = PROTOCOL_VERSION;
-    wire.command = COMMAND_UDP;
-    wire.client_id_len = 0;
+    let wire = WireControlHead {
+        version: PROTOCOL_VERSION,
+        command: COMMAND_UDP,
+        client_id_len: 0,
+    };
+    dst_prefix(dst, size_of::<WireControlHead>())?.copy_from_slice(wire.as_bytes());
     Ok(size_of::<WireControlHead>())
 }
 
@@ -155,28 +152,18 @@ pub fn decode_udp_setup_prefix(src: &[u8]) -> Result<usize> {
 }
 
 pub fn encode_tunnel_reply(dst: &mut [u8]) -> Result<usize> {
-    let slot = dst.first_mut().ok_or(Error::BufferTooSmall {
-        needed: 1,
-        available: 0,
-    })?;
-    *slot = COMMAND_TUNNEL;
+    dst_prefix(dst, 1)?[0] = COMMAND_TUNNEL;
     Ok(1)
 }
 
-pub(crate) fn encode_error_reply(dst: &mut [u8], code: u8, message: &str) -> Result<usize> {
+/// Server error reply with [`ERROR_REJECT`]; the message is cut to 255 bytes.
+pub fn encode_reject(dst: &mut [u8], message: &str) -> Result<usize> {
     let msg = &message.as_bytes()[..message.len().min(usize::from(u8::MAX))];
     let needed = 3 + msg.len();
-    let available = dst.len();
-    let dst = dst
-        .get_mut(..needed)
-        .ok_or(Error::BufferTooSmall { needed, available })?;
-    dst[..3].copy_from_slice(&[COMMAND_ERROR, code, msg.len() as u8]);
-    dst[3..].copy_from_slice(msg);
+    let (head, tail) = dst_prefix(dst, needed)?.split_at_mut(3);
+    head.copy_from_slice(&[COMMAND_ERROR, ERROR_REJECT, msg.len() as u8]);
+    tail.copy_from_slice(msg);
     Ok(needed)
-}
-
-pub fn encode_reject(dst: &mut [u8], message: &str) -> Result<usize> {
-    encode_error_reply(dst, ERROR_REJECT, message)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,11 +288,7 @@ fn encode_udp_datagram(
     payload: &[u8],
 ) -> Result<usize> {
     let needed = header_len + payload.len();
-    let available = dst.len();
-    let dst = dst
-        .get_mut(..needed)
-        .ok_or(Error::BufferTooSmall { needed, available })?;
-    let (header, payload_dst) = dst.split_at_mut(header_len);
+    let (header, payload_dst) = dst_prefix(dst, needed)?.split_at_mut(header_len);
     let (marker_dst, tail) = header.split_at_mut(marker.len());
     marker_dst.copy_from_slice(marker);
     let (v4, v6);
@@ -345,36 +328,18 @@ fn decode_udp_datagram<'a>(
 
 fn parse_ip_tail(src: &[u8]) -> Result<(AddressRef<'_>, usize)> {
     let (&atyp, rest) = src.split_first().ok_or(Error::Truncated)?;
-    let (ip, ip_len) = match atyp {
-        ATYP_IPV4 => (
-            IpAddr::from(*rest.first_chunk::<4>().ok_or(Error::Truncated)?),
-            4,
-        ),
-        ATYP_IPV6 => (
-            IpAddr::from(*rest.first_chunk::<16>().ok_or(Error::Truncated)?),
-            16,
-        ),
+    let (addr, ip_len) = match atyp {
+        ATYP_IPV4 => (ip_port::<4>(rest), 4),
+        ATYP_IPV6 => (ip_port::<16>(rest), 16),
         other => return Err(Error::InvalidAddressType(other)),
     };
-    let port = rest[ip_len..].first_chunk().ok_or(Error::Truncated)?;
-    let addr = SocketAddr::new(ip, u16::from_be_bytes(*port));
+    let addr = addr.ok_or(Error::Truncated)?;
     Ok((AddressRef::Ip(addr), 1 + ip_len + 2))
 }
 
 fn parse_domain_tail(src: &[u8]) -> Result<(AddressRef<'_>, usize)> {
     let (host, port, len) = split_host_port(src)?;
     Ok((AddressRef::domain(host, port)?, len))
-}
-
-/// `LEN(1) HOST(LEN) PORT(2)` without host validation.
-fn split_host_port(src: &[u8]) -> Result<(&str, u16, usize)> {
-    let (&host_len, rest) = src.split_first().ok_or(Error::Truncated)?;
-    let (host, rest) = rest
-        .split_at_checked(usize::from(host_len))
-        .ok_or(Error::Truncated)?;
-    let port = rest.first_chunk().ok_or(Error::Truncated)?;
-    let host = std::str::from_utf8(host).map_err(|_| Error::InvalidHostUtf8)?;
-    Ok((host, u16::from_be_bytes(*port), 1 + host.len() + 2))
 }
 
 #[cfg(test)]

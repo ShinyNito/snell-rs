@@ -59,6 +59,11 @@ impl From<ProtocolError> for SessionError {
 }
 
 impl SessionError {
+    /// The peer closed the stream before `context` completed.
+    pub(crate) fn eof(context: &'static str) -> Self {
+        Self::Io(io::Error::new(io::ErrorKind::UnexpectedEof, context))
+    }
+
     pub(crate) fn is_stale_pool_error(&self) -> bool {
         match self {
             Self::HandshakeTimeout | Self::ConnectTimeout | Self::ReuseIdleTimeout => true,

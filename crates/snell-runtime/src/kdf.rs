@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use snell_protocol::{KDF_MAX_INFLIGHT, KDF_MAX_QUEUED, Psk};
 use tokio::sync::Semaphore;
@@ -8,23 +7,22 @@ use crate::error::SessionError;
 
 /// Bounded Argon2id gate. KDF does not run unconstrained on the reactor poll.
 pub(crate) struct KdfLimiter {
-    sem: Arc<Semaphore>,
-    queued: AtomicUsize,
-    max_queued: usize,
+    running: Arc<Semaphore>,
+    /// Waiting slots. A full queue fails closed instead of growing.
+    queue: Semaphore,
 }
 
 impl KdfLimiter {
     #[cfg(test)]
     pub(crate) fn block_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
-        self.sem
-            .clone()
-            .try_acquire_many_owned(self.sem.available_permits() as u32)
+        Arc::clone(&self.running)
+            .try_acquire_many_owned(self.running.available_permits() as u32)
             .unwrap()
     }
 
     #[cfg(test)]
     pub(crate) fn queued_for_test(&self) -> usize {
-        self.queued.load(Ordering::SeqCst)
+        KDF_MAX_QUEUED - self.queue.available_permits()
     }
 
     pub(crate) fn new() -> Self {
@@ -32,10 +30,13 @@ impl KdfLimiter {
             .map(|n| n.get())
             .unwrap_or(1)
             .clamp(1, KDF_MAX_INFLIGHT);
+        Self::with_limits(inflight, KDF_MAX_QUEUED)
+    }
+
+    fn with_limits(inflight: usize, queued: usize) -> Self {
         Self {
-            sem: Arc::new(Semaphore::new(inflight)),
-            queued: AtomicUsize::new(0),
-            max_queued: KDF_MAX_QUEUED,
+            running: Arc::new(Semaphore::new(inflight)),
+            queue: Semaphore::new(queued),
         }
     }
 
@@ -44,23 +45,17 @@ impl KdfLimiter {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let permit = match self.sem.clone().try_acquire_owned() {
+        let permit = match Arc::clone(&self.running).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                let queued = self.queued.fetch_add(1, Ordering::SeqCst);
-                if queued >= self.max_queued {
-                    self.queued.fetch_sub(1, Ordering::SeqCst);
-                    return Err(SessionError::KdfQueueFull);
-                }
-                let waiting = Waiting(&self.queued);
-                let permit = self
-                    .sem
-                    .clone()
+                let _waiting = self
+                    .queue
+                    .try_acquire()
+                    .map_err(|_| SessionError::KdfQueueFull)?;
+                Arc::clone(&self.running)
                     .acquire_owned()
                     .await
-                    .map_err(|_| SessionError::Cancelled)?;
-                drop(waiting);
-                permit
+                    .map_err(|_| SessionError::Cancelled)?
             }
         };
         tokio::task::spawn_blocking(move || {
@@ -86,13 +81,6 @@ impl KdfLimiter {
     }
 }
 
-struct Waiting<'a>(&'a AtomicUsize);
-impl Drop for Waiting<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,12 +102,8 @@ mod tests {
     async fn cancellation_keeps_waiting_and_running_counts_exact() {
         use std::future::Future;
         use std::task::{Context, Waker};
-        let limiter = Arc::new(KdfLimiter {
-            sem: Arc::new(Semaphore::new(1)),
-            queued: AtomicUsize::new(0),
-            max_queued: 1,
-        });
-        let permit = limiter.sem.clone().acquire_owned().await.unwrap();
+        let limiter = Arc::new(KdfLimiter::with_limits(1, 1));
+        let permit = limiter.running.clone().acquire_owned().await.unwrap();
         let mut queued = Box::pin(limiter.run(|| ()));
         assert!(
             queued
@@ -127,9 +111,13 @@ mod tests {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        assert_eq!(limiter.queued.load(Ordering::SeqCst), 1);
+        assert_eq!(limiter.queue.available_permits(), 0);
+        assert!(matches!(
+            limiter.run(|| ()).await,
+            Err(SessionError::KdfQueueFull)
+        ));
         drop(queued);
-        assert_eq!(limiter.queued.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.queue.available_permits(), 1);
         drop(permit);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
@@ -146,16 +134,17 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(
-            limiter.sem.available_permits(),
+            limiter.running.available_permits(),
             0,
             "blocking work still owns the permit"
         );
         finish_tx.send(()).unwrap();
-        let permit = tokio::time::timeout(std::time::Duration::from_secs(2), limiter.sem.acquire())
-            .await
-            .unwrap()
-            .unwrap();
+        let permit =
+            tokio::time::timeout(std::time::Duration::from_secs(2), limiter.running.acquire())
+                .await
+                .unwrap()
+                .unwrap();
         drop(permit);
-        assert_eq!(limiter.sem.available_permits(), 1);
+        assert_eq!(limiter.running.available_permits(), 1);
     }
 }

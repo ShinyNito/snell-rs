@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+Performance-first review cleanup. No protocol, wire format, or configuration-file changes: golden fixtures and the v6 padding-generator corpus hashes are byte-identical.
+
+### Performance
+- v6 shaped padding generators no longer divide by a runtime value for every byte. Generator 1 uses a byte-width reciprocal and a branch-free choice, generator 2 byte-width arithmetic, generator 3 cycling iterators. `profile::bench::fill_baseline`, median for a 1460-byte fill: generator 1 11.5 µs → 1.5 µs, generator 2 2.55 µs → 0.64 µs, generator 3 6.08 µs → 2.95 µs, generator 0 unchanged. End to end on the same 4-CPU host, against 0.1.2 built and run back to back: `v6_record` encode+decode of 64-byte records is 3.2–3.4× faster for generator 1 and 1.5–1.7× for generators 2 and 3; `tcp_loopback` v6-shaped 64-byte ping-pong p50 went from 78–81 µs to 58–67 µs over three runs; `udp_loopback` v6-shaped burst from 857–934 ms to 514–578 ms. Generator 0, v4, and v6-unshaped stayed within ±2% in interleaved reruns.
+- Record sealing commits capacity the reservation already holds instead of re-validating it per record, and record headers are built infallibly from encoder-bounded lengths. The v6 shaped decoder authenticates the record prefix in place as AAD instead of copying it with the header.
+- Upstream SOCKS5 UDP sends the header and the borrowed payload as one vectored datagram, like the client response path, instead of repacking them through a leased buffer.
+
+### Changed
+- Encoders track one lifecycle state (ready, reserving, poisoned) instead of separate `reserving`, `poisoned`, and per-reservation `sealed` flags. The v4 chunk window is one `Option` instead of a salt flag, a zero sentinel, and a timestamp; the v6 shaped encoder derives "salt sent" from its last-write time; v6 decoders keep the cipher and its salt (the replay identity) in one `Option`.
+- `V6UnshapedEncoder` has no type parameters and `V6ShapedEncoder` only its clock: the unused entropy/clock generics are gone. `Clock::unix_secs` was never read and is removed; `UnixClock` is now `MonotonicClock`.
+- The unsafe-raw encoder keeps per-record layout in its reservation instead of encoder fields.
+- SOCKS5 address fields are validated in one pass; Snell and SOCKS5 parsers share the IP and domain tail readers; encoders share one destination-capacity check.
+- `snell_runtime::ClientConfig` enables reuse through `pool: Some(_)` alone; the separate `reuse` flag is removed.
+- The KDF wait queue and the SOCKS5 UDP control limit are Tokio semaphores instead of hand-rolled counters and drop guards; the server UDP association limit is one atomic `try_update`.
+- `snell-config` returns the runtime's `Outbound` and `TcpBrutal` instead of duplicate types the binary had to convert.
+- The accept loop's backoff handling is inlined into `AcceptLoop::next`; TCP Fast Open and tcp-brutal share one `setsockopt` helper.
+
+### Tests
+- Codec behavior shared by v4, v6-unshaped, and v6-shaped (fragmentation, decode-ahead, zero chunks, tamper detection, cancellation, Debug redaction) runs once per codec in `snell-testkit`; `seal_init` parity runs once per codec in the buffer module. The per-codec copies are removed.
+- SOCKS5 TCP/UDP test helpers live once in `snell-testkit::oracle`, built on the protocol crate's SOCKS5 codec, and replace copies in the runtime tests, binary tests, and benches. `ProcessPair` takes `ServerOptions`.
+- Duplicate or tautological tests are removed, and process tests share one parametrized body.
+
 ## 0.1.2
 
 Internal cleanup. No protocol, wire format, configuration, or CLI changes; golden fixtures are byte-identical.

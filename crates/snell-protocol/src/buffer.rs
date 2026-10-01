@@ -128,13 +128,10 @@ impl Buffer {
     /// for capacity, so absolute indices stay valid.
     pub(crate) fn reserve_record(&mut self, total: usize, fixed: usize) -> Result<usize> {
         debug_assert!(fixed <= total);
-        let spare = self.spare_capacity_mut(total)?;
-        spare[..fixed].fill(MaybeUninit::new(0));
-        // SAFETY: `fill` initialized `fixed` bytes of the tail.
-        unsafe {
-            self.commit(fixed)?;
-        }
-        Ok(self.storage.len() - fixed)
+        self.spare_capacity_mut(total)?;
+        let start = self.storage.len();
+        self.extend_zeroed(fixed);
+        Ok(start)
     }
 
     /// Copy `bytes` into the uninitialized tail and commit them.
@@ -142,10 +139,37 @@ impl Buffer {
         if bytes.is_empty() {
             return Ok(());
         }
-        let spare = self.spare_capacity_mut(bytes.len())?;
-        spare[..bytes.len()].write_copy_of_slice(bytes);
-        // SAFETY: `write_copy_of_slice` initialized `bytes.len()` bytes of the tail.
-        unsafe { self.commit(bytes.len()) }
+        self.spare_capacity_mut(bytes.len())?[..bytes.len()].write_copy_of_slice(bytes);
+        // SAFETY: the bounds-checked write initialized `bytes.len()` spare bytes.
+        unsafe { self.storage.set_len(self.storage.len() + bytes.len()) };
+        Ok(())
+    }
+
+    /// Zero-fill and commit `n` spare bytes. The slice index bounds `n` by
+    /// the allocation; callers have already checked it against `max`.
+    fn extend_zeroed(&mut self, n: usize) {
+        self.storage.spare_capacity_mut()[..n].fill(MaybeUninit::new(0));
+        // SAFETY: the bounds-checked fill initialized `n` spare bytes.
+        unsafe { self.storage.set_len(self.storage.len() + n) };
+    }
+
+    /// Zero-commit up to absolute index `end` inside capacity a record
+    /// reservation holds. Committed bytes are never touched.
+    pub(crate) fn zero_extend_to(&mut self, end: usize) {
+        if let Some(n) = end.checked_sub(self.storage.len()) {
+            self.extend_zeroed(n);
+        }
+    }
+
+    /// Move the committed end of a reserved record to absolute `end`,
+    /// zero-filling reserved capacity or dropping unused bytes.
+    pub(crate) fn set_record_end(&mut self, end: usize) {
+        debug_assert!(end >= self.start);
+        if end > self.storage.len() {
+            self.zero_extend_to(end);
+        } else {
+            self.storage.truncate(end);
+        }
     }
 
     /// Entire uninitialized tail without compaction. The caller may initialize
@@ -162,13 +186,10 @@ impl Buffer {
         if n == 0 {
             return Ok(self.storage.len());
         }
-        let spare = self.spare_capacity_mut(n)?;
-        spare[..n].fill(MaybeUninit::new(0));
-        // SAFETY: `fill` initialized `n` bytes of the tail.
-        unsafe {
-            self.commit(n)?;
-        }
-        Ok(self.storage.len() - n)
+        self.spare_capacity_mut(n)?;
+        let start = self.storage.len();
+        self.extend_zeroed(n);
+        Ok(start)
     }
 
     /// # Safety
@@ -264,12 +285,7 @@ impl Slot {
     /// (payload and tag) for in-place writers.
     pub(crate) fn payload_mut<'b>(&self, buf: &'b mut Buffer) -> &'b mut [u8] {
         let end = self.payload_start + self.max_payload;
-        let record_end = end + TAG_LEN;
-        if buf.end() < record_end {
-            // Capacity was reserved by `reserve_record`; this cannot fail.
-            buf.reserve_zeroed(record_end - buf.end())
-                .expect("record capacity reserved");
-        }
+        buf.zero_extend_to(end + TAG_LEN);
         buf.range_mut(self.payload_start + self.prefix_len, end)
     }
 
@@ -316,7 +332,7 @@ impl<E: crate::Entropy, C: crate::Clock> crate::V4Reservation<'_, E, C> {
         self.seal_init_impl(written)
     }
 }
-impl<E: crate::Entropy, C: crate::Clock> crate::V6ShapedReservation<'_, E, C> {
+impl<C: crate::Clock> crate::V6ShapedReservation<'_, C> {
     /// Seal caller-initialized payload from `reserve_scattered`.
     /// Payloads remain in place. Returns the record's split offset; send `[split..]`
     /// followed by `[..split]`, excluding neither range.
@@ -336,7 +352,7 @@ impl<E: crate::Entropy, C: crate::Clock> crate::V6ShapedReservation<'_, E, C> {
         self.seal_init_impl(written)
     }
 }
-impl<E: crate::Entropy, C: crate::Clock> crate::V6UnshapedReservation<'_, E, C> {
+impl crate::V6UnshapedReservation<'_> {
     /// Seal bytes initialized directly in the uninitialized payload slot.
     ///
     /// # Safety
@@ -350,6 +366,66 @@ impl<E: crate::Entropy, C: crate::Clock> crate::V6UnshapedReservation<'_, E, C> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        FixedClock, Psk, RepeatEntropy, SALT_LEN, V4Encoder, V6_WIRE_CAP, V6ShapedEncoder,
+        V6UnshapedEncoder,
+    };
+
+    /// `seal_init` over `payload_uninit` is byte-identical to `seal` over
+    /// `payload_mut` for first, prefixed, and short records. Mixing the two
+    /// fails closed, cancels the record, and leaves the encoder usable.
+    macro_rules! seal_init_parity {
+        ($name:ident, $make:expr) => {
+            #[test]
+            #[cfg_attr(miri, ignore = "ring's AES-GCM is foreign code")]
+            fn $name() {
+                let psk = Psk::new(b"0123456789abcdef").unwrap();
+                let (mut a_enc, mut b_enc) = ($make(&psk), $make(&psk));
+                let mut a = Buffer::new(V6_WIRE_CAP);
+                let mut b = Buffer::new(V6_WIRE_CAP);
+                for (prefix, msg, hint) in [
+                    (&b""[..], &b"hello"[..], 5),
+                    (b"pfx", b"steady", 6),
+                    (b"", b"abc", 8),
+                ] {
+                    let mut rec = a_enc.reserve(&mut a, prefix, hint).unwrap();
+                    rec.payload_mut()[..msg.len()].copy_from_slice(msg);
+                    rec.seal(msg.len()).unwrap();
+
+                    let mut rec = b_enc.reserve(&mut b, prefix, hint).unwrap();
+                    rec.payload_uninit()[..msg.len()].write_copy_of_slice(msg);
+                    rec.seal_init_impl(msg.len()).unwrap();
+                }
+                assert_eq!(a.filled(), b.filled());
+
+                a.consume(a.len()).unwrap();
+                let mut rec = a_enc.reserve(&mut a, &[], 5).unwrap();
+                rec.payload_mut()[..5].copy_from_slice(b"hello");
+                assert!(rec.payload_uninit().is_empty());
+                assert_eq!(rec.seal_init_impl(5), Err(Error::PendingWire));
+                assert!(a.is_empty(), "a failed seal cancels the record");
+                let mut rec = a_enc.reserve(&mut a, &[], 5).unwrap();
+                rec.payload_mut()[..5].copy_from_slice(b"hello");
+                rec.seal(5).unwrap();
+                assert!(!a.is_empty());
+            }
+        };
+    }
+
+    seal_init_parity!(v4_seal_init_parity, |psk| V4Encoder::with_salt(
+        psk,
+        [7; SALT_LEN],
+        32,
+        RepeatEntropy { byte: 0x3c },
+        FixedClock::new(0),
+    )
+    .unwrap());
+    seal_init_parity!(v6_unshaped_seal_init_parity, |psk| {
+        V6UnshapedEncoder::with_salt(psk, [7; SALT_LEN]).unwrap()
+    });
+    seal_init_parity!(v6_shaped_seal_init_parity, |psk| {
+        V6ShapedEncoder::with_salt(psk, [7; SALT_LEN], FixedClock::new(0)).unwrap()
+    });
 
     #[test]
     fn failed_reservation_does_not_move_live_bytes() {

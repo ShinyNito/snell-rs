@@ -16,12 +16,6 @@ pub(crate) enum AcceptClass {
     Fatal,
 }
 
-#[derive(Debug)]
-pub(crate) enum OnAccept {
-    Ready(TcpStream, SocketAddr),
-    RetryAfter(Duration),
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct AcceptBackoff {
     consecutive: u32,
@@ -43,52 +37,11 @@ impl AcceptBackoff {
 
 pub(crate) fn classify_accept_error(error: &io::Error) -> AcceptClass {
     if is_resource_limit(error) {
-        return AcceptClass::Resource;
-    }
-    if is_ignorable_accept(error) {
-        return AcceptClass::Ignore;
-    }
-    AcceptClass::Fatal
-}
-
-pub(crate) fn on_accept_result(
-    result: io::Result<(TcpStream, SocketAddr)>,
-    backoff: &mut AcceptBackoff,
-) -> Result<OnAccept, io::Error> {
-    match result {
-        Ok((stream, addr)) => {
-            backoff.reset();
-            Ok(OnAccept::Ready(stream, addr))
-        }
-        Err(error) => match classify_accept_error(&error) {
-            AcceptClass::Resource => {
-                let delay = backoff.next_delay();
-                if backoff.consecutive == 1 {
-                    tracing::warn!(
-                        delay_ms = delay.as_millis(),
-                        "accept backing off (file descriptors exhausted)"
-                    );
-                }
-                Ok(OnAccept::RetryAfter(delay))
-            }
-            AcceptClass::Ignore => Ok(OnAccept::RetryAfter(Duration::ZERO)),
-            AcceptClass::Fatal => Err(error),
-        },
-    }
-}
-
-pub(crate) async fn apply_accept_result(
-    result: io::Result<(TcpStream, SocketAddr)>,
-    backoff: &mut AcceptBackoff,
-) -> Result<Option<(TcpStream, SocketAddr)>, io::Error> {
-    match on_accept_result(result, backoff)? {
-        OnAccept::Ready(stream, addr) => Ok(Some((stream, addr))),
-        OnAccept::RetryAfter(delay) => {
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-            Ok(None)
-        }
+        AcceptClass::Resource
+    } else if is_ignorable_accept(error) {
+        AcceptClass::Ignore
+    } else {
+        AcceptClass::Fatal
     }
 }
 
@@ -109,12 +62,30 @@ impl<'a> AcceptLoop<'a> {
         }
     }
 
-    pub(crate) async fn next(&mut self) -> Result<(TcpStream, SocketAddr), io::Error> {
+    /// Next connection. Descriptor exhaustion backs off instead of tearing
+    /// the listener down; aborted handshakes are skipped.
+    pub(crate) async fn next(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
         loop {
-            if let Some(pair) =
-                apply_accept_result(self.accept_once().await, &mut self.backoff).await?
-            {
-                return Ok(pair);
+            let error = match self.accept_once().await {
+                Ok(accepted) => {
+                    self.backoff.reset();
+                    return Ok(accepted);
+                }
+                Err(error) => error,
+            };
+            match classify_accept_error(&error) {
+                AcceptClass::Resource => {
+                    let delay = self.backoff.next_delay();
+                    if self.backoff.consecutive == 1 {
+                        tracing::warn!(
+                            delay_ms = delay.as_millis(),
+                            "accept backing off (file descriptors exhausted)"
+                        );
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                AcceptClass::Ignore => {}
+                AcceptClass::Fatal => return Err(error),
             }
         }
     }
@@ -196,46 +167,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn emfile_and_enfile_are_resource_limits() {
-        assert_eq!(
-            classify_accept_error(&emfile_error()),
-            AcceptClass::Resource
-        );
-        assert_eq!(
-            classify_accept_error(&enfile_error()),
-            AcceptClass::Resource
-        );
-    }
-
-    #[test]
-    fn connection_aborted_is_ignored() {
-        let error = io::Error::from_raw_os_error(conn_aborted_code());
-        assert_eq!(classify_accept_error(&error), AcceptClass::Ignore);
-    }
-
-    #[test]
-    fn other_accept_errors_are_fatal() {
-        let error = io::Error::other("listener broken");
-        assert_eq!(classify_accept_error(&error), AcceptClass::Fatal);
-        let mut backoff = AcceptBackoff::default();
-        let err = on_accept_result(Err(error), &mut backoff).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-    }
-
-    #[test]
-    fn resource_backoff_is_bounded() {
-        let mut backoff = AcceptBackoff::default();
-        let mut last = Duration::ZERO;
-        for _ in 0..16 {
-            let OnAccept::RetryAfter(delay) =
-                on_accept_result(Err(emfile_error()), &mut backoff).unwrap()
-            else {
-                panic!("EMFILE must retry");
-            };
-            assert!(delay >= ACCEPT_BACKOFF_MIN);
-            assert!(delay <= ACCEPT_BACKOFF_MAX);
-            last = delay;
+    fn accept_errors_are_classified() {
+        for error in [emfile_error(), enfile_error()] {
+            assert_eq!(classify_accept_error(&error), AcceptClass::Resource);
         }
+        let aborted = io::Error::from_raw_os_error(conn_aborted_code());
+        assert_eq!(classify_accept_error(&aborted), AcceptClass::Ignore);
+        let broken = io::Error::other("listener broken");
+        assert_eq!(classify_accept_error(&broken), AcceptClass::Fatal);
+    }
+
+    #[test]
+    fn resource_backoff_doubles_to_the_cap_and_resets() {
+        let mut backoff = AcceptBackoff::default();
+        assert_eq!(backoff.next_delay(), ACCEPT_BACKOFF_MIN);
+        assert_eq!(backoff.next_delay(), ACCEPT_BACKOFF_MIN * 2);
+        let last = (0..16).map(|_| backoff.next_delay()).last().unwrap();
         assert_eq!(last, ACCEPT_BACKOFF_MAX);
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), ACCEPT_BACKOFF_MIN);
     }
 }

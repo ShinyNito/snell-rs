@@ -1195,6 +1195,7 @@ name = "snell-config"
 version = "0.1.2"
 dependencies = [
  "snell-protocol",
+ "snell-runtime",
  "thiserror",
 ]
 

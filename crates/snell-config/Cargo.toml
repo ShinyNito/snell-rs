@@ -10,4 +10,5 @@ description = "Raw-to-validated Snell configuration"
 
 [dependencies]
 snell-protocol = { path = "../snell-protocol", version = "0.1.2" }
+snell-runtime = { path = "../snell-runtime", version = "0.1.2" }
 thiserror.workspace = true

@@ -26,7 +26,7 @@ pub(crate) fn splitmix64(mut x: u64) -> u64 {
     x
 }
 
-pub(crate) fn prf32_fold(namespace: u64, label: u32, a: u64, b: u64) -> u32 {
+pub(crate) fn prf32(namespace: u64, label: u32, a: u64, b: u64) -> u32 {
     let x = namespace
         ^ b.wrapping_mul(PRF_COEF_B).wrapping_add(PRF_ADD_B)
         ^ u64::from(label).wrapping_mul(GOLDEN_GAMMA)
@@ -35,16 +35,9 @@ pub(crate) fn prf32_fold(namespace: u64, label: u32, a: u64, b: u64) -> u32 {
     (y ^ (y >> 32)) as u32
 }
 
-pub(crate) fn prf32_seq(namespace: u64, label: u32, seq: u64, domain: u32) -> u32 {
-    prf32_fold(namespace, label, seq, u64::from(domain))
-}
-
-pub(crate) fn prf32(namespace: u64, label: u32, domain: u32) -> u32 {
-    prf32_seq(namespace, label, 0, domain)
-}
-
-pub(crate) fn expand_stream(namespace: u64, label: u32, seq: u64, len_hint: u64, out: &mut [u8]) {
-    debug_assert_eq!(out.len() as u64, len_hint);
+/// Keystream for `out`; its length is mixed into the state.
+pub(crate) fn expand_stream(namespace: u64, label: u32, seq: u64, out: &mut [u8]) {
+    let len_hint = out.len() as u64;
     let mut state = EXPAND_STATE_INIT;
     state = state.wrapping_add(seq.wrapping_mul(EXPAND_COEF_SEQ));
     state ^= u64::from(label).wrapping_mul(EXPAND_COEF_LABEL);
@@ -53,12 +46,10 @@ pub(crate) fn expand_stream(namespace: u64, label: u32, seq: u64, len_hint: u64,
         .wrapping_add(EXPAND_ADD_LEN);
     state ^= namespace;
 
-    let n_full = out.len() / 8 * 8;
-    let (full, tail) = out.split_at_mut(n_full);
-    let (blocks, _) = full.as_chunks_mut::<8>();
+    let (blocks, tail) = out.as_chunks_mut::<8>();
     for block in blocks {
         state = state.wrapping_add(GOLDEN_GAMMA);
-        block.copy_from_slice(&splitmix64(state).to_le_bytes());
+        *block = splitmix64(state).to_le_bytes();
     }
     if !tail.is_empty() {
         state = state.wrapping_add(GOLDEN_GAMMA);
@@ -89,12 +80,6 @@ mod tests {
     }
 
     #[test]
-    fn prf32_is_seq_zero() {
-        let ns = 0xa71f_0c54_d839_6e2b;
-        assert_eq!(prf32(ns, 2, 0x51a7), prf32_seq(ns, 2, 0, 0x51a7));
-    }
-
-    #[test]
     fn expand_first_block_is_splitmix_of_state() {
         let ns = 0u64;
         let mut state = EXPAND_STATE_INIT;
@@ -105,7 +90,7 @@ mod tests {
         state = state.wrapping_add(GOLDEN_GAMMA);
         let expected = splitmix64(state).to_le_bytes();
         let mut out = [0u8; 8];
-        expand_stream(ns, 0, 0, 8, &mut out);
+        expand_stream(ns, 0, 0, &mut out);
         assert_eq!(out, expected);
     }
 
@@ -113,8 +98,8 @@ mod tests {
     fn expand_length_changes_prefix() {
         let mut a = [0u8; 16];
         let mut b = [0u8; 32];
-        expand_stream(0x917b_3c48_e6a2_05d4, 0, 0, 16, &mut a);
-        expand_stream(0x917b_3c48_e6a2_05d4, 0, 0, 32, &mut b);
+        expand_stream(0x917b_3c48_e6a2_05d4, 0, 0, &mut a);
+        expand_stream(0x917b_3c48_e6a2_05d4, 0, 0, &mut b);
         assert_ne!(&a[..], &b[..16]);
     }
 }
