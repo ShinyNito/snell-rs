@@ -41,8 +41,10 @@ impl DecodedRecord {
 
 /// Record encoder lifecycle. At most one reservation is outstanding, and a
 /// failed seal that already advanced the nonce poisons the encoder for good.
+///
+/// Public only to the crate-private [`Seal`](crate::codec::sealed::Seal) trait.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum EncoderState {
+pub enum EncoderState {
     #[default]
     Ready,
     /// A reservation is outstanding, including one leaked with `mem::forget`,

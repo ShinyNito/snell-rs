@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use snell_protocol::socks5::Reply;
 use snell_protocol::{
-    Address, ProtocolFlavor, Psk, V4Decoder, V4Encoder, V6ShapedDecoder, V6ShapedEncoder,
-    V6UnshapedDecoder, V6UnshapedEncoder,
+    Address, ProtocolFlavor, Psk, RecordDecoder, V4Decoder, V4Encoder, V6ShapedDecoder,
+    V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{Instrument, debug, info, warn};

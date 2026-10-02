@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
 use snell_protocol::{
-    Address, Buffer, DecodeStatus, FixedClock, Psk, RepeatEntropy, SALT_LEN, V4_WIRE_CAP,
-    V4Decoder, V4Encoder, V6_WIRE_CAP, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder,
-    V6UnshapedEncoder, decode_connect_request, decode_udp_request, decode_udp_response,
-    decode_udp_setup_prefix, encode_connect_request, encode_reject, encode_tunnel_reply,
-    encode_udp_request, encode_udp_response, encode_udp_setup,
+    Address, Buffer, DecodeStatus, FixedClock, Psk, RecordDecoder, RecordEncoder, RepeatEntropy,
+    SALT_LEN, V4Decoder, V4Encoder, V6_WIRE_CAP, V6ShapedDecoder, V6ShapedEncoder,
+    V6UnshapedDecoder, V6UnshapedEncoder, decode_connect_request, decode_udp_request,
+    decode_udp_response, decode_udp_setup_prefix, encode_connect_request, encode_reject,
+    encode_tunnel_reply, encode_udp_request, encode_udp_response, encode_udp_setup,
 };
-use snell_testkit::load_golden_dir;
+use snell_testkit::{load_golden_dir, seal_records};
 
 fn fixture(name: &str) -> Vec<u8> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden");
@@ -92,28 +92,23 @@ fn udp_datagram_fixtures_round_trip() {
     );
 }
 
-/// Seal `hello` as the first record, compare it with the fixture, and decode
-/// it back. Each codec contributes its encoder, capacity, and decoder.
-macro_rules! assert_hello_record {
-    ($name:expr, $encoder:expr, $wire_cap:expr, $decoder:expr) => {{
-        let name = $name;
-        let expected = fixture(name);
-        let mut encoder = $encoder;
-        let mut out = Buffer::new($wire_cap);
-        let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
-        rec.payload_mut()[..5].copy_from_slice(b"hello");
-        rec.seal(5).unwrap();
-        assert_eq!(out.filled(), expected, "{name}");
+/// Seal `hello` as the first record, compare it with the fixture `name`,
+/// and decode it back. Returns the decoder for further checks.
+fn assert_hello_record<D: RecordDecoder>(
+    name: &str,
+    mut encoder: impl RecordEncoder,
+    mut decoder: D,
+) -> D {
+    let expected = fixture(name);
+    assert_eq!(seal_records(&mut encoder, &[b"hello"]), expected, "{name}");
 
-        let mut decoder = $decoder;
-        let mut buf = Buffer::new($wire_cap);
-        buf.extend_from_slice(&expected).unwrap();
-        let DecodeStatus::Record(record) = decoder.decode(&mut buf).unwrap() else {
-            panic!("{name}: record not decoded");
-        };
-        assert_eq!(record.plaintext(buf.filled()), b"hello", "{name}");
-        decoder
-    }};
+    let mut buf = Buffer::new(V6_WIRE_CAP);
+    buf.extend_from_slice(&expected).unwrap();
+    let DecodeStatus::Record(record) = decoder.decode(&mut buf).unwrap() else {
+        panic!("{name}: record not decoded");
+    };
+    assert_eq!(record.plaintext(buf.filled()), b"hello", "{name}");
+    decoder
 }
 
 #[test]
@@ -123,34 +118,28 @@ fn record_fixtures_match_codecs() {
         ("v4-record-hello-salt-07-no-padding", 0),
         ("v4-record-hello-salt-07-padding-8", 8),
     ] {
-        assert_hello_record!(
-            name,
-            V4Encoder::with_salt(
-                &psk(),
-                [7; SALT_LEN],
-                padding,
-                RepeatEntropy { byte: 0x3c },
-                clock
-            )
-            .unwrap(),
-            V4_WIRE_CAP,
-            V4Decoder::new(psk())
-        );
+        let encoder = V4Encoder::with_salt(
+            &psk(),
+            [7; SALT_LEN],
+            padding,
+            RepeatEntropy { byte: 0x3c },
+            clock,
+        )
+        .unwrap();
+        assert_hello_record(name, encoder, V4Decoder::new(psk()));
     }
 
-    let decoder = assert_hello_record!(
+    let decoder = assert_hello_record(
         "v6-unshaped-hello-salt-07",
         V6UnshapedEncoder::with_salt(&psk(), [7; SALT_LEN]).unwrap(),
-        V4_WIRE_CAP,
-        V6UnshapedDecoder::new(psk())
+        V6UnshapedDecoder::new(psk()),
     );
     assert_eq!(decoder.replay_identity(), Some([7u8; SALT_LEN]));
 
-    let decoder = assert_hello_record!(
+    let decoder = assert_hello_record(
         "v6-shaped-hello-salt-07",
         V6ShapedEncoder::with_salt(&psk(), [7; SALT_LEN], clock).unwrap(),
-        V6_WIRE_CAP,
-        V6ShapedDecoder::new(psk())
+        V6ShapedDecoder::new(psk()),
     );
     assert_eq!(decoder.replay_identity(), Some([7u8; SALT_LEN]));
 }

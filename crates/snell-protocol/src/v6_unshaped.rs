@@ -3,7 +3,9 @@
 use core::fmt;
 
 use crate::aead::Aes128Gcm;
-use crate::buffer::Slot;
+use crate::buffer::{Reservation, Slot};
+use crate::codec::sealed::Seal;
+use crate::codec::{RecordDecoder, RecordEncoder};
 use crate::header::{opened_header, parse_v6_plain_header, plain_header};
 use crate::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::{
@@ -17,13 +19,6 @@ pub struct V6UnshapedEncoder {
     salt: [u8; SALT_LEN],
     salt_sent: bool,
     state: EncoderState,
-}
-
-#[must_use = "unsealed reservations are cancelled on drop"]
-pub struct V6UnshapedReservation<'a> {
-    encoder: &'a mut V6UnshapedEncoder,
-    buf: &'a mut Buffer,
-    slot: Slot,
 }
 
 impl V6UnshapedEncoder {
@@ -47,50 +42,6 @@ impl V6UnshapedEncoder {
         Self::new(psk, OsEntropy)
     }
 
-    pub fn reserve<'buf>(
-        &'buf mut self,
-        buf: &'buf mut Buffer,
-        prefix: &[u8],
-        hint: usize,
-    ) -> Result<V6UnshapedReservation<'buf>> {
-        self.state.ensure_ready()?;
-        let max_payload = prefix.len().saturating_add(hint).min(MAX_PACKET_SIZE);
-        if prefix.len() > max_payload {
-            return Err(Error::PayloadTooLarge);
-        }
-
-        let first = !self.salt_sent;
-        let fixed = usize::from(first) * SALT_LEN + HEADER_CIPHER_LEN;
-        let record_start = buf.reserve_record(fixed + max_payload + TAG_LEN, fixed)?;
-        if first {
-            buf.range_mut(record_start, record_start + SALT_LEN)
-                .copy_from_slice(&self.salt);
-        }
-        buf.extend_from_slice(prefix)?;
-        self.state = EncoderState::Reserving;
-        Ok(V6UnshapedReservation {
-            encoder: self,
-            buf,
-            slot: Slot {
-                record_start,
-                payload_start: record_start + fixed,
-                prefix_len: prefix.len(),
-                max_payload,
-            },
-        })
-    }
-
-    fn finish(&mut self, buf: &mut Buffer, slot: &Slot, payload_len: usize) -> Result<()> {
-        let nonce_before = self.nonce;
-        let result = self.seal_record(buf, slot, payload_len);
-        self.state = EncoderState::after_seal(result.is_err() && self.nonce != nonce_before);
-        match result {
-            Ok(()) => self.salt_sent = true,
-            Err(_) => buf.truncate(slot.record_start)?,
-        }
-        result
-    }
-
     fn seal_record(&mut self, buf: &mut Buffer, slot: &Slot, payload_len: usize) -> Result<()> {
         let header_start = slot.payload_start - HEADER_CIPHER_LEN;
         let record_end = if payload_len == 0 {
@@ -112,41 +63,59 @@ impl V6UnshapedEncoder {
     }
 }
 
-impl V6UnshapedReservation<'_> {
-    pub fn payload_mut(&mut self) -> &mut [u8] {
-        self.slot.payload_mut(self.buf)
-    }
+impl RecordEncoder for V6UnshapedEncoder {
+    fn reserve<'a>(
+        &'a mut self,
+        buf: &'a mut Buffer,
+        prefix: &[u8],
+        hint: usize,
+    ) -> Result<Reservation<'a, Self>> {
+        self.state.ensure_ready()?;
+        let max_payload = prefix.len().saturating_add(hint).min(MAX_PACKET_SIZE);
+        if prefix.len() > max_payload {
+            return Err(Error::PayloadTooLarge);
+        }
 
-    /// Uninitialized payload slot after the prefix. Fill a prefix of it (for
-    /// example through Tokio `ReadBuf::uninit`), then call [`Self::seal_init`].
-    /// Do not mix with [`Self::payload_mut`]. Empty once materialized.
-    pub fn payload_uninit(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
-        self.slot.payload_uninit(self.buf)
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.slot.capacity()
-    }
-
-    pub fn seal(self, written: usize) -> Result<()> {
-        let total = self.slot.total(written)?;
-        self.encoder.finish(self.buf, &self.slot, total)
-    }
-
-    /// Seal after the caller initialized `written` bytes of
-    /// [`Self::payload_uninit`]. Commits them without zero-filling first.
-    pub(crate) fn seal_init_impl(self, written: usize) -> Result<()> {
-        let total = self.slot.commit_init(self.buf, written)?;
-        self.encoder.finish(self.buf, &self.slot, total)
+        let first = !self.salt_sent;
+        let fixed = usize::from(first) * SALT_LEN + HEADER_CIPHER_LEN;
+        let record_start = buf.reserve_record(fixed + max_payload + TAG_LEN, fixed)?;
+        if first {
+            buf.range_mut(record_start, record_start + SALT_LEN)
+                .copy_from_slice(&self.salt);
+        }
+        buf.extend_from_slice(prefix)?;
+        let slot = Slot {
+            record_start,
+            payload_start: record_start + fixed,
+            prefix_len: prefix.len(),
+            max_payload,
+        };
+        Ok(Reservation::new(self, buf, slot, ()))
     }
 }
 
-impl Drop for V6UnshapedReservation<'_> {
-    fn drop(&mut self) {
-        if self.encoder.state == EncoderState::Reserving {
-            let _ = self.buf.truncate(self.slot.record_start);
-            self.encoder.state = EncoderState::Ready;
+impl Seal for V6UnshapedEncoder {
+    type Record = ();
+
+    fn state(&mut self) -> &mut EncoderState {
+        &mut self.state
+    }
+
+    fn finish(
+        &mut self,
+        buf: &mut Buffer,
+        slot: &Slot,
+        _: &(),
+        payload_len: usize,
+    ) -> Result<usize> {
+        let nonce_before = self.nonce;
+        let result = self.seal_record(buf, slot, payload_len);
+        self.state = EncoderState::after_seal(result.is_err() && self.nonce != nonce_before);
+        match result {
+            Ok(()) => self.salt_sent = true,
+            Err(_) => buf.truncate(slot.record_start)?,
         }
+        result.map(|()| 0)
     }
 }
 
@@ -188,33 +157,13 @@ impl V6UnshapedDecoder {
         }
     }
 
-    /// 16-byte AEAD salt, available after the first record's salt is parsed.
-    pub fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
-        self.key.as_ref().map(|(_, salt)| *salt)
+    fn header_offset(&self) -> usize {
+        self.pending.offset() + usize::from(self.include_salt) * SALT_LEN
     }
+}
 
-    pub fn has_unconsumed_plaintext(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    pub fn kdf_need(&self) -> usize {
-        if self.key.is_none() && matches!(self.step, ReadStep::Salt) {
-            SALT_LEN
-        } else {
-            0
-        }
-    }
-
-    pub fn kdf_salt(&self, buf: &Buffer) -> Result<[u8; SALT_LEN]> {
-        buf.filled().first_chunk().copied().ok_or(Error::Truncated)
-    }
-
-    pub fn install_aead(&mut self, salt: [u8; SALT_LEN], key: [u8; AES_128_KEY_LEN]) -> Result<()> {
-        self.key = Some((Aes128Gcm::new(&key)?, salt));
-        Ok(())
-    }
-
-    pub fn decode(&mut self, buf: &mut Buffer) -> Result<DecodeStatus> {
+impl RecordDecoder for V6UnshapedDecoder {
+    fn decode(&mut self, buf: &mut Buffer) -> Result<DecodeStatus> {
         loop {
             match self.step {
                 ReadStep::Salt => {
@@ -271,12 +220,33 @@ impl V6UnshapedDecoder {
         }
     }
 
-    pub fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
+    fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
         self.pending.consume(buf, record)
     }
 
-    fn header_offset(&self) -> usize {
-        self.pending.offset() + usize::from(self.include_salt) * SALT_LEN
+    fn has_unconsumed_plaintext(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
+        self.key.as_ref().map(|(_, salt)| *salt)
+    }
+
+    fn kdf_need(&self) -> usize {
+        if self.key.is_none() && matches!(self.step, ReadStep::Salt) {
+            SALT_LEN
+        } else {
+            0
+        }
+    }
+
+    fn kdf_salt(&self, buf: &Buffer) -> Result<[u8; SALT_LEN]> {
+        buf.filled().first_chunk().copied().ok_or(Error::Truncated)
+    }
+
+    fn install_aead(&mut self, salt: [u8; SALT_LEN], key: [u8; AES_128_KEY_LEN]) -> Result<()> {
+        self.key = Some((Aes128Gcm::new(&key)?, salt));
+        Ok(())
     }
 }
 

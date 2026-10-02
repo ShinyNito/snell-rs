@@ -1,14 +1,14 @@
 use crate::buffer::{BufferPool, PooledBuffer};
 use snell_protocol::{
     AUTO_DETECT_PREFIX_MAX, AUTO_DETECT_TIMEOUT_SECS, DecodeStatus, ParseState, PlainStream, Psk,
-    RecordKind, SERVER_EARLY_PAYLOAD_MAX, V4Decoder, V4Encoder, V6ShapedDecoder, V6ShapedEncoder,
+    RecordDecoder, RecordKind, SERVER_EARLY_PAYLOAD_MAX, V4Decoder, V4Encoder, V6ShapedDecoder,
+    V6ShapedEncoder,
 };
 use std::sync::Arc;
 use tokio::net::TcpStream;
 
 use crate::bufio::read_into_recv;
 use crate::codec::Codec;
-use crate::codec::TcpDecoder;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::replay::ReplayCache;
@@ -32,7 +32,7 @@ struct Candidate<D> {
     state: Cand,
 }
 
-impl<D: TcpDecoder> Candidate<D> {
+impl<D: RecordDecoder> Candidate<D> {
     fn new(decoder: D, buffers: &Arc<BufferPool>) -> Self {
         Self {
             decoder,

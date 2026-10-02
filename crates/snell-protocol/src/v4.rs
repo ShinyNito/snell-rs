@@ -3,8 +3,10 @@
 use core::fmt;
 
 use crate::aead::Aes128Gcm;
-use crate::buffer::Slot;
+use crate::buffer::{Reservation, Slot};
 use crate::chunk::V4ChunkState;
+use crate::codec::sealed::Seal;
+use crate::codec::{RecordDecoder, RecordEncoder};
 use crate::header::{RecordHeader, opened_header, parse_v4_plain_header, plain_header};
 use crate::padding::{fill_v4_padding, swap_even_indices};
 use crate::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
@@ -27,20 +29,12 @@ pub struct V4Encoder<E = OsEntropy, C = MonotonicClock> {
 
 /// Per-record layout decided by [`V4Encoder::reserve`].
 #[derive(Clone, Copy, Debug)]
-struct V4Record {
-    slot: Slot,
+pub struct V4Record {
     header_start: usize,
     padding_len: usize,
+    /// Chunk budget at reserve time; a sealed record grows the window from it.
     budget: usize,
     reserved_at: u64,
-}
-
-/// RAII payload slot. Drop without [`V4Reservation::seal`] cancels the record.
-#[must_use = "unsealed reservations are cancelled on drop"]
-pub struct V4Reservation<'a, E: Entropy = OsEntropy, C: Clock = MonotonicClock> {
-    encoder: &'a mut V4Encoder<E, C>,
-    buf: &'a mut Buffer,
-    record: V4Record,
 }
 
 impl<E: Entropy, C: Clock> V4Encoder<E, C> {
@@ -75,13 +69,49 @@ impl<E: Entropy, C: Clock> V4Encoder<E, C> {
         })
     }
 
-    /// Reserve a record in `buf`. `prefix` is copied into the payload slot.
-    pub fn reserve<'buf>(
-        &'buf mut self,
-        buf: &'buf mut Buffer,
+    fn seal_record(
+        &mut self,
+        buf: &mut Buffer,
+        slot: &Slot,
+        record: &V4Record,
+        payload_len: usize,
+    ) -> Result<()> {
+        let header_start = record.header_start;
+        let padding_start = header_start + HEADER_CIPHER_LEN;
+        let (padding_len, record_end) = if payload_len == 0 {
+            (0, padding_start)
+        } else {
+            (
+                record.padding_len,
+                slot.payload_start + payload_len + TAG_LEN,
+            )
+        };
+        // Zero-commit through the tag slot; never touches committed payload.
+        buf.set_record_end(record_end);
+
+        let header = buf.range_mut(header_start, padding_start);
+        header[..HEADER_PLAIN_LEN].copy_from_slice(&plain_header(padding_len, payload_len));
+        self.aead.seal(&mut self.nonce, &[], header)?;
+        if payload_len > 0 {
+            let body = buf.range_mut(padding_start, record_end);
+            let (padding, cipher_and_tag) = body.split_at_mut(padding_len);
+            self.aead.seal(&mut self.nonce, &[], cipher_and_tag)?;
+            if padding_len > 0 {
+                fill_v4_padding(padding, cipher_and_tag, &mut self.entropy)?;
+                swap_even_indices(padding, cipher_and_tag);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<E: Entropy, C: Clock> RecordEncoder for V4Encoder<E, C> {
+    fn reserve<'a>(
+        &'a mut self,
+        buf: &'a mut Buffer,
         prefix: &[u8],
         hint: usize,
-    ) -> Result<V4Reservation<'buf, E, C>> {
+    ) -> Result<Reservation<'a, Self>> {
         self.state.ensure_ready()?;
         let now = self.clock.monotonic_secs();
         let budget = self.chunk.record_budget(now);
@@ -106,116 +136,50 @@ impl<E: Entropy, C: Clock> V4Encoder<E, C> {
                 .copy_from_slice(&self.salt);
         }
         buf.extend_from_slice(prefix)?;
-        self.state = EncoderState::Reserving;
-        Ok(V4Reservation {
-            encoder: self,
-            buf,
-            record: V4Record {
-                slot: Slot {
-                    record_start,
-                    payload_start: record_start + fixed,
-                    prefix_len: prefix.len(),
-                    max_payload,
-                },
-                header_start: record_start + salt_len,
-                padding_len,
-                budget,
-                reserved_at: now,
-            },
-        })
+        let slot = Slot {
+            record_start,
+            payload_start: record_start + fixed,
+            prefix_len: prefix.len(),
+            max_payload,
+        };
+        let record = V4Record {
+            header_start: record_start + salt_len,
+            padding_len,
+            budget,
+            reserved_at: now,
+        };
+        Ok(Reservation::new(self, buf, slot, record))
+    }
+}
+
+impl<E: Entropy, C: Clock> Seal for V4Encoder<E, C> {
+    type Record = V4Record;
+
+    fn state(&mut self) -> &mut EncoderState {
+        &mut self.state
     }
 
-    fn finish(&mut self, buf: &mut Buffer, record: &V4Record, payload_len: usize) -> Result<()> {
+    fn finish(
+        &mut self,
+        buf: &mut Buffer,
+        slot: &Slot,
+        record: &V4Record,
+        payload_len: usize,
+    ) -> Result<usize> {
         let nonce_before = self.nonce;
-        let result = self.seal_record(buf, record, payload_len);
+        let result = self.seal_record(buf, slot, record, payload_len);
         self.state = EncoderState::after_seal(result.is_err() && self.nonce != nonce_before);
         match result {
             Ok(()) => self.chunk.commit_write(record.reserved_at, record.budget),
-            Err(_) => buf.truncate(record.slot.record_start)?,
+            Err(_) => buf.truncate(slot.record_start)?,
         }
-        result
-    }
-
-    fn seal_record(
-        &mut self,
-        buf: &mut Buffer,
-        record: &V4Record,
-        payload_len: usize,
-    ) -> Result<()> {
-        let header_start = record.header_start;
-        let padding_start = header_start + HEADER_CIPHER_LEN;
-        let (padding_len, record_end) = if payload_len == 0 {
-            (0, padding_start)
-        } else {
-            (
-                record.padding_len,
-                record.slot.payload_start + payload_len + TAG_LEN,
-            )
-        };
-        // Zero-commit through the tag slot; never touches committed payload.
-        buf.set_record_end(record_end);
-
-        let header = buf.range_mut(header_start, padding_start);
-        header[..HEADER_PLAIN_LEN].copy_from_slice(&plain_header(padding_len, payload_len));
-        self.aead.seal(&mut self.nonce, &[], header)?;
-        if payload_len > 0 {
-            let body = buf.range_mut(padding_start, record_end);
-            let (padding, cipher_and_tag) = body.split_at_mut(padding_len);
-            self.aead.seal(&mut self.nonce, &[], cipher_and_tag)?;
-            if padding_len > 0 {
-                fill_v4_padding(padding, cipher_and_tag, &mut self.entropy)?;
-                swap_even_indices(padding, cipher_and_tag);
-            }
-        }
-        Ok(())
+        result.map(|()| 0)
     }
 }
 
 impl V4Encoder {
     pub fn os(psk: &Psk) -> Result<Self> {
         Self::new(psk, OsEntropy, MonotonicClock::new())
-    }
-}
-
-impl<E: Entropy, C: Clock> V4Reservation<'_, E, C> {
-    pub fn payload_mut(&mut self) -> &mut [u8] {
-        self.record.slot.payload_mut(self.buf)
-    }
-
-    /// Uninitialized payload slot after the prefix. Fill a prefix of it (for
-    /// example through Tokio `ReadBuf::uninit`), then call [`Self::seal_init`].
-    /// Do not mix with [`Self::payload_mut`]. Empty once materialized.
-    pub fn payload_uninit(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
-        self.record.slot.payload_uninit(self.buf)
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.record.slot.capacity()
-    }
-
-    pub fn padding_len(&self) -> usize {
-        self.record.padding_len
-    }
-
-    pub fn seal(self, written: usize) -> Result<()> {
-        let total = self.record.slot.total(written)?;
-        self.encoder.finish(self.buf, &self.record, total)
-    }
-
-    /// Seal after the caller initialized `written` bytes of
-    /// [`Self::payload_uninit`]. Commits them without zero-filling first.
-    pub(crate) fn seal_init_impl(self, written: usize) -> Result<()> {
-        let total = self.record.slot.commit_init(self.buf, written)?;
-        self.encoder.finish(self.buf, &self.record, total)
-    }
-}
-
-impl<E: Entropy, C: Clock> Drop for V4Reservation<'_, E, C> {
-    fn drop(&mut self) {
-        if self.encoder.state == EncoderState::Reserving {
-            let _ = self.buf.truncate(self.record.slot.record_start);
-            self.encoder.state = EncoderState::Ready;
-        }
     }
 }
 
@@ -257,34 +221,13 @@ impl V4Decoder {
         }
     }
 
-    pub fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
-        None
+    fn header_offset(&self) -> usize {
+        self.pending.offset() + usize::from(self.include_salt) * SALT_LEN
     }
+}
 
-    pub fn has_unconsumed_plaintext(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    /// Bytes of salt required before Argon2id. Zero after the key is installed.
-    pub fn kdf_need(&self) -> usize {
-        if self.aead.is_none() && matches!(self.step, ReadStep::Salt) {
-            SALT_LEN
-        } else {
-            0
-        }
-    }
-
-    pub fn kdf_salt(&self, buf: &Buffer) -> Result<[u8; SALT_LEN]> {
-        buf.filled().first_chunk().copied().ok_or(Error::Truncated)
-    }
-
-    /// Skip inline KDF in [`Self::decode`] after the runtime derived the key.
-    pub fn install_aead(&mut self, key: [u8; AES_128_KEY_LEN]) -> Result<()> {
-        self.aead = Some(Aes128Gcm::new(&key)?);
-        Ok(())
-    }
-
-    pub fn decode(&mut self, buf: &mut Buffer) -> Result<DecodeStatus> {
+impl RecordDecoder for V4Decoder {
+    fn decode(&mut self, buf: &mut Buffer) -> Result<DecodeStatus> {
         loop {
             match self.step {
                 ReadStep::Salt => {
@@ -337,12 +280,34 @@ impl V4Decoder {
         }
     }
 
-    pub fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
+    fn consume(&mut self, buf: &mut Buffer, record: &DecodedRecord) -> Result<()> {
         self.pending.consume(buf, record)
     }
 
-    fn header_offset(&self) -> usize {
-        self.pending.offset() + usize::from(self.include_salt) * SALT_LEN
+    fn has_unconsumed_plaintext(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// v4 salts are not replay-checked.
+    fn replay_identity(&self) -> Option<[u8; SALT_LEN]> {
+        None
+    }
+
+    fn kdf_need(&self) -> usize {
+        if self.aead.is_none() && matches!(self.step, ReadStep::Salt) {
+            SALT_LEN
+        } else {
+            0
+        }
+    }
+
+    fn kdf_salt(&self, buf: &Buffer) -> Result<[u8; SALT_LEN]> {
+        buf.filled().first_chunk().copied().ok_or(Error::Truncated)
+    }
+
+    fn install_aead(&mut self, _salt: [u8; SALT_LEN], key: [u8; AES_128_KEY_LEN]) -> Result<()> {
+        self.aead = Some(Aes128Gcm::new(&key)?);
+        Ok(())
     }
 }
 
@@ -506,17 +471,20 @@ mod tests {
         let mut encoder = encoder(8, FixedClock::new(0));
         let first_limit = V4_MSS_BASE - V4_FIRST_RECORD_OVERHEAD - 8;
         let mut out = encode_buf();
-        {
-            let mut first = encoder.reserve(&mut out, &[], MAX_PACKET_SIZE).unwrap();
-            assert_eq!(first.capacity(), first_limit);
-            assert_eq!(first.padding_len(), 8);
-            first.payload_mut().fill(0x42);
-            first.seal(first_limit).unwrap();
-        }
+        let mut first = encoder.reserve(&mut out, &[], MAX_PACKET_SIZE).unwrap();
+        assert_eq!(first.capacity(), first_limit);
+        first.payload_mut().fill(0x42);
+        first.seal(first_limit).unwrap();
+        let padded = SALT_LEN + HEADER_CIPHER_LEN + 8 + first_limit + TAG_LEN;
+        assert_eq!(out.len(), padded, "only the first record is padded");
         out.consume(out.len()).unwrap();
-        let second = encoder.reserve(&mut out, &[], MAX_PACKET_SIZE).unwrap();
-        assert_eq!(second.padding_len(), 0);
-        assert_eq!(second.capacity(), next_v4_chunk_limit(first_limit));
+
+        let second_limit = next_v4_chunk_limit(first_limit);
+        let mut second = encoder.reserve(&mut out, &[], MAX_PACKET_SIZE).unwrap();
+        assert_eq!(second.capacity(), second_limit);
+        second.payload_mut().fill(0x42);
+        second.seal(second_limit).unwrap();
+        assert_eq!(out.len(), HEADER_CIPHER_LEN + second_limit + TAG_LEN);
     }
 
     #[test]

@@ -8,18 +8,17 @@ use std::time::Duration;
 
 use snell_protocol::{
     AddressRef, COMMAND_UDP, ConnectRequest, DecodeStatus, Error, MAX_CONNECT_REQUEST_LEN,
-    MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk, REUSE_IDLE_TIMEOUT_SECS, RecordKind,
-    SERVER_EARLY_PAYLOAD_MAX, ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS, aead_key,
-    encode_connect_request, encode_reject, encode_tunnel_reply, encode_udp_request,
+    MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk, REUSE_IDLE_TIMEOUT_SECS, RecordDecoder,
+    RecordEncoder, RecordKind, SERVER_EARLY_PAYLOAD_MAX, ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS,
+    aead_key, encode_connect_request, encode_reject, encode_tunnel_reply, encode_udp_request,
     encode_udp_response, encode_udp_setup, udp_request_len, udp_response_len,
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::bufio::{READ_WINDOW, ReadReady, TcpReservation, poll_read_into, poll_read_record};
+use crate::bufio::{READ_WINDOW, ReadReady, poll_read_into, poll_read_record};
 use crate::bufio::{drain_encode, read_into_recv};
-use crate::codec::{TcpDecoder, TcpEncoder};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::replay::ReplayCache;
@@ -49,7 +48,7 @@ pub(crate) async fn with_handshake_timeout<T>(
     .await
 }
 
-pub(crate) async fn write_udp_setup<E: TcpEncoder, W: AsyncWrite + Unpin>(
+pub(crate) async fn write_udp_setup<E: RecordEncoder, W: AsyncWrite + Unpin>(
     encoder: &mut E,
     buffers: &Arc<BufferPool>,
     writer: &mut W,
@@ -59,7 +58,7 @@ pub(crate) async fn write_udp_setup<E: TcpEncoder, W: AsyncWrite + Unpin>(
     write_plain_records(encoder, buffers, writer, &req[..n]).await
 }
 
-pub(crate) async fn write_udp_request<E: TcpEncoder, W: AsyncWrite + Unpin>(
+pub(crate) async fn write_udp_request<E: RecordEncoder, W: AsyncWrite + Unpin>(
     encoder: &mut E,
     buffers: &Arc<BufferPool>,
     writer: &mut W,
@@ -73,7 +72,7 @@ pub(crate) async fn write_udp_request<E: TcpEncoder, W: AsyncWrite + Unpin>(
     .await
 }
 
-pub(crate) async fn write_udp_response<E: TcpEncoder, W: AsyncWrite + Unpin>(
+pub(crate) async fn write_udp_response<E: RecordEncoder, W: AsyncWrite + Unpin>(
     encoder: &mut E,
     buffers: &Arc<BufferPool>,
     writer: &mut W,
@@ -95,7 +94,7 @@ async fn write_udp_plain<E, W, F>(
     fill: F,
 ) -> Result<(), SessionError>
 where
-    E: TcpEncoder,
+    E: RecordEncoder,
     W: AsyncWrite + Unpin,
     F: FnOnce(&mut [u8]) -> snell_protocol::Result<usize>,
 {
@@ -111,7 +110,7 @@ where
 
 // Let the codec report the exact required capacity. This keeps protocol
 // overhead calculations out of the runtime, including shaped padding.
-fn encode_record<E: TcpEncoder>(
+fn encode_record<E: RecordEncoder>(
     encoder: &mut E,
     encode: &mut PooledBuffer,
     hint: usize,
@@ -131,7 +130,7 @@ fn encode_record<E: TcpEncoder>(
     }
 }
 
-pub(crate) async fn write_connect<E: TcpEncoder, W: AsyncWrite + Unpin>(
+pub(crate) async fn write_connect<E: RecordEncoder, W: AsyncWrite + Unpin>(
     encoder: &mut E,
     buffers: &Arc<BufferPool>,
     writer: &mut W,
@@ -143,7 +142,7 @@ pub(crate) async fn write_connect<E: TcpEncoder, W: AsyncWrite + Unpin>(
     write_plain_records(encoder, buffers, writer, &req[..n]).await
 }
 
-pub(crate) async fn write_tunnel<E: TcpEncoder, W: AsyncWrite + Unpin>(
+pub(crate) async fn write_tunnel<E: RecordEncoder, W: AsyncWrite + Unpin>(
     encoder: &mut E,
     buffers: &Arc<BufferPool>,
     writer: &mut W,
@@ -153,7 +152,7 @@ pub(crate) async fn write_tunnel<E: TcpEncoder, W: AsyncWrite + Unpin>(
     write_plain_records(encoder, buffers, writer, &buf[..n]).await
 }
 
-pub(crate) async fn write_reject<E: TcpEncoder, W: AsyncWrite + Unpin>(
+pub(crate) async fn write_reject<E: RecordEncoder, W: AsyncWrite + Unpin>(
     encoder: &mut E,
     buffers: &Arc<BufferPool>,
     writer: &mut W,
@@ -164,7 +163,7 @@ pub(crate) async fn write_reject<E: TcpEncoder, W: AsyncWrite + Unpin>(
     write_plain_records(encoder, buffers, writer, &buf[..n]).await
 }
 
-async fn write_plain_records<E: TcpEncoder, W: AsyncWrite + Unpin>(
+async fn write_plain_records<E: RecordEncoder, W: AsyncWrite + Unpin>(
     encoder: &mut E,
     buffers: &Arc<BufferPool>,
     writer: &mut W,
@@ -186,7 +185,7 @@ async fn write_plain_records<E: TcpEncoder, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-pub(crate) async fn read_server_tunnel<D: TcpDecoder, R: ReadReady + Unpin>(
+pub(crate) async fn read_server_tunnel<D: RecordDecoder, R: ReadReady + Unpin>(
     decoder: &mut D,
     recv: &mut PooledBuffer,
     reader: &mut R,
@@ -251,7 +250,7 @@ pub(crate) fn parse_first_request(
     }
 }
 
-pub(crate) async fn read_server_connect<D: TcpDecoder, R: ReadReady + Unpin>(
+pub(crate) async fn read_server_connect<D: RecordDecoder, R: ReadReady + Unpin>(
     decoder: &mut D,
     recv: &mut PooledBuffer,
     reader: &mut R,
@@ -296,7 +295,7 @@ pub(crate) enum RecordEvent {
     Data(snell_protocol::DecodedRecord),
 }
 
-async fn drain_early_payload<D: TcpDecoder, R: ReadReady + Unpin>(
+async fn drain_early_payload<D: RecordDecoder, R: ReadReady + Unpin>(
     decoder: &mut D,
     recv: &mut PooledBuffer,
     reader: &mut R,
@@ -339,7 +338,7 @@ async fn drain_early_payload<D: TcpDecoder, R: ReadReady + Unpin>(
     }
 }
 
-pub(crate) async fn decode_once<D: TcpDecoder, R: ReadReady + Unpin>(
+pub(crate) async fn decode_once<D: RecordDecoder, R: ReadReady + Unpin>(
     decoder: &mut D,
     recv: &mut PooledBuffer,
     reader: &mut R,
@@ -363,7 +362,7 @@ pub(crate) async fn decode_once<D: TcpDecoder, R: ReadReady + Unpin>(
     }
 }
 
-pub(crate) async fn maybe_install_kdf<D: TcpDecoder>(
+pub(crate) async fn maybe_install_kdf<D: RecordDecoder>(
     decoder: &mut D,
     recv: &PooledBuffer,
     kdf: &KdfLimiter,
@@ -414,7 +413,7 @@ async fn fill_until<R: ReadReady + Unpin>(
     Ok(())
 }
 
-pub(crate) async fn relay<E: TcpEncoder, D: TcpDecoder>(
+pub(crate) async fn relay<E: RecordEncoder, D: RecordDecoder>(
     snell: &mut TcpStream,
     plain: &mut TcpStream,
     encoder: &mut E,
@@ -454,7 +453,7 @@ async fn pump_plain_to_snell<R, W, E>(
 where
     R: ReadReady + Unpin,
     W: AsyncWrite + Unpin,
-    E: TcpEncoder,
+    E: RecordEncoder,
 {
     let mut encode = buffers.get(snell_protocol::V6_WIRE_CAP);
     // Shaped records store their body before their header. Preserve wire order
@@ -636,7 +635,7 @@ async fn pump_snell_to_plain<R, W, D>(
 where
     R: ReadReady + Unpin,
     W: AsyncWrite + Unpin,
-    D: TcpDecoder,
+    D: RecordDecoder,
 {
     // Decoded-ahead records not yet written: their plaintext ranges stay
     // valid against the unmoved `filled()` view until any is consumed, so

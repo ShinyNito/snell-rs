@@ -25,11 +25,15 @@ Performance-first review cleanup. No protocol, wire format, or configuration-fil
 - The accept loop's backoff handling is inlined into `AcceptLoop::next`; TCP Fast Open and tcp-brutal share one `setsockopt` helper.
 - Server exact-flavor sessions share one setup path parameterized by codec constructors; the client opens tunnels through one `establish` step that tries a pooled connection and falls back to a fresh dial. Pooled connections and the auto-detected codec use one `Codec` enum.
 - The client UDP relay keeps its routing tables in one `Routes` value (association per peer, peers per control connection) and its shared handles in one `Relay`, instead of passing them separately to each task.
+- `snell-protocol` defines the record codec interface: `RecordEncoder` and `RecordDecoder` traits, implemented directly by each codec, and one generic `Reservation` that replaces `V4Reservation`, `V6ShapedReservation`, `V6UnshapedReservation`, and `V6UnsafeRawReservation`. The runtime's `TcpEncoder`, `TcpDecoder`, and `TcpReservation` traits, which only forwarded to these methods through macros, are removed. `Reservation::seal` returns the record's split for every codec.
+- The v6 shaped encoder has one record layout, the in-place one sessions always used; the contiguous layout, used only by tests and benches, is removed along with `reserve_scattered`, `seal_scattered`, and `seal_init_scattered`. Wire bytes are pinned by digests recorded from 0.1.2.
+- Sealing a payload that was never written fails with `PendingWire` for every codec; previously only the v6 shaped encoder checked, and the others sealed zeros.
 
 ### Tests
 - Codec behavior shared by v4, v6-unshaped, and v6-shaped (fragmentation, decode-ahead, zero chunks, tamper detection, cancellation, Debug redaction) runs once per codec in `snell-testkit`; `seal_init` parity runs once per codec in the buffer module. The per-codec copies are removed.
 - SOCKS5 TCP/UDP test helpers live once in `snell-testkit::oracle`, built on the protocol crate's SOCKS5 codec, and replace copies in the runtime tests, binary tests, and benches. `ProcessPair` takes `ServerOptions`.
 - Duplicate or tautological tests are removed, and process tests share one parametrized body.
+- The shared codec suite and the golden record checks are generic functions over the codec traits instead of macro bodies; `snell-testkit::seal_records` returns records in wire order. The seal-init parity check also runs on the unsafe-raw codec, so Miri covers the unsafe payload path.
 
 ## 0.1.2
 

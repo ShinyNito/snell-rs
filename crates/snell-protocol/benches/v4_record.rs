@@ -5,8 +5,8 @@
 use std::time::Instant;
 
 use snell_protocol::{
-    Buffer, DecodeStatus, FixedClock, Psk, RecordKind, RepeatEntropy, SALT_LEN, V4_WIRE_CAP,
-    V4Decoder, V4Encoder,
+    Buffer, DecodeStatus, FixedClock, Psk, RecordDecoder, RecordEncoder, RecordKind, RepeatEntropy,
+    SALT_LEN, V4_WIRE_CAP, V4Decoder, V4Encoder,
 };
 
 fn seal_and_take<'a>(

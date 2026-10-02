@@ -1,6 +1,6 @@
 use crate::socks5::{self, Command};
 use crate::{
-    Address, AddressRef, Buffer, DecodeStatus, Error, ParseState, Psk, V4Decoder,
+    Address, AddressRef, Buffer, DecodeStatus, Error, ParseState, Psk, RecordDecoder, V4Decoder,
     decode_connect_request_prefix, encode_connect_request,
 };
 

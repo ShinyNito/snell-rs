@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use snell_protocol::{
-    ConnectRequest, Error as ProtocolError, ProtocolFlavor, ProtocolSelection, Psk, V4Decoder,
-    V4Encoder, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
+    ConnectRequest, Error as ProtocolError, ProtocolFlavor, ProtocolSelection, Psk, RecordDecoder,
+    RecordEncoder, V4Decoder, V4Encoder, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder,
+    V6UnshapedEncoder,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -14,7 +15,7 @@ use tracing::{Instrument, debug, info, warn};
 
 use crate::auto::detect_protocol;
 use crate::bind_listener;
-use crate::codec::{TcpDecoder, TcpEncoder, with_codec};
+use crate::codec::with_codec;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
@@ -163,7 +164,7 @@ struct ExactSession<'a, D, E> {
     replay: Option<&'a ReplayCache>,
 }
 
-impl<D: TcpDecoder, E: TcpEncoder + Send + 'static> ExactSession<'_, D, E> {
+impl<D: RecordDecoder, E: RecordEncoder + Send + 'static> ExactSession<'_, D, E> {
     /// Authenticate the first request, then derive the response key, under
     /// one deadline. The codec is built here rather than passed in, so the
     /// future holds a single copy of it.
@@ -197,7 +198,7 @@ impl<D: TcpDecoder, E: TcpEncoder + Send + 'static> ExactSession<'_, D, E> {
 
 /// Serve requests on an authenticated session: UDP, or CONNECTs until the
 /// client stops reusing the connection.
-async fn server_session<E: TcpEncoder, D: TcpDecoder>(
+async fn server_session<E: RecordEncoder, D: RecordDecoder>(
     mut snell: TcpStream,
     encoder: &mut E,
     decoder: &mut D,

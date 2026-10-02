@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use snell_protocol::socks5;
 use snell_protocol::{
-    Address, AddressRef, Error, MAX_PACKET_SIZE, ProtocolFlavor, ProtocolSelection, Psk, V4Decoder,
-    V4Encoder,
+    Address, AddressRef, Error, MAX_PACKET_SIZE, ProtocolFlavor, ProtocolSelection, Psk,
+    RecordEncoder, V4Decoder, V4Encoder,
 };
 use snell_testkit::oracle::{
     socks5_connect, socks5_echo_roundtrip, socks5_udp_associate, socks5_udp_echo_roundtrip,

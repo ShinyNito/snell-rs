@@ -2,7 +2,9 @@
 
 use core::fmt;
 
-use crate::buffer::Slot;
+use crate::buffer::{Reservation, Slot};
+use crate::codec::RecordEncoder;
+use crate::codec::sealed::Seal;
 use crate::header::{parse_v6_plain_header, plain_header};
 use crate::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::{Buffer, Error, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, Result};
@@ -12,77 +14,55 @@ pub struct V6UnsafeRawEncoder {
     state: EncoderState,
 }
 
-#[must_use = "unsealed reservations are cancelled on drop"]
-pub struct V6UnsafeRawReservation<'a> {
-    encoder: &'a mut V6UnsafeRawEncoder,
-    buf: &'a mut Buffer,
-    slot: Slot,
-}
-
 impl V6UnsafeRawEncoder {
     pub fn new() -> Self {
         Self::default()
     }
+}
 
-    pub fn reserve<'buf>(
-        &'buf mut self,
-        buf: &'buf mut Buffer,
+impl RecordEncoder for V6UnsafeRawEncoder {
+    fn reserve<'a>(
+        &'a mut self,
+        buf: &'a mut Buffer,
         prefix: &[u8],
         hint: usize,
-    ) -> Result<V6UnsafeRawReservation<'buf>> {
+    ) -> Result<Reservation<'a, Self>> {
         self.state.ensure_ready()?;
         let max_payload = prefix.len().saturating_add(hint).min(MAX_PACKET_SIZE_V6);
         if prefix.len() > max_payload {
             return Err(Error::PayloadTooLarge);
         }
-        let record_start = buf.reserve_zeroed(HEADER_PLAIN_LEN + max_payload)?;
-        let payload_start = record_start + HEADER_PLAIN_LEN;
-        buf.range_mut(payload_start, payload_start + prefix.len())
-            .copy_from_slice(prefix);
-        self.state = EncoderState::Reserving;
-        Ok(V6UnsafeRawReservation {
-            encoder: self,
-            buf,
-            slot: Slot {
-                record_start,
-                payload_start,
-                prefix_len: prefix.len(),
-                max_payload,
-            },
-        })
+        let record_start = buf.reserve_record(HEADER_PLAIN_LEN + max_payload, HEADER_PLAIN_LEN)?;
+        buf.extend_from_slice(prefix)?;
+        let slot = Slot {
+            record_start,
+            payload_start: record_start + HEADER_PLAIN_LEN,
+            prefix_len: prefix.len(),
+            max_payload,
+        };
+        Ok(Reservation::new(self, buf, slot, ()))
     }
 }
 
-impl V6UnsafeRawReservation<'_> {
-    pub fn payload_mut(&mut self) -> &mut [u8] {
-        let slot = &self.slot;
-        self.buf.range_mut(
-            slot.payload_start + slot.prefix_len,
-            slot.payload_start + slot.max_payload,
-        )
+impl Seal for V6UnsafeRawEncoder {
+    type Record = ();
+
+    fn state(&mut self) -> &mut EncoderState {
+        &mut self.state
     }
 
-    pub fn capacity(&self) -> usize {
-        self.slot.capacity()
-    }
-
-    pub fn seal(self, written: usize) -> Result<()> {
-        let total = self.slot.total(written)?;
-        self.buf.set_record_end(self.slot.payload_start + total);
-        self.buf
-            .range_mut(self.slot.record_start, self.slot.payload_start)
-            .copy_from_slice(&plain_header(0, total));
-        self.encoder.state = EncoderState::Ready;
-        Ok(())
-    }
-}
-
-impl Drop for V6UnsafeRawReservation<'_> {
-    fn drop(&mut self) {
-        if self.encoder.state == EncoderState::Reserving {
-            let _ = self.buf.truncate(self.slot.record_start);
-            self.encoder.state = EncoderState::Ready;
-        }
+    fn finish(
+        &mut self,
+        buf: &mut Buffer,
+        slot: &Slot,
+        _: &(),
+        payload_len: usize,
+    ) -> Result<usize> {
+        buf.set_record_end(slot.payload_start + payload_len);
+        buf.range_mut(slot.record_start, slot.payload_start)
+            .copy_from_slice(&plain_header(0, payload_len));
+        self.state = EncoderState::Ready;
+        Ok(0)
     }
 }
 

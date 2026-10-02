@@ -3,7 +3,9 @@
 
 use std::mem::MaybeUninit;
 
-use crate::{Error, Result, TAG_LEN};
+use crate::codec::RecordEncoder;
+use crate::record::EncoderState;
+use crate::{Error, Result};
 
 /// Fixed backing allocation and a live byte range; never grows implicitly.
 pub struct Buffer {
@@ -220,10 +222,6 @@ impl Buffer {
         &mut self.storage[start..end]
     }
 
-    pub(crate) fn copy_within(&mut self, src: usize, dest: usize, n: usize) {
-        self.storage.copy_within(src..src + n, dest);
-    }
-
     /// Indices are absolute in `storage` and invalid across compact.
     pub(crate) fn truncate(&mut self, len: usize) -> Result<()> {
         if len < self.start || len > self.storage.len() {
@@ -264,102 +262,131 @@ impl Buffer {
     }
 }
 
-/// Payload slot of one reserved record, shared by the record encoders.
+/// Payload slot of one reserved record.
 ///
 /// Offsets are absolute in [`Buffer`] storage. [`Buffer::reserve_record`]
 /// guarantees they stay valid until the record is sealed or cancelled.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Slot {
+pub struct Slot {
     pub(crate) record_start: usize,
     pub(crate) payload_start: usize,
+    /// Bytes copied in front of the caller's payload at reserve time.
     pub(crate) prefix_len: usize,
+    /// Payload capacity, including the prefix.
     pub(crate) max_payload: usize,
 }
 
-impl Slot {
-    pub(crate) const fn capacity(&self) -> usize {
-        self.max_payload - self.prefix_len
+/// A record reserved in a [`Buffer`] by a [`RecordEncoder`]: write the
+/// payload, then seal it. Dropping it unsealed cancels the record.
+///
+/// The payload is written either through [`payload_mut`](Self::payload_mut)
+/// and sealed with [`seal`](Self::seal), or read straight into
+/// [`payload_uninit`](Self::payload_uninit) and sealed with
+/// [`seal_init`](Self::seal_init), which skips zero-filling it first.
+#[must_use = "unsealed reservations are cancelled on drop"]
+pub struct Reservation<'a, E: RecordEncoder> {
+    encoder: &'a mut E,
+    buf: &'a mut Buffer,
+    slot: Slot,
+    record: E::Record,
+}
+
+impl<'a, E: RecordEncoder> Reservation<'a, E> {
+    /// Hold `slot` for `encoder` once its prefix has been written. The
+    /// encoder stays `Reserving` until the record is sealed or cancelled.
+    pub(crate) fn new(
+        encoder: &'a mut E,
+        buf: &'a mut Buffer,
+        slot: Slot,
+        record: E::Record,
+    ) -> Self {
+        *encoder.state() = EncoderState::Reserving;
+        Self {
+            encoder,
+            buf,
+            slot,
+            record,
+        }
     }
 
-    /// Payload after the prefix, materializing the rest of the record
-    /// (payload and tag) for in-place writers.
-    pub(crate) fn payload_mut<'b>(&self, buf: &'b mut Buffer) -> &'b mut [u8] {
-        let end = self.payload_start + self.max_payload;
-        buf.zero_extend_to(end + TAG_LEN);
-        buf.range_mut(self.payload_start + self.prefix_len, end)
+    /// Payload bytes available after the prefix.
+    pub fn capacity(&self) -> usize {
+        self.slot.max_payload - self.slot.prefix_len
     }
 
-    /// Uninitialized payload after the prefix; empty once materialized.
-    pub(crate) fn payload_uninit<'b>(&self, buf: &'b mut Buffer) -> &'b mut [MaybeUninit<u8>] {
-        if buf.end() != self.payload_start + self.prefix_len {
+    /// The zero-filled payload after the prefix.
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        let end = self.slot.payload_start + self.slot.max_payload;
+        self.buf.zero_extend_to(end);
+        self.buf.range_mut(self.unwritten_start(), end)
+    }
+
+    /// The uninitialized payload after the prefix, for example for Tokio's
+    /// `ReadBuf::uninit`. Empty once [`payload_mut`](Self::payload_mut) has
+    /// zero-filled it.
+    pub fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
+        if self.buf.end() != self.unwritten_start() {
             return &mut [];
         }
-        &mut buf.spare_uninit()[..self.capacity()]
+        let capacity = self.capacity();
+        &mut self.buf.spare_uninit()[..capacity]
     }
 
-    /// Total payload length for `written` bytes after the prefix.
-    pub(crate) fn total(&self, written: usize) -> Result<usize> {
-        self.prefix_len
+    /// Seal `written` bytes of [`payload_mut`](Self::payload_mut). Returns
+    /// the record's split: send `[split..]` of the record, then `[..split]`.
+    pub fn seal(mut self, written: usize) -> Result<usize> {
+        let total = self.total(written)?;
+        if self.buf.end() < self.slot.payload_start + total {
+            return Err(Error::PendingWire);
+        }
+        self.finish(total)
+    }
+
+    /// Seal `written` bytes initialized in
+    /// [`payload_uninit`](Self::payload_uninit). Returns the record's split,
+    /// as [`seal`](Self::seal) does.
+    ///
+    /// # Safety
+    /// The first `written` bytes of `payload_uninit()` must have been
+    /// initialized since the reservation was created.
+    pub unsafe fn seal_init(mut self, written: usize) -> Result<usize> {
+        let total = self.total(written)?;
+        if self.buf.end() != self.unwritten_start() {
+            return Err(Error::PendingWire);
+        }
+        // SAFETY: the caller initialized these bytes of `payload_uninit`,
+        // which starts at the committed end of `buf`.
+        unsafe { self.buf.commit(written)? };
+        self.finish(total)
+    }
+
+    /// Absolute index just past the prefix, where the caller's bytes go.
+    fn unwritten_start(&self) -> usize {
+        self.slot.payload_start + self.slot.prefix_len
+    }
+
+    /// Payload length for `written` bytes after the prefix.
+    fn total(&self, written: usize) -> Result<usize> {
+        self.slot
+            .prefix_len
             .checked_add(written)
-            .filter(|&total| total <= self.max_payload)
+            .filter(|&total| total <= self.slot.max_payload)
             .ok_or(Error::PayloadTooLarge)
     }
 
-    /// Commit `written` caller-initialized bytes of [`Self::payload_uninit`].
-    /// Returns the total payload length including the prefix.
-    pub(crate) fn commit_init(&self, buf: &mut Buffer, written: usize) -> Result<usize> {
-        let total = self.total(written)?;
-        if buf.end() != self.payload_start + self.prefix_len {
-            return Err(Error::PendingWire);
-        }
-        // SAFETY: the public reservation entry points are unsafe and require
-        // these exact payload bytes to have been initialized.
-        unsafe {
-            buf.commit(written)?;
-        }
-        Ok(total)
+    fn finish(&mut self, payload_len: usize) -> Result<usize> {
+        self.encoder
+            .finish(self.buf, &self.slot, &self.record, payload_len)
     }
 }
 
-// Unsafe entry points live here, alongside the storage initialization boundary.
-impl<E: crate::Entropy, C: crate::Clock> crate::V4Reservation<'_, E, C> {
-    /// Seal bytes initialized directly in the uninitialized payload slot.
-    ///
-    /// # Safety
-    /// The first `written` bytes of this reservation's `payload_uninit()`
-    /// must have been initialized since the reservation was created.
-    pub unsafe fn seal_init(self, written: usize) -> Result<()> {
-        self.seal_init_impl(written)
-    }
-}
-impl<C: crate::Clock> crate::V6ShapedReservation<'_, C> {
-    /// Seal caller-initialized payload from `reserve_scattered`.
-    /// Payloads remain in place. Returns the record's split offset; send `[split..]`
-    /// followed by `[..split]`, excluding neither range.
-    ///
-    /// # Safety
-    /// The first `written` bytes of `payload_uninit()` must be initialized.
-    pub unsafe fn seal_init_scattered(self, written: usize) -> Result<usize> {
-        self.seal_init_scattered_impl(written)
-    }
-
-    /// Seal bytes initialized directly in the uninitialized payload slot.
-    ///
-    /// # Safety
-    /// The first `written` bytes of this reservation's `payload_uninit()`
-    /// must have been initialized since the reservation was created.
-    pub unsafe fn seal_init(self, written: usize) -> Result<()> {
-        self.seal_init_impl(written)
-    }
-}
-impl crate::V6UnshapedReservation<'_> {
-    /// Seal bytes initialized directly in the uninitialized payload slot.
-    ///
-    /// # Safety
-    /// The first `written` bytes of this reservation's `payload_uninit()`
-    /// must have been initialized since the reservation was created.
-    pub unsafe fn seal_init(self, written: usize) -> Result<()> {
-        self.seal_init_impl(written)
+impl<E: RecordEncoder> Drop for Reservation<'_, E> {
+    fn drop(&mut self) {
+        let state = self.encoder.state();
+        if *state == EncoderState::Reserving {
+            *state = EncoderState::Ready;
+            let _ = self.buf.truncate(self.slot.record_start);
+        }
     }
 }
 
@@ -374,58 +401,88 @@ mod tests {
     /// `seal_init` over `payload_uninit` is byte-identical to `seal` over
     /// `payload_mut` for first, prefixed, and short records. Mixing the two
     /// fails closed, cancels the record, and leaves the encoder usable.
-    macro_rules! seal_init_parity {
-        ($name:ident, $make:expr) => {
-            #[test]
-            #[cfg_attr(miri, ignore = "ring's AES-GCM is foreign code")]
-            fn $name() {
-                let psk = Psk::new(b"0123456789abcdef").unwrap();
-                let (mut a_enc, mut b_enc) = ($make(&psk), $make(&psk));
-                let mut a = Buffer::new(V6_WIRE_CAP);
-                let mut b = Buffer::new(V6_WIRE_CAP);
-                for (prefix, msg, hint) in [
-                    (&b""[..], &b"hello"[..], 5),
-                    (b"pfx", b"steady", 6),
-                    (b"", b"abc", 8),
-                ] {
-                    let mut rec = a_enc.reserve(&mut a, prefix, hint).unwrap();
-                    rec.payload_mut()[..msg.len()].copy_from_slice(msg);
-                    rec.seal(msg.len()).unwrap();
+    fn assert_seal_init_parity<E: RecordEncoder>(make: impl Fn(&Psk) -> E) {
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
+        let (mut a_enc, mut b_enc) = (make(&psk), make(&psk));
+        let mut a = Buffer::new(V6_WIRE_CAP);
+        let mut b = Buffer::new(V6_WIRE_CAP);
+        for (prefix, msg, hint) in [
+            (&b""[..], &b"hello"[..], 5),
+            (b"pfx", b"steady", 6),
+            (b"", b"abc", 8),
+        ] {
+            let mut rec = a_enc.reserve(&mut a, prefix, hint).unwrap();
+            rec.payload_mut()[..msg.len()].copy_from_slice(msg);
+            rec.seal(msg.len()).unwrap();
 
-                    let mut rec = b_enc.reserve(&mut b, prefix, hint).unwrap();
-                    rec.payload_uninit()[..msg.len()].write_copy_of_slice(msg);
-                    rec.seal_init_impl(msg.len()).unwrap();
-                }
-                assert_eq!(a.filled(), b.filled());
+            let mut rec = b_enc.reserve(&mut b, prefix, hint).unwrap();
+            rec.payload_uninit()[..msg.len()].write_copy_of_slice(msg);
+            // SAFETY: the preceding write initialized `msg.len()` bytes.
+            unsafe { rec.seal_init(msg.len()) }.unwrap();
+        }
+        assert_eq!(a.filled(), b.filled());
 
-                a.consume(a.len()).unwrap();
-                let mut rec = a_enc.reserve(&mut a, &[], 5).unwrap();
-                rec.payload_mut()[..5].copy_from_slice(b"hello");
-                assert!(rec.payload_uninit().is_empty());
-                assert_eq!(rec.seal_init_impl(5), Err(Error::PendingWire));
-                assert!(a.is_empty(), "a failed seal cancels the record");
-                let mut rec = a_enc.reserve(&mut a, &[], 5).unwrap();
-                rec.payload_mut()[..5].copy_from_slice(b"hello");
-                rec.seal(5).unwrap();
-                assert!(!a.is_empty());
-            }
-        };
+        a.consume(a.len()).unwrap();
+        let mut rec = a_enc.reserve(&mut a, &[], 5).unwrap();
+        rec.payload_mut()[..5].copy_from_slice(b"hello");
+        assert!(rec.payload_uninit().is_empty());
+        // SAFETY: `payload_mut` initialized the payload.
+        assert_eq!(unsafe { rec.seal_init(5) }, Err(Error::PendingWire));
+        assert!(a.is_empty(), "a failed seal cancels the record");
+        let mut rec = a_enc.reserve(&mut a, &[], 5).unwrap();
+        rec.payload_mut()[..5].copy_from_slice(b"hello");
+        rec.seal(5).unwrap();
+        assert!(!a.is_empty());
     }
 
-    seal_init_parity!(v4_seal_init_parity, |psk| V4Encoder::with_salt(
-        psk,
-        [7; SALT_LEN],
-        32,
-        RepeatEntropy { byte: 0x3c },
-        FixedClock::new(0),
-    )
-    .unwrap());
-    seal_init_parity!(v6_unshaped_seal_init_parity, |psk| {
-        V6UnshapedEncoder::with_salt(psk, [7; SALT_LEN]).unwrap()
-    });
-    seal_init_parity!(v6_shaped_seal_init_parity, |psk| {
-        V6ShapedEncoder::with_salt(psk, [7; SALT_LEN], FixedClock::new(0)).unwrap()
-    });
+    #[test]
+    #[cfg_attr(miri, ignore = "ring's AES-GCM is foreign code")]
+    fn v4_seal_init_parity() {
+        assert_seal_init_parity(|psk| {
+            V4Encoder::with_salt(
+                psk,
+                [7; SALT_LEN],
+                32,
+                RepeatEntropy { byte: 0x3c },
+                FixedClock::new(0),
+            )
+            .unwrap()
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "ring's AES-GCM is foreign code")]
+    fn v6_unshaped_seal_init_parity() {
+        assert_seal_init_parity(|psk| V6UnshapedEncoder::with_salt(psk, [7; SALT_LEN]).unwrap());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "ring's AES-GCM is foreign code")]
+    fn v6_shaped_seal_init_parity() {
+        assert_seal_init_parity(|psk| {
+            V6ShapedEncoder::with_salt(psk, [7; SALT_LEN], FixedClock::new(0)).unwrap()
+        });
+    }
+
+    /// The raw codec has no AEAD, so this runs under Miri as well.
+    #[cfg(feature = "unsafe-raw")]
+    #[test]
+    fn v6_raw_seal_init_parity() {
+        assert_seal_init_parity(|_| crate::V6UnsafeRawEncoder::new());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "ring's AES-GCM is foreign code")]
+    fn seal_requires_a_written_payload() {
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
+        let mut encoder = V6UnshapedEncoder::with_salt(&psk, [7; SALT_LEN]).unwrap();
+        let mut out = Buffer::new(V6_WIRE_CAP);
+        let rec = encoder.reserve(&mut out, &[], 5).unwrap();
+        assert_eq!(rec.seal(5), Err(Error::PendingWire));
+        assert!(out.is_empty(), "a failed seal cancels the record");
+        encoder.reserve(&mut out, &[], 5).unwrap().seal(0).unwrap();
+        assert!(!out.is_empty());
+    }
 
     #[test]
     fn failed_reservation_does_not_move_live_bytes() {

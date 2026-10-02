@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use snell_protocol::socks5::{self, Reply};
 use snell_protocol::{
-    Address, Error, MAX_UDP_PACKET_ADDR_LEN, UDP_ASSOCIATION_IDLE_SECS, UDP_DATAGRAM_MAX,
-    decode_udp_request, decode_udp_response,
+    Address, Error, MAX_UDP_PACKET_ADDR_LEN, RecordDecoder, RecordEncoder,
+    UDP_ASSOCIATION_IDLE_SECS, UDP_DATAGRAM_MAX, decode_udp_request, decode_udp_response,
 };
 
 use tokio::io::AsyncReadExt;
@@ -23,7 +23,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 
 use crate::client::dial;
-use crate::codec::{TcpDecoder, TcpEncoder, with_codec};
+use crate::codec::with_codec;
 use crate::dns::DnsResolver;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
@@ -430,7 +430,7 @@ impl Relay {
         })
     }
 
-    async fn pump<E: TcpEncoder, D: TcpDecoder>(
+    async fn pump<E: RecordEncoder, D: RecordDecoder>(
         &self,
         snell: &mut TcpStream,
         encoder: &mut E,
@@ -514,7 +514,7 @@ impl Drop for AssocGuard<'_> {
 }
 
 /// Relay one Snell UDP association through the server's outbound.
-pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
+pub(crate) async fn run_server_udp<E: RecordEncoder, D: RecordDecoder>(
     mut snell: TcpStream,
     encoder: &mut E,
     decoder: &mut D,

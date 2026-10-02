@@ -3,14 +3,13 @@
 
 use std::future::poll_fn;
 use std::io;
-use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use bytes::Buf;
-use snell_protocol::{Result, V4Reservation, V6ShapedReservation, V6UnshapedReservation};
+use snell_protocol::{RecordEncoder, Reservation};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::UdpSocket;
 
@@ -74,9 +73,9 @@ pub(crate) async fn read_into_recv<R: ReadReady + Unpin>(
     poll_fn(|cx| poll_read_into(reader, recv, minimum, 4096, cx)).await
 }
 
-pub(crate) fn poll_read_record<R: ReadReady + Unpin, T: TcpReservation>(
+pub(crate) fn poll_read_record<R: ReadReady + Unpin, E: RecordEncoder>(
     reader: &mut R,
-    mut reservation: T,
+    mut reservation: Reservation<'_, E>,
     cx: &mut Context<'_>,
 ) -> Poll<std::result::Result<(usize, usize), SessionError>> {
     let mut buf = ReadBuf::uninit(reservation.payload_uninit());
@@ -105,49 +104,6 @@ pub(crate) async fn drain_encode<W: AsyncWrite + Unpin>(
     encode.release_empty();
     Ok(())
 }
-
-pub(crate) trait TcpReservation {
-    fn payload_mut(&mut self) -> &mut [u8];
-    /// Uninitialized payload slot; pair with [`Self::seal_init`] after filling
-    /// a prefix through `ReadBuf::uninit`. Do not mix with `payload_mut`.
-    fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>];
-    /// Returns the record-relative split: send `[split..end]`, then `[..split]`.
-    fn seal(self, written: usize) -> Result<usize>;
-    /// Seal after initializing `written` bytes of [`Self::payload_uninit`].
-    unsafe fn seal_init(self, written: usize) -> Result<usize>;
-}
-
-// Every codec seals in place; only v6-shaped records are split (payload first).
-macro_rules! impl_tcp_reservation {
-    ($ty:ident, $seal:ident, $seal_init:ident, $split:expr) => {
-        impl TcpReservation for $ty<'_> {
-            fn payload_mut(&mut self) -> &mut [u8] {
-                $ty::payload_mut(self)
-            }
-
-            fn payload_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-                $ty::payload_uninit(self)
-            }
-
-            fn seal(self, written: usize) -> Result<usize> {
-                $ty::$seal(self, written).map($split)
-            }
-
-            unsafe fn seal_init(self, written: usize) -> Result<usize> {
-                unsafe { $ty::$seal_init(self, written) }.map($split)
-            }
-        }
-    };
-}
-
-impl_tcp_reservation!(V4Reservation, seal, seal_init, |()| 0);
-impl_tcp_reservation!(V6UnshapedReservation, seal, seal_init, |()| 0);
-impl_tcp_reservation!(
-    V6ShapedReservation,
-    seal_scattered,
-    seal_init_scattered,
-    |split| split
-);
 
 /// Lease a datagram buffer only once the socket is readable.
 pub(crate) async fn recv_datagram(

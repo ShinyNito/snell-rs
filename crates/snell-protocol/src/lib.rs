@@ -10,6 +10,7 @@ mod aead;
 mod buffer;
 mod chunk;
 mod clock;
+mod codec;
 mod control;
 mod entropy;
 mod error;
@@ -37,9 +38,10 @@ mod v6_raw;
 mod fragment;
 
 pub use address::{Address, AddressRef};
-pub use buffer::Buffer;
+pub use buffer::{Buffer, Reservation};
 pub use chunk::next_v4_chunk_limit;
 pub use clock::{Clock, FixedClock, MonotonicClock};
+pub use codec::{RecordDecoder, RecordEncoder};
 pub use control::{
     ConnectRequest, ServerReply, UdpPacket, connect_request_len, decode_connect_request,
     decode_connect_request_prefix, decode_server_reply, decode_udp_request, decode_udp_response,
@@ -54,11 +56,8 @@ pub use parse::ParseState;
 pub use record::{DecodeStatus, DecodedRecord, RecordKind};
 pub use secret::Psk;
 pub use stream::PlainStream;
-pub use v4::{V4Decoder, V4Encoder, V4Reservation};
-pub use v6::{
-    V6ShapedDecoder, V6ShapedEncoder, V6ShapedReservation, V6UnshapedDecoder, V6UnshapedEncoder,
-    V6UnshapedReservation,
-};
+pub use v4::{V4Decoder, V4Encoder};
+pub use v6::{V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder};
 
 /// Exact record-codec selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,7 +76,7 @@ pub enum ProtocolSelection {
 }
 
 #[cfg(feature = "unsafe-raw")]
-pub use v6::{V6UnsafeRawDecoder, V6UnsafeRawEncoder, V6UnsafeRawReservation};
+pub use v6::{V6UnsafeRawDecoder, V6UnsafeRawEncoder};
 
 /// Snell CONNECT / UDP-setup version byte. Distinct from the AEAD header marker.
 pub const PROTOCOL_VERSION: u8 = 0x01;
