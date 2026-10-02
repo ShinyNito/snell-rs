@@ -1,23 +1,38 @@
 use core::fmt;
+use std::sync::Arc;
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroizing;
 
+use crate::profile::Profile;
 use crate::{Error, PSK_MAX_LEN, PSK_MIN_LEN, Result};
 
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct Psk(Vec<u8>);
+/// A pre-shared key. Clones share one allocation holding the key bytes,
+/// wiped when the last clone drops, and the v6 shaped profile derived from
+/// them once, so sessions neither copy the key nor re-derive the profile.
+#[derive(Clone)]
+pub struct Psk(Arc<Key>);
+
+struct Key {
+    bytes: Zeroizing<Vec<u8>>,
+    profile: Profile,
+}
 
 impl Psk {
     pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self> {
-        let bytes = bytes.into();
+        let bytes = Zeroizing::new(bytes.into());
         if !(PSK_MIN_LEN..=PSK_MAX_LEN).contains(&bytes.len()) {
             return Err(Error::InvalidPskLen(bytes.len()));
         }
-        Ok(Self(bytes))
+        let profile = Profile::derive(&bytes);
+        Ok(Self(Arc::new(Key { bytes, profile })))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.0.bytes
+    }
+
+    pub(crate) fn profile(&self) -> &Profile {
+        &self.0.profile
     }
 }
 

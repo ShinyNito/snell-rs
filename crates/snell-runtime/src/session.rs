@@ -400,14 +400,6 @@ pub(crate) async fn wait_reuse_idle<R: ReadReady + Unpin>(
     .await
 }
 
-pub(crate) fn client_may_pool<D: TcpDecoder>(recv: &PooledBuffer, decoder: &D) -> bool {
-    recv.is_empty() && !decoder.has_unconsumed_plaintext()
-}
-
-pub(crate) fn server_may_reuse<D: TcpDecoder>(decoder: &D) -> bool {
-    !decoder.has_unconsumed_plaintext()
-}
-
 async fn fill_until<R: ReadReady + Unpin>(
     reader: &mut R,
     recv: &mut PooledBuffer,

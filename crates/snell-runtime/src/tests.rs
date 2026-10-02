@@ -18,10 +18,11 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+use crate::codec::Codec;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::outbound::Outbound;
-use crate::pool::{PooledCodec, PooledConn, ReusePool};
+use crate::pool::{Connection, ReusePool};
 use crate::replay::ReplayCache;
 use crate::server::handle_server;
 use crate::session::{write_tunnel, write_udp_request, write_udp_setup};
@@ -334,6 +335,7 @@ async fn start_counted(
         udp: UdpOptions::default(),
         tcp_brutal: None,
     };
+    let server_cfg = Arc::new(server_cfg);
     let kdf = Arc::new(KdfLimiter::new());
     let replay = Arc::new(ReplayCache::new());
     let accepts_server = accepts.clone();
@@ -343,14 +345,12 @@ async fn start_counted(
                 break;
             };
             accepts_server.fetch_add(1, Ordering::SeqCst);
-            let server_cfg = server_cfg.clone();
-            let kdf = kdf.clone();
-            let replay = replay.clone();
+            let (server_cfg, kdf, replay) = (server_cfg.clone(), kdf.clone(), replay.clone());
             tokio::spawn(async move {
                 let permit = Arc::new(tokio::sync::Semaphore::new(1))
                     .try_acquire_owned()
                     .unwrap();
-                let _ = handle_server(stream, server_cfg, kdf, replay, permit).await;
+                let _ = handle_server(stream, &server_cfg, &kdf, &replay, permit).await;
             });
         }
     });
@@ -439,9 +439,9 @@ async fn stale_pool_retries_once() {
     let psk = Psk::new(PSK.to_vec()).unwrap();
     let encoder = V4Encoder::os(&psk).unwrap();
     let decoder = V4Decoder::new(psk);
-    assert!(pool.put(PooledConn {
+    assert!(pool.put(Connection {
         stream,
-        codec: PooledCodec::V4 { encoder, decoder },
+        codec: Codec::V4 { encoder, decoder },
     }));
     // Close only after checkout and the attempted CONNECT. A preclosed socket
     // is rejected by put/take and never reaches the retry path.
@@ -538,16 +538,11 @@ async fn early_payload_over_64kib_is_rejected() {
     };
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        handle_server(
-            stream,
-            cfg,
-            Arc::new(KdfLimiter::new()),
-            Arc::new(ReplayCache::new()),
-            Arc::new(tokio::sync::Semaphore::new(1))
-                .try_acquire_owned()
-                .unwrap(),
-        )
-        .await
+        let (kdf, replay) = (KdfLimiter::new(), ReplayCache::new());
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        handle_server(stream, &cfg, &kdf, &replay, permit).await
     });
 
     let mut client = TcpStream::connect(addr).await.unwrap();

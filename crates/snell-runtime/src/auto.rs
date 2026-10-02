@@ -7,10 +7,10 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 
 use crate::bufio::read_into_recv;
+use crate::codec::Codec;
 use crate::codec::TcpDecoder;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
-use crate::pool::PooledCodec;
 use crate::replay::ReplayCache;
 use crate::session::{
     FirstRequest, HANDSHAKE_PLAIN_MAX, ServerFirst, maybe_install_kdf, parse_first_request,
@@ -121,7 +121,7 @@ pub(crate) async fn detect_protocol(
     kdf: &KdfLimiter,
     replay: &ReplayCache,
     buffers: &Arc<BufferPool>,
-) -> Result<(PooledCodec, PooledBuffer, ServerFirst), SessionError> {
+) -> Result<(Codec, PooledBuffer, ServerFirst), SessionError> {
     let detect = detect_inner(stream, psk, kdf, replay, buffers);
     with_timeout(
         AUTO_DETECT_TIMEOUT_SECS,
@@ -137,7 +137,7 @@ async fn detect_inner(
     kdf: &KdfLimiter,
     replay: &ReplayCache,
     buffers: &Arc<BufferPool>,
-) -> Result<(PooledCodec, PooledBuffer, ServerFirst), SessionError> {
+) -> Result<(Codec, PooledBuffer, ServerFirst), SessionError> {
     let mut prefix = buffers.get(AUTO_DETECT_PREFIX_MAX);
     let mut v4 = Candidate::new(V4Decoder::new(psk.clone()), buffers);
     let mut v6 = Candidate::new(V6ShapedDecoder::new(psk.clone()), buffers);
@@ -152,7 +152,7 @@ async fn detect_inner(
         }
         if let Some(first) = v4.take_match() {
             let encoder = kdf.derive(psk, V4Encoder::os).await?;
-            let codec = PooledCodec::V4 {
+            let codec = Codec::V4 {
                 encoder,
                 decoder: v4.decoder,
             };
@@ -163,7 +163,7 @@ async fn detect_inner(
                 replay.insert(id)?;
             }
             let encoder = kdf.derive(psk, V6ShapedEncoder::os).await?;
-            let codec = PooledCodec::V6Shaped {
+            let codec = Codec::V6Shaped {
                 encoder,
                 decoder: v6.decoder,
             };

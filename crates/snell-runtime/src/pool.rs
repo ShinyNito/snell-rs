@@ -2,35 +2,19 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use snell_protocol::{
-    CLIENT_POOL_MAX_IDLE_SECS, CLIENT_POOL_MAX_SIZE, V4Decoder, V4Encoder, V6ShapedDecoder,
-    V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
-};
+use snell_protocol::{CLIENT_POOL_MAX_IDLE_SECS, CLIENT_POOL_MAX_SIZE};
 use tokio::net::TcpStream;
 
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum PooledCodec {
-    V4 {
-        encoder: V4Encoder,
-        decoder: V4Decoder,
-    },
-    V6Shaped {
-        encoder: V6ShapedEncoder,
-        decoder: V6ShapedDecoder,
-    },
-    V6Unshaped {
-        encoder: V6UnshapedEncoder,
-        decoder: V6UnshapedDecoder,
-    },
-}
+use crate::codec::Codec;
 
-pub(crate) struct PooledConn {
+/// An authenticated client connection to the server and its session codec.
+pub(crate) struct Connection {
     pub stream: TcpStream,
-    pub codec: PooledCodec,
+    pub codec: Codec,
 }
 
 struct PooledEntry {
-    conn: PooledConn,
+    conn: Connection,
     returned_at: Instant,
 }
 
@@ -74,7 +58,7 @@ impl ReusePool {
         }
     }
 
-    pub(crate) fn take(&self) -> Option<PooledConn> {
+    pub(crate) fn take(&self) -> Option<Connection> {
         let mut entries = self.lock();
         std::iter::from_fn(|| entries.pop_front())
             .find(|entry| {
@@ -83,7 +67,7 @@ impl ReusePool {
             .map(|entry| entry.conn)
     }
 
-    pub(crate) fn put(&self, conn: PooledConn) -> bool {
+    pub(crate) fn put(&self, conn: Connection) -> bool {
         if self.max_size == 0 || socket_dead(&conn.stream) {
             return false;
         }
@@ -131,6 +115,7 @@ fn socket_dead(stream: &TcpStream) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snell_protocol::{Psk, V4Decoder, V4Encoder};
     use std::thread;
     use tokio::net::TcpListener;
 
@@ -145,11 +130,11 @@ mod tests {
                 .await
                 .unwrap();
             let (mut peer, _) = listener.accept().await.unwrap();
-            let psk = snell_protocol::Psk::new(b"0123456789abcdef").unwrap();
+            let psk = Psk::new(b"0123456789abcdef").unwrap();
             assert_eq!(
-                pool.put(PooledConn {
+                pool.put(Connection {
                     stream,
-                    codec: PooledCodec::V4 {
+                    codec: Codec::V4 {
                         encoder: V4Encoder::os(&psk).unwrap(),
                         decoder: V4Decoder::new(psk),
                     }
@@ -178,13 +163,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let stream = TcpStream::connect(addr).await.unwrap();
         let _peer = listener.accept().await.unwrap().0;
-        let psk = snell_protocol::Psk::new(b"0123456789abcdef").unwrap();
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
         let encoder = V4Encoder::os(&psk).unwrap();
         let decoder = V4Decoder::new(psk);
         let pool = ReusePool::with_limits(2, Duration::from_millis(1));
-        assert!(pool.put(PooledConn {
+        assert!(pool.put(Connection {
             stream,
-            codec: PooledCodec::V4 { encoder, decoder },
+            codec: Codec::V4 { encoder, decoder },
         }));
         thread::sleep(Duration::from_millis(3));
         assert!(pool.take().is_none());
@@ -197,13 +182,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let stream = TcpStream::connect(addr).await.unwrap();
         let peer = listener.accept().await.unwrap().0;
-        let psk = snell_protocol::Psk::new(b"0123456789abcdef").unwrap();
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
         let encoder = V4Encoder::os(&psk).unwrap();
         let decoder = V4Decoder::new(psk);
         let pool = ReusePool::with_limits(2, Duration::from_secs(300));
-        assert!(pool.put(PooledConn {
+        assert!(pool.put(Connection {
             stream,
-            codec: PooledCodec::V4 { encoder, decoder },
+            codec: Codec::V4 { encoder, decoder },
         }));
         drop(peer);
         tokio::time::sleep(Duration::from_millis(30)).await;

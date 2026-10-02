@@ -21,8 +21,8 @@ use crate::outbound::Outbound;
 use crate::platform::{self, AcceptLoop, TcpBrutal, prepare_session_stream};
 use crate::replay::ReplayCache;
 use crate::session::{
-    ServerFirst, read_server_connect, relay, server_may_reuse, wait_reuse_idle,
-    with_handshake_timeout, write_reject, write_tunnel,
+    ServerFirst, read_server_connect, relay, wait_reuse_idle, with_handshake_timeout, write_reject,
+    write_tunnel,
 };
 use crate::udp::{UdpOptions, run_server_udp};
 
@@ -56,6 +56,7 @@ pub async fn serve_server(
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SessionError> {
     tokio::pin!(shutdown);
+    let config = Arc::new(config);
     let kdf = Arc::new(KdfLimiter::new());
     let replay = Arc::new(ReplayCache::new());
     let mut accept = AcceptLoop::new(&listener);
@@ -70,18 +71,18 @@ pub async fn serve_server(
             }
             accepted = accept.next() => {
                 let (stream, peer) = accepted?;
-                let Ok(handshake) = handshakes.clone().try_acquire_owned() else {
+                let Ok(handshake) = Arc::clone(&handshakes).try_acquire_owned() else {
                     drop(stream);
                     continue;
                 };
-                let config = config.clone();
-                let kdf = kdf.clone();
-                let replay = replay.clone();
+                let config = Arc::clone(&config);
+                let kdf = Arc::clone(&kdf);
+                let replay = Arc::clone(&replay);
                 let id = session_ids.fetch_add(1, Ordering::Relaxed);
                 let span = tracing::info_span!("session", id, peer = %peer);
                 tokio::spawn(async move {
                     debug!("accepted");
-                    match handle_server(stream, config, kdf, replay, handshake).await {
+                    match handle_server(stream, &config, &kdf, &replay, handshake).await {
                         Ok(()) => debug!("session finished"),
                         Err(error) if error.is_peer_closed() => {
                             debug!(error = %error, "session closed by peer");
@@ -97,10 +98,10 @@ pub async fn serve_server(
 }
 
 pub(crate) async fn handle_server(
-    mut snell: TcpStream,
-    config: ServerConfig,
-    kdf: Arc<KdfLimiter>,
-    replay: Arc<ReplayCache>,
+    snell: TcpStream,
+    config: &ServerConfig,
+    kdf: &KdfLimiter,
+    replay: &ReplayCache,
     handshake: OwnedSemaphorePermit,
 ) -> Result<(), SessionError> {
     prepare_session_stream(&snell)?;
@@ -109,139 +110,122 @@ pub(crate) async fn handle_server(
     {
         warn!(error = %error, "tcp_brutal unavailable; continuing without it");
     }
-    let psk = &config.psk;
     match config.selection {
         ProtocolSelection::Exact(ProtocolFlavor::V4 | ProtocolFlavor::V5) => {
-            let decoder = V4Decoder::new(psk.clone());
-            exact_session(snell, decoder, config, &kdf, None, handshake, V4Encoder::os).await
+            let session = ExactSession {
+                make_decoder: V4Decoder::new,
+                make_encoder: V4Encoder::os,
+                replay: None,
+            };
+            session.run(snell, config, kdf, handshake).await
         }
         ProtocolSelection::Exact(ProtocolFlavor::V6Shaped) => {
-            let decoder = V6ShapedDecoder::new(psk.clone());
-            let replay = Some(replay.as_ref());
-            exact_session(
-                snell,
-                decoder,
-                config,
-                &kdf,
-                replay,
-                handshake,
-                V6ShapedEncoder::os,
-            )
-            .await
+            let session = ExactSession {
+                make_decoder: V6ShapedDecoder::new,
+                make_encoder: V6ShapedEncoder::os,
+                replay: Some(replay),
+            };
+            session.run(snell, config, kdf, handshake).await
         }
         ProtocolSelection::Exact(ProtocolFlavor::V6Unshaped) => {
-            let decoder = V6UnshapedDecoder::new(psk.clone());
-            let replay = Some(replay.as_ref());
-            exact_session(
-                snell,
-                decoder,
-                config,
-                &kdf,
-                replay,
-                handshake,
-                V6UnshapedEncoder::os,
-            )
-            .await
+            let session = ExactSession {
+                make_decoder: V6UnshapedDecoder::new,
+                make_encoder: V6UnshapedEncoder::os,
+                replay: Some(replay),
+            };
+            session.run(snell, config, kdf, handshake).await
         }
-        ProtocolSelection::Auto => {
-            let (codec, recv, first) =
-                detect_protocol(&mut snell, psk, &kdf, &replay, &config.buffers).await?;
-            drop(handshake);
-            with_codec!(codec, |encoder, decoder| {
-                server_session(
-                    snell,
-                    encoder,
-                    decoder,
-                    config.outbound,
-                    &kdf,
-                    &config.psk,
-                    recv,
-                    first,
-                    &config.udp,
-                )
-                .await
-            })
-        }
+        ProtocolSelection::Auto => auto_session(snell, config, kdf, replay, handshake).await,
     }
 }
 
-// All exact flavors authenticate before deriving a response key, under one deadline.
-async fn exact_session<E, D>(
+async fn auto_session(
     mut snell: TcpStream,
-    mut decoder: D,
-    config: ServerConfig,
+    config: &ServerConfig,
     kdf: &KdfLimiter,
-    replay: Option<&ReplayCache>,
+    replay: &ReplayCache,
     handshake: OwnedSemaphorePermit,
-    make_encoder: fn(&Psk) -> Result<E, ProtocolError>,
-) -> Result<(), SessionError>
-where
-    D: TcpDecoder,
-    E: TcpEncoder + Send + 'static,
-{
-    let mut recv = config.buffers.get(snell_protocol::V6_WIRE_CAP);
-    let (first, encoder) = with_handshake_timeout(async {
-        let first = read_server_connect(
-            &mut decoder,
-            &mut recv,
-            &mut snell,
-            kdf,
-            &config.psk,
-            replay,
-        )
-        .await?;
-        let encoder = kdf.derive(&config.psk, make_encoder).await?;
-        Ok((first, encoder))
-    })
-    .await?;
+) -> Result<(), SessionError> {
+    // Boxed: detection state is large and needed only until the first request
+    // authenticates, not for the session's lifetime.
+    let detect = detect_protocol(&mut snell, &config.psk, kdf, replay, &config.buffers);
+    let (mut codec, recv, first) = Box::pin(detect).await?;
     drop(handshake);
-    server_session(
-        snell,
-        encoder,
-        decoder,
-        config.outbound,
-        kdf,
-        &config.psk,
-        recv,
-        first,
-        &config.udp,
-    )
-    .await
+    with_codec!(&mut codec, |encoder, decoder| {
+        server_session(snell, encoder, decoder, config, kdf, recv, first).await
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One exact flavor: how to build its codec, and whether salts are replay-checked.
+struct ExactSession<'a, D, E> {
+    make_decoder: fn(Psk) -> D,
+    make_encoder: fn(&Psk) -> Result<E, ProtocolError>,
+    replay: Option<&'a ReplayCache>,
+}
+
+impl<D: TcpDecoder, E: TcpEncoder + Send + 'static> ExactSession<'_, D, E> {
+    /// Authenticate the first request, then derive the response key, under
+    /// one deadline. The codec is built here rather than passed in, so the
+    /// future holds a single copy of it.
+    async fn run(
+        self,
+        mut snell: TcpStream,
+        config: &ServerConfig,
+        kdf: &KdfLimiter,
+        handshake: OwnedSemaphorePermit,
+    ) -> Result<(), SessionError> {
+        let mut decoder = (self.make_decoder)(config.psk.clone());
+        let mut recv = config.buffers.get(snell_protocol::V6_WIRE_CAP);
+        let (first, mut encoder) = with_handshake_timeout(async {
+            let first = read_server_connect(
+                &mut decoder,
+                &mut recv,
+                &mut snell,
+                kdf,
+                &config.psk,
+                self.replay,
+            )
+            .await?;
+            let encoder = kdf.derive(&config.psk, self.make_encoder).await?;
+            Ok((first, encoder))
+        })
+        .await?;
+        drop(handshake);
+        server_session(snell, &mut encoder, &mut decoder, config, kdf, recv, first).await
+    }
+}
+
+/// Serve requests on an authenticated session: UDP, or CONNECTs until the
+/// client stops reusing the connection.
 async fn server_session<E: TcpEncoder, D: TcpDecoder>(
     mut snell: TcpStream,
-    mut encoder: E,
-    mut decoder: D,
-    outbound: Outbound,
+    encoder: &mut E,
+    decoder: &mut D,
+    config: &ServerConfig,
     kdf: &KdfLimiter,
-    psk: &Psk,
     mut recv: PooledBuffer,
     mut command: ServerFirst,
-    udp: &UdpOptions,
 ) -> Result<(), SessionError> {
-    let buffers = Arc::clone(recv.pool());
+    let buffers = &config.buffers;
     let mut reused = false;
     loop {
         let (ConnectRequest { destination, reuse }, leftover) = match command {
             ServerFirst::Connect { request, leftover } => (request, leftover),
             ServerFirst::Udp => {
-                return run_server_udp(snell, encoder, decoder, outbound, kdf, psk, recv, udp)
-                    .await;
+                return run_server_udp(snell, encoder, decoder, config, kdf, recv).await;
             }
         };
 
         let mut remote = match with_handshake_timeout(async {
-            let remote = outbound.connect(&destination).await?;
-            write_tunnel(&mut encoder, &buffers, &mut snell).await?;
+            let remote = config.outbound.connect(&destination).await?;
+            write_tunnel(encoder, buffers, &mut snell).await?;
             Ok(remote)
         })
         .await
         {
             Ok(remote) => remote,
             Err(error) => {
-                let _ = write_reject(&mut encoder, &buffers, &mut snell, &error.to_string()).await;
+                let _ = write_reject(encoder, buffers, &mut snell, &error.to_string()).await;
                 return Err(error);
             }
         };
@@ -255,27 +239,24 @@ async fn server_session<E: TcpEncoder, D: TcpDecoder>(
         relay(
             &mut snell,
             &mut remote,
-            &mut encoder,
-            &mut decoder,
+            encoder,
+            decoder,
             &mut recv,
             leftover,
             reuse,
         )
         .await?;
-        if !reuse {
-            return Ok(());
-        }
-        if !server_may_reuse(&decoder) {
+        if !reuse || decoder.has_unconsumed_plaintext() {
             return Ok(());
         }
         recv.release_empty();
         wait_reuse_idle(&mut snell, &mut recv).await?;
         command = with_handshake_timeout(read_server_connect(
-            &mut decoder,
+            decoder,
             &mut recv,
             &mut snell,
             kdf,
-            psk,
+            &config.psk,
             None,
         ))
         .await?;
@@ -318,11 +299,12 @@ mod tests {
                 tcp_brutal: None,
             };
             let handshakes = Arc::new(Semaphore::new(1));
+            let replay = ReplayCache::new();
             let mut session = Box::pin(handle_server(
                 stream,
-                config,
-                kdf.clone(),
-                Arc::new(ReplayCache::new()),
+                &config,
+                &kdf,
+                &replay,
                 handshakes.clone().try_acquire_owned().unwrap(),
             ));
             assert!(
@@ -368,13 +350,11 @@ mod tests {
                 buffers: buffers.clone(),
                 tcp_brutal: None,
             };
-            let task = tokio::spawn(handle_server(
-                stream,
-                config,
-                Arc::new(KdfLimiter::new()),
-                Arc::new(ReplayCache::new()),
-                handshakes.clone().try_acquire_owned().unwrap(),
-            ));
+            let handshake = handshakes.clone().try_acquire_owned().unwrap();
+            let task = tokio::spawn(async move {
+                let (kdf, replay) = (KdfLimiter::new(), ReplayCache::new());
+                handle_server(stream, &config, &kdf, &replay, handshake).await
+            });
             let mut encoder = V4Encoder::os(&psk).unwrap();
             let mut decoder = V4Decoder::new(psk.clone());
             let client_buffers = Arc::new(BufferPool::default());

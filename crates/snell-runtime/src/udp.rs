@@ -4,7 +4,7 @@
 //! Each association owns one Snell TCP. Idle uses a per-association `Sleep`,
 //! not an O(N) map scan. Queue full is `try_send` failure plus a real counter.
 
-use crate::buffer::{BufferPool, PooledBuffer};
+use crate::buffer::PooledBuffer;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use snell_protocol::socks5::{self, Reply};
 use snell_protocol::{
-    Address, Error, MAX_UDP_PACKET_ADDR_LEN, ProtocolFlavor, Psk, UDP_ASSOCIATION_IDLE_SECS,
-    UDP_DATAGRAM_MAX, decode_udp_request, decode_udp_response,
+    Address, Error, MAX_UDP_PACKET_ADDR_LEN, UDP_ASSOCIATION_IDLE_SECS, UDP_DATAGRAM_MAX,
+    decode_udp_request, decode_udp_response,
 };
 
 use tokio::io::AsyncReadExt;
@@ -22,18 +22,20 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 
-use crate::client::dial_and_codec;
+use crate::client::dial;
 use crate::codec::{TcpDecoder, TcpEncoder, with_codec};
 use crate::dns::DnsResolver;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
-use crate::outbound::Outbound;
 use crate::packet::{PacketBuf, PacketQuota};
+use crate::platform::prepare_session_stream;
+use crate::pool::Connection;
 use crate::session::{
     RecordEvent, decode_once, read_server_tunnel, with_handshake_timeout, write_reject,
     write_tunnel, write_udp_request, write_udp_response, write_udp_setup,
 };
 use crate::socks::write_socks5_reply_bind;
+use crate::{ClientConfig, ServerConfig};
 
 const UDP_ASSOCIATION_MAX: usize = 256;
 const UDP_CONTROL_MAX: usize = 256;
@@ -121,20 +123,27 @@ struct InboundDgram {
     buf: PacketBuf,
 }
 
-struct AssocEntry {
+/// SOCKS5 UDP relay state shared by the dispatcher and association tasks.
+struct Relay {
+    socket: UdpSocket,
+    config: Arc<ClientConfig>,
+    kdf: Arc<KdfLimiter>,
+    quota: Arc<PacketQuota>,
+    ctrl: mpsc::Sender<Ctrl>,
+}
+
+/// A client peer's association task and the control connection it belongs to.
+struct Association {
     tx: mpsc::Sender<InboundDgram>,
     control: ControlId,
 }
 
-/// Client peers routed through each SOCKS5 control connection.
-type Controls = HashMap<ControlId, HashSet<SocketAddr>>;
-
-#[derive(Clone)]
-struct Dial {
-    server: SocketAddr,
-    psk: Psk,
-    version: ProtocolFlavor,
-    kdf: Arc<KdfLimiter>,
+/// Associations by client peer, and the peers of each SOCKS5 control
+/// connection. The two maps change together.
+#[derive(Default)]
+struct Routes {
+    associations: HashMap<SocketAddr, Association>,
+    peers: HashMap<ControlId, HashSet<SocketAddr>>,
 }
 
 #[derive(Clone)]
@@ -171,16 +180,14 @@ impl Drop for ControlGuard {
 impl UdpHub {
     pub async fn start(
         listen: SocketAddr,
-        config: crate::ClientConfig,
+        config: Arc<ClientConfig>,
         kdf: Arc<KdfLimiter>,
     ) -> Result<Self, SessionError> {
         let socket = UdpSocket::bind(SocketAddr::new(listen.ip(), 0)).await?;
         let bind = socket.local_addr()?;
-        let socket = Arc::new(socket);
         let limits = config.udp.limits;
-        let metrics = config.udp.metrics.clone();
-        let pool = Arc::new(PacketQuota::new(
-            config.buffers.clone(),
+        let quota = Arc::new(PacketQuota::new(
+            Arc::clone(&config.buffers),
             limits.pool_bufs,
             limits.pool_bytes,
         ));
@@ -189,38 +196,27 @@ impl UdpHub {
             .saturating_mul(2)
             .saturating_add(limits.max_associations)
             .max(1);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel(ctrl_cap);
-        let dial = Dial {
-            server: config.server,
-            psk: config.psk.clone(),
-            version: config.version,
-            kdf,
-        };
-        let dispatcher = tokio::spawn(dispatcher(
+        let (ctrl, ctrl_rx) = mpsc::channel(ctrl_cap);
+        let relay = Relay {
             socket,
-            ctrl_rx,
-            ctrl_tx.clone(),
-            pool,
-            metrics.clone(),
-            limits,
-            dial,
-        ));
+            config,
+            kdf,
+            quota,
+            ctrl: ctrl.clone(),
+        };
+        let dispatcher = tokio::spawn(dispatcher(Arc::new(relay), ctrl_rx));
         Ok(Self {
             bind,
-            _dispatcher: Arc::new(StopDispatcher(dispatcher.abort_handle())),
-            ctrl: ctrl_tx,
+            ctrl,
             next_control: Arc::new(AtomicU64::new(1)),
             controls: Arc::new(Semaphore::new(limits.max_controls)),
+            _dispatcher: Arc::new(StopDispatcher(dispatcher.abort_handle())),
         })
-    }
-
-    pub fn bind_addr(&self) -> SocketAddr {
-        self.bind
     }
 
     pub async fn handle_associate(&self, mut local: TcpStream) -> Result<(), SessionError> {
         let Ok(slot) = Arc::clone(&self.controls).try_acquire_owned() else {
-            write_socks5_reply_bind(&mut local, Reply::GeneralFailure, self.bind_addr()).await?;
+            write_socks5_reply_bind(&mut local, Reply::GeneralFailure, self.bind).await?;
             return Err(SessionError::UdpLimit);
         };
         let id = self.next_control.fetch_add(1, Ordering::Relaxed);
@@ -241,20 +237,11 @@ impl UdpHub {
             .send(Ctrl::Add(id))
             .await
             .map_err(|_| SessionError::Cancelled)?;
-        write_socks5_reply_bind(&mut local, Reply::Succeeded, self.bind_addr()).await?;
+        write_socks5_reply_bind(&mut local, Reply::Succeeded, self.bind).await?;
         // The association lives until the SOCKS5 control connection closes.
         while local.read(&mut [0u8; 1]).await.is_ok_and(|n| n > 0) {}
         Ok(())
     }
-}
-
-/// Prefer a control with no peers yet; `None` when no control is live.
-fn pick_control(controls: &Controls) -> Option<ControlId> {
-    controls
-        .iter()
-        .find(|(_, peers)| peers.is_empty())
-        .or_else(|| controls.iter().next())
-        .map(|(id, _)| *id)
 }
 
 fn offer(
@@ -275,146 +262,119 @@ fn offer(
     }
 }
 
-async fn dispatcher(
-    socket: Arc<UdpSocket>,
-    mut ctrl_rx: mpsc::Receiver<Ctrl>,
-    ctrl_tx: mpsc::Sender<Ctrl>,
-    pool: Arc<PacketQuota>,
-    metrics: Arc<UdpMetrics>,
-    limits: UdpLimits,
-    dial: Dial,
-) {
-    let mut map: HashMap<SocketAddr, AssocEntry> = HashMap::new();
-    let mut controls = Controls::new();
+async fn dispatcher(relay: Arc<Relay>, mut ctrl_rx: mpsc::Receiver<Ctrl>) {
+    let metrics = &relay.config.udp.metrics;
+    let mut routes = Routes::default();
     loop {
         tokio::select! {
             ctrl = ctrl_rx.recv() => {
                 let Some(ctrl) = ctrl else { return; };
-                apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
+                routes.apply(ctrl, metrics);
                 continue;
             }
-            ready = socket.readable() => { if ready.is_err() { return; } }
+            ready = relay.socket.readable() => { if ready.is_err() { return; } }
         }
         tokio::select! {
             ctrl = ctrl_rx.recv() => {
                 let Some(ctrl) = ctrl else { return; };
-                apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
+                routes.apply(ctrl, metrics);
             }
-            result = pool.recv_from(&socket) => {
-                match result {
-                    Ok(Some((buf, peer))) => handle_datagram(peer, buf, &mut map, &mut controls, &pool, &metrics, limits, &dial, &socket, &ctrl_tx),
-                    Ok(None) => {
-                        metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
-                        tokio::select! {
-                            ctrl = ctrl_rx.recv() => {
-                                let Some(ctrl) = ctrl else { return; };
-                                apply_ctrl(ctrl, &mut map, &mut controls, &metrics);
-                            }
-                            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            result = relay.quota.recv_from(&relay.socket) => match result {
+                Ok(Some((buf, peer))) => routes.route(&relay, peer, buf),
+                Ok(None) => {
+                    metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
+                    tokio::select! {
+                        ctrl = ctrl_rx.recv() => {
+                            let Some(ctrl) = ctrl else { return; };
+                            routes.apply(ctrl, metrics);
                         }
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
                     }
-                    Err(_) => {}
                 }
-            }
+                Err(_) => {}
+            },
         }
     }
 }
 
-fn apply_ctrl(
-    ctrl: Ctrl,
-    map: &mut HashMap<SocketAddr, AssocEntry>,
-    controls: &mut Controls,
-    metrics: &UdpMetrics,
-) {
-    match ctrl {
-        Ctrl::Add(id) => {
-            controls.insert(id, HashSet::new());
-        }
-        Ctrl::Remove(id) => {
-            if let Some(peers) = controls.remove(&id) {
-                for peer in peers {
-                    if map.remove(&peer).is_some() {
+impl Routes {
+    fn apply(&mut self, ctrl: Ctrl, metrics: &UdpMetrics) {
+        match ctrl {
+            Ctrl::Add(id) => {
+                self.peers.insert(id, HashSet::new());
+            }
+            Ctrl::Remove(id) => {
+                for peer in self.peers.remove(&id).unwrap_or_default() {
+                    if self.associations.remove(&peer).is_some() {
                         metrics.associations.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }
-        }
-        Ctrl::Closed(peer) => {
-            if let Some(entry) = map.remove(&peer) {
-                metrics.associations.fetch_sub(1, Ordering::Relaxed);
-                if let Some(peers) = controls.get_mut(&entry.control) {
-                    peers.remove(&peer);
+            Ctrl::Closed(peer) => {
+                if let Some(association) = self.associations.remove(&peer) {
+                    metrics.associations.fetch_sub(1, Ordering::Relaxed);
+                    if let Some(peers) = self.peers.get_mut(&association.control) {
+                        peers.remove(&peer);
+                    }
                 }
             }
         }
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn handle_datagram(
-    peer: SocketAddr,
-    buf: PacketBuf,
-    map: &mut HashMap<SocketAddr, AssocEntry>,
-    controls: &mut Controls,
-    pool: &Arc<PacketQuota>,
-    metrics: &Arc<UdpMetrics>,
-    limits: UdpLimits,
-    dial: &Dial,
-    socket: &Arc<UdpSocket>,
-    ctrl_tx: &mpsc::Sender<Ctrl>,
-) {
-    let packet = match socks5::parse_udp_packet(buf.as_slice()) {
-        Ok(packet) => packet,
-        Err(_) => {
-            metrics.invalid.fetch_add(1, Ordering::Relaxed);
+    /// Prefer a control with no peers yet; `None` when no control is live.
+    fn pick_control(&self) -> Option<ControlId> {
+        self.peers
+            .iter()
+            .find(|(_, peers)| peers.is_empty())
+            .or_else(|| self.peers.iter().next())
+            .map(|(id, _)| *id)
+    }
+
+    /// Queue a client datagram on its association, starting one for a new peer.
+    fn route(&mut self, relay: &Arc<Relay>, peer: SocketAddr, buf: PacketBuf) {
+        let udp = &relay.config.udp;
+        let metrics = &udp.metrics;
+        let packet = match socks5::parse_udp_packet(buf.as_slice()) {
+            Ok(packet) => packet,
+            Err(_) => {
+                metrics.invalid.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        if packet.frag != 0 {
+            metrics.frag_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-    };
-    if packet.frag != 0 {
-        metrics.frag_dropped.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    let dest = packet.destination.into_owned();
-    let header_len = packet.header_len;
-    let dgram = InboundDgram {
-        dest,
-        header_len,
-        buf,
-    };
+        let dgram = InboundDgram {
+            dest: packet.destination.into_owned(),
+            header_len: packet.header_len,
+            buf,
+        };
 
-    if let Some(entry) = map.get(&peer) {
-        let _ = offer(&entry.tx, dgram, metrics);
-        return;
+        if let Some(association) = self.associations.get(&peer) {
+            let _ = offer(&association.tx, dgram, metrics);
+            return;
+        }
+        let Some(control) = self.pick_control() else {
+            metrics.invalid.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if self.associations.len() >= udp.limits.max_associations {
+            metrics.map_full.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let (tx, rx) = mpsc::channel(udp.limits.queue_max.max(1));
+        if offer(&tx, dgram, metrics).is_err() {
+            return;
+        }
+        self.associations.insert(peer, Association { tx, control });
+        if let Some(peers) = self.peers.get_mut(&control) {
+            peers.insert(peer);
+        }
+        metrics.associations.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(client = %peer, "udp association created");
+        tokio::spawn(run_association(Arc::clone(relay), rx, peer));
     }
-
-    let Some(control) = pick_control(controls) else {
-        metrics.invalid.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    if map.len() >= limits.max_associations {
-        metrics.map_full.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    let (tx, rx) = mpsc::channel(limits.queue_max.max(1));
-    if offer(&tx, dgram, metrics).is_err() {
-        return;
-    }
-    map.insert(peer, AssocEntry { tx, control });
-    if let Some(peers) = controls.get_mut(&control) {
-        peers.insert(peer);
-    }
-    metrics.associations.fetch_add(1, Ordering::Relaxed);
-    tracing::debug!(client = %peer, "udp association created");
-    tokio::spawn(client_assoc(
-        rx,
-        peer,
-        socket.clone(),
-        dial.clone(),
-        ctrl_tx.clone(),
-        metrics.clone(),
-        limits.idle,
-        pool.buffers.clone(),
-    ));
 }
 
 enum AssocEnd {
@@ -422,132 +382,92 @@ enum AssocEnd {
     Closed,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn client_assoc(
+async fn run_association(
+    relay: Arc<Relay>,
     mut rx: mpsc::Receiver<InboundDgram>,
     peer: SocketAddr,
-    socks_udp: Arc<UdpSocket>,
-    dial: Dial,
-    ctrl: mpsc::Sender<Ctrl>,
-    metrics: Arc<UdpMetrics>,
-    idle: Duration,
-    buffers: Arc<BufferPool>,
 ) {
-    let end = client_assoc_inner(&mut rx, peer, socks_udp, dial, &metrics, idle, &buffers).await;
-    if matches!(end, Ok(AssocEnd::Idle)) {
-        metrics.idle_expired.fetch_add(1, Ordering::Relaxed);
+    if let Ok(AssocEnd::Idle) = relay.associate(&mut rx, peer).await {
+        relay
+            .config
+            .udp
+            .metrics
+            .idle_expired
+            .fetch_add(1, Ordering::Relaxed);
         tracing::debug!(client = %peer, "udp association expired after idle timeout");
     }
     // Datagrams still queued when the association dies (dial failure, TCP
     // error, idle race) must return to the pool, or its live count leaks.
     drop(rx);
-    let _ = ctrl.send(Ctrl::Closed(peer)).await;
+    let _ = relay.ctrl.send(Ctrl::Closed(peer)).await;
 }
 
-async fn client_assoc_inner(
-    rx: &mut mpsc::Receiver<InboundDgram>,
-    peer: SocketAddr,
-    socks_udp: Arc<UdpSocket>,
-    dial: Dial,
-    metrics: &UdpMetrics,
-    idle: Duration,
-    buffers: &Arc<BufferPool>,
-) -> Result<AssocEnd, SessionError> {
-    let (mut snell, mut codec) =
-        dial_and_codec(dial.server, &dial.psk, dial.version, &dial.kdf).await?;
-    let mut recv = buffers.get(snell_protocol::V6_WIRE_CAP);
-    with_codec!(&mut codec, |encoder, decoder| {
-        open_udp(
-            &mut snell, encoder, decoder, buffers, &mut recv, &dial.kdf, &dial.psk,
-        )
-        .await?;
-        pump_client(
-            &mut snell, encoder, decoder, buffers, &mut recv, &dial.kdf, &dial.psk, rx, peer,
-            &socks_udp, metrics, idle,
-        )
-        .await
-    })
-}
-
-async fn open_udp<E: TcpEncoder, D: TcpDecoder>(
-    snell: &mut TcpStream,
-    encoder: &mut E,
-    decoder: &mut D,
-    buffers: &Arc<BufferPool>,
-    recv: &mut PooledBuffer,
-    kdf: &crate::kdf::KdfLimiter,
-    psk: &Psk,
-) -> Result<(), SessionError> {
-    crate::platform::prepare_session_stream(snell)?;
-    with_handshake_timeout(async {
-        write_udp_setup(encoder, buffers, snell).await?;
-        let leftover = read_server_tunnel(decoder, recv, snell, kdf, psk).await?;
-        if !leftover.is_empty() {
-            return Err(SessionError::Protocol(Error::Malformed(
-                "udp tunnel leftover",
-            )));
-        }
-        Ok(())
-    })
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn pump_client<E, D>(
-    snell: &mut TcpStream,
-    encoder: &mut E,
-    decoder: &mut D,
-    buffers: &Arc<BufferPool>,
-    recv: &mut PooledBuffer,
-    kdf: &crate::kdf::KdfLimiter,
-    psk: &Psk,
-    rx: &mut mpsc::Receiver<InboundDgram>,
-    peer: SocketAddr,
-    socks_udp: &UdpSocket,
-    metrics: &UdpMetrics,
-    idle: Duration,
-) -> Result<AssocEnd, SessionError>
-where
-    E: TcpEncoder,
-    D: TcpDecoder,
-{
-    let (mut snell_r, mut snell_w) = snell.split();
-    let sleep = tokio::time::sleep(idle);
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            _ = &mut sleep => return Ok(AssocEnd::Idle),
-            dgram = rx.recv() => {
-                let Some(dgram) = dgram else {
-                    return Ok(AssocEnd::Closed);
-                };
-                sleep.as_mut().reset(Instant::now() + idle);
-                let payload = &dgram.buf.as_slice()[dgram.header_len..];
-                let result = write_udp_request(
-                    encoder,
-                    buffers,
-                    &mut snell_w,
-                    dgram.dest.as_view(),
-                    payload,
-                )
-                .await;
-                match result {
-                    Err(SessionError::Protocol(Error::PayloadTooLarge)) => {
-                        metrics.oversize.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(error) => return Err(error),
-                    Ok(()) => {}
+impl Relay {
+    /// Open a Snell UDP session for `peer` and relay until idle or closed.
+    async fn associate(
+        &self,
+        rx: &mut mpsc::Receiver<InboundDgram>,
+        peer: SocketAddr,
+    ) -> Result<AssocEnd, SessionError> {
+        let mut conn = dial(&self.config, &self.kdf).await?;
+        let Connection { stream, codec } = &mut conn;
+        prepare_session_stream(stream)?;
+        let mut recv = self.config.buffers.get(snell_protocol::V6_WIRE_CAP);
+        with_codec!(codec, |encoder, decoder| {
+            with_handshake_timeout(async {
+                write_udp_setup(encoder, &self.config.buffers, stream).await?;
+                let leftover =
+                    read_server_tunnel(decoder, &mut recv, stream, &self.kdf, &self.config.psk)
+                        .await?;
+                if !leftover.is_empty() {
+                    return Err(Error::Malformed("udp tunnel leftover").into());
                 }
-            }
-            record = decode_once(decoder, recv, &mut snell_r, kdf, psk) => {
-                sleep.as_mut().reset(Instant::now() + idle);
-                match record? {
-                    RecordEvent::Zero => return Ok(AssocEnd::Closed),
-                    RecordEvent::Data(record) => {
-                        let plain = record.plaintext(recv.filled());
-                        send_socks_response(socks_udp, peer, plain, metrics).await?;
-                        decoder.consume(recv, &record)?;
+                Ok(())
+            })
+            .await?;
+            self.pump(stream, encoder, decoder, &mut recv, rx, peer)
+                .await
+        })
+    }
+
+    async fn pump<E: TcpEncoder, D: TcpDecoder>(
+        &self,
+        snell: &mut TcpStream,
+        encoder: &mut E,
+        decoder: &mut D,
+        recv: &mut PooledBuffer,
+        rx: &mut mpsc::Receiver<InboundDgram>,
+        peer: SocketAddr,
+    ) -> Result<AssocEnd, SessionError> {
+        let (buffers, udp) = (&self.config.buffers, &self.config.udp);
+        let (mut snell_r, mut snell_w) = snell.split();
+        let sleep = tokio::time::sleep(udp.limits.idle);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => return Ok(AssocEnd::Idle),
+                dgram = rx.recv() => {
+                    let Some(dgram) = dgram else {
+                        return Ok(AssocEnd::Closed);
+                    };
+                    sleep.as_mut().reset(Instant::now() + udp.limits.idle);
+                    let payload = &dgram.buf.as_slice()[dgram.header_len..];
+                    let address = dgram.dest.as_view();
+                    match write_udp_request(encoder, buffers, &mut snell_w, address, payload).await {
+                        Err(SessionError::Protocol(Error::PayloadTooLarge)) => {
+                            udp.metrics.oversize.fetch_add(1, Ordering::Relaxed);
+                        }
+                        result => result?,
                     }
+                }
+                record = decode_once(decoder, recv, &mut snell_r, &self.kdf, &self.config.psk) => {
+                    sleep.as_mut().reset(Instant::now() + udp.limits.idle);
+                    let RecordEvent::Data(record) = record? else {
+                        return Ok(AssocEnd::Closed);
+                    };
+                    let plain = record.plaintext(recv.filled());
+                    send_socks_response(&self.socket, peer, plain, &udp.metrics).await?;
+                    decoder.consume(recv, &record)?;
                 }
             }
         }
@@ -593,18 +513,16 @@ impl Drop for AssocGuard<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Relay one Snell UDP association through the server's outbound.
 pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
     mut snell: TcpStream,
-    mut encoder: E,
-    mut decoder: D,
-    outbound: Outbound,
-    kdf: &crate::kdf::KdfLimiter,
-    psk: &Psk,
+    encoder: &mut E,
+    decoder: &mut D,
+    config: &ServerConfig,
+    kdf: &KdfLimiter,
     mut recv: PooledBuffer,
-    udp: &UdpOptions,
 ) -> Result<(), SessionError> {
-    let buffers = Arc::clone(recv.pool());
+    let (buffers, udp) = (&config.buffers, &config.udp);
     let max = udp.limits.max_associations as u64;
     let admitted = udp
         .metrics
@@ -614,49 +532,20 @@ pub(crate) async fn run_server_udp<E: TcpEncoder, D: TcpDecoder>(
         });
     if admitted.is_err() {
         udp.metrics.map_full.fetch_add(1, Ordering::Relaxed);
-        let _ = write_reject(&mut encoder, &buffers, &mut snell, "udp association limit").await;
+        let _ = write_reject(encoder, buffers, &mut snell, "udp association limit").await;
         return Err(SessionError::UdpLimit);
     }
     let _guard = AssocGuard(&udp.metrics);
 
-    let mut flow = match outbound.open_udp(&udp.dns, recv.pool()).await {
+    let mut flow = match config.outbound.open_udp(&udp.dns, buffers).await {
         Ok(flow) => flow,
         Err(error) => {
-            let _ = write_reject(&mut encoder, &buffers, &mut snell, &error.to_string()).await;
+            let _ = write_reject(encoder, buffers, &mut snell, &error.to_string()).await;
             return Err(error);
         }
     };
-    write_tunnel(&mut encoder, &buffers, &mut snell).await?;
-    pump_server(
-        &mut snell,
-        &mut encoder,
-        &mut decoder,
-        &buffers,
-        &mut recv,
-        kdf,
-        psk,
-        &mut flow,
-        udp,
-    )
-    .await
-}
+    write_tunnel(encoder, buffers, &mut snell).await?;
 
-#[allow(clippy::too_many_arguments)]
-async fn pump_server<E, D>(
-    snell: &mut TcpStream,
-    encoder: &mut E,
-    decoder: &mut D,
-    buffers: &Arc<BufferPool>,
-    recv: &mut PooledBuffer,
-    kdf: &crate::kdf::KdfLimiter,
-    psk: &Psk,
-    flow: &mut crate::outbound::UdpFlow,
-    udp: &UdpOptions,
-) -> Result<(), SessionError>
-where
-    E: TcpEncoder,
-    D: TcpDecoder,
-{
     let (mut snell_r, mut snell_w) = snell.split();
     let sleep = tokio::time::sleep(udp.limits.idle);
     tokio::pin!(sleep);
@@ -667,47 +556,31 @@ where
                 tracing::debug!("udp association expired after idle timeout");
                 return Ok(());
             }
-            record = decode_once(decoder, recv, &mut snell_r, kdf, psk) => {
+            record = decode_once(decoder, &mut recv, &mut snell_r, kdf, &config.psk) => {
                 sleep.as_mut().reset(Instant::now() + udp.limits.idle);
-                match record? {
-                    RecordEvent::Zero => return Ok(()),
-                    RecordEvent::Data(record) => {
-                        let plain = record.plaintext(recv.filled());
-                        match decode_udp_request(plain) {
-                            Ok(pkt) => {
-                                if flow
-                                    .send(pkt.address, pkt.payload, &udp.dns)
-                                    .await
-                                    .is_err()
-                                {
-                                    udp.metrics.invalid.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            Err(_) => {
-                                udp.metrics.invalid.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        decoder.consume(recv, &record)?;
-                    }
+                let RecordEvent::Data(record) = record? else {
+                    return Ok(());
+                };
+                let sent = match decode_udp_request(record.plaintext(recv.filled())) {
+                    Ok(packet) => flow.send(packet.address, packet.payload, &udp.dns).await,
+                    Err(error) => Err(error.into()),
+                };
+                if sent.is_err() {
+                    udp.metrics.invalid.fetch_add(1, Ordering::Relaxed);
                 }
+                decoder.consume(&mut recv, &record)?;
             }
             reply = flow.recv(&udp.metrics.frag_dropped, &udp.metrics.invalid) => {
                 sleep.as_mut().reset(Instant::now() + udp.limits.idle);
                 let reply = reply?;
-                match write_udp_response(
-                    encoder,
-                    buffers,
-                    &mut snell_w,
-                    reply.addr.as_view(),
-                    reply.payload(),
-                )
-                .await
+                let address = reply.addr.as_view();
+                match write_udp_response(encoder, buffers, &mut snell_w, address, reply.payload())
+                    .await
                 {
                     Err(SessionError::Protocol(Error::PayloadTooLarge)) => {
                         udp.metrics.oversize.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(error) => return Err(error),
-                    Ok(()) => {}
+                    result => result?,
                 }
             }
         }
@@ -717,53 +590,92 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snell_protocol::{AddressRef, ProtocolFlavor, Psk};
     use std::net::Ipv4Addr;
+
+    /// A relay that dials `server`, and the receiver of its control messages.
+    async fn test_relay(
+        server: SocketAddr,
+        quota: Arc<PacketQuota>,
+    ) -> (Arc<Relay>, mpsc::Receiver<Ctrl>) {
+        let (ctrl, ctrl_rx) = mpsc::channel(4);
+        let config = ClientConfig {
+            listen: server,
+            server,
+            psk: Psk::new(b"0123456789abcdef").unwrap(),
+            version: ProtocolFlavor::V4,
+            pool: None,
+            udp: UdpOptions::default(),
+            buffers: Arc::clone(&quota.buffers),
+        };
+        let relay = Relay {
+            socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            config: Arc::new(config),
+            kdf: Arc::new(KdfLimiter::new()),
+            quota,
+            ctrl,
+        };
+        (Arc::new(relay), ctrl_rx)
+    }
 
     #[tokio::test]
     async fn existing_association_routes_packets_and_releases_rejected_queue_items() {
-        let pool = Arc::new(PacketQuota::new(Arc::default(), 2, 1024));
-        let metrics = Arc::new(UdpMetrics::default());
+        let quota = Arc::new(PacketQuota::new(Arc::default(), 2, 1024));
         let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 3456));
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (relay, _ctrl_rx) = test_relay(peer, Arc::clone(&quota)).await;
         let (tx, mut rx) = mpsc::channel(1);
-        let mut map = HashMap::from([(peer, AssocEntry { tx, control: 7 })]);
-        let mut controls = HashMap::new();
-        let (ctrl, _ctrl_rx) = mpsc::channel(1);
-        let dial = Dial {
-            server: peer,
-            psk: Psk::new(b"0123456789abcdef").unwrap(),
-            version: ProtocolFlavor::V4,
-            kdf: Arc::new(KdfLimiter::new()),
-        };
+        let mut routes = Routes::default();
+        routes
+            .associations
+            .insert(peer, Association { tx, control: 7 });
         let mut packet = [0u8; 64];
-        let header =
-            socks5::encode_udp_header(&mut packet, 0, snell_protocol::AddressRef::Ip(peer))
-                .unwrap();
+        let header = socks5::encode_udp_header(&mut packet, 0, AddressRef::Ip(peer)).unwrap();
         packet[header..header + 4].copy_from_slice(b"ping");
         for _ in 0..2 {
-            let mut buf = pool.acquire(header + 4).unwrap();
+            let mut buf = quota.acquire(header + 4).unwrap();
             buf.extend(&packet[..header + 4]).unwrap();
-            handle_datagram(
-                peer,
-                buf,
-                &mut map,
-                &mut controls,
-                &pool,
-                &metrics,
-                UdpLimits::default(),
-                &dial,
-                &socket,
-                &ctrl,
-            );
+            routes.route(&relay, peer, buf);
         }
-        assert_eq!(map.len(), 1);
+        assert_eq!(routes.associations.len(), 1);
+        let metrics = &relay.config.udp.metrics;
         assert_eq!(metrics.queue_full.load(Ordering::Relaxed), 1);
-        assert_eq!(pool.live(), 1);
+        assert_eq!(quota.live(), 1);
         let packet = rx.try_recv().unwrap();
         assert_eq!(&packet.buf.as_slice()[packet.header_len..], b"ping");
         drop(packet);
-        assert_eq!(pool.live(), 0);
-        assert_eq!(pool.buffers.leased_bytes(), 0);
+        assert_eq!(quota.live(), 0);
+        assert_eq!(quota.buffers.leased_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn association_dial_failure_releases_queued_buffers() {
+        let quota = Arc::new(PacketQuota::new(Arc::default(), 4, 1024 * 1024));
+        let (tx, rx) = mpsc::channel(4);
+        for _ in 0..2 {
+            let mut buf = quota.acquire(64).unwrap();
+            buf.extend(b"ping").unwrap();
+            tx.try_send(InboundDgram {
+                dest: Address::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+                header_len: 0,
+                buf,
+            })
+            .unwrap();
+        }
+        assert_eq!(quota.live(), 2);
+        // Bind then drop: dialing this port fails fast with connection refused.
+        let dead = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let (relay, mut ctrl_rx) = test_relay(dead, Arc::clone(&quota)).await;
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 3456));
+        run_association(relay, rx, peer).await;
+        assert!(matches!(ctrl_rx.recv().await, Some(Ctrl::Closed(_))));
+        assert_eq!(
+            quota.live(),
+            0,
+            "queued datagram buffers must return to the pool when the association dies"
+        );
     }
 
     #[tokio::test]
@@ -774,7 +686,7 @@ mod tests {
             let sender = UdpSocket::bind(bind).await.unwrap();
             let receiver = UdpSocket::bind(bind).await.unwrap();
             for source in ["203.0.113.5:1234", "[2001:db8::5]:1234"] {
-                let source = snell_protocol::AddressRef::Ip(source.parse().unwrap());
+                let source = AddressRef::Ip(source.parse().unwrap());
                 for payload in [b"".as_slice(), payload.as_slice()] {
                     let mut plain = vec![0; 1500];
                     let n =
@@ -817,7 +729,7 @@ mod tests {
         let mut plain = [0; 64];
         let n = snell_protocol::encode_udp_response(
             &mut plain,
-            snell_protocol::AddressRef::Ip("127.0.0.1:9".parse().unwrap()),
+            AddressRef::Ip("127.0.0.1:9".parse().unwrap()),
             b"pong",
         )
         .unwrap();
@@ -842,7 +754,7 @@ mod tests {
         let payload = vec![0x5a; 65507];
         let n = snell_protocol::encode_udp_response(
             &mut plain,
-            snell_protocol::AddressRef::Ip("203.0.113.5:1234".parse().unwrap()),
+            AddressRef::Ip("203.0.113.5:1234".parse().unwrap()),
             &payload,
         )
         .unwrap();
@@ -862,54 +774,6 @@ mod tests {
         assert_eq!(
             receiver.try_recv_from(&mut [0; 64]).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock,
-        );
-    }
-
-    #[tokio::test]
-    async fn assoc_dial_failure_releases_queued_buffers() {
-        let pool = Arc::new(PacketQuota::new(Arc::default(), 4, 1024 * 1024));
-        let (tx, rx) = mpsc::channel(4);
-        for _ in 0..2 {
-            let mut buf = pool.acquire(64).unwrap();
-            buf.extend(b"ping").unwrap();
-            tx.try_send(InboundDgram {
-                dest: Address::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
-                header_len: 0,
-                buf,
-            })
-            .unwrap();
-        }
-        assert_eq!(pool.live(), 2);
-        // Bind then drop: dialing this port fails fast with connection refused.
-        let dead = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap()
-        };
-        let socks_udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
-        let metrics = Arc::new(UdpMetrics::default());
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 3456));
-        client_assoc(
-            rx,
-            peer,
-            socks_udp,
-            Dial {
-                server: dead,
-                psk: Psk::new(b"0123456789abcdef".to_vec()).unwrap(),
-                version: ProtocolFlavor::V4,
-                kdf: Arc::new(KdfLimiter::new()),
-            },
-            ctrl_tx,
-            metrics,
-            Duration::from_secs(5),
-            pool.buffers.clone(),
-        )
-        .await;
-        assert!(matches!(ctrl_rx.recv().await, Some(Ctrl::Closed(_))));
-        assert_eq!(
-            pool.live(),
-            0,
-            "queued datagram buffers must return to the pool when the association dies"
         );
     }
 

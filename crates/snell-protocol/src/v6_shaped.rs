@@ -5,7 +5,7 @@ use core::fmt;
 use crate::aead::Aes128Gcm;
 use crate::buffer::Slot;
 use crate::header::{RecordHeader, opened_header, parse_v6_plain_header, plain_header};
-use crate::profile::{Profile, mix_padding_payload};
+use crate::profile::mix_padding_payload;
 use crate::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::{
     AES_128_KEY_LEN, Buffer, Clock, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN,
@@ -17,7 +17,8 @@ pub struct V6ShapedEncoder<C = MonotonicClock> {
     nonce: Nonce,
     salt: [u8; SALT_LEN],
     seq: u32,
-    profile: Profile,
+    /// Shared key; its derived profile shapes every record.
+    psk: Psk,
     chunk_size: usize,
     /// `None` until the first record, which carries the salt block, is sealed.
     last_write_secs: Option<u64>,
@@ -65,7 +66,7 @@ impl<C: Clock> V6ShapedEncoder<C> {
             nonce: Nonce::new(),
             salt,
             seq: 0,
-            profile: Profile::derive(psk),
+            psk: psk.clone(),
             chunk_size: 0,
             last_write_secs: None,
             clock,
@@ -112,21 +113,22 @@ impl<C: Clock> V6ShapedEncoder<C> {
 
         let first = self.last_write_secs.is_none();
         let salt_block_len = if first {
-            self.profile.salt_block_len()
+            self.psk.profile().salt_block_len()
         } else {
             0
         };
-        let prefix_len = self.profile.record_prefix_len(self.seq);
+        let prefix_len = self.psk.profile().record_prefix_len(self.seq);
         let fixed =
-            salt_block_len + prefix_len + HEADER_CIPHER_LEN + self.profile.max_padding_len();
+            salt_block_len + prefix_len + HEADER_CIPHER_LEN + self.psk.profile().max_padding_len();
         // A contiguous record pads for the hint up front; a short write may
         // need more padding, which `seal_record` handles by moving the payload.
         let (initialized, payload_offset) = if scattered {
             (0, 0)
         } else {
-            let padding = self
-                .profile
-                .final_padding_len(self.seq, prefix_len, max_payload, first);
+            let padding =
+                self.psk
+                    .profile()
+                    .final_padding_len(self.seq, prefix_len, max_payload, first);
             let offset = salt_block_len + prefix_len + HEADER_CIPHER_LEN + padding;
             (offset, offset)
         };
@@ -154,16 +156,17 @@ impl<C: Clock> V6ShapedEncoder<C> {
         if self.chunk_size == 0
             || self
                 .last_write_secs
-                .is_some_and(|last| now.saturating_sub(last) > self.profile.idle_reset_secs())
+                .is_some_and(|last| now.saturating_sub(last) > self.psk.profile().idle_reset_secs())
         {
-            self.chunk_size = self.profile.chunk_initial();
+            self.chunk_size = self.psk.profile().chunk_initial();
         }
         let limit = self
-            .profile
+            .psk
+            .profile()
             .chunk_limit(self.seq, self.chunk_size)
             .min(MAX_PACKET_SIZE_V6);
         if self.seq == 0 {
-            limit.min(self.profile.first_record_cap())
+            limit.min(self.psk.profile().first_record_cap())
         } else {
             limit
         }
@@ -179,21 +182,21 @@ impl<C: Clock> V6ShapedEncoder<C> {
             // The hint was exact; reuse the padding decision made by reserve.
             record.slot.payload_start - record.contiguous_padding_start()
         } else {
-            self.profile.final_padding_len(
+            self.psk.profile().final_padding_len(
                 self.seq,
                 record.prefix_len,
                 payload_len,
                 self.last_write_secs.is_none(),
             )
         };
-        debug_assert!(padding_len <= self.profile.max_padding_len());
+        debug_assert!(padding_len <= self.psk.profile().max_padding_len());
 
         let nonce_before = self.nonce;
         let result = self.seal_record(buf, record, padding_len, payload_len);
         self.state = EncoderState::after_seal(result.is_err() && self.nonce != nonce_before);
         match result {
             Ok(_) => {
-                self.chunk_size = self.profile.advance_chunk_size(self.chunk_size);
+                self.chunk_size = self.psk.profile().advance_chunk_size(self.chunk_size);
                 self.seq = self.seq.wrapping_add(1);
                 self.last_write_secs = Some(self.clock.monotonic_secs());
             }
@@ -243,7 +246,7 @@ impl<C: Clock> V6ShapedEncoder<C> {
 
         // Generate salt, prefix and header directly at their final addresses.
         if record.salt_block_len > 0 {
-            self.profile.write_salt_block(
+            self.psk.profile().write_salt_block(
                 &self.salt,
                 buf.range_mut(prefix_start - record.salt_block_len, prefix_start),
             );
@@ -251,10 +254,10 @@ impl<C: Clock> V6ShapedEncoder<C> {
         let (prefix, header) = buf
             .range_mut(prefix_start, padding_start)
             .split_at_mut(record.prefix_len);
-        self.profile.fill_official(self.seq, prefix);
+        self.psk.profile().fill_official(self.seq, prefix);
         header[..HEADER_PLAIN_LEN].copy_from_slice(&plain_header(padding_len, payload_len));
         self.aead.seal(&mut self.nonce, prefix, header)?;
-        self.profile.fill_official(
+        self.psk.profile().fill_official(
             self.seq,
             buf.range_mut(padding_start, padding_start + padding_len),
         );
@@ -273,7 +276,7 @@ impl<C: Clock> V6ShapedEncoder<C> {
                     .split_at_mut(padding_len)
             };
             self.aead.seal(&mut self.nonce, padding, cipher_and_tag)?;
-            mix_padding_payload(&self.profile, self.seq, padding, cipher_and_tag);
+            mix_padding_payload(self.psk.profile(), self.seq, padding, cipher_and_tag);
         }
         // Physical layout is [payload+tag][salt+prefix+header+padding]. Send
         // [split..end] followed by [start..split] to preserve the wire layout.
@@ -304,7 +307,7 @@ impl<C: Clock> V6ShapedReservation<'_, C> {
     }
 
     pub fn padding_len(&self) -> usize {
-        self.encoder.profile.max_padding_len()
+        self.encoder.psk.profile().max_padding_len()
     }
 
     pub fn seal(self, written: usize) -> Result<()> {
@@ -382,7 +385,6 @@ enum ReadStep {
 
 pub struct V6ShapedDecoder {
     psk: Psk,
-    profile: Profile,
     /// Session cipher and the salt it was derived from (the replay identity).
     key: Option<(Aes128Gcm, [u8; SALT_LEN])>,
     nonce: Nonce,
@@ -395,7 +397,6 @@ pub struct V6ShapedDecoder {
 impl V6ShapedDecoder {
     pub fn new(psk: Psk) -> Self {
         Self {
-            profile: Profile::derive(&psk),
             psk,
             key: None,
             nonce: Nonce::new(),
@@ -417,7 +418,7 @@ impl V6ShapedDecoder {
 
     pub fn kdf_need(&self) -> usize {
         if self.key.is_none() && matches!(self.step, ReadStep::Salt) {
-            self.profile.salt_block_len()
+            self.psk.profile().salt_block_len()
         } else {
             0
         }
@@ -426,9 +427,9 @@ impl V6ShapedDecoder {
     pub fn kdf_salt(&self, buf: &Buffer) -> Result<[u8; SALT_LEN]> {
         let block = buf
             .filled()
-            .get(..self.profile.salt_block_len())
+            .get(..self.psk.profile().salt_block_len())
             .ok_or(Error::Truncated)?;
-        Ok(self.profile.extract_salt(block))
+        Ok(self.psk.profile().extract_salt(block))
     }
 
     pub fn install_aead(&mut self, salt: [u8; SALT_LEN], key: [u8; AES_128_KEY_LEN]) -> Result<()> {
@@ -440,7 +441,10 @@ impl V6ShapedDecoder {
         loop {
             match self.step {
                 ReadStep::Salt => {
-                    if let Some(need) = self.pending.need(buf, self.profile.salt_block_len())? {
+                    if let Some(need) = self
+                        .pending
+                        .need(buf, self.psk.profile().salt_block_len())?
+                    {
                         return Ok(need);
                     }
                     if self.key.is_none() {
@@ -482,7 +486,7 @@ impl V6ShapedDecoder {
                     }
                     let body = &mut buf.filled_mut()[body_off..body_end];
                     let (padding, cipher_and_tag) = body.split_at_mut(header.padding_len);
-                    mix_padding_payload(&self.profile, self.seq, padding, cipher_and_tag);
+                    mix_padding_payload(self.psk.profile(), self.seq, padding, cipher_and_tag);
                     let (aead, _) = self.key.as_ref().ok_or(Error::Aead)?;
                     aead.open(&mut self.nonce, padding, cipher_and_tag)?;
                     self.next_record();
@@ -501,7 +505,7 @@ impl V6ShapedDecoder {
 
     fn header_step(&self) -> ReadStep {
         ReadStep::Header {
-            prefix_len: self.profile.record_prefix_len(self.seq),
+            prefix_len: self.psk.profile().record_prefix_len(self.seq),
         }
     }
 
@@ -513,7 +517,7 @@ impl V6ShapedDecoder {
 
     fn header_offset(&self) -> usize {
         let salt = if self.include_salt {
-            self.profile.salt_block_len()
+            self.psk.profile().salt_block_len()
         } else {
             0
         };
@@ -660,7 +664,8 @@ mod tests {
             rec.seal(5).unwrap();
         }
         let wire = out.filled();
-        let profile = Profile::derive(&psk());
+        let psk = psk();
+        let profile = psk.profile();
         assert_ne!(&wire[..SALT_LEN], &[7u8; SALT_LEN]);
         assert_eq!(
             profile.extract_salt(&wire[..profile.salt_block_len()]),
@@ -673,7 +678,8 @@ mod tests {
         let mut enc = encoder();
         let mut out = Buffer::new(V6_WIRE_CAP);
         let rec = enc.reserve(&mut out, &[], MAX_PACKET_SIZE_V6).unwrap();
-        let profile = Profile::derive(&psk());
+        let psk = psk();
+        let profile = psk.profile();
         assert!(rec.capacity() <= profile.first_record_cap());
     }
 }

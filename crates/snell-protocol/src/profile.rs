@@ -3,7 +3,7 @@
 use crate::kdf::profile_secret;
 use crate::prf::{GOLDEN_GAMMA, expand_stream, prf32, splitmix64};
 use crate::salt::{MIX_HANDSHAKE_DOMAIN, extract as salt_extract, write as salt_write};
-use crate::{HEADER_CIPHER_LEN, Psk, SALT_LEN, TAG_LEN, V6_MAX_PREFIX_LEN};
+use crate::{HEADER_CIPHER_LEN, SALT_LEN, TAG_LEN, V6_MAX_PREFIX_LEN};
 
 const HANDSHAKE_DOMAIN: u32 = 0x7053;
 const CHUNK_INITIAL_DOMAIN: u32 = 0xf17c;
@@ -166,7 +166,8 @@ pub struct Profile {
 }
 
 impl Profile {
-    pub fn derive(psk: &Psk) -> Self {
+    /// Profile for raw PSK bytes; [`Psk`](crate::Psk) derives it once per key.
+    pub(crate) fn derive(psk: &[u8]) -> Self {
         let secret = profile_secret(psk);
         let namespaces = Namespaces::derive(&secret);
 
@@ -518,9 +519,17 @@ impl Profile {
         } else {
             ((scaled + 50) / 100) as u32
         };
-        let table = &GENERATOR0_TABLE[target_bits as usize - 1];
-        for (i, byte) in out.iter_mut().enumerate() {
-            *byte = table[i & 7][usize::from(*byte)];
+        // Byte `i` uses row `i % 8`: walk eight bytes at a time so each
+        // lookup's row is a constant.
+        let rows = &GENERATOR0_TABLE[target_bits as usize - 1];
+        let (blocks, tail) = out.as_chunks_mut::<8>();
+        for block in blocks {
+            for (byte, row) in block.iter_mut().zip(rows) {
+                *byte = row[usize::from(*byte)];
+            }
+        }
+        for (byte, row) in tail.iter_mut().zip(rows) {
+            *byte = row[usize::from(*byte)];
         }
     }
 
@@ -560,20 +569,32 @@ impl Profile {
     fn apply_generator_3(&self, seq: u32, out: &mut [u8]) {
         let mut motif = [0u8; 32];
         self.namespaces.expand(MOTIF, seq, &mut motif);
-        // g5 is 1..=8 and g6 is 7..=23: the motif length fits and the interval
-        // is non-zero. Cycling iterators track `i % g6` and `i % motif_len`.
-        let motif = motif[..self.g5 * 4].iter().cycle();
-        let phases = (0..self.g6).cycle();
+        // g5 is 1..=8 and g6 is 7..=23. Every period of g6 bytes holds
+        // g6 - 3 patterned bytes, two decimal digits, and one kept byte; a
+        // patterned byte `i` mixes `motif[i % motif_len]` into a stride.
+        let motif_len = self.g5 * 4;
+        let period = self.g6;
+        // The motif repeated far enough that any period's patterned run reads
+        // it as one contiguous slice: run start < 32, run length <= 20.
+        let mut repeated = [0u8; 64];
+        for chunk in repeated.chunks_mut(motif_len) {
+            chunk.copy_from_slice(&motif[..chunk.len()]);
+        }
+        let advance = period % motif_len;
         let stride = (self.g5 + 3) as u8;
-        for (i, ((byte, r), &m)) in out.iter_mut().zip(phases).zip(motif).enumerate() {
-            let b = *byte;
-            *byte = if r + 3 < self.g6 {
-                stride.wrapping_mul(i as u8) ^ m
-            } else if r + 1 < self.g6 {
-                0x30 + b % 10
-            } else {
-                b
-            };
+        let mut motif_at = 0;
+        for (start, chunk) in (0..).step_by(period).zip(out.chunks_mut(period)) {
+            let (patterned, rest) = chunk.split_at_mut(chunk.len().min(period - 3));
+            for ((byte, &m), i) in patterned.iter_mut().zip(&repeated[motif_at..]).zip(start..) {
+                *byte = stride.wrapping_mul(i as u8) ^ m;
+            }
+            for byte in rest.iter_mut().take(2) {
+                *byte = 0x30 + *byte % 10;
+            }
+            motif_at += advance;
+            if motif_at >= motif_len {
+                motif_at -= motif_len;
+            }
         }
     }
 }
@@ -721,9 +742,7 @@ const fn pick_usize(raw: u32, lo: usize, hi: usize) -> usize {
 mod tests {
     use super::*;
 
-    fn test_psk() -> Psk {
-        Psk::new(b"test psk 16 byte").unwrap()
-    }
+    const TEST_PSK: &[u8] = b"test psk 16 byte";
 
     #[test]
     fn generator0_matches_canonical_bit_order_exhaustively() {
@@ -765,7 +784,7 @@ mod tests {
 
     #[test]
     fn profile_derivation_matches_canonical_constants() {
-        let profile = Profile::derive(&test_psk());
+        let profile = Profile::derive(TEST_PSK);
         assert_eq!(profile.namespaces.profile, 0xb69d_2dab_f942_0ee1);
         assert_eq!(profile.namespaces.prefix, 0x33bd_41e0_6ce7_0796);
         assert_eq!(profile.namespaces.motif, 0xddf9_dcc5_ba13_ef14);
@@ -789,7 +808,7 @@ mod tests {
 
     #[test]
     fn official_psk_chunk_profile() {
-        let profile = Profile::derive(&Psk::new(b"0123456789abcdef").unwrap());
+        let profile = Profile::derive(b"0123456789abcdef");
         assert_eq!(profile.chunk_policy, 1);
         assert_eq!(profile.chunk_initial, 876);
         assert_eq!(profile.first_record_cap, 299);
@@ -805,7 +824,7 @@ mod tests {
 
     #[test]
     fn fill_and_prefix_match_canonical() {
-        let profile = Profile::derive(&test_psk());
+        let profile = Profile::derive(TEST_PSK);
         let mut fill = vec![0; 32];
         let mut salt_fill = vec![0; 32];
         profile.fill_official(7, &mut fill);
@@ -858,7 +877,7 @@ mod tests {
 
     #[test]
     fn salt_block_round_trips_salt() {
-        let profile = Profile::derive(&test_psk());
+        let profile = Profile::derive(TEST_PSK);
         let salt = [0x5a; SALT_LEN];
         let mut block = vec![0; profile.salt_block_len()];
         profile.write_salt_block(&salt, &mut block);
@@ -867,7 +886,7 @@ mod tests {
 
     #[test]
     fn mixing_is_self_inverse() {
-        let profile = Profile::derive(&test_psk());
+        let profile = Profile::derive(TEST_PSK);
         let mut padding = (0..128u8).collect::<Vec<_>>();
         let mut payload = (128..=255u8).collect::<Vec<_>>();
         let original_padding = padding.clone();

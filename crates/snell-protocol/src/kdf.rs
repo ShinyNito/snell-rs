@@ -9,11 +9,11 @@ use crate::{
     PROFILE_SEED_24, Psk, Result, SALT_LEN,
 };
 
-/// BLAKE2b-256 over the profile seed and PSK. [`Psk`] already enforces the length.
-pub(crate) fn profile_secret(psk: &Psk) -> [u8; 32] {
+/// BLAKE2b-256 over the profile seed and the PSK bytes.
+pub(crate) fn profile_secret(psk: &[u8]) -> [u8; 32] {
     Blake2b::<U32>::new()
         .chain_update(PROFILE_SEED_24)
-        .chain_update(psk.as_bytes())
+        .chain_update(psk)
         .finalize()
         .into()
 }
