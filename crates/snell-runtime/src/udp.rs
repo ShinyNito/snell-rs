@@ -257,11 +257,15 @@ fn offer(
     }
 }
 
+/// Route client datagrams to associations. Control messages are polled
+/// first (`biased`): a control is registered before its client is told to
+/// send, so its datagrams must never be routed ahead of its `Add`.
 async fn dispatcher(relay: Arc<Relay>, mut ctrl_rx: mpsc::Receiver<Ctrl>) {
     let metrics = &relay.config.udp.metrics;
     let mut routes = Routes::default();
     loop {
         tokio::select! {
+            biased;
             ctrl = ctrl_rx.recv() => {
                 let Some(ctrl) = ctrl else { return; };
                 routes.apply(ctrl, metrics);
@@ -270,6 +274,7 @@ async fn dispatcher(relay: Arc<Relay>, mut ctrl_rx: mpsc::Receiver<Ctrl>) {
             ready = relay.socket.readable() => { if ready.is_err() { return; } }
         }
         tokio::select! {
+            biased;
             ctrl = ctrl_rx.recv() => {
                 let Some(ctrl) = ctrl else { return; };
                 routes.apply(ctrl, metrics);
@@ -279,7 +284,8 @@ async fn dispatcher(relay: Arc<Relay>, mut ctrl_rx: mpsc::Receiver<Ctrl>) {
                 Ok(None) => {
                     metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
                     tokio::select! {
-                                    ctrl = ctrl_rx.recv() => {
+                        biased;
+                        ctrl = ctrl_rx.recv() => {
                             let Some(ctrl) = ctrl else { return; };
                             routes.apply(ctrl, metrics);
                         }
@@ -640,6 +646,46 @@ mod tests {
         drop(packet);
         assert_eq!(quota.live(), 0);
         assert_eq!(quota.buffers.leased_bytes(), 0);
+    }
+
+    /// SOCKS5 replies only after queueing `Add`, so by the time the client's
+    /// first datagram arrives its control is registered. The dispatcher must
+    /// apply that `Add` first even when both are ready, or it drops the
+    /// datagram for want of a control.
+    #[tokio::test]
+    async fn queued_control_is_applied_before_a_ready_datagram() {
+        // Accepts connections (in the backlog) but never answers, so each
+        // association stays open while the test looks at it.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = silent.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut packet = [0u8; 64];
+        let n = socks5::encode_udp_packet(&mut packet, 0, AddressRef::Ip(server), b"ping").unwrap();
+        // An unbiased choice drops the datagram with probability 1/4 per run.
+        for _ in 0..16 {
+            let quota = Arc::new(PacketQuota::new(Arc::default(), 4, 1 << 20));
+            let (relay, ctrl_rx) = test_relay(server, quota).await;
+            relay.ctrl.send(Ctrl::Add(1)).await.unwrap();
+            let relay_addr = relay.socket.local_addr().unwrap();
+            client.send_to(&packet[..n], relay_addr).await.unwrap();
+            relay.socket.readable().await.unwrap();
+
+            let metrics = Arc::clone(&relay.config.udp.metrics);
+            let dispatcher = tokio::spawn(dispatcher(relay, ctrl_rx));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while metrics.associations.load(Ordering::Relaxed)
+                    + metrics.invalid.load(Ordering::Relaxed)
+                    == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            dispatcher.abort();
+            assert_eq!(metrics.invalid.load(Ordering::Relaxed), 0);
+            assert_eq!(metrics.associations.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[tokio::test]
