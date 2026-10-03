@@ -1,16 +1,18 @@
 use std::future::{Future, poll_fn};
 use std::io;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use snell_protocol::{
-    AddressRef, COMMAND_UDP, ConnectRequest, DecodeStatus, Error, MAX_CONNECT_REQUEST_LEN,
-    MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk, REUSE_IDLE_TIMEOUT_SECS, RecordDecoder,
-    RecordEncoder, RecordKind, SERVER_EARLY_PAYLOAD_MAX, ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS,
-    aead_key, encode_connect_request, encode_reject, encode_tunnel_reply, encode_udp_request,
-    encode_udp_response, encode_udp_setup, udp_request_len, udp_response_len,
+    AddressRef, COMMAND_UDP, ConnectRequest, DecodeStatus, DecodedRecord, Error,
+    MAX_CONNECT_REQUEST_LEN, MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk,
+    REUSE_IDLE_TIMEOUT_SECS, RecordDecoder, RecordEncoder, RecordKind, SERVER_EARLY_PAYLOAD_MAX,
+    ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS, aead_key, encode_connect_request, encode_reject,
+    encode_tunnel_reply, encode_udp_request, encode_udp_response, encode_udp_setup,
+    udp_request_len, udp_response_len,
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
@@ -457,11 +459,7 @@ where
     E: RecordEncoder,
 {
     let mut encode = buffers.get(snell_protocol::V6_WIRE_CAP);
-    // Shaped records store their body before their header. Preserve wire order
-    // in these ranges until the entire batch has drained.
-    let mut ranges = [const { 0..0 }; ENCODE_SLICES_MAX];
-    let mut count = 0;
-    let mut write_off = 0;
+    let mut batch = EncodeBatch::default();
     let mut phase = Phase::Reading;
     poll_fn(|cx| {
         loop {
@@ -469,13 +467,9 @@ where
                 return Pin::new(&mut *writer).poll_shutdown(cx).map_err(Into::into);
             }
 
-            if phase == Phase::Reading && encode.is_empty() {
-                loop {
-                    if count > ENCODE_SLICES_MAX - 2 {
-                        break;
-                    }
-                    let start = encode.len();
-                    let had_pending = !encode.is_empty();
+            if phase == Phase::Reading && batch.is_empty() {
+                while batch.has_room() {
+                    let had_pending = !batch.is_empty();
                     match reader.poll_ready(cx) {
                         Poll::Ready(ready) => ready?,
                         Poll::Pending if had_pending => break,
@@ -496,13 +490,7 @@ where
                             phase = Phase::SendZeroChunk;
                             break;
                         }
-                        Poll::Ready(Ok((_, split))) => append_encode_ranges(
-                            &mut ranges,
-                            &mut count,
-                            start,
-                            encode.len(),
-                            split,
-                        ),
+                        Poll::Ready(Ok((_, split))) => batch.push(encode.len(), split),
                         Poll::Ready(Err(SessionError::Protocol(Error::PayloadTooLarge)))
                             if had_pending =>
                         {
@@ -518,12 +506,11 @@ where
                 }
             }
 
-            if phase == Phase::SendZeroChunk && count <= ENCODE_SLICES_MAX - 2 {
-                let start = encode.len();
-                let had_pending = !encode.is_empty();
+            if phase == Phase::SendZeroChunk && batch.has_room() {
+                let had_pending = !batch.is_empty();
                 match encode_record(encoder, &mut encode, 0, |_| Ok(0)) {
                     Ok((_, split)) => {
-                        append_encode_ranges(&mut ranges, &mut count, start, encode.len(), split);
+                        batch.push(encode.len(), split);
                         phase = Phase::Draining;
                     }
                     Err(SessionError::Protocol(Error::PayloadTooLarge)) if had_pending => {}
@@ -531,19 +518,11 @@ where
                 }
             }
 
-            if !encode.is_empty() {
-                let filled = encode.filled();
-                let mut slices = [io::IoSlice::new(&[]); ENCODE_SLICES_MAX];
-                let parts = ranges[..count].iter().map(|range| &filled[range.clone()]);
-                let slice_count = unwritten_slices(parts, write_off, &mut slices);
-                if slice_count == 0 {
-                    let consumed = encode.len();
-                    encode.consume(consumed)?;
-                    count = 0;
-                    write_off = 0;
-                    continue;
-                }
-                write_off += ready!(poll_write_slices(writer, cx, &slices[..slice_count]))?;
+            if !batch.is_empty() {
+                ready!(batch.poll_write(writer, encode.filled(), cx))?;
+                batch.clear();
+                let len = encode.len();
+                encode.consume(len)?;
                 continue;
             }
 
@@ -575,24 +554,87 @@ enum Phase {
     ShuttingDown,
 }
 
+/// Most slices one encode batch writes; each record adds at most two.
 const ENCODE_SLICES_MAX: usize = 64;
 
-fn append_encode_ranges(
-    ranges: &mut [std::ops::Range<usize>; ENCODE_SLICES_MAX],
-    count: &mut usize,
-    start: usize,
+// Batch offsets are stored as `u32`: session buffers are at most this long.
+const _: () = assert!(snell_protocol::V6_WIRE_CAP <= u32::MAX as usize);
+
+/// Records sealed into the encode buffer and not yet fully written, as
+/// wire-order ranges of the buffer. A shaped record keeps its body before
+/// its header, so it can be two ranges; a range that continues the previous
+/// one extends it.
+struct EncodeBatch {
+    ranges: [Range<u32>; ENCODE_SLICES_MAX],
+    len: usize,
+    /// Where the last record ends, and so where the next one starts.
     end: usize,
-    split: usize,
-) {
-    for range in [start + split..end, start..start + split] {
-        if range.is_empty() {
-            continue;
+    written: usize,
+}
+
+impl Default for EncodeBatch {
+    fn default() -> Self {
+        Self {
+            ranges: [const { 0..0 }; ENCODE_SLICES_MAX],
+            len: 0,
+            end: 0,
+            written: 0,
         }
-        if *count != 0 && ranges[*count - 1].end == range.start {
-            ranges[*count - 1].end = range.end;
-        } else {
-            ranges[*count] = range;
-            *count += 1;
+    }
+}
+
+impl EncodeBatch {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether another record, up to two ranges, still fits.
+    fn has_room(&self) -> bool {
+        self.len <= ENCODE_SLICES_MAX - 2
+    }
+
+    /// Add the record that ends at `end`, sent as `[split..]` then
+    /// `[..split]` relative to its start, where the previous one ended.
+    fn push(&mut self, end: usize, split: usize) {
+        let start = std::mem::replace(&mut self.end, end);
+        for range in [start + split..end, start..start + split] {
+            if range.is_empty() {
+                continue;
+            }
+            let range = range.start as u32..range.end as u32;
+            match self.ranges[..self.len].last_mut() {
+                Some(last) if last.end == range.start => last.end = range.end,
+                _ => {
+                    self.ranges[self.len] = range;
+                    self.len += 1;
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.end = 0;
+        self.written = 0;
+    }
+
+    /// Write the rest of the batch from `filled`, the encode buffer.
+    fn poll_write<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        filled: &[u8],
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            let mut slices = [io::IoSlice::new(&[]); ENCODE_SLICES_MAX];
+            let parts = self.ranges[..self.len]
+                .iter()
+                .map(|range| &filled[range.start as usize..range.end as usize]);
+            let count = unwritten_slices(parts, self.written, &mut slices);
+            if count == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            self.written += ready!(poll_write_slices(writer, cx, &slices[..count]))?;
         }
     }
 }
@@ -649,17 +691,7 @@ where
     W: AsyncWrite + Unpin,
     D: RecordDecoder,
 {
-    // Decoded-ahead records not yet written: their plaintext ranges stay
-    // valid against the unmoved `filled()` view until any is consumed, so
-    // the batch is flushed with one vectored write, then consumed FIFO.
-    // Batch metadata uses fixed-size slots.
-    let mut batch: [Option<snell_protocol::DecodedRecord>; WRITE_BATCH_MAX] = Default::default();
-    let mut batch_count = 0usize;
-    let mut batch_len = 0usize;
-    let mut write_off = 0usize;
-    // How the stream ends once the batch is written: `Ok` after a zero chunk,
-    // `Err` for a decode error deferred behind the records decoded before it.
-    let mut batch_end: Option<Result<(), SessionError>> = None;
+    let mut batch = DecodeBatch::default();
     let mut shutting_down = false;
     poll_fn(|cx| {
         loop {
@@ -668,39 +700,19 @@ where
                 return Pin::new(&mut *writer).poll_shutdown(cx).map_err(Into::into);
             }
 
-            if batch_count > 0 {
-                if write_off < batch_len {
-                    let filled = recv.filled();
-                    let mut slices = [io::IoSlice::new(&[]); WRITE_BATCH_MAX];
-                    let parts = batch[..batch_count]
-                        .iter()
-                        .flatten()
-                        .map(|record| record.plaintext(filled));
-                    let count = unwritten_slices(parts, write_off, &mut slices);
-                    write_off += ready!(poll_write_slices(writer, cx, &slices[..count]))?;
-                    continue;
-                }
-                for record in batch[..batch_count].iter_mut().filter_map(Option::take) {
-                    decoder.consume(recv, &record)?;
-                }
-                batch_count = 0;
-                batch_len = 0;
-                write_off = 0;
-                match batch_end.take() {
-                    Some(Err(error)) => return Poll::Ready(Err(error)),
-                    Some(Ok(())) => shutting_down = true,
-                    None => {}
-                }
+            if !batch.is_empty() {
+                ready!(batch.poll_write(writer, recv.filled(), cx))?;
+                shutting_down = batch.consume(decoder, recv)?;
                 continue;
             }
 
             // Fill a batch by decode-ahead. No reads happen mid-batch, so no
-            // compaction can move the plaintext under the collected ranges.
+            // compaction can move the plaintext under the decoded ranges.
             loop {
                 match decoder.decode(recv) {
                     Ok(DecodeStatus::NeedMore { minimum }) => {
-                        if batch_count > 0 {
-                            // Flush what is ready before reading more.
+                        if !batch.is_empty() {
+                            // Write what is ready before reading more.
                             break;
                         }
                         let Poll::Ready(read) =
@@ -720,31 +732,27 @@ where
                     }
                     Ok(DecodeStatus::Record(record)) => {
                         if record.kind == RecordKind::ZeroChunk {
-                            if batch_count == 0 {
+                            if batch.is_empty() {
                                 decoder.consume(recv, &record)?;
                                 shutting_down = true;
                             } else {
-                                // Consumed FIFO with the batch, then end.
-                                batch[batch_count] = Some(record);
-                                batch_count += 1;
-                                batch_end = Some(Ok(()));
+                                // Consumed in order with the batch, then end.
+                                batch.push(&record);
+                                batch.end = Some(Ok(()));
                             }
                             break;
                         }
-                        batch_len += record.plaintext.len();
-                        batch[batch_count] = Some(record);
-                        batch_count += 1;
-                        if batch_count == WRITE_BATCH_MAX {
+                        batch.push(&record);
+                        if batch.is_full() {
                             break;
                         }
                     }
                     Err(error) => {
-                        if batch_count == 0 {
+                        if batch.is_empty() {
                             return Poll::Ready(Err(error.into()));
                         }
-                        // Flush decoded records before surfacing the error,
-                        // matching the former write-per-record order.
-                        batch_end = Some(Err(error.into()));
+                        // Write the records decoded before the error first.
+                        batch.end = Some(Err(error.into()));
                         break;
                     }
                 }
@@ -752,6 +760,101 @@ where
         }
     })
     .await
+}
+
+/// Decoded records not yet written. Their plaintext ranges stay valid
+/// against the unmoved `filled()` view until any record is consumed, so the
+/// batch is written with one vectored write, then consumed in order.
+#[derive(Default)]
+struct DecodeBatch {
+    records: [BatchedRecord; WRITE_BATCH_MAX],
+    len: usize,
+    written: usize,
+    /// How the stream ends once the batch is written: `Ok` after a zero
+    /// chunk, `Err` for a decode error deferred behind the earlier records.
+    end: Option<Result<(), SessionError>>,
+}
+
+impl DecodeBatch {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == WRITE_BATCH_MAX
+    }
+
+    fn push(&mut self, record: &DecodedRecord) {
+        self.records[self.len] = BatchedRecord {
+            plaintext: record.plaintext.start as u32..record.plaintext.end as u32,
+            consumed: record.consumed as u32,
+            kind: record.kind,
+        };
+        self.len += 1;
+    }
+
+    /// Write the rest of the batch's plaintext from `filled`.
+    fn poll_write<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        filled: &[u8],
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            let mut slices = [io::IoSlice::new(&[]); WRITE_BATCH_MAX];
+            let parts = self.records[..self.len].iter().map(|record| {
+                let Range { start, end } = record.plaintext;
+                &filled[start as usize..end as usize]
+            });
+            let count = unwritten_slices(parts, self.written, &mut slices);
+            if count == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            self.written += ready!(poll_write_slices(writer, cx, &slices[..count]))?;
+        }
+    }
+
+    /// Consume the written records from `recv`. Returns whether the stream
+    /// ended with them, or the error deferred behind them.
+    fn consume<D: RecordDecoder>(
+        &mut self,
+        decoder: &mut D,
+        recv: &mut PooledBuffer,
+    ) -> Result<bool, SessionError> {
+        for record in &self.records[..self.len] {
+            let Range { start, end } = record.plaintext;
+            let record = DecodedRecord {
+                consumed: record.consumed as usize,
+                plaintext: start as usize..end as usize,
+                kind: record.kind,
+            };
+            decoder.consume(recv, &record)?;
+        }
+        self.len = 0;
+        self.written = 0;
+        match self.end.take() {
+            Some(end) => end.map(|()| true),
+            None => Ok(false),
+        }
+    }
+}
+
+/// A [`DecodedRecord`] at half the size: buffer offsets fit `u32`.
+#[derive(Clone)]
+struct BatchedRecord {
+    plaintext: Range<u32>,
+    consumed: u32,
+    kind: RecordKind,
+}
+
+impl Default for BatchedRecord {
+    fn default() -> Self {
+        Self {
+            plaintext: 0..0,
+            consumed: 0,
+            kind: RecordKind::Data,
+        }
+    }
 }
 
 #[cfg(test)]

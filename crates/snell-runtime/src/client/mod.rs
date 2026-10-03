@@ -106,9 +106,14 @@ async fn handle_client(
     udp_controls: &Semaphore,
 ) -> Result<(), SessionError> {
     prepare_session_stream(&local)?;
-    match with_handshake_timeout(accept_socks5(&mut local)).await? {
+    // Boxed: SOCKS5 negotiation state is larger than a relay's and dead
+    // once the request is parsed.
+    match Box::pin(with_handshake_timeout(accept_socks5(&mut local))).await? {
         Socks5Command::Connect(destination) => connect(&mut local, config, &destination, kdf).await,
-        Socks5Command::UdpAssociate => udp::associate(local, config, kdf, udp_controls).await,
+        // Boxed: only UDP associations pay for UDP relay state.
+        Socks5Command::UdpAssociate => {
+            Box::pin(udp::associate(local, config, kdf, udp_controls)).await
+        }
     }
 }
 
@@ -234,8 +239,8 @@ async fn open_tunnel(
     config: &ClientConfig,
     kdf: &KdfLimiter,
 ) -> Result<Vec<u8>, SessionError> {
+    // `connect_tcp` already set the socket options of dialed connections.
     let Connection { stream, codec } = conn;
-    prepare_session_stream(stream)?;
     with_codec!(codec, |encoder, decoder| {
         with_handshake_timeout(async {
             write_connect(

@@ -158,10 +158,10 @@ async fn auto_session(
     // Boxed: detection state is large and needed only until the first request
     // authenticates, not for the session's lifetime.
     let detect = detect_protocol(&mut snell, &config.psk, kdf, replay, &config.buffers);
-    let (mut codec, recv, first) = Box::pin(detect).await?;
+    let (mut codec, mut recv, first) = Box::pin(detect).await?;
     drop(handshake);
     with_codec!(&mut codec, |encoder, decoder| {
-        server_session(snell, encoder, decoder, config, kdf, recv, first).await
+        server_session(&mut snell, encoder, decoder, config, kdf, &mut recv, first).await
     })
 }
 
@@ -176,6 +176,10 @@ impl<D: RecordDecoder, E: RecordEncoder + Send + 'static> ExactSession<'_, D, E>
     /// Authenticate the first request, then derive the response key, under
     /// one deadline. The codec is built here rather than passed in, so the
     /// future holds a single copy of it.
+    ///
+    /// Transient steps are boxed here and in `server_session`: their state
+    /// is larger than the relay's, and unboxed it would size every
+    /// connection's task for its whole lifetime.
     async fn run(
         self,
         mut snell: TcpStream,
@@ -185,7 +189,7 @@ impl<D: RecordDecoder, E: RecordEncoder + Send + 'static> ExactSession<'_, D, E>
     ) -> Result<(), SessionError> {
         let mut decoder = (self.make_decoder)(config.psk.clone());
         let mut recv = config.buffers.get(snell_protocol::V6_WIRE_CAP);
-        let (first, mut encoder) = with_handshake_timeout(async {
+        let (first, mut encoder) = Box::pin(with_handshake_timeout(async {
             let first = read_server_connect(
                 &mut decoder,
                 &mut recv,
@@ -197,22 +201,23 @@ impl<D: RecordDecoder, E: RecordEncoder + Send + 'static> ExactSession<'_, D, E>
             .await?;
             let encoder = kdf.derive(&config.psk, self.make_encoder).await?;
             Ok((first, encoder))
-        })
+        }))
         .await?;
         drop(handshake);
-        server_session(snell, &mut encoder, &mut decoder, config, kdf, recv, first).await
+        let (encoder, decoder) = (&mut encoder, &mut decoder);
+        server_session(&mut snell, encoder, decoder, config, kdf, &mut recv, first).await
     }
 }
 
 /// Serve requests on an authenticated session: UDP, or CONNECTs until the
 /// client stops reusing the connection.
 async fn server_session<E: RecordEncoder, D: RecordDecoder>(
-    mut snell: TcpStream,
+    snell: &mut TcpStream,
     encoder: &mut E,
     decoder: &mut D,
     config: &ServerConfig,
     kdf: &KdfLimiter,
-    mut recv: PooledBuffer,
+    recv: &mut PooledBuffer,
     mut command: ServerFirst,
 ) -> Result<(), SessionError> {
     let buffers = &config.buffers;
@@ -221,20 +226,22 @@ async fn server_session<E: RecordEncoder, D: RecordDecoder>(
         let (ConnectRequest { destination, reuse }, leftover) = match command {
             ServerFirst::Connect { request, leftover } => (request, leftover),
             ServerFirst::Udp => {
-                return run_server_udp(snell, encoder, decoder, config, kdf, recv).await;
+                // Boxed: only UDP sessions pay for UDP relay state.
+                let udp = run_server_udp(snell, encoder, decoder, config, kdf, recv);
+                return Box::pin(udp).await;
             }
         };
 
-        let mut remote = match with_handshake_timeout(async {
+        let open = with_handshake_timeout(async {
             let remote = config.outbound.connect(&destination).await?;
-            write_tunnel(encoder, buffers, &mut snell).await?;
+            write_tunnel(encoder, buffers, snell).await?;
             Ok(remote)
-        })
-        .await
-        {
+        });
+        let mut remote = match Box::pin(open).await {
             Ok(remote) => remote,
             Err(error) => {
-                let _ = write_reject(encoder, buffers, &mut snell, &error.to_string()).await;
+                // Boxed: a failure path should not size every session.
+                let _ = Box::pin(write_reject(encoder, buffers, snell, &error.to_string())).await;
                 return Err(error);
             }
         };
@@ -245,30 +252,14 @@ async fn server_session<E: RecordEncoder, D: RecordDecoder>(
         );
 
         drop(destination);
-        relay(
-            &mut snell,
-            &mut remote,
-            encoder,
-            decoder,
-            &mut recv,
-            leftover,
-            reuse,
-        )
-        .await?;
+        relay(snell, &mut remote, encoder, decoder, recv, leftover, reuse).await?;
         if !reuse || decoder.has_unconsumed_plaintext() {
             return Ok(());
         }
         recv.release_empty();
-        wait_reuse_idle(&mut snell, &mut recv).await?;
-        command = with_handshake_timeout(read_server_connect(
-            decoder,
-            &mut recv,
-            &mut snell,
-            kdf,
-            &config.psk,
-            None,
-        ))
-        .await?;
+        wait_reuse_idle(snell, recv).await?;
+        let next = read_server_connect(decoder, recv, snell, kdf, &config.psk, None);
+        command = Box::pin(with_handshake_timeout(next)).await?;
         reused = true;
     }
 }
