@@ -40,6 +40,7 @@ Performance-first review cleanup. No protocol, wire format, or configuration-fil
 - Codec behavior shared by v4, v6-unshaped, and v6-shaped (fragmentation, decode-ahead, zero chunks, tamper detection, cancellation, Debug redaction) runs once per codec in `snell-testkit`; `seal_init` parity runs once per codec in the buffer module. The per-codec copies are removed.
 - SOCKS5 TCP/UDP test helpers live once in `snell-testkit::oracle`, built on the protocol crate's SOCKS5 codec, and replace copies in the runtime tests, binary tests, and benches. `ProcessPair` takes `ServerOptions`.
 - Duplicate or tautological tests are removed, and process tests share one parametrized body.
+- The process oracle keeps only its throughput run; its v4 echo and reuse tests repeated `snell`'s process tests, which now also cover an auto-detecting server with a reusing client.
 - The shared codec suite and the golden record checks are generic functions over the codec traits instead of macro bodies; `snell-testkit::seal_records` returns records in wire order. The seal-init parity check also runs on the unsafe-raw codec, so Miri covers the unsafe payload path.
 
 ## 0.1.2

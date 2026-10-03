@@ -57,11 +57,6 @@ async fn v6_unshaped_process_echo() {
 }
 
 #[tokio::test]
-async fn v4_reuse_process_echoes() {
-    process_echo(server("4"), client("v4", true), 2).await;
-}
-
-#[tokio::test]
 async fn v6_shaped_reuse_process_echoes() {
     process_echo(server("6"), client("v6-default", true), 2).await;
 }
@@ -69,4 +64,9 @@ async fn v6_shaped_reuse_process_echoes() {
 #[tokio::test]
 async fn auto_server_v4_client_process_echo() {
     process_echo(ServerOptions::default(), client("v4", false), 1).await;
+}
+
+#[tokio::test]
+async fn auto_server_v4_reuse_process_echoes() {
+    process_echo(ServerOptions::default(), client("v4", true), 2).await;
 }
