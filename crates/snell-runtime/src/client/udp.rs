@@ -347,18 +347,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_takes_the_control_ip_then_only_the_first_port() {
+    async fn relay_takes_only_the_first_port() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = socket.local_addr().unwrap();
         let mut relay = Relay {
             socket,
-            client_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            client_ip: Ipv4Addr::LOCALHOST.into(),
             client: None,
         };
-        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let first = UdpSocket::bind("127.0.0.2:0").await.unwrap();
-        let other_port = UdpSocket::bind("127.0.0.2:0").await.unwrap();
-        stranger.send_to(b"stranger", relay_addr).await.unwrap();
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other_port = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         first.send_to(b"one", relay_addr).await.unwrap();
         other_port.send_to(b"other", relay_addr).await.unwrap();
         first.send_to(b"two", relay_addr).await.unwrap();
@@ -369,7 +367,34 @@ mod tests {
             assert_eq!(datagram.filled(), expected);
             assert_eq!(from, first.local_addr().unwrap());
         }
-        assert_eq!(metrics.invalid.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.invalid.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn relay_drops_datagrams_from_other_ips() {
+        // Telling two sources apart by IP needs a second loopback address.
+        // Linux and Windows serve all of 127.0.0.0/8; macOS only has 127.0.0.1
+        // unless `lo0` is aliased, so skip there instead of failing.
+        let Ok(client) = UdpSocket::bind("127.0.0.2:0").await else {
+            eprintln!("skipped: 127.0.0.2 is not available on this host");
+            return;
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = socket.local_addr().unwrap();
+        let mut relay = Relay {
+            socket,
+            client_ip: Ipv4Addr::new(127, 0, 0, 2).into(),
+            client: None,
+        };
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger.send_to(b"stranger", relay_addr).await.unwrap();
+        client.send_to(b"one", relay_addr).await.unwrap();
+
+        let (buffers, metrics) = (Arc::default(), UdpMetrics::default());
+        let (datagram, from) = relay.recv(&buffers, &metrics).await.unwrap();
+        assert_eq!(datagram.filled(), b"one");
+        assert_eq!(from, client.local_addr().unwrap());
+        assert_eq!(metrics.invalid.load(Ordering::Relaxed), 1);
     }
 
     /// The relay socket exists before the reply names it, and the association
