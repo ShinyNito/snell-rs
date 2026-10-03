@@ -11,10 +11,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use snell_protocol::{
-    ConnectRequest, Error as ProtocolError, ProtocolFlavor, ProtocolSelection, Psk, RecordDecoder,
+    Address, Error as ProtocolError, ProtocolFlavor, ProtocolSelection, Psk, RecordDecoder,
     RecordEncoder, V4Decoder, V4Encoder, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder,
     V6UnshapedEncoder,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{Instrument, debug, info, warn};
@@ -220,10 +221,9 @@ async fn server_session<E: RecordEncoder, D: RecordDecoder>(
     recv: &mut PooledBuffer,
     mut command: ServerFirst,
 ) -> Result<(), SessionError> {
-    let buffers = &config.buffers;
     let mut reused = false;
     loop {
-        let (ConnectRequest { destination, reuse }, leftover) = match command {
+        let (request, leftover) = match command {
             ServerFirst::Connect { request, leftover } => (request, leftover),
             ServerFirst::Udp => {
                 // Boxed: only UDP sessions pay for UDP relay state.
@@ -231,28 +231,20 @@ async fn server_session<E: RecordEncoder, D: RecordDecoder>(
                 return Box::pin(udp).await;
             }
         };
-
-        let open = with_handshake_timeout(async {
-            let remote = config.outbound.connect(&destination).await?;
-            write_tunnel(encoder, buffers, snell).await?;
-            Ok(remote)
-        });
-        let mut remote = match Box::pin(open).await {
-            Ok(remote) => remote,
-            Err(error) => {
-                // Boxed: a failure path should not size every session.
-                let _ = Box::pin(write_reject(encoder, buffers, snell, &error.to_string())).await;
-                return Err(error);
-            }
-        };
-        info!(
-            target = %destination,
+        let reuse = request.reuse;
+        // Boxed: dialing, the reply, the destination, and the early payload
+        // are dead once the tunnel is open, so the relay does not reserve
+        // their space.
+        let open = open_remote(
+            snell,
+            encoder,
+            config,
+            request.destination,
+            leftover,
             reused,
-            "handshake completed, tunnel established"
         );
-
-        drop(destination);
-        relay(snell, &mut remote, encoder, decoder, recv, leftover, reuse).await?;
+        let mut remote = Box::pin(open).await?;
+        relay(snell, &mut remote, encoder, decoder, recv, reuse).await?;
         if !reuse || decoder.has_unconsumed_plaintext() {
             return Ok(());
         }
@@ -262,6 +254,40 @@ async fn server_session<E: RecordEncoder, D: RecordDecoder>(
         command = Box::pin(with_handshake_timeout(next)).await?;
         reused = true;
     }
+}
+
+/// Dial `destination` and answer the client, then pass on the stream bytes
+/// that arrived with the request.
+async fn open_remote<E: RecordEncoder>(
+    snell: &mut TcpStream,
+    encoder: &mut E,
+    config: &ServerConfig,
+    destination: Address,
+    early_payload: Vec<u8>,
+    reused: bool,
+) -> Result<TcpStream, SessionError> {
+    let buffers = &config.buffers;
+    let open = with_handshake_timeout(async {
+        let remote = config.outbound.connect(&destination).await?;
+        write_tunnel(encoder, buffers, snell).await?;
+        Ok(remote)
+    });
+    let mut remote = match open.await {
+        Ok(remote) => remote,
+        Err(error) => {
+            let _ = write_reject(encoder, buffers, snell, &error.to_string()).await;
+            return Err(error);
+        }
+    };
+    info!(
+        target = %destination,
+        reused,
+        "handshake completed, tunnel established"
+    );
+    if !early_payload.is_empty() {
+        remote.write_all(&early_payload).await?;
+    }
+    Ok(remote)
 }
 
 #[cfg(test)]

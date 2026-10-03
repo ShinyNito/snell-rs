@@ -15,6 +15,7 @@ use snell_protocol::{
     Address, ProtocolFlavor, Psk, RecordDecoder, V4Decoder, V4Encoder, V6ShapedDecoder,
     V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{Instrument, debug, info, warn};
@@ -109,7 +110,18 @@ async fn handle_client(
     // Boxed: SOCKS5 negotiation state is larger than a relay's and dead
     // once the request is parsed.
     match Box::pin(with_handshake_timeout(accept_socks5(&mut local))).await? {
-        Socks5Command::Connect(destination) => connect(&mut local, config, &destination, kdf).await,
+        Socks5Command::Connect(destination) => {
+            // Boxed: dialing, CONNECT, and the destination itself are dead once
+            // the tunnel is open, so the relay does not reserve their space.
+            let mut tunnel = Box::pin(open(&mut local, config, destination, kdf)).await?;
+            if relay_tunnel(&mut local, config, &mut tunnel).await?
+                && let Some(pool) = &config.pool
+                && pool.put(tunnel.conn)
+            {
+                debug!(pool_len = pool.len(), "returned connection to reuse pool");
+            }
+            Ok(())
+        }
         // Boxed: only UDP associations pay for UDP relay state.
         Socks5Command::UdpAssociate => {
             Box::pin(udp::associate(local, config, kdf, udp_controls)).await
@@ -117,24 +129,21 @@ async fn handle_client(
     }
 }
 
-/// CONNECT `destination` over a pooled or freshly dialed Snell connection,
-/// relay `local` through it, and return it to the pool when reusable.
-///
-/// Establishing is boxed: its state is needed only until the tunnel opens,
-/// and would otherwise stay reserved for the whole relay.
-async fn connect(
+/// Open a tunnel to `destination` over a pooled or freshly dialed Snell
+/// connection, answer the SOCKS5 client, and pass on stream bytes that
+/// arrived with the server's reply.
+async fn open(
     local: &mut TcpStream,
     config: &ClientConfig,
-    destination: &Address,
+    destination: Address,
     kdf: &KdfLimiter,
-) -> Result<(), SessionError> {
-    let Tunnel {
-        mut conn,
-        mut recv,
+) -> Result<Tunnel, SessionError> {
+    let Established {
+        tunnel,
         leftover,
         reused,
-    } = match Box::pin(establish(config, destination, kdf)).await {
-        Ok(tunnel) => tunnel,
+    } = match establish(config, &destination, kdf).await {
+        Ok(established) => established,
         Err(error) => return Err(write_socks5_fail(local, error).await),
     };
     write_socks5_reply(local, Reply::Succeeded).await?;
@@ -144,27 +153,38 @@ async fn connect(
         reused,
         "handshake completed, tunnel established"
     );
-
-    let reuse = config.pool.is_some();
-    let Connection { stream, codec } = &mut conn;
-    let reusable = with_codec!(codec, |encoder, decoder| {
-        relay(stream, local, encoder, decoder, &mut recv, leftover, reuse).await?;
-        reuse && recv.is_empty() && !decoder.has_unconsumed_plaintext()
-    });
-    if reusable
-        && let Some(pool) = &config.pool
-        && pool.put(conn)
-    {
-        debug!(pool_len = pool.len(), "returned connection to reuse pool");
+    if !leftover.is_empty() {
+        local.write_all(&leftover).await?;
     }
-    Ok(())
+    Ok(tunnel)
 }
 
-/// An open tunnel: the connection, its receive lease, and stream bytes that
-/// arrived with the server's reply.
+/// Relay `local` through the tunnel until either side closes. Returns
+/// whether the connection can go back to the reuse pool.
+async fn relay_tunnel(
+    local: &mut TcpStream,
+    config: &ClientConfig,
+    tunnel: &mut Tunnel,
+) -> Result<bool, SessionError> {
+    let reuse = config.pool.is_some();
+    let Tunnel { conn, recv } = tunnel;
+    let Connection { stream, codec } = conn;
+    Ok(with_codec!(codec, |encoder, decoder| {
+        relay(stream, local, encoder, decoder, recv, reuse).await?;
+        reuse && recv.is_empty() && !decoder.has_unconsumed_plaintext()
+    }))
+}
+
+/// A Snell connection with an open tunnel, and its receive lease.
 struct Tunnel {
     conn: Connection,
     recv: PooledBuffer,
+}
+
+/// A tunnel just established, with the stream bytes that arrived with the
+/// server's reply and whether its connection came from the pool.
+struct Established {
+    tunnel: Tunnel,
     leftover: Vec<u8>,
     reused: bool,
 }
@@ -176,15 +196,14 @@ async fn establish(
     config: &ClientConfig,
     destination: &Address,
     kdf: &KdfLimiter,
-) -> Result<Tunnel, SessionError> {
+) -> Result<Established, SessionError> {
     let reuse = config.pool.is_some();
     if let Some(mut conn) = config.pool.as_ref().and_then(ReusePool::take) {
         let mut recv = config.buffers.get(snell_protocol::V6_WIRE_CAP);
         match open_tunnel(&mut conn, &mut recv, destination, reuse, config, kdf).await {
             Ok(leftover) => {
-                return Ok(Tunnel {
-                    conn,
-                    recv,
+                return Ok(Established {
+                    tunnel: Tunnel { conn, recv },
                     leftover,
                     reused: true,
                 });
@@ -196,9 +215,8 @@ async fn establish(
     let mut conn = dial(config, kdf).await?;
     let mut recv = config.buffers.get(snell_protocol::V6_WIRE_CAP);
     let leftover = open_tunnel(&mut conn, &mut recv, destination, reuse, config, kdf).await?;
-    Ok(Tunnel {
-        conn,
-        recv,
+    Ok(Established {
+        tunnel: Tunnel { conn, recv },
         leftover,
         reused: false,
     })

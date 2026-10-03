@@ -422,14 +422,8 @@ pub(crate) async fn relay<E: RecordEncoder, D: RecordDecoder>(
     encoder: &mut E,
     decoder: &mut D,
     recv: &mut PooledBuffer,
-    initial_to_plain: Vec<u8>,
     keep_snell_open: bool,
 ) -> Result<(), SessionError> {
-    if !initial_to_plain.is_empty() {
-        tokio::io::AsyncWriteExt::write_all(plain, &initial_to_plain).await?;
-    }
-
-    drop(initial_to_plain);
     let (mut snell_r, mut snell_w) = snell.split();
     let (mut plain_r, mut plain_w) = plain.split();
     let buffers = Arc::clone(recv.pool());
@@ -554,33 +548,23 @@ enum Phase {
     ShuttingDown,
 }
 
-/// Most slices one encode batch writes; each record adds at most two.
-const ENCODE_SLICES_MAX: usize = 64;
+/// Entries in one encode batch, written with one vectored write; a run of
+/// unsplit records is one entry.
+const ENCODE_BATCH_MAX: usize = 32;
 
 // Batch offsets are stored as `u32`: session buffers are at most this long.
 const _: () = assert!(snell_protocol::V6_WIRE_CAP <= u32::MAX as usize);
 
 /// Records sealed into the encode buffer and not yet fully written, as
-/// wire-order ranges of the buffer. A shaped record keeps its body before
-/// its header, so it can be two ranges; a range that continues the previous
-/// one extends it.
+/// `(split, end)`: a record starts where the previous one ended (the first
+/// at 0) and goes on the wire as `[start + split..end]`, then
+/// `[start..start + split]`. Only shaped records split; consecutive unsplit
+/// records are contiguous on the wire and share one entry.
+#[derive(Default)]
 struct EncodeBatch {
-    ranges: [Range<u32>; ENCODE_SLICES_MAX],
+    records: [(u32, u32); ENCODE_BATCH_MAX],
     len: usize,
-    /// Where the last record ends, and so where the next one starts.
-    end: usize,
     written: usize,
-}
-
-impl Default for EncodeBatch {
-    fn default() -> Self {
-        Self {
-            ranges: [const { 0..0 }; ENCODE_SLICES_MAX],
-            len: 0,
-            end: 0,
-            written: 0,
-        }
-    }
 }
 
 impl EncodeBatch {
@@ -588,33 +572,25 @@ impl EncodeBatch {
         self.len == 0
     }
 
-    /// Whether another record, up to two ranges, still fits.
     fn has_room(&self) -> bool {
-        self.len <= ENCODE_SLICES_MAX - 2
+        self.len < ENCODE_BATCH_MAX
     }
 
-    /// Add the record that ends at `end`, sent as `[split..]` then
-    /// `[..split]` relative to its start, where the previous one ended.
+    /// Add the record that ends at `end`; `split` is relative to its start.
     fn push(&mut self, end: usize, split: usize) {
-        let start = std::mem::replace(&mut self.end, end);
-        for range in [start + split..end, start..start + split] {
-            if range.is_empty() {
-                continue;
-            }
-            let range = range.start as u32..range.end as u32;
-            match self.ranges[..self.len].last_mut() {
-                Some(last) if last.end == range.start => last.end = range.end,
-                _ => {
-                    self.ranges[self.len] = range;
-                    self.len += 1;
-                }
-            }
+        if split == 0
+            && let Some(last) = self.records[..self.len].last_mut()
+            && last.0 == 0
+        {
+            last.1 = end as u32;
+            return;
         }
+        self.records[self.len] = (split as u32, end as u32);
+        self.len += 1;
     }
 
     fn clear(&mut self) {
         self.len = 0;
-        self.end = 0;
         self.written = 0;
     }
 
@@ -626,53 +602,70 @@ impl EncodeBatch {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            let mut slices = [io::IoSlice::new(&[]); ENCODE_SLICES_MAX];
-            let parts = self.ranges[..self.len]
-                .iter()
-                .map(|range| &filled[range.start as usize..range.end as usize]);
-            let count = unwritten_slices(parts, self.written, &mut slices);
-            if count == 0 {
-                return Poll::Ready(Ok(()));
+            let mut slices = [io::IoSlice::new(&[]); 2 * ENCODE_BATCH_MAX];
+            let mut unwritten = Unwritten::new(&mut slices, self.written);
+            let mut start = 0;
+            for &(split, end) in &self.records[..self.len] {
+                let (split, end) = (start + split as usize, end as usize);
+                unwritten.push(&filled[split..end]);
+                unwritten.push(&filled[start..split]);
+                start = end;
             }
-            self.written += ready!(poll_write_slices(writer, cx, &slices[..count]))?;
+            match ready!(unwritten.poll_write(writer, cx))? {
+                0 => return Poll::Ready(Ok(())),
+                written => self.written += written,
+            }
         }
     }
 }
 
-/// Fill `slices` with the parts not yet written, skipping the first
-/// `written` bytes. Returns the number of slices filled.
-fn unwritten_slices<'a>(
-    parts: impl Iterator<Item = &'a [u8]>,
-    mut written: usize,
-    slices: &mut [io::IoSlice<'a>],
-) -> usize {
-    let mut count = 0;
-    for part in parts {
-        if written >= part.len() {
-            written -= part.len();
-            continue;
-        }
-        slices[count] = io::IoSlice::new(&part[written..]);
-        written = 0;
-        count += 1;
-    }
-    count
+/// A batch's bytes not yet written, gathered in wire order into `slices`
+/// for one vectored write. The slices are borrowed rather than owned so the
+/// array is not copied when this is built.
+struct Unwritten<'a, 's> {
+    slices: &'s mut [io::IoSlice<'a>],
+    len: usize,
+    /// Bytes of the batch already written, still to be skipped.
+    skip: usize,
 }
 
-/// One (vectored) write; a zero-length write is an error, never progress.
-fn poll_write_slices<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    cx: &mut Context<'_>,
-    slices: &[io::IoSlice<'_>],
-) -> Poll<io::Result<usize>> {
-    let written = match slices {
-        [single] => ready!(Pin::new(writer).poll_write(cx, single))?,
-        _ => ready!(Pin::new(writer).poll_write_vectored(cx, slices))?,
-    };
-    if written == 0 {
-        return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+impl<'a, 's> Unwritten<'a, 's> {
+    fn new(slices: &'s mut [io::IoSlice<'a>], written: usize) -> Self {
+        Self {
+            slices,
+            len: 0,
+            skip: written,
+        }
     }
-    Poll::Ready(Ok(written))
+
+    /// Add the batch's next part.
+    fn push(&mut self, part: &'a [u8]) {
+        if self.skip >= part.len() {
+            self.skip -= part.len();
+            return;
+        }
+        self.slices[self.len] = io::IoSlice::new(&part[self.skip..]);
+        self.skip = 0;
+        self.len += 1;
+    }
+
+    /// Write once. Returns how much was written, 0 only when nothing is
+    /// left; a zero-length write is an error, never progress.
+    fn poll_write<W: AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<usize>> {
+        let written = match &self.slices[..self.len] {
+            [] => return Poll::Ready(Ok(0)),
+            [single] => ready!(Pin::new(writer).poll_write(cx, single))?,
+            slices => ready!(Pin::new(writer).poll_write_vectored(cx, slices))?,
+        };
+        if written == 0 {
+            return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+        }
+        Poll::Ready(Ok(written))
+    }
 }
 
 /// Vectored-write fan-in limit: at most this many decoded records are
@@ -802,15 +795,15 @@ impl DecodeBatch {
     ) -> Poll<io::Result<()>> {
         loop {
             let mut slices = [io::IoSlice::new(&[]); WRITE_BATCH_MAX];
-            let parts = self.records[..self.len].iter().map(|record| {
+            let mut unwritten = Unwritten::new(&mut slices, self.written);
+            for record in &self.records[..self.len] {
                 let Range { start, end } = record.plaintext;
-                &filled[start as usize..end as usize]
-            });
-            let count = unwritten_slices(parts, self.written, &mut slices);
-            if count == 0 {
-                return Poll::Ready(Ok(()));
+                unwritten.push(&filled[start as usize..end as usize]);
             }
-            self.written += ready!(poll_write_slices(writer, cx, &slices[..count]))?;
+            match ready!(unwritten.poll_write(writer, cx))? {
+                0 => return Poll::Ready(Ok(())),
+                written => self.written += written,
+            }
         }
     }
 
@@ -991,6 +984,40 @@ mod buffer_tests {
         assert_eq!(recv.len(), 4100);
         assert_eq!(&recv.filled()[4096..], b"next");
         assert!(recv.filled()[..4096].iter().all(|&b| b == 0x55));
+    }
+
+    #[tokio::test]
+    async fn encode_batch_writes_split_records_in_wire_order() {
+        // Records as (length, split): unsplit runs share an entry, and a
+        // split record goes out from its split, then its start.
+        let records = [(3, 0), (2, 0), (4, 1), (2, 0), (3, 2), (1, 0), (2, 0)];
+        let filled: Vec<u8> = (0..records.iter().map(|r| r.0).sum::<usize>() as u8).collect();
+        let mut expected = Vec::new();
+        let mut start = 0;
+        for &(len, split) in &records {
+            expected.extend_from_slice(&filled[start + split..start + len]);
+            expected.extend_from_slice(&filled[start..start + split]);
+            start += len;
+        }
+        for limit in [1, 2, 3, 5, usize::MAX] {
+            let mut batch = EncodeBatch::default();
+            let mut end = 0;
+            for &(len, split) in &records {
+                end += len;
+                batch.push(end, split);
+            }
+            assert_eq!(batch.len, 5, "unsplit neighbors must share an entry");
+            let mut output = Output {
+                bytes: Vec::new(),
+                limit,
+                writes: 0,
+                pending: false,
+            };
+            poll_fn(|cx| batch.poll_write(&mut output, &filled, cx))
+                .await
+                .unwrap();
+            assert_eq!(output.bytes, expected, "write limit {limit}");
+        }
     }
 
     #[tokio::test]
