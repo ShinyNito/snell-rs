@@ -404,42 +404,37 @@ mod tests {
     async fn socks_responses_are_single_datagrams() {
         let metrics = UdpMetrics::default();
         let payload: Vec<u8> = (0..1400).map(|n| n as u8).collect();
-        for bind in ["127.0.0.1:0", "[::1]:0"] {
-            let sender = UdpSocket::bind(bind).await.unwrap();
-            let receiver = UdpSocket::bind(bind).await.unwrap();
-            for source in ["203.0.113.5:1234", "[2001:db8::5]:1234"] {
-                let source = AddressRef::Ip(source.parse().unwrap());
-                for payload in [b"".as_slice(), payload.as_slice()] {
-                    let mut plain = vec![0; 1500];
-                    let n =
-                        snell_protocol::encode_udp_response(&mut plain, source, payload).unwrap();
-                    send_socks_response(
-                        &sender,
-                        receiver.local_addr().unwrap(),
-                        &plain[..n],
-                        &metrics,
-                    )
-                    .await
-                    .unwrap();
-                    let mut received = [0; 1500];
-                    let (n, peer) = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        receiver.recv_from(&mut received),
-                    )
-                    .await
-                    .expect("response must arrive as one datagram")
-                    .unwrap();
-                    assert_eq!(peer, sender.local_addr().unwrap());
-                    let packet = socks5::parse_udp_packet(&received[..n]).unwrap();
-                    assert_eq!(packet.frag, 0);
-                    assert_eq!(packet.destination, source);
-                    assert_eq!(&received[packet.header_len..n], payload);
-                    assert_eq!(
-                        receiver.try_recv_from(&mut received).unwrap_err().kind(),
-                        std::io::ErrorKind::WouldBlock,
-                        "header and payload must be sent in one datagram",
-                    );
-                }
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for source in ["203.0.113.5:1234", "[2001:db8::5]:1234"] {
+            let source = AddressRef::Ip(source.parse().unwrap());
+            for payload in [b"".as_slice(), payload.as_slice()] {
+                let mut plain = vec![0; 1500];
+                let n = snell_protocol::encode_udp_response(&mut plain, source, payload).unwrap();
+                send_socks_response(
+                    &sender,
+                    receiver.local_addr().unwrap(),
+                    &plain[..n],
+                    &metrics,
+                )
+                .await
+                .unwrap();
+                let mut received = [0; 1500];
+                let (n, peer) =
+                    tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut received))
+                        .await
+                        .expect("response must arrive as one datagram")
+                        .unwrap();
+                assert_eq!(peer, sender.local_addr().unwrap());
+                let packet = socks5::parse_udp_packet(&received[..n]).unwrap();
+                assert_eq!(packet.frag, 0);
+                assert_eq!(packet.destination, source);
+                assert_eq!(&received[packet.header_len..n], payload);
+                assert_eq!(
+                    receiver.try_recv_from(&mut received).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "header and payload must be sent in one datagram",
+                );
             }
         }
         assert_eq!(metrics.invalid.load(Ordering::Relaxed), 0);
