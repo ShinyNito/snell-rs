@@ -9,6 +9,6 @@ publish.workspace = true
 description = "Raw-to-validated Snell configuration"
 
 [dependencies]
-snell-protocol = { path = "../snell-protocol", version = "0.1.2" }
-snell-runtime = { path = "../snell-runtime", version = "0.1.2" }
+snell-protocol = { path = "../snell-protocol", version = "0.2.0" }
+snell-runtime = { path = "../snell-runtime", version = "0.2.0" }
 thiserror.workspace = true

@@ -4,9 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.2.0
 
-Performance-first review cleanup. No protocol, wire format, or configuration-file changes: golden fixtures and the v6 padding-generator corpus hashes are byte-identical.
+Performance-first review cleanup. No protocol, wire format, or configuration-file changes: golden fixtures and the v6 padding-generator corpus hashes are byte-identical. The client's SOCKS5 UDP relay behaves differently (see Fixed and the last Changed entry), and several `snell-runtime` and `snell-protocol` items were removed or renamed (see Changed), hence the minor version bump.
 
 ### Fixed
 - The client's SOCKS5 UDP relay could drop a client's first datagram. Every association shared one relay socket, and a dispatcher task learned about each new control connection through a channel, so a datagram could be routed before its control was registered. Each UDP ASSOCIATE now binds its own relay socket before it replies, as RFC 1928 describes, so the association exists before the client can send to it. The dispatcher, its routing maps and control channel, the per-association queues, and the shared packet quota are gone.
