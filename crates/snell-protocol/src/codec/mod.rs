@@ -1,9 +1,22 @@
-//! The record codec interface: what callers that drive any TCP record codec
+//! Record codecs, and the interface callers that drive any of them
 //! generically rely on.
 
+pub(crate) mod clock;
+pub(crate) mod header;
+pub(crate) mod record;
+mod v4;
+pub(crate) mod v6;
+
+pub use clock::{Clock, FixedClock, MonotonicClock};
+pub use record::{DecodeStatus, DecodedRecord, RecordKind};
+pub use v4::{V4Decoder, V4Encoder, next_v4_chunk_limit};
+pub use v6::{V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder};
+#[cfg(feature = "unsafe-raw")]
+pub use v6::{V6UnsafeRawDecoder, V6UnsafeRawEncoder};
+
 use crate::buffer::{Reservation, Slot};
-use crate::record::{DecodeStatus, DecodedRecord, EncoderState};
 use crate::{AES_128_KEY_LEN, Buffer, Result, SALT_LEN};
+use record::EncoderState;
 
 /// Seals payloads into records, in place in a [`Buffer`].
 ///

@@ -6,58 +6,35 @@
 #![deny(unsafe_code)]
 
 mod address;
-mod aead;
 mod buffer;
-mod chunk;
-mod clock;
 mod codec;
 mod control;
-mod entropy;
+mod crypto;
 mod error;
-mod header;
-mod kdf;
-mod nonce;
-mod padding;
 mod parse;
-mod prf;
-mod profile;
-mod record;
-mod salt;
-mod secret;
 pub mod socks5;
-mod stream;
-mod v4;
-mod v6;
-mod v6_shaped;
-mod v6_unshaped;
-
-#[cfg(feature = "unsafe-raw")]
-mod v6_raw;
 
 #[cfg(test)]
 mod fragment;
 
 pub use address::{Address, AddressRef};
 pub use buffer::{Buffer, Reservation};
-pub use chunk::next_v4_chunk_limit;
-pub use clock::{Clock, FixedClock, MonotonicClock};
-pub use codec::{RecordDecoder, RecordEncoder};
-pub use control::{
-    ConnectRequest, ServerReply, UdpPacket, connect_request_len, decode_connect_request,
-    decode_connect_request_prefix, decode_server_reply, decode_udp_request, decode_udp_response,
-    decode_udp_setup_prefix, encode_connect_request, encode_reject, encode_tunnel_reply,
-    encode_udp_request, encode_udp_response, encode_udp_setup, udp_request_len, udp_response_len,
+pub use codec::{
+    Clock, DecodeStatus, DecodedRecord, FixedClock, MonotonicClock, RecordDecoder, RecordEncoder,
+    RecordKind, V4Decoder, V4Encoder, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder,
+    V6UnshapedEncoder, next_v4_chunk_limit,
 };
-pub use entropy::{Entropy, OsEntropy, RepeatEntropy, SequenceEntropy};
+pub use control::{
+    ConnectRequest, PlainStream, ServerReply, UdpPacket, connect_request_len,
+    decode_connect_request, decode_connect_request_prefix, decode_server_reply, decode_udp_request,
+    decode_udp_response, decode_udp_setup_prefix, encode_connect_request, encode_reject,
+    encode_tunnel_reply, encode_udp_request, encode_udp_response, encode_udp_setup,
+    udp_request_len, udp_response_len,
+};
+pub(crate) use crypto::Nonce;
+pub use crypto::{Entropy, OsEntropy, Psk, RepeatEntropy, SequenceEntropy, aead_key};
 pub use error::{Error, Result};
-pub use kdf::aead_key;
-pub(crate) use nonce::Nonce;
 pub use parse::ParseState;
-pub use record::{DecodeStatus, DecodedRecord, RecordKind};
-pub use secret::Psk;
-pub use stream::PlainStream;
-pub use v4::{V4Decoder, V4Encoder};
-pub use v6::{V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder};
 
 /// Exact record-codec selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,7 +53,7 @@ pub enum ProtocolSelection {
 }
 
 #[cfg(feature = "unsafe-raw")]
-pub use v6::{V6UnsafeRawDecoder, V6UnsafeRawEncoder};
+pub use codec::{V6UnsafeRawDecoder, V6UnsafeRawEncoder};
 
 /// Snell CONNECT / UDP-setup version byte. Distinct from the AEAD header marker.
 pub const PROTOCOL_VERSION: u8 = 0x01;

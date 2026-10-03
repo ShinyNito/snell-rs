@@ -1,20 +1,24 @@
 //! v4 record codec. v5 TCP uses the same types.
 
+mod chunk;
+mod padding;
+
 use core::fmt;
 
-use crate::aead::Aes128Gcm;
 use crate::buffer::{Reservation, Slot};
-use crate::chunk::V4ChunkState;
+use crate::codec::header::{RecordHeader, opened_header, parse_v4_plain_header, plain_header};
+use crate::codec::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::codec::sealed::Seal;
 use crate::codec::{RecordDecoder, RecordEncoder};
-use crate::header::{RecordHeader, opened_header, parse_v4_plain_header, plain_header};
-use crate::padding::{fill_v4_padding, swap_even_indices};
-use crate::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
+use crate::crypto::aead::Aes128Gcm;
 use crate::{
     AES_128_KEY_LEN, Buffer, Clock, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN,
     MAX_PACKET_SIZE, MonotonicClock, Nonce, OsEntropy, Psk, Result, SALT_LEN, TAG_LEN,
     V4_INITIAL_PADDING_MIN, V4_INITIAL_PADDING_SPAN,
 };
+use chunk::V4ChunkState;
+pub use chunk::next_v4_chunk_limit;
+use padding::{fill_v4_padding, swap_even_indices};
 
 /// v4 TCP record encoder. v5 TCP uses the same type.
 pub struct V4Encoder<E = OsEntropy, C = MonotonicClock> {
@@ -321,7 +325,6 @@ impl fmt::Debug for V4Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunk::next_v4_chunk_limit;
     use crate::{
         Address, COMMAND_CONNECT, FixedClock, ParseState, PlainStream, RecordKind, RepeatEntropy,
         SequenceEntropy, V4_FIRST_RECORD_OVERHEAD, V4_MSS_BASE, V4_RESET_OVERHEAD, V4_WIRE_CAP,

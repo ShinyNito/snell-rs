@@ -34,6 +34,7 @@ Performance-first review cleanup. No protocol, wire format, or configuration-fil
 - Platform socket options follow the usual `sys` layout: each OS module exports the same functions and `platform` re-exports them under `cfg`, replacing per-function `cfg` dispatch blocks and the TFO wrappers between them. Other platforms report TCP Fast Open and tcp-brutal unsupported from one place.
 - `socks5::Command` and `socks5::Reply` convert with `From<u8>`/`Into<u8>` instead of `from_u8`/`to_u8`.
 - `KdfLimiter::derive` holds the queue and blocking-pool logic directly instead of forwarding to a generic `run`. The local-to-Snell pump tracks one close `Phase` instead of three booleans. `UdpFlow` is one socket plus a route instead of two variants repeating the socket and buffer pool, and leases from the caller's pool. The v4 chunk window no longer re-clamps budgets that are already bounded.
+- Modules are grouped by domain. `snell-protocol`: `codec/` (with `v4/` and `v6/`), `control/`, `crypto/`. `snell-runtime`: `client/` (SOCKS5 inbound, pool, UDP relay), `server/` (auto-detection, outbound, UDP associations), with shared session, buffer, and platform code at the top. Public paths are unchanged.
 - `UdpOptions` no longer implements `Default`, which panicked when the system DNS configuration was missing; use `UdpOptions::new()`.
 
 ### Tests

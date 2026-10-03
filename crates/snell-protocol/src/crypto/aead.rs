@@ -3,7 +3,7 @@ use core::fmt;
 use ring::aead::{self, Aad, LessSafeKey, UnboundKey};
 use zeroize::Zeroize;
 
-use crate::kdf::aead_key;
+use crate::crypto::kdf::aead_key;
 use crate::{AES_128_KEY_LEN, Error, Nonce, Psk, Result, SALT_LEN, TAG_LEN};
 
 /// AES-128-GCM with empty or caller-supplied AAD.

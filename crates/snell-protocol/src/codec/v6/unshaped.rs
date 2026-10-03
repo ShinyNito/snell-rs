@@ -2,12 +2,12 @@
 
 use core::fmt;
 
-use crate::aead::Aes128Gcm;
 use crate::buffer::{Reservation, Slot};
+use crate::codec::header::{opened_header, parse_v6_plain_header, plain_header};
+use crate::codec::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::codec::sealed::Seal;
 use crate::codec::{RecordDecoder, RecordEncoder};
-use crate::header::{opened_header, parse_v6_plain_header, plain_header};
-use crate::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
+use crate::crypto::aead::Aes128Gcm;
 use crate::{
     AES_128_KEY_LEN, Buffer, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE,
     Nonce, OsEntropy, Psk, Result, SALT_LEN, TAG_LEN,

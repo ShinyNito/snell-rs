@@ -4,7 +4,7 @@
 use std::mem::MaybeUninit;
 
 use crate::codec::RecordEncoder;
-use crate::record::EncoderState;
+use crate::codec::record::EncoderState;
 use crate::{Error, Result};
 
 /// Fixed backing allocation and a live byte range; never grows implicitly.

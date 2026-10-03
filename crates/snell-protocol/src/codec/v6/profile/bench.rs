@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
-#[path = "../../benches/support/profile_cases.rs"]
+#[path = "../../../../benches/support/profile_cases.rs"]
 mod profile_cases;
 
 const LENGTHS: [usize; 4] = [32, 128, 512, 1460];

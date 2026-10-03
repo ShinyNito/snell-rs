@@ -3,7 +3,7 @@
 //! Callers pass blocks of the profile's salt-block length, which is always in
 //! `SALT_LEN + 0x10..=SALT_LEN + 0x80`, so every permuted index is in bounds.
 
-use crate::prf::{PRF_ADD_A, PRF_ADD_B, PRF_COEF_A, PRF_COEF_B, prf32, splitmix64};
+use super::prf::{PRF_ADD_A, PRF_ADD_B, PRF_COEF_A, PRF_COEF_B, prf32, splitmix64};
 use crate::{MAX_SALT_BLOCK_LEN, SALT_LEN};
 
 /// Domain mixed into the handshake salt shuffle and mask.

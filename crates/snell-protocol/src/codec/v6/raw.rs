@@ -4,9 +4,9 @@ use core::fmt;
 
 use crate::buffer::{Reservation, Slot};
 use crate::codec::RecordEncoder;
+use crate::codec::header::{parse_v6_plain_header, plain_header};
+use crate::codec::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::codec::sealed::Seal;
-use crate::header::{parse_v6_plain_header, plain_header};
-use crate::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::{Buffer, Error, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, Result};
 
 #[derive(Default)]
@@ -148,7 +148,7 @@ impl fmt::Debug for V6UnsafeRawDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::header::RecordHeader;
+    use crate::codec::header::RecordHeader;
 
     fn seal(encoder: &mut V6UnsafeRawEncoder, out: &mut Buffer, payload: &[u8]) {
         let mut rec = encoder.reserve(out, &[], payload.len()).unwrap();

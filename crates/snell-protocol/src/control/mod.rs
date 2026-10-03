@@ -1,3 +1,10 @@
+//! Snell control messages carried in record plaintext: CONNECT, UDP setup,
+//! server replies, and UDP datagrams.
+
+mod stream;
+
+pub use stream::PlainStream;
+
 use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr};
 

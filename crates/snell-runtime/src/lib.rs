@@ -9,7 +9,6 @@
 
 #![deny(unsafe_code)]
 
-mod auto;
 mod buffer;
 mod bufio;
 mod client;
@@ -17,14 +16,10 @@ mod codec;
 mod dns;
 mod error;
 mod kdf;
-mod outbound;
-mod packet;
 mod platform;
-mod pool;
 mod replay;
 mod server;
 mod session;
-mod socks;
 mod udp;
 
 use std::io;
@@ -36,12 +31,10 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::time::timeout;
 
 pub use buffer::BufferPool;
-pub use client::{ClientConfig, run_client, serve_client};
+pub use client::{ClientConfig, ReusePool, run_client, serve_client};
 pub use error::SessionError;
-pub use outbound::Outbound;
 pub use platform::{PlatformError, TcpBrutal};
-pub use pool::ReusePool;
-pub use server::{ServerConfig, run_server, serve_server};
+pub use server::{Outbound, ServerConfig, run_server, serve_server};
 pub use snell_protocol::{ProtocolFlavor, ProtocolSelection};
 pub use udp::{UdpLimits, UdpMetrics, UdpOptions};
 

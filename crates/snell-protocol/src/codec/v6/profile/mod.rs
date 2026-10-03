@@ -1,8 +1,8 @@
 //! v6 shaped profile: namespace PRF, salt block, prefix, padding, mix, chunk.
 
-use crate::kdf::profile_secret;
-use crate::prf::{GOLDEN_GAMMA, expand_stream, prf32, splitmix64};
-use crate::salt::{MIX_HANDSHAKE_DOMAIN, extract as salt_extract, write as salt_write};
+use super::prf::{GOLDEN_GAMMA, expand_stream, prf32, splitmix64};
+use super::salt::{MIX_HANDSHAKE_DOMAIN, extract as salt_extract, write as salt_write};
+use crate::crypto::kdf::profile_secret;
 use crate::{HEADER_CIPHER_LEN, SALT_LEN, TAG_LEN, V6_MAX_PREFIX_LEN};
 
 const HANDSHAKE_DOMAIN: u32 = 0x7053;

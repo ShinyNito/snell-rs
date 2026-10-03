@@ -1,3 +1,10 @@
+//! Server: accepts Snell connections, authenticates and replay-checks them,
+//! and relays CONNECT and UDP through the configured outbound.
+
+mod auto;
+mod outbound;
+mod udp;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,20 +19,21 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{Instrument, debug, info, warn};
 
-use crate::auto::detect_protocol;
 use crate::bind_listener;
 use crate::buffer::{BufferPool, PooledBuffer};
 use crate::codec::with_codec;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
-use crate::outbound::Outbound;
 use crate::platform::{self, AcceptLoop, TcpBrutal, prepare_session_stream};
 use crate::replay::ReplayCache;
 use crate::session::{
     ServerFirst, read_server_connect, relay, wait_reuse_idle, with_handshake_timeout, write_reject,
     write_tunnel,
 };
-use crate::udp::{UdpOptions, run_server_udp};
+use crate::udp::UdpOptions;
+use auto::detect_protocol;
+pub use outbound::Outbound;
+use udp::run_server_udp;
 
 // Admission applies only until the first request has authenticated.
 const SERVER_MAX_HANDSHAKES: usize = 512;

@@ -18,15 +18,16 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+use crate::client::Connection;
 use crate::codec::Codec;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
-use crate::outbound::Outbound;
-use crate::pool::{Connection, ReusePool};
 use crate::replay::ReplayCache;
 use crate::server::handle_server;
 use crate::session::{write_tunnel, write_udp_request, write_udp_setup};
-use crate::{ClientConfig, ServerConfig, UdpOptions, serve_client, serve_server};
+use crate::{
+    ClientConfig, Outbound, ReusePool, ServerConfig, UdpOptions, serve_client, serve_server,
+};
 
 const PSK: &[u8] = b"0123456789abcdef";
 

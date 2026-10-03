@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
-use crate::profile::Profile;
+use crate::codec::v6::profile::Profile;
 use crate::{Error, PSK_MAX_LEN, PSK_MIN_LEN, Result};
 
 /// A pre-shared key. Clones share one allocation holding the key bytes,

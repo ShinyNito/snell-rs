@@ -1,3 +1,11 @@
+//! Client: a local SOCKS5 proxy that tunnels CONNECT and UDP ASSOCIATE
+//! through Snell, reusing pooled connections when enabled.
+
+mod packet;
+mod pool;
+mod socks;
+mod udp;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,11 +24,13 @@ use crate::codec::{Codec, with_codec};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::platform::{AcceptLoop, prepare_session_stream};
-use crate::pool::{Connection, ReusePool};
 use crate::session::{read_server_tunnel, relay, with_handshake_timeout, write_connect};
-use crate::socks::{Socks5Command, accept_socks5, socks5_reply_from_error, write_socks5_reply};
-use crate::udp::{UdpHub, UdpOptions};
+use crate::udp::UdpOptions;
 use crate::{bind_listener, connect_tcp};
+pub(crate) use pool::Connection;
+pub use pool::ReusePool;
+use socks::{Socks5Command, accept_socks5, socks5_reply_from_error, write_socks5_reply};
+use udp::UdpHub;
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
