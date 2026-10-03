@@ -12,15 +12,6 @@ use crate::buffer::PooledBuffer;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::session::{RecordEvent, decode_once, write_reject, write_tunnel, write_udp_response};
-use crate::udp::UdpMetrics;
-
-struct AssocGuard<'a>(&'a UdpMetrics);
-
-impl Drop for AssocGuard<'_> {
-    fn drop(&mut self) {
-        self.0.associations.fetch_sub(1, Ordering::Relaxed);
-    }
-}
 
 /// Relay one Snell UDP association through the server's outbound.
 pub(crate) async fn run_server_udp<E: RecordEncoder, D: RecordDecoder>(
@@ -32,19 +23,10 @@ pub(crate) async fn run_server_udp<E: RecordEncoder, D: RecordDecoder>(
     mut recv: PooledBuffer,
 ) -> Result<(), SessionError> {
     let (buffers, udp) = (&config.buffers, &config.udp);
-    let max = udp.limits.max_associations as u64;
-    let admitted = udp
-        .metrics
-        .associations
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            (n < max).then_some(n + 1)
-        });
-    if admitted.is_err() {
-        udp.metrics.map_full.fetch_add(1, Ordering::Relaxed);
+    let Some(_slot) = udp.metrics.admit(udp.limits.max_associations) else {
         let _ = write_reject(encoder, buffers, &mut snell, "udp association limit").await;
         return Err(SessionError::UdpLimit);
-    }
-    let _guard = AssocGuard(&udp.metrics);
+    };
 
     let flow = match config.outbound.open_udp(&udp.dns).await {
         Ok(flow) => flow,

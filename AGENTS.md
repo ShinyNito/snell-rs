@@ -12,7 +12,10 @@ All crates stay unpublished (`publish = false`).
 - Do not add unbounded queues, maps, pools, tasks, or buffers.
 - Do not claim a performance improvement without benchmark evidence.
 - Do not use channels in the TCP per-connection data path.
-- Do not use trait objects or boxed futures in steady-state record processing.
+- Do not add trait objects or boxed futures without a reason. Boxing is fine
+  when it lowers memory or raises throughput (for example, boxing a large
+  transient setup future so long-lived connections do not reserve its
+  space); say why at the call site and back it with measurements.
 - Do not log secrets.
 - Peer-controlled input must never panic.
 - Do not publish crates to crates.io.

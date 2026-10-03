@@ -105,7 +105,7 @@ pub(crate) async fn drain_encode<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Lease a datagram buffer only once the socket is readable.
+/// Receive one datagram, leasing its buffer only once the socket is readable.
 pub(crate) async fn recv_datagram(
     socket: &UdpSocket,
     buffers: &Arc<BufferPool>,
@@ -114,21 +114,12 @@ pub(crate) async fn recv_datagram(
         ready!(socket.poll_recv_ready(cx))?;
         let mut buffer = buffers.get(snell_protocol::UDP_DATAGRAM_MAX);
         buffer.ensure(snell_protocol::UDP_DATAGRAM_MAX)?;
-        let peer = ready!(poll_recv_datagram(socket, &mut buffer, cx))?;
+        let mut read = ReadBuf::uninit(buffer.spare_capacity_mut(1)?);
+        let peer = ready!(socket.poll_recv_from(cx, &mut read))?;
+        let n = read.filled().len();
+        // SAFETY: the datagram was written into this exact spare slice.
+        unsafe { buffer.commit(n) }?;
         Poll::Ready(Ok((buffer, peer)))
     })
     .await
-}
-
-pub(crate) fn poll_recv_datagram(
-    socket: &UdpSocket,
-    recv: &mut PooledBuffer,
-    cx: &mut Context<'_>,
-) -> Poll<std::result::Result<SocketAddr, SessionError>> {
-    let mut read = ReadBuf::uninit(recv.spare_capacity_mut(1)?);
-    let peer = ready!(socket.poll_recv_from(cx, &mut read))?;
-    let n = read.filled().len();
-    // SAFETY: the datagram was written into this exact spare slice.
-    unsafe { recv.commit(n) }?;
-    Poll::Ready(Ok(peer))
 }

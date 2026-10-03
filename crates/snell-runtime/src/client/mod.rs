@@ -1,7 +1,6 @@
 //! Client: a local SOCKS5 proxy that tunnels CONNECT and UDP ASSOCIATE
 //! through Snell, reusing pooled connections when enabled.
 
-mod packet;
 mod pool;
 mod socks;
 mod udp;
@@ -17,6 +16,7 @@ use snell_protocol::{
     V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::buffer::{BufferPool, PooledBuffer};
@@ -30,7 +30,6 @@ use crate::{bind_listener, connect_tcp};
 pub(crate) use pool::Connection;
 pub use pool::ReusePool;
 use socks::{Socks5Command, accept_socks5, socks5_reply_from_error, write_socks5_reply};
-use udp::UdpHub;
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -62,12 +61,7 @@ pub async fn serve_client(
     tokio::pin!(shutdown);
     let config = Arc::new(config);
     let kdf = Arc::new(KdfLimiter::new());
-    let hub = UdpHub::start(
-        listener.local_addr()?,
-        Arc::clone(&config),
-        Arc::clone(&kdf),
-    )
-    .await?;
+    let udp_controls = Arc::new(Semaphore::new(config.udp.limits.max_controls));
     let mut reuse_maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut accept = AcceptLoop::new(&listener);
     let session_ids = AtomicU64::new(1);
@@ -85,12 +79,12 @@ pub async fn serve_client(
                 let (stream, peer) = accepted?;
                 let config = Arc::clone(&config);
                 let kdf = Arc::clone(&kdf);
-                let hub = hub.clone();
+                let udp_controls = Arc::clone(&udp_controls);
                 let id = session_ids.fetch_add(1, Ordering::Relaxed);
                 let span = tracing::info_span!("session", id, peer = %peer);
                 tokio::spawn(async move {
                     debug!("accepted");
-                    match handle_client(stream, &config, &kdf, &hub).await {
+                    match handle_client(stream, &config, &kdf, &udp_controls).await {
                         Ok(()) => debug!("session finished"),
                         Err(error) if error.is_peer_closed() => {
                             debug!(error = %error, "session closed by peer");
@@ -109,12 +103,12 @@ async fn handle_client(
     mut local: TcpStream,
     config: &ClientConfig,
     kdf: &KdfLimiter,
-    hub: &UdpHub,
+    udp_controls: &Semaphore,
 ) -> Result<(), SessionError> {
     prepare_session_stream(&local)?;
     match with_handshake_timeout(accept_socks5(&mut local)).await? {
         Socks5Command::Connect(destination) => connect(&mut local, config, &destination, kdf).await,
-        Socks5Command::UdpAssociate => hub.handle_associate(local).await,
+        Socks5Command::UdpAssociate => udp::associate(local, config, kdf, udp_controls).await,
     }
 }
 

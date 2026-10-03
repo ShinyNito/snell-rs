@@ -816,7 +816,7 @@ async fn udp_idle_expires_association() {
 }
 
 #[tokio::test]
-async fn udp_associations_stay_capped() {
+async fn udp_sessions_stay_capped() {
     let mut client_udp = UdpOptions::new().unwrap();
     client_udp.limits.max_associations = 4;
     let pair = start_pair_udp(
@@ -827,16 +827,22 @@ async fn udp_associations_stay_capped() {
     )
     .await;
     let echo = spawn_udp_echo().await.unwrap();
-    let (_tcp, relay, _) = socks5_udp_associate(pair.socks).await.unwrap();
     let packet = socks5_udp_packet(echo, 0, b"cap");
-    for _ in 0..16 {
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut associations = Vec::new();
+    for _ in 0..8 {
+        let (control, relay, client) = socks5_udp_associate(pair.socks).await.unwrap();
         client.send_to(&packet, relay).await.unwrap();
+        associations.push((control, client));
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let live = pair.client_udp.metrics.associations.load(Ordering::Relaxed);
-    assert!(live <= 4, "associations={live}");
-    assert!(pair.client_udp.metrics.map_full.load(Ordering::Relaxed) >= 1);
+    let metrics = &pair.client_udp.metrics;
+    timeout(Duration::from_secs(5), async {
+        while metrics.map_full.load(Ordering::Relaxed) < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sessions beyond the cap are refused");
+    assert_eq!(metrics.associations.load(Ordering::Relaxed), 4);
 }
 
 #[tokio::test]
