@@ -100,7 +100,7 @@ async fn start_pair(flavor: ProtocolFlavor, pool: ReusePool) -> Pair {
         selection: ProtocolSelection::Exact(flavor),
         outbound: Outbound::Direct,
         buffers: Default::default(),
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new().unwrap(),
         tcp_brutal: None,
     };
     tokio::spawn(async move {
@@ -116,7 +116,7 @@ async fn start_pair(flavor: ProtocolFlavor, pool: ReusePool) -> Pair {
         version: flavor,
         pool: Some(pool),
         buffers: Default::default(),
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new().unwrap(),
     };
     tokio::spawn(async move {
         let _ = serve_client(client_listener, client_cfg, async {

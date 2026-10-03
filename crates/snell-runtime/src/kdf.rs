@@ -40,10 +40,15 @@ impl KdfLimiter {
         }
     }
 
-    pub(crate) async fn run<T, F>(&self, f: F) -> Result<T, SessionError>
+    /// Run one Argon2id-bound derivation (a key or a record encoder) on the
+    /// blocking pool, waiting in the bounded queue when every slot is busy.
+    pub(crate) async fn derive<T>(
+        &self,
+        psk: &Psk,
+        derive: impl FnOnce(&Psk) -> snell_protocol::Result<T> + Send + 'static,
+    ) -> Result<T, SessionError>
     where
         T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
     {
         let permit = match Arc::clone(&self.running).try_acquire_owned() {
             Ok(permit) => permit,
@@ -58,26 +63,14 @@ impl KdfLimiter {
                     .map_err(|_| SessionError::Cancelled)?
             }
         };
-        tokio::task::spawn_blocking(move || {
+        let psk = psk.clone();
+        let derived = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            f()
+            derive(&psk)
         })
         .await
-        .map_err(|_| SessionError::Cancelled)
-    }
-
-    /// Run one Argon2id-bound derivation (a key or a record encoder) over a
-    /// clone of `psk`; the clone is zeroized when the blocking task drops it.
-    pub(crate) async fn derive<T>(
-        &self,
-        psk: &Psk,
-        derive: impl FnOnce(&Psk) -> snell_protocol::Result<T> + Send + 'static,
-    ) -> Result<T, SessionError>
-    where
-        T: Send + 'static,
-    {
-        let psk = psk.clone();
-        Ok(self.run(move || derive(&psk)).await??)
+        .map_err(|_| SessionError::Cancelled)?;
+        Ok(derived?)
     }
 }
 
@@ -98,13 +91,15 @@ mod tests {
             .unwrap();
         assert_eq!(inline, spawned);
     }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_keeps_waiting_and_running_counts_exact() {
         use std::future::Future;
         use std::task::{Context, Waker};
         let limiter = Arc::new(KdfLimiter::with_limits(1, 1));
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
         let permit = limiter.running.clone().acquire_owned().await.unwrap();
-        let mut queued = Box::pin(limiter.run(|| ()));
+        let mut queued = Box::pin(limiter.derive(&psk, |_| Ok(())));
         assert!(
             queued
                 .as_mut()
@@ -113,7 +108,7 @@ mod tests {
         );
         assert_eq!(limiter.queue.available_permits(), 0);
         assert!(matches!(
-            limiter.run(|| ()).await,
+            limiter.derive(&psk, |_| Ok(())).await,
             Err(SessionError::KdfQueueFull)
         ));
         drop(queued);
@@ -124,9 +119,10 @@ mod tests {
         let task_limiter = limiter.clone();
         let task = tokio::spawn(async move {
             task_limiter
-                .run(move || {
+                .derive(&psk, move |_| {
                     started_tx.send(()).unwrap();
                     finish_rx.recv().unwrap();
+                    Ok(())
                 })
                 .await
         });

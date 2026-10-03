@@ -1,20 +1,24 @@
+use libc::TCP_FASTOPEN;
 use rustix::io::Errno;
 use tokio::net::TcpSocket;
 
 use super::PlatformError;
+use super::sockopt::set_tcp_int;
 
-pub(super) fn set_tcp_fastopen_listener(socket: &TcpSocket) -> Result<(), PlatformError> {
-    super::tfo::set_tcp_fastopen(socket, 1).map_err(tfo_error)
+/// macOS uses one option for both sides of a connection.
+pub(crate) fn set_tcp_fastopen_listener(socket: &TcpSocket) -> Result<(), PlatformError> {
+    set_tcp_int(socket, TCP_FASTOPEN, 1).map_err(tfo_error)
 }
 
-pub(super) fn set_tcp_fastopen_connect(socket: &TcpSocket) -> Result<(), PlatformError> {
-    set_tcp_fastopen_listener(socket)
+pub(crate) use set_tcp_fastopen_listener as set_tcp_fastopen_connect;
+
+#[cfg(test)]
+pub(crate) fn read_tcp_fastopen_listener(socket: &TcpSocket) -> Result<i32, PlatformError> {
+    super::sockopt::get_tcp_int(socket, TCP_FASTOPEN).map_err(tfo_error)
 }
 
 #[cfg(test)]
-pub(super) fn read_tcp_fastopen_listener(socket: &TcpSocket) -> Result<i32, PlatformError> {
-    super::tfo::get_tcp_fastopen(socket).map_err(tfo_error)
-}
+pub(crate) use read_tcp_fastopen_listener as read_tcp_fastopen_connect;
 
 fn tfo_error(error: Errno) -> PlatformError {
     match error {

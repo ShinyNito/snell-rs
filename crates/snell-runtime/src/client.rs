@@ -1,4 +1,3 @@
-use crate::buffer::{BufferPool, PooledBuffer};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,6 +11,7 @@ use snell_protocol::{
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{Instrument, debug, info, warn};
 
+use crate::buffer::{BufferPool, PooledBuffer};
 use crate::codec::{Codec, with_codec};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;

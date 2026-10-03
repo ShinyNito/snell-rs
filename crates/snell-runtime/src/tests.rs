@@ -63,7 +63,7 @@ async fn start_pair_with(
         selection: ProtocolSelection::Exact(version),
         outbound,
         buffers: buffers.clone(),
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new().unwrap(),
         tcp_brutal,
     };
     tokio::spawn(async move {
@@ -80,7 +80,7 @@ async fn start_pair_with(
         version,
         pool,
         buffers: buffers.clone(),
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new().unwrap(),
     };
     tokio::spawn(async move {
         let _ = serve_client(client_listener, client_cfg, async {
@@ -207,7 +207,7 @@ async fn handshake_timeout() {
         selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
         outbound: Outbound::Direct,
         buffers: Default::default(),
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new().unwrap(),
         tcp_brutal: None,
     };
     tokio::spawn(async move {
@@ -259,7 +259,7 @@ async fn socks5_reply_when_snell_closes_after_dial() {
         version: ProtocolFlavor::V4,
         pool: None,
         buffers: Default::default(),
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new().unwrap(),
     };
     tokio::spawn(async move {
         let _ = serve_client(client_listener, cfg, async {
@@ -332,7 +332,7 @@ async fn start_counted(
         selection,
         outbound: Outbound::Direct,
         buffers: Default::default(),
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new().unwrap(),
         tcp_brutal: None,
     };
     let server_cfg = Arc::new(server_cfg);
@@ -362,7 +362,7 @@ async fn start_counted(
         version,
         pool,
         buffers: Default::default(),
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new().unwrap(),
     };
     tokio::spawn(async move {
         let _ = serve_client(client_listener, client_cfg, async {
@@ -533,7 +533,7 @@ async fn early_payload_over_64kib_is_rejected() {
         selection: ProtocolSelection::Exact(ProtocolFlavor::V4),
         outbound: Outbound::Direct,
         buffers: Default::default(),
-        udp: UdpOptions::default(),
+        udp: UdpOptions::new().unwrap(),
         tcp_brutal: None,
     };
     let server = tokio::spawn(async move {
@@ -653,8 +653,8 @@ async fn udp_echo_version(version: ProtocolFlavor, payload: &[u8]) {
     let pair = start_pair_udp(
         version,
         Outbound::Direct,
-        UdpOptions::default(),
-        UdpOptions::default(),
+        UdpOptions::new().unwrap(),
+        UdpOptions::new().unwrap(),
     )
     .await;
     let got = socks5_udp_echo_roundtrip(pair.socks, payload)
@@ -690,8 +690,8 @@ async fn udp_burst_all_datagrams_roundtrip() {
     let pair = start_pair_udp(
         ProtocolFlavor::V4,
         Outbound::Direct,
-        UdpOptions::default(),
-        UdpOptions::default(),
+        UdpOptions::new().unwrap(),
+        UdpOptions::new().unwrap(),
     )
     .await;
     let echo = spawn_udp_echo().await.unwrap();
@@ -769,8 +769,8 @@ async fn udp_frag_nonzero_is_dropped() {
     let pair = start_pair_udp(
         ProtocolFlavor::V4,
         Outbound::Direct,
-        UdpOptions::default(),
-        UdpOptions::default(),
+        UdpOptions::new().unwrap(),
+        UdpOptions::new().unwrap(),
     )
     .await;
     let echo = spawn_udp_echo().await.unwrap();
@@ -786,13 +786,13 @@ async fn udp_frag_nonzero_is_dropped() {
 
 #[tokio::test]
 async fn udp_idle_expires_association() {
-    let mut client_udp = UdpOptions::default();
+    let mut client_udp = UdpOptions::new().unwrap();
     client_udp.limits.idle = Duration::from_millis(80);
     let pair = start_pair_udp(
         ProtocolFlavor::V4,
         Outbound::Direct,
         client_udp,
-        UdpOptions::default(),
+        UdpOptions::new().unwrap(),
     )
     .await;
     let echo = spawn_udp_echo().await.unwrap();
@@ -816,13 +816,13 @@ async fn udp_idle_expires_association() {
 
 #[tokio::test]
 async fn udp_associations_stay_capped() {
-    let mut client_udp = UdpOptions::default();
+    let mut client_udp = UdpOptions::new().unwrap();
     client_udp.limits.max_associations = 4;
     let pair = start_pair_udp(
         ProtocolFlavor::V4,
         Outbound::Direct,
         client_udp,
-        UdpOptions::default(),
+        UdpOptions::new().unwrap(),
     )
     .await;
     let echo = spawn_udp_echo().await.unwrap();
@@ -855,8 +855,8 @@ async fn udp_socks5_outbound_echo() {
     let pair = start_pair_udp(
         ProtocolFlavor::V4,
         Outbound::Socks5 { server: proxy_addr },
-        UdpOptions::default(),
-        UdpOptions::default(),
+        UdpOptions::new().unwrap(),
+        UdpOptions::new().unwrap(),
     )
     .await;
     let got = socks5_udp_echo_roundtrip(pair.socks, b"via-socks5-udp")

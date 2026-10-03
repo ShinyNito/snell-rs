@@ -1,4 +1,3 @@
-use crate::buffer::{BufferPool, PooledBuffer};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,6 +14,7 @@ use tracing::{Instrument, debug, info, warn};
 
 use crate::auto::detect_protocol;
 use crate::bind_listener;
+use crate::buffer::{BufferPool, PooledBuffer};
 use crate::codec::with_codec;
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
@@ -295,7 +295,7 @@ mod tests {
                 psk: Psk::new(b"0123456789abcdef").unwrap(),
                 selection,
                 outbound: Outbound::Direct,
-                udp: UdpOptions::default(),
+                udp: UdpOptions::new().unwrap(),
                 buffers: buffers.clone(),
                 tcp_brutal: None,
             };
@@ -347,7 +347,7 @@ mod tests {
                 psk: psk.clone(),
                 selection,
                 outbound: Outbound::Direct,
-                udp: UdpOptions::default(),
+                udp: UdpOptions::new().unwrap(),
                 buffers: buffers.clone(),
                 tcp_brutal: None,
             };

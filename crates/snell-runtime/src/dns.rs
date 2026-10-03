@@ -36,6 +36,9 @@ impl DnsResolver {
     }
 
     pub async fn resolve(&self, host: &str, port: u16) -> Result<SocketAddr, SessionError> {
+        // Hickory returns IP literals directly only while `ndots <= 4`; with
+        // the system's `ndots:5` (common in Kubernetes) it would try search
+        // domains first.
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(SocketAddr::new(ip, port));
         }

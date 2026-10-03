@@ -69,7 +69,7 @@ async fn role(args: &[String]) -> io::Result<()> {
                 selection: ProtocolSelection::Exact(flavor),
                 outbound: Outbound::Direct,
                 buffers,
-                udp: UdpOptions::default(),
+                udp: UdpOptions::new().unwrap(),
                 tcp_brutal: None,
             },
             std::future::pending(),
@@ -85,7 +85,7 @@ async fn role(args: &[String]) -> io::Result<()> {
                 version: flavor,
                 pool: None,
                 buffers,
-                udp: UdpOptions::default(),
+                udp: UdpOptions::new().unwrap(),
             },
             std::future::pending(),
         )

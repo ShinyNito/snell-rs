@@ -115,9 +115,7 @@ impl<E: Entropy, C: Clock> RecordEncoder for V4Encoder<E, C> {
         self.state.ensure_ready()?;
         let now = self.clock.monotonic_secs();
         let budget = self.chunk.record_budget(now);
-        let max_payload = self
-            .chunk
-            .payload_limit(now, prefix.len().saturating_add(hint));
+        let max_payload = prefix.len().saturating_add(hint).min(budget);
         if prefix.len() > max_payload {
             return Err(Error::PayloadTooLarge);
         }

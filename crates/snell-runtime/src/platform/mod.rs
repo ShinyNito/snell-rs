@@ -1,7 +1,8 @@
 //! Platform socket options and accept-error backoff.
 //!
-//! Keepalive uses socket2. Unix TFO uses rustix AsFd-style sockopts. The only
-//! remaining kernel FFI is Linux tcp-brutal `TCP_BRUTAL_PARAMS`.
+//! Keepalive uses socket2. TCP Fast Open and the tcp-brutal parameters go
+//! through [`sockopt`], the only kernel FFI. Each OS module exports the same
+//! functions, re-exported here; other platforms report them unsupported.
 
 mod accept;
 #[cfg(target_os = "linux")]
@@ -9,9 +10,9 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(unix)]
-mod tfo;
+mod sockopt;
 mod udp;
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 mod windows;
 
 use std::io;
@@ -19,10 +20,20 @@ use std::time::Duration;
 
 use snell_protocol::{TCP_KEEPALIVE_IDLE_SECS, TCP_KEEPALIVE_INTERVAL_SECS};
 use socket2::{SockRef, TcpKeepalive};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpStream;
 
 pub(crate) use accept::AcceptLoop;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{apply_tcp_brutal, set_tcp_fastopen_connect, set_tcp_fastopen_listener};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::{read_tcp_fastopen_connect, read_tcp_fastopen_listener};
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::{read_tcp_fastopen_connect, read_tcp_fastopen_listener};
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{set_tcp_fastopen_connect, set_tcp_fastopen_listener};
 pub(crate) use udp::send_udp_parts;
+#[cfg(all(test, windows))]
+pub(crate) use windows::read_keepalive;
 
 /// Validated tcp-brutal request. Off unless config sets this.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,120 +78,35 @@ pub(crate) fn apply_keepalive(stream: &TcpStream) -> io::Result<()> {
     sock.set_tcp_keepalive(&keepalive)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn read_keepalive(stream: &TcpStream) -> Result<Keepalive, PlatformError> {
-    #[cfg(unix)]
-    {
-        let sock = SockRef::from(stream);
-        Ok(Keepalive {
-            enabled: sock.keepalive()?,
-            idle: sock.tcp_keepalive_time()?,
-            interval: sock.tcp_keepalive_interval()?,
-        })
-    }
-    #[cfg(windows)]
-    {
-        windows::read_keepalive(stream)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = stream;
-        Err(PlatformError::Unsupported("tcp keepalive"))
-    }
+    let sock = SockRef::from(stream);
+    Ok(Keepalive {
+        enabled: sock.keepalive()?,
+        idle: sock.tcp_keepalive_time()?,
+        interval: sock.tcp_keepalive_interval()?,
+    })
 }
 
-pub(crate) fn set_tcp_fastopen_listener(socket: &TcpSocket) -> Result<(), PlatformError> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::set_tcp_fastopen_listener(socket)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::set_tcp_fastopen_listener(socket)
-    }
-    #[cfg(windows)]
-    {
-        windows::set_tcp_fastopen_listener(socket)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        let _ = socket;
-        Err(PlatformError::Unsupported("tcp fast open"))
-    }
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn set_tcp_fastopen_listener(_: &tokio::net::TcpSocket) -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported("tcp fast open"))
 }
 
-pub(crate) fn set_tcp_fastopen_connect(socket: &TcpSocket) -> Result<(), PlatformError> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::set_tcp_fastopen_connect(socket)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::set_tcp_fastopen_connect(socket)
-    }
-    #[cfg(windows)]
-    {
-        windows::set_tcp_fastopen_connect(socket)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        let _ = socket;
-        Err(PlatformError::Unsupported("tcp fast open"))
-    }
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) use set_tcp_fastopen_listener as set_tcp_fastopen_connect;
+
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) fn read_tcp_fastopen_listener(_: &tokio::net::TcpSocket) -> Result<i32, PlatformError> {
+    Err(PlatformError::Unsupported("tcp fast open"))
 }
 
-#[cfg(test)]
-pub(crate) fn read_tcp_fastopen_connect(socket: &TcpSocket) -> Result<i32, PlatformError> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::read_tcp_fastopen_connect(socket)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::read_tcp_fastopen_listener(socket)
-    }
-    #[cfg(windows)]
-    {
-        windows::read_tcp_fastopen_listener(socket)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        let _ = socket;
-        Err(PlatformError::Unsupported("tcp fast open"))
-    }
-}
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) use read_tcp_fastopen_listener as read_tcp_fastopen_connect;
 
-#[cfg(test)]
-pub(crate) fn read_tcp_fastopen_listener(socket: &TcpSocket) -> Result<i32, PlatformError> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::read_tcp_fastopen_listener(socket)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::read_tcp_fastopen_listener(socket)
-    }
-    #[cfg(windows)]
-    {
-        windows::read_tcp_fastopen_listener(socket)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        let _ = socket;
-        Err(PlatformError::Unsupported("tcp fast open"))
-    }
-}
-
-pub(crate) fn apply_tcp_brutal(stream: &TcpStream, params: TcpBrutal) -> Result<(), PlatformError> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::apply_tcp_brutal(stream, params)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (stream, params);
-        Err(PlatformError::Unsupported("tcp_brutal is Linux-only"))
-    }
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn apply_tcp_brutal(_: &TcpStream, _: TcpBrutal) -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported("tcp_brutal is Linux-only"))
 }
 
 #[cfg(test)]

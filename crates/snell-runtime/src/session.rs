@@ -1,4 +1,3 @@
-use crate::buffer::{BufferPool, PooledBuffer};
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
@@ -17,8 +16,10 @@ use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::bufio::{READ_WINDOW, ReadReady, poll_read_into, poll_read_record};
-use crate::bufio::{drain_encode, read_into_recv};
+use crate::buffer::{BufferPool, PooledBuffer};
+use crate::bufio::{
+    READ_WINDOW, ReadReady, drain_encode, poll_read_into, poll_read_record, read_into_recv,
+};
 use crate::error::SessionError;
 use crate::kdf::KdfLimiter;
 use crate::replay::ReplayCache;
@@ -461,16 +462,14 @@ where
     let mut ranges = [const { 0..0 }; ENCODE_SLICES_MAX];
     let mut count = 0;
     let mut write_off = 0;
-    let mut local_eof = false;
-    let mut zero_sent = false;
-    let mut shutting_down = false;
+    let mut phase = Phase::Reading;
     poll_fn(|cx| {
         loop {
-            if shutting_down {
+            if phase == Phase::ShuttingDown {
                 return Pin::new(&mut *writer).poll_shutdown(cx).map_err(Into::into);
             }
 
-            if !local_eof && encode.is_empty() {
+            if phase == Phase::Reading && encode.is_empty() {
                 loop {
                     if count > ENCODE_SLICES_MAX - 2 {
                         break;
@@ -494,7 +493,7 @@ where
                     };
                     match read {
                         Poll::Ready(Ok((0, _))) => {
-                            local_eof = true;
+                            phase = Phase::SendZeroChunk;
                             break;
                         }
                         Poll::Ready(Ok((_, split))) => append_encode_ranges(
@@ -519,13 +518,13 @@ where
                 }
             }
 
-            if local_eof && !zero_sent && count <= ENCODE_SLICES_MAX - 2 {
+            if phase == Phase::SendZeroChunk && count <= ENCODE_SLICES_MAX - 2 {
                 let start = encode.len();
                 let had_pending = !encode.is_empty();
                 match encode_record(encoder, &mut encode, 0, |_| Ok(0)) {
                     Ok((_, split)) => {
                         append_encode_ranges(&mut ranges, &mut count, start, encode.len(), split);
-                        zero_sent = true;
+                        phase = Phase::Draining;
                     }
                     Err(SessionError::Protocol(Error::PayloadTooLarge)) if had_pending => {}
                     Err(error) => return Poll::Ready(Err(error)),
@@ -548,12 +547,12 @@ where
                 continue;
             }
 
-            if local_eof && zero_sent {
+            if phase == Phase::Draining {
                 encode.release_empty();
                 if keep_snell_open {
                     return Poll::Ready(Ok(()));
                 }
-                shutting_down = true;
+                phase = Phase::ShuttingDown;
                 continue;
             }
 
@@ -561,6 +560,19 @@ where
         }
     })
     .await
+}
+
+/// How far the local-to-Snell direction is through closing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    /// Sealing local reads into records.
+    Reading,
+    /// Local EOF: queue a zero chunk so the peer sees this direction end.
+    SendZeroChunk,
+    /// The zero chunk is queued; finish once every record is written.
+    Draining,
+    /// Shutting down the Snell write half.
+    ShuttingDown,
 }
 
 const ENCODE_SLICES_MAX: usize = 64;

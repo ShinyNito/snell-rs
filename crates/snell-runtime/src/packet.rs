@@ -1,8 +1,10 @@
 //! UDP in-flight quotas. Backing storage belongs to the shared BufferPool.
-use crate::SessionError;
-use crate::buffer::{BufferPool, PooledBuffer};
+
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, ready};
+
+use crate::SessionError;
+use crate::buffer::{BufferPool, PooledBuffer};
 
 pub(crate) struct PacketBuf {
     data: PooledBuffer,

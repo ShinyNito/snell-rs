@@ -1,8 +1,9 @@
+use libc::{TCP_FASTOPEN, TCP_FASTOPEN_CONNECT};
 use rustix::io::Errno;
 use rustix::net::sockopt;
-use socket2::SockRef;
 use tokio::net::{TcpSocket, TcpStream};
 
+use super::sockopt::{set_tcp_int, set_tcp_opt};
 use super::{PlatformError, TcpBrutal};
 
 const TCP_FASTOPEN_QUEUE: i32 = 256;
@@ -10,22 +11,22 @@ const TCP_FASTOPEN_QUEUE: i32 = 256;
 const TCP_BRUTAL_PARAMS: i32 = 23301;
 const BRUTAL_PARAMS_LEN: usize = 12;
 
-pub(super) fn set_tcp_fastopen_listener(socket: &TcpSocket) -> Result<(), PlatformError> {
-    super::tfo::set_tcp_fastopen(socket, TCP_FASTOPEN_QUEUE).map_err(tfo_error)
+pub(crate) fn set_tcp_fastopen_listener(socket: &TcpSocket) -> Result<(), PlatformError> {
+    set_tcp_int(socket, TCP_FASTOPEN, TCP_FASTOPEN_QUEUE).map_err(tfo_error)
 }
 
-pub(super) fn set_tcp_fastopen_connect(socket: &TcpSocket) -> Result<(), PlatformError> {
-    super::tfo::set_tcp_fastopen_connect(socket, true).map_err(tfo_error)
-}
-
-#[cfg(test)]
-pub(super) fn read_tcp_fastopen_listener(socket: &TcpSocket) -> Result<i32, PlatformError> {
-    super::tfo::get_tcp_fastopen(socket).map_err(tfo_error)
+pub(crate) fn set_tcp_fastopen_connect(socket: &TcpSocket) -> Result<(), PlatformError> {
+    set_tcp_int(socket, TCP_FASTOPEN_CONNECT, 1).map_err(tfo_error)
 }
 
 #[cfg(test)]
-pub(super) fn read_tcp_fastopen_connect(socket: &TcpSocket) -> Result<i32, PlatformError> {
-    super::tfo::get_tcp_fastopen_connect(socket).map_err(tfo_error)
+pub(crate) fn read_tcp_fastopen_listener(socket: &TcpSocket) -> Result<i32, PlatformError> {
+    super::sockopt::get_tcp_int(socket, TCP_FASTOPEN).map_err(tfo_error)
+}
+
+#[cfg(test)]
+pub(crate) fn read_tcp_fastopen_connect(socket: &TcpSocket) -> Result<i32, PlatformError> {
+    super::sockopt::get_tcp_int(socket, TCP_FASTOPEN_CONNECT).map_err(tfo_error)
 }
 
 fn tfo_error(error: Errno) -> PlatformError {
@@ -37,14 +38,9 @@ fn tfo_error(error: Errno) -> PlatformError {
     }
 }
 
-pub(super) fn apply_tcp_brutal(stream: &TcpStream, params: TcpBrutal) -> Result<(), PlatformError> {
-    let sock = SockRef::from(stream);
-    apply_brutal(&sock, params)
-}
-
-fn apply_brutal(sock: &socket2::Socket, params: TcpBrutal) -> Result<(), PlatformError> {
-    sockopt::set_tcp_congestion(sock, "brutal").map_err(brutal_error)?;
-    set_brutal_params(sock, params).map_err(brutal_error)
+pub(crate) fn apply_tcp_brutal(stream: &TcpStream, params: TcpBrutal) -> Result<(), PlatformError> {
+    sockopt::set_tcp_congestion(stream, "brutal").map_err(brutal_error)?;
+    set_tcp_opt(stream, TCP_BRUTAL_PARAMS, &brutal_params(params)).map_err(brutal_error)
 }
 
 fn brutal_error(error: Errno) -> PlatformError {
@@ -54,10 +50,6 @@ fn brutal_error(error: Errno) -> PlatformError {
         }
         _ => PlatformError::Io(error.into()),
     }
-}
-
-fn set_brutal_params(sock: &socket2::Socket, params: TcpBrutal) -> Result<(), Errno> {
-    super::tfo::set_tcp_opt(sock, TCP_BRUTAL_PARAMS, &brutal_params(params))
 }
 
 /// The tcp-brutal module ABI at `TCP_BRUTAL_PARAMS`: packed native-endian

@@ -1,4 +1,3 @@
-use crate::buffer::{BufferPool, PooledBuffer};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
+use crate::buffer::{BufferPool, PooledBuffer};
+use crate::bufio::recv_datagram;
 use crate::connect_tcp;
 use crate::dns::DnsResolver;
 use crate::error::SessionError;
@@ -31,14 +32,10 @@ impl Outbound {
         }
     }
 
-    pub(crate) async fn open_udp(
-        self,
-        dns: &DnsResolver,
-        buffers: &Arc<BufferPool>,
-    ) -> Result<UdpFlow, SessionError> {
+    pub(crate) async fn open_udp(self, dns: &DnsResolver) -> Result<UdpFlow, SessionError> {
         match self {
-            Self::Direct => UdpFlow::direct(buffers).await,
-            Self::Socks5 { server } => UdpFlow::socks5(server, dns, buffers).await,
+            Self::Direct => UdpFlow::direct().await,
+            Self::Socks5 { server } => UdpFlow::socks5(server, dns).await,
         }
     }
 }
@@ -55,36 +52,34 @@ impl UdpRecv {
     }
 }
 
-/// Sockets and routing state only; every datagram owns its processing lease.
-pub(crate) enum UdpFlow {
-    Direct {
-        socket: UdpSocket,
-        buffers: Arc<BufferPool>,
-    },
+/// An association's upstream UDP socket. It holds no buffer: every
+/// received datagram owns its own lease.
+pub(crate) struct UdpFlow {
+    socket: UdpSocket,
+    route: UdpRoute,
+}
+
+enum UdpRoute {
+    Direct,
+    /// Through a SOCKS5 relay; the association lives as long as `_control`.
     Socks5 {
-        _control: TcpStream,
-        socket: UdpSocket,
         relay: SocketAddr,
-        buffers: Arc<BufferPool>,
+        _control: TcpStream,
     },
 }
 
 impl UdpFlow {
-    async fn direct(buffers: &Arc<BufferPool>) -> Result<Self, SessionError> {
+    async fn direct() -> Result<Self, SessionError> {
         let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
-        Ok(Self::Direct {
+        Ok(Self {
             socket,
-            buffers: Arc::clone(buffers),
+            route: UdpRoute::Direct,
         })
     }
 
-    async fn socks5(
-        server: SocketAddr,
-        dns: &DnsResolver,
-        buffers: &Arc<BufferPool>,
-    ) -> Result<Self, SessionError> {
-        let mut stream = connect_tcp(server).await?;
-        let bind = socks5_udp_associate(&mut stream, dns).await?;
+    async fn socks5(server: SocketAddr, dns: &DnsResolver) -> Result<Self, SessionError> {
+        let mut control = connect_tcp(server).await?;
+        let bind = socks5_udp_associate(&mut control, dns).await?;
         let relay = rewrite_unspecified(bind, server);
         let local = if relay.is_ipv4() {
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
@@ -92,77 +87,75 @@ impl UdpFlow {
             SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
         };
         let socket = UdpSocket::bind(local).await?;
-        Ok(Self::Socks5 {
-            _control: stream,
+        Ok(Self {
             socket,
-            relay,
-            buffers: Arc::clone(buffers),
+            route: UdpRoute::Socks5 {
+                relay,
+                _control: control,
+            },
         })
     }
 
     pub(crate) async fn send(
-        &mut self,
+        &self,
         dest: AddressRef<'_>,
         payload: &[u8],
         dns: &DnsResolver,
     ) -> Result<(), SessionError> {
-        match self {
-            Self::Direct { socket, .. } => {
+        match &self.route {
+            UdpRoute::Direct => {
                 let addr = match dest {
                     AddressRef::Ip(addr) => addr,
                     AddressRef::Domain { host, port } => dns.resolve(host, port).await?,
                 };
-                socket.send_to(payload, addr).await?;
-                Ok(())
+                self.socket.send_to(payload, addr).await?;
             }
-            Self::Socks5 { socket, relay, .. } => {
+            UdpRoute::Socks5 { relay, .. } => {
                 // Header and borrowed payload leave as one vectored datagram;
                 // the kernel rejects one that exceeds the UDP limit.
                 let mut hdr = [0u8; 3 + MAX_UDP_PACKET_ADDR_LEN];
                 let hdr_len = socks5::encode_udp_header(&mut hdr, 0, dest)?;
-                send_udp_parts(socket, *relay, &hdr[..hdr_len], payload).await?;
-                Ok(())
+                send_udp_parts(&self.socket, *relay, &hdr[..hdr_len], payload).await?;
             }
         }
+        Ok(())
     }
 
+    /// Receive the next datagram, skipping (and counting) relay datagrams
+    /// that are malformed or fragmented.
     pub(crate) async fn recv(
-        &mut self,
+        &self,
+        buffers: &Arc<BufferPool>,
         frag_dropped: &AtomicU64,
         invalid: &AtomicU64,
     ) -> Result<UdpRecv, SessionError> {
-        match self {
-            Self::Direct { socket, buffers } => {
-                let (buffer, from) = crate::bufio::recv_datagram(socket, buffers).await?;
-                Ok(UdpRecv {
+        loop {
+            let (buffer, from) = recv_datagram(&self.socket, buffers).await?;
+            if let UdpRoute::Direct = self.route {
+                return Ok(UdpRecv {
                     addr: Address::Ip(from),
                     buffer,
                     header_len: 0,
-                })
+                });
             }
-            Self::Socks5 {
-                socket, buffers, ..
-            } => loop {
-                let (buffer, _) = crate::bufio::recv_datagram(socket, buffers).await?;
-                let packet = match socks5::parse_udp_packet(buffer.filled()) {
-                    Ok(packet) => packet,
-                    Err(_) => {
-                        invalid.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                };
-                if packet.frag != 0 {
-                    frag_dropped.fetch_add(1, Ordering::Relaxed);
+            let packet = match socks5::parse_udp_packet(buffer.filled()) {
+                Ok(packet) => packet,
+                Err(_) => {
+                    invalid.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                let header_len = packet.header_len;
-                let addr = packet.destination.into_owned();
-                return Ok(UdpRecv {
-                    addr,
-                    buffer,
-                    header_len,
-                });
-            },
+            };
+            if packet.frag != 0 {
+                frag_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let header_len = packet.header_len;
+            let addr = packet.destination.into_owned();
+            return Ok(UdpRecv {
+                addr,
+                buffer,
+                header_len,
+            });
         }
     }
 }
@@ -265,18 +258,15 @@ mod tests {
     #[tokio::test]
     async fn received_datagram_owns_its_lease_and_idle_flow_holds_none() {
         let buffers = Arc::new(BufferPool::default());
-        let mut flow = UdpFlow::direct(&buffers).await.unwrap();
-        let UdpFlow::Direct { socket, .. } = &flow else {
-            unreachable!()
-        };
-        let destination =
-            SocketAddr::from((Ipv4Addr::LOCALHOST, socket.local_addr().unwrap().port()));
+        let flow = UdpFlow::direct().await.unwrap();
+        let port = flow.socket.local_addr().unwrap().port();
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let frag = AtomicU64::new(0);
         let invalid = AtomicU64::new(0);
         for payload in [b"first".as_slice(), b"second"] {
             {
-                let recv = flow.recv(&frag, &invalid);
+                let recv = flow.recv(&buffers, &frag, &invalid);
                 tokio::pin!(recv);
                 assert!(
                     recv.as_mut()
@@ -286,7 +276,7 @@ mod tests {
                 assert_eq!(buffers.leased_bytes(), 0);
             }
             peer.send_to(payload, destination).await.unwrap();
-            let packet = flow.recv(&frag, &invalid).await.unwrap();
+            let packet = flow.recv(&buffers, &frag, &invalid).await.unwrap();
             assert_eq!(packet.payload(), payload);
             assert!(buffers.leased_bytes() > 0);
             drop(packet);

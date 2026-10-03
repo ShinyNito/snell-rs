@@ -1,12 +1,13 @@
-use crate::buffer::{BufferPool, PooledBuffer};
+use std::sync::Arc;
+
 use snell_protocol::{
     AUTO_DETECT_PREFIX_MAX, AUTO_DETECT_TIMEOUT_SECS, DecodeStatus, ParseState, PlainStream, Psk,
     RecordDecoder, RecordKind, SERVER_EARLY_PAYLOAD_MAX, V4Decoder, V4Encoder, V6ShapedDecoder,
     V6ShapedEncoder,
 };
-use std::sync::Arc;
 use tokio::net::TcpStream;
 
+use crate::buffer::{BufferPool, PooledBuffer};
 use crate::bufio::read_into_recv;
 use crate::codec::Codec;
 use crate::error::SessionError;

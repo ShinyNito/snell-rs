@@ -4,7 +4,6 @@
 //! Each association owns one Snell TCP. Idle uses a per-association `Sleep`,
 //! not an O(N) map scan. Queue full is `try_send` failure plus a real counter.
 
-use crate::buffer::PooledBuffer;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,12 +15,12 @@ use snell_protocol::{
     Address, Error, MAX_UDP_PACKET_ADDR_LEN, RecordDecoder, RecordEncoder,
     UDP_ASSOCIATION_IDLE_SECS, UDP_DATAGRAM_MAX, decode_udp_request, decode_udp_response,
 };
-
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 
+use crate::buffer::PooledBuffer;
 use crate::client::dial;
 use crate::codec::with_codec;
 use crate::dns::DnsResolver;
@@ -92,13 +91,9 @@ pub struct UdpOptions {
     pub dns: DnsResolver,
 }
 
-impl Default for UdpOptions {
-    fn default() -> Self {
-        Self::new().expect("system DNS configuration")
-    }
-}
-
 impl UdpOptions {
+    /// Default limits, fresh metrics, and a resolver from the system DNS
+    /// configuration.
     pub fn new() -> Result<Self, SessionError> {
         let limits = UdpLimits::default();
         Ok(Self {
@@ -284,7 +279,7 @@ async fn dispatcher(relay: Arc<Relay>, mut ctrl_rx: mpsc::Receiver<Ctrl>) {
                 Ok(None) => {
                     metrics.no_buffer.fetch_add(1, Ordering::Relaxed);
                     tokio::select! {
-                        ctrl = ctrl_rx.recv() => {
+                                    ctrl = ctrl_rx.recv() => {
                             let Some(ctrl) = ctrl else { return; };
                             routes.apply(ctrl, metrics);
                         }
@@ -537,7 +532,7 @@ pub(crate) async fn run_server_udp<E: RecordEncoder, D: RecordDecoder>(
     }
     let _guard = AssocGuard(&udp.metrics);
 
-    let mut flow = match config.outbound.open_udp(&udp.dns, buffers).await {
+    let flow = match config.outbound.open_udp(&udp.dns).await {
         Ok(flow) => flow,
         Err(error) => {
             let _ = write_reject(encoder, buffers, &mut snell, &error.to_string()).await;
@@ -570,7 +565,7 @@ pub(crate) async fn run_server_udp<E: RecordEncoder, D: RecordDecoder>(
                 }
                 decoder.consume(&mut recv, &record)?;
             }
-            reply = flow.recv(&udp.metrics.frag_dropped, &udp.metrics.invalid) => {
+            reply = flow.recv(buffers, &udp.metrics.frag_dropped, &udp.metrics.invalid) => {
                 sleep.as_mut().reset(Instant::now() + udp.limits.idle);
                 let reply = reply?;
                 let address = reply.addr.as_view();
@@ -605,7 +600,7 @@ mod tests {
             psk: Psk::new(b"0123456789abcdef").unwrap(),
             version: ProtocolFlavor::V4,
             pool: None,
-            udp: UdpOptions::default(),
+            udp: UdpOptions::new().unwrap(),
             buffers: Arc::clone(&quota.buffers),
         };
         let relay = Relay {

@@ -28,8 +28,8 @@ pub enum Command {
     Other(u8),
 }
 
-impl Command {
-    pub const fn from_u8(value: u8) -> Self {
+impl From<u8> for Command {
+    fn from(value: u8) -> Self {
         match value {
             CMD_CONNECT => Self::Connect,
             CMD_BIND => Self::Bind,
@@ -37,13 +37,15 @@ impl Command {
             other => Self::Other(other),
         }
     }
+}
 
-    pub const fn to_u8(self) -> u8 {
-        match self {
-            Self::Connect => CMD_CONNECT,
-            Self::Bind => CMD_BIND,
-            Self::UdpAssociate => CMD_UDP_ASSOCIATE,
-            Self::Other(value) => value,
+impl From<Command> for u8 {
+    fn from(command: Command) -> Self {
+        match command {
+            Command::Connect => CMD_CONNECT,
+            Command::Bind => CMD_BIND,
+            Command::UdpAssociate => CMD_UDP_ASSOCIATE,
+            Command::Other(value) => value,
         }
     }
 }
@@ -62,8 +64,8 @@ pub enum Reply {
     Other(u8),
 }
 
-impl Reply {
-    pub const fn from_u8(value: u8) -> Self {
+impl From<u8> for Reply {
+    fn from(value: u8) -> Self {
         match value {
             0x00 => Self::Succeeded,
             0x01 => Self::GeneralFailure,
@@ -77,22 +79,26 @@ impl Reply {
             other => Self::Other(other),
         }
     }
+}
 
-    pub const fn to_u8(self) -> u8 {
-        match self {
-            Self::Succeeded => 0x00,
-            Self::GeneralFailure => 0x01,
-            Self::ConnectionNotAllowed => 0x02,
-            Self::NetworkUnreachable => 0x03,
-            Self::HostUnreachable => 0x04,
-            Self::ConnectionRefused => 0x05,
-            Self::TtlExpired => 0x06,
-            Self::CommandNotSupported => 0x07,
-            Self::AddressTypeNotSupported => 0x08,
-            Self::Other(value) => value,
+impl From<Reply> for u8 {
+    fn from(reply: Reply) -> Self {
+        match reply {
+            Reply::Succeeded => 0x00,
+            Reply::GeneralFailure => 0x01,
+            Reply::ConnectionNotAllowed => 0x02,
+            Reply::NetworkUnreachable => 0x03,
+            Reply::HostUnreachable => 0x04,
+            Reply::ConnectionRefused => 0x05,
+            Reply::TtlExpired => 0x06,
+            Reply::CommandNotSupported => 0x07,
+            Reply::AddressTypeNotSupported => 0x08,
+            Reply::Other(value) => value,
         }
     }
+}
 
+impl Reply {
     pub fn from_io_error(err: &std::io::Error) -> Self {
         match err.kind() {
             std::io::ErrorKind::ConnectionRefused => Self::ConnectionRefused,
@@ -187,7 +193,7 @@ pub fn method_selection_need(buf: &[u8]) -> Result<ParseState<u8>> {
 
 pub fn request_need(buf: &[u8]) -> Result<ParseState<RequestRef<'_>>> {
     parse_cmd_addr(buf, |command, destination, header_len| RequestRef {
-        command: Command::from_u8(command),
+        command: command.into(),
         destination,
         header_len,
     })
@@ -198,19 +204,19 @@ pub fn encode_request(
     command: Command,
     destination: AddressRef<'_>,
 ) -> Result<usize> {
-    encode_cmd_addr(dst, command.to_u8(), destination)
+    encode_three_addr(dst, [VERSION, command.into(), 0], destination)
 }
 
 pub fn reply_need(buf: &[u8]) -> Result<ParseState<ReplyRef<'_>>> {
     parse_cmd_addr(buf, |rep, bind, header_len| ReplyRef {
-        reply: Reply::from_u8(rep),
+        reply: rep.into(),
         bind,
         header_len,
     })
 }
 
 pub fn encode_reply(dst: &mut [u8], reply: Reply, bind: AddressRef<'_>) -> Result<usize> {
-    encode_cmd_addr(dst, reply.to_u8(), bind)
+    encode_three_addr(dst, [VERSION, reply.into(), 0], bind)
 }
 
 pub fn parse_udp_packet(buf: &[u8]) -> Result<UdpPacketRef<'_>> {
@@ -267,10 +273,6 @@ fn parse_cmd_addr<'a, T>(
         ParseState::Need(n) => ParseState::Need(3 + n),
         ParseState::Done((address, len)) => ParseState::Done(build(buf[1], address, 3 + len)),
     })
-}
-
-fn encode_cmd_addr(dst: &mut [u8], cmd: u8, address: AddressRef<'_>) -> Result<usize> {
-    encode_three_addr(dst, [VERSION, cmd, 0], address)
 }
 
 /// `head(3) ATYP ADDR PORT`, the shape shared by requests, replies and UDP headers.
