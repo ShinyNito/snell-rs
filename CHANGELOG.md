@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.2.1
+
+Test-only release. No code, protocol, wire format, configuration, or CLI changes.
+
+### Changed
+- The client UDP relay's filter test is split in two. The port-pinning check uses `127.0.0.1` only; the IP check needs a second loopback address and skips on hosts without one, so `cargo test` passes on macOS, where `127.0.0.2` is not configured by default.
+
 ## 0.2.0
 
 Performance-first review cleanup. No protocol, wire format, or configuration-file changes: golden fixtures and the v6 padding-generator corpus hashes are byte-identical. The client's SOCKS5 UDP relay behaves differently (see Fixed and the last Changed entry), and several `snell-runtime` and `snell-protocol` items were removed or renamed (see Changed), hence the minor version bump.
