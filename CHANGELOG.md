@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.2.2 - 2026-11-01
+
+UDP correctness and dependency security fixes. TCP chunking, existing golden wire fixtures, configuration files, and CLI behavior are unchanged. All crates remain unpublished; source users of `RecordEncoder::reserve` must pass `RecordSize` instead of a bare length hint.
+
+### Fixed
+- UDP requests and replies reserve capacity for a complete datagram instead of using the current TCP chunk budget. v6 default (shaped) accepts logical frames up to 65,535 bytes, including the address and port, independently of the profile, sequence number, and idle window. v4/v5 datagrams retain their 16,383-byte protocol limit.
+- v6 unshaped UDP encoding and frame decoding accept logical payloads up to 65,535 bytes instead of rejecting frames above 16,383 bytes. TCP encoding retains its existing 16,383-byte chunk budget.
+- Direct UDP outbound selects a socket matching the destination address family. Each association creates its IPv6 socket on first use and receives replies from both sockets; IPv4-only associations keep one socket.
+
+### Security
+- Updated Tokio from 1.53.1 to 1.53.3 to address `RUSTSEC-2026-0386`, concerning I/O safety in `AsyncFd` constructors.
+- Updated Hickory resolver, net, and proto from 0.26.1 to 0.26.3. This includes fixes for irrelevant CNAME following (`GHSA-6f2x-v7q7-m7m5`), repeated truncated-response retries (`GHSA-6w6g-hm98-mhgm`), and hidden DNSSEC validation failures (`GHSA-5j98-2g5x-46v6`), plus subsequent upstream regression fixes. Resolver features, timeouts, cache limits, and IP-family preference are unchanged; DNSSEC remains disabled in this project's build.
+
+### Changed
+- `RecordSize::Stream` and `RecordSize::Datagram` express reservation requirements explicitly. Codecs share the capacity check, and the runtime no longer repeats it after reserving a UDP frame.
+- `UdpFlow` owns direct and SOCKS5 resources in separate variants; the forwarding-only `Outbound::open_udp` layer is removed.
+- Removed model/platform promotional text and links from the README. Added the repository's initial `SECURITY.md` template.
+
+### Tests
+- Added v6 UDP frame-boundary tests covering IPv4, IPv6, and domain headers, partial writes, oversized-frame rejection, and continued use after rejection. Unshaped decoding also checks a maximum-sized frame constructed independently of its encoder.
+- Added direct UDP tests alternating IPv4 and IPv6 destinations, and consolidated UDP echo checks for all four protocol selections. Socket echo tests use 8,000-byte payloads to stay below macOS's default datagram limit; codec tests cover 20,000-byte and maximum-sized logical frames.
+
 ## 0.2.1
 
 Test-only release. No code, protocol, wire format, configuration, or CLI changes.
