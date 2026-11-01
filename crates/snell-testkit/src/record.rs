@@ -1,6 +1,6 @@
 //! Record helpers for codec tests.
 
-use snell_protocol::{Buffer, RecordEncoder, V6_WIRE_CAP};
+use snell_protocol::{Buffer, RecordEncoder, RecordSize, V6_WIRE_CAP};
 
 /// Seal each payload as one record and return the records in wire order.
 ///
@@ -10,7 +10,9 @@ pub fn seal_records(encoder: &mut impl RecordEncoder, payloads: &[&[u8]]) -> Vec
     let mut out = Buffer::new(V6_WIRE_CAP);
     let mut wire = Vec::new();
     for payload in payloads {
-        let mut record = encoder.reserve(&mut out, &[], payload.len()).unwrap();
+        let mut record = encoder
+            .reserve(&mut out, &[], RecordSize::Stream(payload.len()))
+            .unwrap();
         record.payload_mut()[..payload.len()].copy_from_slice(payload);
         let split = record.seal(payload.len()).unwrap();
         wire.extend_from_slice(&out.filled()[split..]);

@@ -15,8 +15,32 @@ pub use v6::{V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEnco
 pub use v6::{V6UnsafeRawDecoder, V6UnsafeRawEncoder};
 
 use crate::buffer::{Reservation, Slot};
-use crate::{AES_128_KEY_LEN, Buffer, Result, SALT_LEN};
+use crate::{AES_128_KEY_LEN, Buffer, Error, Result, SALT_LEN};
 use record::EncoderState;
+
+/// Capacity requested after the record's plaintext prefix.
+#[derive(Clone, Copy, Debug)]
+pub enum RecordSize {
+    /// Stream bytes may be split at the codec's current chunk budget.
+    Stream(usize),
+    /// A datagram must fit in one logical frame, including its address and port.
+    Datagram(usize),
+}
+
+impl RecordSize {
+    fn payload_len(self, prefix_len: usize, limit: usize) -> Result<usize> {
+        match self {
+            Self::Stream(hint) if prefix_len <= limit => {
+                Ok(prefix_len.saturating_add(hint).min(limit))
+            }
+            Self::Datagram(len) => prefix_len
+                .checked_add(len)
+                .filter(|&total| total <= limit)
+                .ok_or(Error::PayloadTooLarge),
+            Self::Stream(_) => Err(Error::PayloadTooLarge),
+        }
+    }
+}
 
 /// Seals payloads into records, in place in a [`Buffer`].
 ///
@@ -25,12 +49,13 @@ use record::EncoderState;
 /// cancels the record and leaves the encoder ready for the next one.
 pub trait RecordEncoder: Sized + sealed::Seal {
     /// Reserve a record in `buf` whose payload starts with `prefix` and has
-    /// room for up to `hint` more bytes, within the encoder's record budget.
+    /// capacity determined by `size`. Datagram sizes are exact; stream sizes
+    /// are hints limited by the current chunk budget.
     fn reserve<'a>(
         &'a mut self,
         buf: &'a mut Buffer,
         prefix: &[u8],
-        hint: usize,
+        size: RecordSize,
     ) -> Result<Reservation<'a, Self>>;
 }
 

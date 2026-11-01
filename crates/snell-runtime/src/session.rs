@@ -9,10 +9,10 @@ use std::time::Duration;
 use snell_protocol::{
     AddressRef, COMMAND_UDP, ConnectRequest, DecodeStatus, DecodedRecord, Error,
     MAX_CONNECT_REQUEST_LEN, MAX_PACKET_SIZE_V6, ParseState, PlainStream, Psk,
-    REUSE_IDLE_TIMEOUT_SECS, RecordDecoder, RecordEncoder, RecordKind, SERVER_EARLY_PAYLOAD_MAX,
-    ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS, aead_key, encode_connect_request, encode_reject,
-    encode_tunnel_reply, encode_udp_request, encode_udp_response, encode_udp_setup,
-    udp_request_len, udp_response_len,
+    REUSE_IDLE_TIMEOUT_SECS, RecordDecoder, RecordEncoder, RecordKind, RecordSize,
+    SERVER_EARLY_PAYLOAD_MAX, ServerReply, TCP_HANDSHAKE_TIMEOUT_SECS, aead_key,
+    encode_connect_request, encode_reject, encode_tunnel_reply, encode_udp_request,
+    encode_udp_response, encode_udp_setup, udp_request_len, udp_response_len,
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
@@ -102,12 +102,7 @@ where
     F: FnOnce(&mut [u8]) -> snell_protocol::Result<usize>,
 {
     let mut encode = buffers.get(snell_protocol::V6_WIRE_CAP);
-    let (_, split) = encode_record(encoder, &mut encode, needed, |slot| {
-        if slot.len() < needed {
-            return Err(Error::PayloadTooLarge);
-        }
-        fill(slot)
-    })?;
+    let (_, split) = encode_record(encoder, &mut encode, RecordSize::Datagram(needed), fill)?;
     drain_encode(writer, &mut encode, split).await
 }
 
@@ -116,11 +111,11 @@ where
 fn encode_record<E: RecordEncoder>(
     encoder: &mut E,
     encode: &mut PooledBuffer,
-    hint: usize,
+    size: RecordSize,
     fill: impl FnOnce(&mut [u8]) -> snell_protocol::Result<usize>,
 ) -> Result<(usize, usize), SessionError> {
     loop {
-        let needed = match encoder.reserve(encode, &[], hint) {
+        let needed = match encoder.reserve(encode, &[], size) {
             Err(Error::BufferTooSmall { needed, .. }) => needed,
             Err(error) => return Err(error.into()),
             Ok(mut reservation) => {
@@ -174,14 +169,19 @@ async fn write_plain_records<E: RecordEncoder, W: AsyncWrite + Unpin>(
 ) -> Result<(), SessionError> {
     let mut encode = buffers.get(snell_protocol::V6_WIRE_CAP);
     while !src.is_empty() {
-        let (take, split) = encode_record(encoder, &mut encode, src.len(), |slot| {
-            let take = slot.len().min(src.len());
-            if take == 0 {
-                return Err(Error::PayloadTooLarge);
-            }
-            slot[..take].copy_from_slice(&src[..take]);
-            Ok(take)
-        })?;
+        let (take, split) = encode_record(
+            encoder,
+            &mut encode,
+            RecordSize::Stream(src.len()),
+            |slot| {
+                let take = slot.len().min(src.len());
+                if take == 0 {
+                    return Err(Error::PayloadTooLarge);
+                }
+                slot[..take].copy_from_slice(&src[..take]);
+                Ok(take)
+            },
+        )?;
         drain_encode(writer, &mut encode, split).await?;
         src = &src[take..];
     }
@@ -475,10 +475,11 @@ where
                     // A lease grown to its maximum holds any record, so the
                     // reservation never asks for more capacity.
                     encode.ensure(encode.max())?;
-                    let read = match encoder.reserve(&mut encode, &[], RECORD_HINT) {
-                        Ok(reservation) => poll_read_record(reader, reservation, cx),
-                        Err(error) => Poll::Ready(Err(error.into())),
-                    };
+                    let read =
+                        match encoder.reserve(&mut encode, &[], RecordSize::Stream(RECORD_HINT)) {
+                            Ok(reservation) => poll_read_record(reader, reservation, cx),
+                            Err(error) => Poll::Ready(Err(error.into())),
+                        };
                     match read {
                         Poll::Ready(Ok((0, _))) => {
                             phase = Phase::SendZeroChunk;
@@ -502,7 +503,7 @@ where
 
             if phase == Phase::SendZeroChunk && batch.has_room() {
                 let had_pending = !batch.is_empty();
-                match encode_record(encoder, &mut encode, 0, |_| Ok(0)) {
+                match encode_record(encoder, &mut encode, RecordSize::Stream(0), |_| Ok(0)) {
                     Ok((_, split)) => {
                         batch.push(encode.len(), split);
                         phase = Phase::Draining;
@@ -937,13 +938,19 @@ mod buffer_tests {
         let mut wire = snell_protocol::Buffer::new(snell_protocol::V6_WIRE_CAP);
         let mut expected = Vec::new();
         for byte in [1, 2, 3] {
-            let mut r = encoder.reserve(&mut wire, &[], 1460).unwrap();
+            let mut r = encoder
+                .reserve(&mut wire, &[], RecordSize::Stream(1460))
+                .unwrap();
             let n = r.capacity();
             r.payload_mut()[..n].fill(byte);
             r.seal(n).unwrap();
             expected.extend(std::iter::repeat_n(byte, n));
         }
-        encoder.reserve(&mut wire, &[], 0).unwrap().seal(0).unwrap();
+        encoder
+            .reserve(&mut wire, &[], RecordSize::Stream(0))
+            .unwrap()
+            .seal(0)
+            .unwrap();
         for limit in [usize::MAX, 7] {
             let pool = Arc::new(BufferPool::default());
             let mut recv = pool.get(snell_protocol::V6_WIRE_CAP);
@@ -1027,17 +1034,27 @@ mod buffer_tests {
         let mut wire = snell_protocol::Buffer::new(snell_protocol::V6_WIRE_CAP);
         // V4 increases its record budget after successful records.
         for _ in 0..16 {
-            let mut record = encoder.reserve(&mut wire, &[], 1).unwrap();
+            let mut record = encoder
+                .reserve(&mut wire, &[], RecordSize::Stream(1))
+                .unwrap();
             record.payload_mut()[0] = 0x55;
             record.seal(1).unwrap();
         }
         let mut record = encoder
-            .reserve(&mut wire, &[], snell_protocol::MAX_PACKET_SIZE)
+            .reserve(
+                &mut wire,
+                &[],
+                RecordSize::Stream(snell_protocol::MAX_PACKET_SIZE),
+            )
             .unwrap();
         assert_eq!(record.capacity(), snell_protocol::MAX_PACKET_SIZE);
         record.payload_mut().fill(0x55);
         record.seal(snell_protocol::MAX_PACKET_SIZE).unwrap();
-        encoder.reserve(&mut wire, &[], 0).unwrap().seal(0).unwrap();
+        encoder
+            .reserve(&mut wire, &[], RecordSize::Stream(0))
+            .unwrap()
+            .seal(0)
+            .unwrap();
         let pool = Arc::new(BufferPool::default());
         for _ in 0..2 {
             let mut recv = pool.get(snell_protocol::V6_WIRE_CAP);
@@ -1165,8 +1182,95 @@ mod buffer_tests {
         }
     }
 
+    async fn udp_frame_boundaries<E: RecordEncoder, D: RecordDecoder>(
+        mut encoder: E,
+        mut decoder: D,
+    ) {
+        let pool = Arc::new(BufferPool::default());
+        for address in [
+            AddressRef::Ip("127.0.0.1:53".parse().unwrap()),
+            AddressRef::Ip("[::1]:53".parse().unwrap()),
+            AddressRef::Domain {
+                host: "example.com",
+                port: 53,
+            },
+        ] {
+            for response in [false, true] {
+                let header_len = if response {
+                    udp_response_len(address, 0).unwrap()
+                } else {
+                    udp_request_len(address, 0).unwrap()
+                };
+                for len in [
+                    20_000,
+                    MAX_PACKET_SIZE_V6 - header_len,
+                    MAX_PACKET_SIZE_V6 - header_len + 1,
+                    1,
+                ] {
+                    let payload = vec![0x5a; len];
+                    let mut output = Output {
+                        bytes: Vec::new(),
+                        limit: 37,
+                        writes: 0,
+                        pending: true,
+                    };
+                    let result = if response {
+                        write_udp_response(&mut encoder, &pool, &mut output, address, &payload)
+                            .await
+                    } else {
+                        write_udp_request(&mut encoder, &pool, &mut output, address, &payload).await
+                    };
+                    if len + header_len > MAX_PACKET_SIZE_V6 {
+                        assert!(matches!(
+                            result,
+                            Err(SessionError::Protocol(Error::PayloadTooLarge))
+                        ));
+                        assert!(output.bytes.is_empty());
+                        continue;
+                    }
+                    result.unwrap();
+                    let mut wire = snell_protocol::Buffer::new(output.bytes.len());
+                    wire.extend_from_slice(&output.bytes).unwrap();
+                    let DecodeStatus::Record(record) = decoder.decode(&mut wire).unwrap() else {
+                        panic!("datagram must be one complete record");
+                    };
+                    let plain = record.plaintext(wire.filled());
+                    let packet = if response {
+                        snell_protocol::decode_udp_response(plain).unwrap()
+                    } else {
+                        snell_protocol::decode_udp_request(plain).unwrap()
+                    };
+                    assert_eq!(packet.address, address);
+                    assert_eq!(packet.payload, payload);
+                    decoder.consume(&mut wire, &record).unwrap();
+                    assert!(wire.is_empty());
+                }
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn shaped_handshake_and_udp_records_survive_partial_writes() {
+    async fn shaped_udp_frame_boundaries() {
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
+        udp_frame_boundaries(
+            snell_protocol::V6ShapedEncoder::os(&psk).unwrap(),
+            snell_protocol::V6ShapedDecoder::new(psk),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unshaped_udp_frame_boundaries() {
+        let psk = Psk::new(b"0123456789abcdef").unwrap();
+        udp_frame_boundaries(
+            snell_protocol::V6UnshapedEncoder::os(&psk).unwrap(),
+            snell_protocol::V6UnshapedDecoder::new(psk),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shaped_handshake_records_survive_partial_writes() {
         let psk = Psk::new(b"0123456789abcdef").unwrap();
         let pool = Arc::new(BufferPool::default());
         let mut encoder = snell_protocol::V6ShapedEncoder::os(&psk).unwrap();
@@ -1180,12 +1284,6 @@ mod buffer_tests {
         write_plain_records(&mut encoder, &pool, &mut output, &data)
             .await
             .unwrap();
-        write_udp_plain(&mut encoder, &pool, &mut output, 96, |slot| {
-            slot[..96].fill(0x5a);
-            Ok(96)
-        })
-        .await
-        .unwrap();
         assert_eq!(pool.leased_bytes(), 0);
         let mut decoder = snell_protocol::V6ShapedDecoder::new(psk);
         let mut wire = snell_protocol::Buffer::new(output.bytes.len());
@@ -1199,8 +1297,7 @@ mod buffer_tests {
             actual.extend_from_slice(record.plaintext(wire.filled()));
             decoder.consume(&mut wire, &record).unwrap();
         }
-        assert_eq!(&actual[..data.len()], data);
-        assert_eq!(&actual[data.len()..], &[0x5a; 96]);
+        assert_eq!(actual, data);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1299,10 +1396,16 @@ mod buffer_tests {
         let psk = Psk::new(b"0123456789abcdef").unwrap();
         let mut encoder = snell_protocol::V4Encoder::os(&psk).unwrap();
         let mut wire = snell_protocol::Buffer::new(snell_protocol::V6_WIRE_CAP);
-        let mut r = encoder.reserve(&mut wire, &[], 128).unwrap();
+        let mut r = encoder
+            .reserve(&mut wire, &[], RecordSize::Stream(128))
+            .unwrap();
         r.payload_mut()[..128].fill(0x69);
         r.seal(128).unwrap();
-        encoder.reserve(&mut wire, &[], 0).unwrap().seal(0).unwrap();
+        encoder
+            .reserve(&mut wire, &[], RecordSize::Stream(0))
+            .unwrap()
+            .seal(0)
+            .unwrap();
         let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut input = PausedInput {
             first: &wire.filled()[..40],

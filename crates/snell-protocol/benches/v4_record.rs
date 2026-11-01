@@ -5,8 +5,8 @@
 use std::time::Instant;
 
 use snell_protocol::{
-    Buffer, DecodeStatus, FixedClock, Psk, RecordDecoder, RecordEncoder, RecordKind, RepeatEntropy,
-    SALT_LEN, V4_WIRE_CAP, V4Decoder, V4Encoder,
+    Buffer, DecodeStatus, FixedClock, Psk, RecordDecoder, RecordEncoder, RecordKind, RecordSize,
+    RepeatEntropy, SALT_LEN, V4_WIRE_CAP, V4Decoder, V4Encoder,
 };
 
 fn seal_and_take<'a>(
@@ -15,7 +15,9 @@ fn seal_and_take<'a>(
     payload: &[u8],
 ) -> &'a [u8] {
     {
-        let mut rec = encoder.reserve(buf, &[], payload.len()).unwrap();
+        let mut rec = encoder
+            .reserve(buf, &[], RecordSize::Stream(payload.len()))
+            .unwrap();
         rec.payload_mut()[..payload.len()].copy_from_slice(payload);
         rec.seal(payload.len()).unwrap();
     }

@@ -7,8 +7,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use snell_protocol::{
-    Buffer, DecodeStatus, FixedClock, Psk, RecordDecoder, RecordEncoder, SALT_LEN, V6_WIRE_CAP,
-    V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
+    Buffer, DecodeStatus, FixedClock, Psk, RecordDecoder, RecordEncoder, RecordSize, SALT_LEN,
+    V6_WIRE_CAP, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 
 mod support {
@@ -51,7 +51,9 @@ fn transfer(
 ) -> usize {
     let mut records = 0;
     while !remaining.is_empty() {
-        let mut reservation = encoder.reserve(out, &[], remaining.len()).unwrap();
+        let mut reservation = encoder
+            .reserve(out, &[], RecordSize::Stream(remaining.len()))
+            .unwrap();
         let n = remaining.len().min(reservation.capacity());
         assert!(n > 0);
         reservation.payload_mut()[..n].copy_from_slice(&remaining[..n]);

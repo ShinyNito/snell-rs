@@ -9,7 +9,7 @@ use crate::buffer::{Reservation, Slot};
 use crate::codec::header::{RecordHeader, opened_header, parse_v4_plain_header, plain_header};
 use crate::codec::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::codec::sealed::Seal;
-use crate::codec::{RecordDecoder, RecordEncoder};
+use crate::codec::{RecordDecoder, RecordEncoder, RecordSize};
 use crate::crypto::aead::Aes128Gcm;
 use crate::{
     AES_128_KEY_LEN, Buffer, Clock, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN,
@@ -114,15 +114,16 @@ impl<E: Entropy, C: Clock> RecordEncoder for V4Encoder<E, C> {
         &'a mut self,
         buf: &'a mut Buffer,
         prefix: &[u8],
-        hint: usize,
+        size: RecordSize,
     ) -> Result<Reservation<'a, Self>> {
         self.state.ensure_ready()?;
         let now = self.clock.monotonic_secs();
         let budget = self.chunk.record_budget(now);
-        let max_payload = prefix.len().saturating_add(hint).min(budget);
-        if prefix.len() > max_payload {
-            return Err(Error::PayloadTooLarge);
-        }
+        let limit = match size {
+            RecordSize::Stream(_) => budget,
+            RecordSize::Datagram(_) => MAX_PACKET_SIZE,
+        };
+        let max_payload = size.payload_len(prefix.len(), limit)?;
 
         let first = !self.chunk.salt_sent();
         let padding_len = if first && max_payload > 0 {
@@ -406,7 +407,9 @@ mod tests {
         buf: &mut Buffer,
         payload: &[u8],
     ) {
-        let mut rec = encoder.reserve(buf, &[], payload.len()).unwrap();
+        let mut rec = encoder
+            .reserve(buf, &[], RecordSize::Stream(payload.len()))
+            .unwrap();
         rec.payload_mut()[..payload.len()].copy_from_slice(payload);
         rec.seal(payload.len()).unwrap();
     }
@@ -461,7 +464,9 @@ mod tests {
         let first = out.filled().to_vec();
         out.consume(10).unwrap();
         {
-            let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
+            let mut rec = encoder
+                .reserve(&mut out, &[], RecordSize::Stream(5))
+                .unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"xxxxx");
         }
         assert_eq!(out.filled(), &first[10..]);
@@ -472,7 +477,9 @@ mod tests {
         let mut encoder = encoder(8, FixedClock::new(0));
         let first_limit = V4_MSS_BASE - V4_FIRST_RECORD_OVERHEAD - 8;
         let mut out = encode_buf();
-        let mut first = encoder.reserve(&mut out, &[], MAX_PACKET_SIZE).unwrap();
+        let mut first = encoder
+            .reserve(&mut out, &[], RecordSize::Stream(MAX_PACKET_SIZE))
+            .unwrap();
         assert_eq!(first.capacity(), first_limit);
         first.payload_mut().fill(0x42);
         first.seal(first_limit).unwrap();
@@ -481,7 +488,9 @@ mod tests {
         out.consume(out.len()).unwrap();
 
         let second_limit = next_v4_chunk_limit(first_limit);
-        let mut second = encoder.reserve(&mut out, &[], MAX_PACKET_SIZE).unwrap();
+        let mut second = encoder
+            .reserve(&mut out, &[], RecordSize::Stream(MAX_PACKET_SIZE))
+            .unwrap();
         assert_eq!(second.capacity(), second_limit);
         second.payload_mut().fill(0x42);
         second.seal(second_limit).unwrap();
@@ -495,14 +504,16 @@ mod tests {
         let mut encoder = encoder(8, clock.clone());
         let mut out = encode_buf();
         encoder
-            .reserve(&mut out, &[], MAX_PACKET_SIZE)
+            .reserve(&mut out, &[], RecordSize::Stream(MAX_PACKET_SIZE))
             .unwrap()
             .seal(0)
             .unwrap();
         out.consume(out.len()).unwrap();
         clock.0.set(130);
         {
-            let rec = encoder.reserve(&mut out, &[], MAX_PACKET_SIZE).unwrap();
+            let rec = encoder
+                .reserve(&mut out, &[], RecordSize::Stream(MAX_PACKET_SIZE))
+                .unwrap();
             assert_eq!(
                 rec.capacity(),
                 next_v4_chunk_limit(V4_MSS_BASE - V4_FIRST_RECORD_OVERHEAD - 8)
@@ -511,7 +522,9 @@ mod tests {
         }
         out.consume(out.len()).unwrap();
         clock.0.set(161);
-        let rec = encoder.reserve(&mut out, &[], MAX_PACKET_SIZE).unwrap();
+        let rec = encoder
+            .reserve(&mut out, &[], RecordSize::Stream(MAX_PACKET_SIZE))
+            .unwrap();
         assert_eq!(rec.capacity(), V4_MSS_BASE - V4_RESET_OVERHEAD);
     }
 
@@ -523,7 +536,9 @@ mod tests {
         let mut encoder = encoder_no_padding();
         let mut out = encode_buf();
         {
-            let mut rec = encoder.reserve(&mut out, &prefix[..n], 5).unwrap();
+            let mut rec = encoder
+                .reserve(&mut out, &prefix[..n], RecordSize::Stream(5))
+                .unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"hello");
             rec.seal(5).unwrap();
         }
@@ -568,14 +583,16 @@ mod tests {
         .unwrap();
         let mut out = encode_buf();
         let err = {
-            let mut rec = encoder.reserve(&mut out, &[], 5).unwrap();
+            let mut rec = encoder
+                .reserve(&mut out, &[], RecordSize::Stream(5))
+                .unwrap();
             rec.payload_mut()[..5].copy_from_slice(b"hello");
             rec.seal(5)
         };
         assert_eq!(err, Err(Error::EntropyExhausted));
         assert!(out.is_empty());
         assert_eq!(
-            encoder.reserve(&mut out, &[], 1).err(),
+            encoder.reserve(&mut out, &[], RecordSize::Stream(1)).err(),
             Some(Error::Poisoned)
         );
     }
@@ -587,10 +604,12 @@ mod tests {
         seal_payload(&mut encoder, &mut out, b"one");
         out.consume(out.len()).unwrap();
         let cancelled_cap = encoder
-            .reserve(&mut out, &[], MAX_PACKET_SIZE)
+            .reserve(&mut out, &[], RecordSize::Stream(MAX_PACKET_SIZE))
             .unwrap()
             .capacity();
-        let rec = encoder.reserve(&mut out, &[], MAX_PACKET_SIZE).unwrap();
+        let rec = encoder
+            .reserve(&mut out, &[], RecordSize::Stream(MAX_PACKET_SIZE))
+            .unwrap();
         assert_eq!(rec.capacity(), cancelled_cap);
         assert_ne!(rec.capacity(), next_v4_chunk_limit(cancelled_cap));
     }

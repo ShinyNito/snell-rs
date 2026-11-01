@@ -21,8 +21,8 @@ pub use address::{Address, AddressRef};
 pub use buffer::{Buffer, Reservation};
 pub use codec::{
     Clock, DecodeStatus, DecodedRecord, FixedClock, MonotonicClock, RecordDecoder, RecordEncoder,
-    RecordKind, V4Decoder, V4Encoder, V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder,
-    V6UnshapedEncoder, next_v4_chunk_limit,
+    RecordKind, RecordSize, V4Decoder, V4Encoder, V6ShapedDecoder, V6ShapedEncoder,
+    V6UnshapedDecoder, V6UnshapedEncoder, next_v4_chunk_limit,
 };
 pub use control::{
     ConnectRequest, PlainStream, ServerReply, UdpPacket, connect_request_len,
@@ -109,14 +109,14 @@ pub const HEADER_CIPHER_LEN: usize = HEADER_PLAIN_LEN + TAG_LEN;
 /// AEAD header marker used by v4 and v6 (`HEADER_PLAIN[0]`).
 pub const HEADER_VERSION_MARKER: u8 = 4;
 
-/// v4 / v6-unshaped maximum payload per record.
+/// v4 maximum payload per record, and v6-unshaped TCP chunk budget.
 pub const MAX_PACKET_SIZE: usize = 0x3fff;
 
 /// Maximum on-wire size of one v4 record, including first-record salt.
 pub const V4_WIRE_CAP: usize =
     SALT_LEN + HEADER_CIPHER_LEN + MAX_PACKET_SIZE + MAX_PACKET_SIZE + TAG_LEN;
 
-/// v6 shaped / unsafe-raw maximum payload (`u16` field).
+/// v6 maximum logical payload (`u16` field), including UDP address and port.
 pub const MAX_PACKET_SIZE_V6: usize = u16::MAX as usize;
 
 /// Largest CONNECT control payload.

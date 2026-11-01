@@ -6,11 +6,11 @@ use crate::buffer::{Reservation, Slot};
 use crate::codec::header::{opened_header, parse_v6_plain_header, plain_header};
 use crate::codec::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::codec::sealed::Seal;
-use crate::codec::{RecordDecoder, RecordEncoder};
+use crate::codec::{RecordDecoder, RecordEncoder, RecordSize};
 use crate::crypto::aead::Aes128Gcm;
 use crate::{
     AES_128_KEY_LEN, Buffer, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, MAX_PACKET_SIZE,
-    Nonce, OsEntropy, Psk, Result, SALT_LEN, TAG_LEN,
+    MAX_PACKET_SIZE_V6, Nonce, OsEntropy, Psk, Result, SALT_LEN, TAG_LEN,
 };
 
 pub struct V6UnshapedEncoder {
@@ -68,13 +68,14 @@ impl RecordEncoder for V6UnshapedEncoder {
         &'a mut self,
         buf: &'a mut Buffer,
         prefix: &[u8],
-        hint: usize,
+        size: RecordSize,
     ) -> Result<Reservation<'a, Self>> {
         self.state.ensure_ready()?;
-        let max_payload = prefix.len().saturating_add(hint).min(MAX_PACKET_SIZE);
-        if prefix.len() > max_payload {
-            return Err(Error::PayloadTooLarge);
-        }
+        let limit = match size {
+            RecordSize::Stream(_) => MAX_PACKET_SIZE,
+            RecordSize::Datagram(_) => MAX_PACKET_SIZE_V6,
+        };
+        let max_payload = size.payload_len(prefix.len(), limit)?;
 
         let first = !self.salt_sent;
         let fixed = usize::from(first) * SALT_LEN + HEADER_CIPHER_LEN;
@@ -268,9 +269,35 @@ mod tests {
     }
 
     fn seal(encoder: &mut V6UnshapedEncoder, buf: &mut Buffer, payload: &[u8]) {
-        let mut rec = encoder.reserve(buf, &[], payload.len()).unwrap();
+        let mut rec = encoder
+            .reserve(buf, &[], RecordSize::Stream(payload.len()))
+            .unwrap();
         rec.payload_mut()[..payload.len()].copy_from_slice(payload);
         rec.seal(payload.len()).unwrap();
+    }
+
+    #[test]
+    fn decodes_full_u16_payload_from_independent_wire() {
+        let salt = [7; SALT_LEN];
+        let aead = Aes128Gcm::derive(&psk(), &salt).unwrap();
+        let mut nonce = Nonce::new();
+        let mut header = [0; HEADER_CIPHER_LEN];
+        header[..HEADER_PLAIN_LEN].copy_from_slice(&plain_header(0, u16::MAX as usize));
+        aead.seal(&mut nonce, &[], &mut header).unwrap();
+        let mut body = vec![0x5a; u16::MAX as usize + TAG_LEN];
+        aead.seal(&mut nonce, &[], &mut body).unwrap();
+        let mut wire = Buffer::new(crate::V6_WIRE_CAP);
+        wire.extend_from_slice(&salt).unwrap();
+        wire.extend_from_slice(&header).unwrap();
+        wire.extend_from_slice(&body).unwrap();
+        let mut decoder = V6UnshapedDecoder::new(psk());
+        let DecodeStatus::Record(record) = decoder.decode(&mut wire).unwrap() else {
+            panic!("missing record");
+        };
+        assert_eq!(
+            record.plaintext(wire.filled()),
+            vec![0x5a; u16::MAX as usize]
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::codec::header::{RecordHeader, opened_header, parse_v6_plain_header, p
 use crate::codec::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::codec::sealed::Seal;
 use crate::codec::v6::profile::mix_padding_payload;
-use crate::codec::{RecordDecoder, RecordEncoder};
+use crate::codec::{RecordDecoder, RecordEncoder, RecordSize};
 use crate::crypto::aead::Aes128Gcm;
 use crate::{
     AES_128_KEY_LEN, Buffer, Clock, Entropy, Error, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN,
@@ -146,17 +146,14 @@ impl<C: Clock> RecordEncoder for V6ShapedEncoder<C> {
         &'a mut self,
         buf: &'a mut Buffer,
         prefix: &[u8],
-        hint: usize,
+        size: RecordSize,
     ) -> Result<Reservation<'a, Self>> {
         self.state.ensure_ready()?;
-        let now = self.clock.monotonic_secs();
-        let max_payload = prefix
-            .len()
-            .saturating_add(hint)
-            .min(self.payload_budget(now));
-        if prefix.len() > max_payload {
-            return Err(Error::PayloadTooLarge);
-        }
+        let limit = match size {
+            RecordSize::Stream(_) => self.payload_budget(self.clock.monotonic_secs()),
+            RecordSize::Datagram(_) => MAX_PACKET_SIZE_V6,
+        };
+        let max_payload = size.payload_len(prefix.len(), limit)?;
 
         let profile = self.psk.profile();
         let salt_block_len = if self.last_write_secs.is_none() {
@@ -435,7 +432,9 @@ mod tests {
                 let hint = if seq < 4 { 1024 } else { MAX_PACKET_SIZE_V6 };
                 let prefix = if seq % 3 == 0 { &b"prefix"[..] } else { &[] };
                 let pending = out.len();
-                let mut rec = encoder.reserve(&mut out, prefix, hint).unwrap();
+                let mut rec = encoder
+                    .reserve(&mut out, prefix, RecordSize::Stream(hint))
+                    .unwrap();
                 let n = match seq {
                     _ if seq % 5 == 0 => 0,
                     _ if seq % 2 == 0 => rec.capacity().min(211),
@@ -461,13 +460,15 @@ mod tests {
         let mut enc = encoder();
         let mut out = Buffer::new(V6_WIRE_CAP);
         assert_eq!(
-            enc.reserve(&mut out, &[], 5).unwrap().seal(5),
+            enc.reserve(&mut out, &[], RecordSize::Stream(5))
+                .unwrap()
+                .seal(5),
             Err(Error::PendingWire)
         );
         assert!(out.is_empty());
         assert_eq!(enc.seq, 0);
         assert!(enc.last_write_secs.is_none());
-        let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
+        let mut rec = enc.reserve(&mut out, &[], RecordSize::Stream(5)).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         let split = rec.seal(5).unwrap();
         let mut wire = Buffer::new(V6_WIRE_CAP);
@@ -484,7 +485,7 @@ mod tests {
     fn salt_block_is_not_a_bare_prefix() {
         let mut enc = encoder();
         let mut out = Buffer::new(V6_WIRE_CAP);
-        let mut rec = enc.reserve(&mut out, &[], 5).unwrap();
+        let mut rec = enc.reserve(&mut out, &[], RecordSize::Stream(5)).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         let split = rec.seal(5).unwrap();
         let wire = [&out.filled()[split..], &out.filled()[..split]].concat();
@@ -501,7 +502,9 @@ mod tests {
     fn first_record_respects_cap() {
         let mut enc = encoder();
         let mut out = Buffer::new(V6_WIRE_CAP);
-        let rec = enc.reserve(&mut out, &[], MAX_PACKET_SIZE_V6).unwrap();
+        let rec = enc
+            .reserve(&mut out, &[], RecordSize::Stream(MAX_PACKET_SIZE_V6))
+            .unwrap();
         let psk = psk();
         let profile = psk.profile();
         assert!(rec.capacity() <= profile.first_record_cap());

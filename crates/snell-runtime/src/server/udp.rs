@@ -7,6 +7,7 @@ use snell_protocol::{Error, RecordDecoder, RecordEncoder, decode_udp_request};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 
+use super::outbound::UdpFlow;
 use crate::ServerConfig;
 use crate::buffer::PooledBuffer;
 use crate::error::SessionError;
@@ -28,7 +29,7 @@ pub(crate) async fn run_server_udp<E: RecordEncoder, D: RecordDecoder>(
         return Err(SessionError::UdpLimit);
     };
 
-    let flow = match config.outbound.open_udp(&udp.dns).await {
+    let mut flow = match UdpFlow::open(config.outbound, &udp.dns).await {
         Ok(flow) => flow,
         Err(error) => {
             let _ = write_reject(encoder, buffers, snell, &error.to_string()).await;

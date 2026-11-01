@@ -394,8 +394,8 @@ impl<E: RecordEncoder> Drop for Reservation<'_, E> {
 mod tests {
     use super::*;
     use crate::{
-        FixedClock, Psk, RepeatEntropy, SALT_LEN, V4Encoder, V6_WIRE_CAP, V6ShapedEncoder,
-        V6UnshapedEncoder,
+        FixedClock, Psk, RecordSize, RepeatEntropy, SALT_LEN, V4Encoder, V6_WIRE_CAP,
+        V6ShapedEncoder, V6UnshapedEncoder,
     };
 
     /// `seal_init` over `payload_uninit` is byte-identical to `seal` over
@@ -411,11 +411,15 @@ mod tests {
             (b"pfx", b"steady", 6),
             (b"", b"abc", 8),
         ] {
-            let mut rec = a_enc.reserve(&mut a, prefix, hint).unwrap();
+            let mut rec = a_enc
+                .reserve(&mut a, prefix, RecordSize::Stream(hint))
+                .unwrap();
             rec.payload_mut()[..msg.len()].copy_from_slice(msg);
             rec.seal(msg.len()).unwrap();
 
-            let mut rec = b_enc.reserve(&mut b, prefix, hint).unwrap();
+            let mut rec = b_enc
+                .reserve(&mut b, prefix, RecordSize::Stream(hint))
+                .unwrap();
             rec.payload_uninit()[..msg.len()].write_copy_of_slice(msg);
             // SAFETY: the preceding write initialized `msg.len()` bytes.
             unsafe { rec.seal_init(msg.len()) }.unwrap();
@@ -423,13 +427,13 @@ mod tests {
         assert_eq!(a.filled(), b.filled());
 
         a.consume(a.len()).unwrap();
-        let mut rec = a_enc.reserve(&mut a, &[], 5).unwrap();
+        let mut rec = a_enc.reserve(&mut a, &[], RecordSize::Stream(5)).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         assert!(rec.payload_uninit().is_empty());
         // SAFETY: `payload_mut` initialized the payload.
         assert_eq!(unsafe { rec.seal_init(5) }, Err(Error::PendingWire));
         assert!(a.is_empty(), "a failed seal cancels the record");
-        let mut rec = a_enc.reserve(&mut a, &[], 5).unwrap();
+        let mut rec = a_enc.reserve(&mut a, &[], RecordSize::Stream(5)).unwrap();
         rec.payload_mut()[..5].copy_from_slice(b"hello");
         rec.seal(5).unwrap();
         assert!(!a.is_empty());
@@ -477,10 +481,16 @@ mod tests {
         let psk = Psk::new(b"0123456789abcdef").unwrap();
         let mut encoder = V6UnshapedEncoder::with_salt(&psk, [7; SALT_LEN]).unwrap();
         let mut out = Buffer::new(V6_WIRE_CAP);
-        let rec = encoder.reserve(&mut out, &[], 5).unwrap();
+        let rec = encoder
+            .reserve(&mut out, &[], RecordSize::Stream(5))
+            .unwrap();
         assert_eq!(rec.seal(5), Err(Error::PendingWire));
         assert!(out.is_empty(), "a failed seal cancels the record");
-        encoder.reserve(&mut out, &[], 5).unwrap().seal(0).unwrap();
+        encoder
+            .reserve(&mut out, &[], RecordSize::Stream(5))
+            .unwrap()
+            .seal(0)
+            .unwrap();
         assert!(!out.is_empty());
     }
 

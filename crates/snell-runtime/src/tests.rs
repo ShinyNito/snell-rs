@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use snell_protocol::socks5;
 use snell_protocol::{
     Address, AddressRef, Error, MAX_PACKET_SIZE, ProtocolFlavor, ProtocolSelection, Psk,
-    RecordEncoder, V4Decoder, V4Encoder,
+    RecordEncoder, RecordSize, V4Decoder, V4Encoder,
 };
 use snell_testkit::oracle::{
     socks5_connect, socks5_echo_roundtrip, socks5_udp_associate, socks5_udp_echo_roundtrip,
@@ -557,7 +557,7 @@ async fn early_payload_over_64kib_is_rejected() {
     let mut offset = 0;
     while offset < plain.len() {
         let mut reservation = encoder
-            .reserve(&mut encode, &[], plain.len() - offset)
+            .reserve(&mut encode, &[], RecordSize::Stream(plain.len() - offset))
             .unwrap();
         let take = reservation.capacity().min(plain.len() - offset);
         reservation.payload_mut()[..take].copy_from_slice(&plain[offset..offset + take]);
@@ -650,38 +650,28 @@ async fn start_pair_udp(
     }
 }
 
-async fn udp_echo_version(version: ProtocolFlavor, payload: &[u8]) {
-    let pair = start_pair_udp(
-        version,
-        Outbound::Direct,
-        UdpOptions::new().unwrap(),
-        UdpOptions::new().unwrap(),
-    )
-    .await;
-    let got = socks5_udp_echo_roundtrip(pair.socks, payload)
-        .await
-        .unwrap();
-    assert_eq!(got, payload);
-}
-
 #[tokio::test]
-async fn v4_udp_echo_roundtrip() {
-    udp_echo_version(ProtocolFlavor::V4, b"phase-7-v4").await;
-}
-
-#[tokio::test]
-async fn v5_udp_echo_roundtrip() {
-    udp_echo_version(ProtocolFlavor::V5, b"phase-7-v5").await;
-}
-
-#[tokio::test]
-async fn v6_shaped_udp_echo_roundtrip() {
-    udp_echo_version(ProtocolFlavor::V6Shaped, b"phase-7-v6-shaped").await;
-}
-
-#[tokio::test]
-async fn v6_unshaped_udp_echo_roundtrip() {
-    udp_echo_version(ProtocolFlavor::V6Unshaped, b"phase-7-v6-unshaped").await;
+async fn udp_echo_all_versions() {
+    // Stay below macOS's default UDP socket limit; codec tests cover full 65,535-byte frames.
+    let payload = vec![0x5a; 8_000];
+    for version in [
+        ProtocolFlavor::V4,
+        ProtocolFlavor::V5,
+        ProtocolFlavor::V6Shaped,
+        ProtocolFlavor::V6Unshaped,
+    ] {
+        let pair = start_pair_udp(
+            version,
+            Outbound::Direct,
+            UdpOptions::new().unwrap(),
+            UdpOptions::new().unwrap(),
+        )
+        .await;
+        let got = socks5_udp_echo_roundtrip(pair.socks, &payload)
+            .await
+            .unwrap_or_else(|error| panic!("{version:?}: {error}"));
+        assert_eq!(got, payload, "{version:?}");
+    }
 }
 
 /// A burst of datagrams queued on one association must all be relayed:

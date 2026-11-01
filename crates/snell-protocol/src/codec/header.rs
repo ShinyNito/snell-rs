@@ -42,9 +42,6 @@ impl RecordHeader {
         if self.padding_len != 0 {
             return Err(Error::InvalidHeader);
         }
-        if self.payload_len > MAX_PACKET_SIZE {
-            return Err(Error::PayloadTooLarge);
-        }
         Ok(self.payload_body_len())
     }
 

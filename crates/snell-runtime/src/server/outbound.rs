@@ -31,13 +31,6 @@ impl Outbound {
             Self::Socks5 { server } => connect_socks5(server, destination).await,
         }
     }
-
-    pub(crate) async fn open_udp(self, dns: &DnsResolver) -> Result<UdpFlow, SessionError> {
-        match self {
-            Self::Direct => UdpFlow::direct().await,
-            Self::Socks5 { server } => UdpFlow::socks5(server, dns).await,
-        }
-    }
 }
 
 pub(crate) struct UdpRecv {
@@ -52,32 +45,31 @@ impl UdpRecv {
     }
 }
 
-/// An association's upstream UDP socket. It holds no buffer: every
-/// received datagram owns its own lease.
-pub(crate) struct UdpFlow {
-    socket: UdpSocket,
-    route: UdpRoute,
-}
-
-enum UdpRoute {
-    Direct,
-    /// Through a SOCKS5 relay; the association lives as long as `_control`.
+/// Upstream sockets belong to one association; receive buffers are leased per datagram.
+pub(crate) enum UdpFlow {
+    Direct {
+        ipv4: UdpSocket,
+        ipv6: Option<UdpSocket>,
+    },
     Socks5 {
+        socket: UdpSocket,
         relay: SocketAddr,
+        /// Keeps the SOCKS5 association alive.
         _control: TcpStream,
     },
 }
 
 impl UdpFlow {
-    async fn direct() -> Result<Self, SessionError> {
-        let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
-        Ok(Self {
-            socket,
-            route: UdpRoute::Direct,
-        })
-    }
-
-    async fn socks5(server: SocketAddr, dns: &DnsResolver) -> Result<Self, SessionError> {
+    pub(crate) async fn open(outbound: Outbound, dns: &DnsResolver) -> Result<Self, SessionError> {
+        let server = match outbound {
+            Outbound::Direct => {
+                return Ok(Self::Direct {
+                    ipv4: UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?,
+                    ipv6: None,
+                });
+            }
+            Outbound::Socks5 { server } => server,
+        };
         let mut control = connect_tcp(server).await?;
         let bind = socks5_udp_associate(&mut control, dns).await?;
         let relay = rewrite_unspecified(bind, server);
@@ -87,35 +79,44 @@ impl UdpFlow {
             SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
         };
         let socket = UdpSocket::bind(local).await?;
-        Ok(Self {
+        Ok(Self::Socks5 {
             socket,
-            route: UdpRoute::Socks5 {
-                relay,
-                _control: control,
-            },
+            relay,
+            _control: control,
         })
     }
 
     pub(crate) async fn send(
-        &self,
+        &mut self,
         dest: AddressRef<'_>,
         payload: &[u8],
         dns: &DnsResolver,
     ) -> Result<(), SessionError> {
-        match &self.route {
-            UdpRoute::Direct => {
+        match self {
+            Self::Direct { ipv4, ipv6 } => {
                 let addr = match dest {
                     AddressRef::Ip(addr) => addr,
                     AddressRef::Domain { host, port } => dns.resolve(host, port).await?,
                 };
-                self.socket.send_to(payload, addr).await?;
+                let socket = if addr.is_ipv4() {
+                    ipv4
+                } else {
+                    match ipv6 {
+                        Some(socket) => socket,
+                        // IPv4-only associations need neither IPv6 support nor a second socket.
+                        None => ipv6.insert(
+                            UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))).await?,
+                        ),
+                    }
+                };
+                socket.send_to(payload, addr).await?;
             }
-            UdpRoute::Socks5 { relay, .. } => {
+            Self::Socks5 { socket, relay, .. } => {
                 // Header and borrowed payload leave as one vectored datagram;
                 // the kernel rejects one that exceeds the UDP limit.
                 let mut hdr = [0u8; 3 + MAX_UDP_PACKET_ADDR_LEN];
                 let hdr_len = socks5::encode_udp_header(&mut hdr, 0, dest)?;
-                send_udp_parts(&self.socket, *relay, &hdr[..hdr_len], payload).await?;
+                send_udp_parts(socket, *relay, &hdr[..hdr_len], payload).await?;
             }
         }
         Ok(())
@@ -129,15 +130,25 @@ impl UdpFlow {
         frag_dropped: &AtomicU64,
         invalid: &AtomicU64,
     ) -> Result<UdpRecv, SessionError> {
-        loop {
-            let (buffer, from) = recv_datagram(&self.socket, buffers).await?;
-            if let UdpRoute::Direct = self.route {
+        let socket = match self {
+            Self::Direct { ipv4, ipv6 } => {
+                let (buffer, from) = match ipv6 {
+                    Some(ipv6) => tokio::select! {
+                        packet = recv_datagram(ipv4, buffers) => packet,
+                        packet = recv_datagram(ipv6, buffers) => packet,
+                    },
+                    None => recv_datagram(ipv4, buffers).await,
+                }?;
                 return Ok(UdpRecv {
                     addr: Address::Ip(from),
                     buffer,
                     header_len: 0,
                 });
             }
+            Self::Socks5 { socket, .. } => socket,
+        };
+        loop {
+            let (buffer, _) = recv_datagram(socket, buffers).await?;
             let packet = match socks5::parse_udp_packet(buffer.filled()) {
                 Ok(packet) => packet,
                 Err(_) => {
@@ -256,10 +267,52 @@ mod tests {
     use std::task::{Context, Waker};
 
     #[tokio::test]
+    async fn direct_udp_sends_and_receives_both_address_families() {
+        let dns = DnsResolver::try_from_system(16, Duration::from_secs(30)).unwrap();
+        let mut flow = UdpFlow::open(Outbound::Direct, &dns).await.unwrap();
+        let buffers = Arc::new(BufferPool::default());
+        let frag = AtomicU64::new(0);
+        let invalid = AtomicU64::new(0);
+        for host in ["::1", "127.0.0.1", "::1"] {
+            let peer = UdpSocket::bind(SocketAddr::new(host.parse().unwrap(), 0))
+                .await
+                .unwrap();
+            let addr = peer.local_addr().unwrap();
+            for dest in [
+                AddressRef::Ip(addr),
+                AddressRef::Domain {
+                    host,
+                    port: addr.port(),
+                },
+            ] {
+                flow.send(dest, b"request", &dns).await.unwrap();
+                let mut data = [0; 64];
+                let (n, from) = timeout(Duration::from_secs(1), peer.recv_from(&mut data))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&data[..n], b"request");
+                assert_eq!(from.is_ipv6(), addr.is_ipv6());
+                peer.send_to(b"reply", from).await.unwrap();
+                let packet = timeout(Duration::from_secs(1), flow.recv(&buffers, &frag, &invalid))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(packet.addr, Address::Ip(addr));
+                assert_eq!(packet.payload(), b"reply");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn received_datagram_owns_its_lease_and_idle_flow_holds_none() {
         let buffers = Arc::new(BufferPool::default());
-        let flow = UdpFlow::direct().await.unwrap();
-        let port = flow.socket.local_addr().unwrap().port();
+        let dns = DnsResolver::try_from_system(16, Duration::from_secs(30)).unwrap();
+        let flow = UdpFlow::open(Outbound::Direct, &dns).await.unwrap();
+        let UdpFlow::Direct { ipv4, .. } = &flow else {
+            unreachable!();
+        };
+        let port = ipv4.local_addr().unwrap().port();
         let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let frag = AtomicU64::new(0);

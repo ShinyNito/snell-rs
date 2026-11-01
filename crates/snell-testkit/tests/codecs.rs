@@ -5,8 +5,8 @@ use std::fmt::Debug;
 
 use snell_protocol::{
     Buffer, DecodeStatus, Error, FixedClock, HEADER_CIPHER_LEN, Psk, RecordDecoder, RecordEncoder,
-    RecordKind, RepeatEntropy, SALT_LEN, V4Decoder, V4Encoder, V6_WIRE_CAP, V6ShapedDecoder,
-    V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
+    RecordKind, RecordSize, RepeatEntropy, SALT_LEN, V4Decoder, V4Encoder, V6_WIRE_CAP,
+    V6ShapedDecoder, V6ShapedEncoder, V6UnshapedDecoder, V6UnshapedEncoder,
 };
 use snell_testkit::seal_records;
 
@@ -146,7 +146,9 @@ impl<E: RecordEncoder + Debug, D: RecordDecoder + Debug> Codec<E, D> {
     fn dropped_reservation_cancels_without_side_effects(&self) {
         let mut encoder = (self.encoder)();
         let mut out = Buffer::new(V6_WIRE_CAP);
-        let mut rec = encoder.reserve(&mut out, b"pfx", 8).unwrap();
+        let mut rec = encoder
+            .reserve(&mut out, b"pfx", RecordSize::Stream(8))
+            .unwrap();
         rec.payload_mut()[0] = 1;
         drop(rec);
         assert!(out.is_empty());

@@ -3,10 +3,10 @@
 use core::fmt;
 
 use crate::buffer::{Reservation, Slot};
-use crate::codec::RecordEncoder;
 use crate::codec::header::{parse_v6_plain_header, plain_header};
 use crate::codec::record::{DecodeStatus, DecodedRecord, EncoderState, Pending};
 use crate::codec::sealed::Seal;
+use crate::codec::{RecordEncoder, RecordSize};
 use crate::{Buffer, Error, HEADER_PLAIN_LEN, MAX_PACKET_SIZE_V6, Result};
 
 #[derive(Default)]
@@ -25,13 +25,10 @@ impl RecordEncoder for V6UnsafeRawEncoder {
         &'a mut self,
         buf: &'a mut Buffer,
         prefix: &[u8],
-        hint: usize,
+        size: RecordSize,
     ) -> Result<Reservation<'a, Self>> {
         self.state.ensure_ready()?;
-        let max_payload = prefix.len().saturating_add(hint).min(MAX_PACKET_SIZE_V6);
-        if prefix.len() > max_payload {
-            return Err(Error::PayloadTooLarge);
-        }
+        let max_payload = size.payload_len(prefix.len(), MAX_PACKET_SIZE_V6)?;
         let record_start = buf.reserve_record(HEADER_PLAIN_LEN + max_payload, HEADER_PLAIN_LEN)?;
         buf.extend_from_slice(prefix)?;
         let slot = Slot {
@@ -151,7 +148,9 @@ mod tests {
     use crate::codec::header::RecordHeader;
 
     fn seal(encoder: &mut V6UnsafeRawEncoder, out: &mut Buffer, payload: &[u8]) {
-        let mut rec = encoder.reserve(out, &[], payload.len()).unwrap();
+        let mut rec = encoder
+            .reserve(out, &[], RecordSize::Stream(payload.len()))
+            .unwrap();
         rec.payload_mut()[..payload.len()].copy_from_slice(payload);
         rec.seal(payload.len()).unwrap();
     }
@@ -191,7 +190,10 @@ mod tests {
     fn dropped_reservation_cancels_and_padding_is_rejected() {
         let mut enc = V6UnsafeRawEncoder::new();
         let mut out = Buffer::new(64);
-        drop(enc.reserve(&mut out, b"pfx", 8).unwrap());
+        drop(
+            enc.reserve(&mut out, b"pfx", RecordSize::Stream(8))
+                .unwrap(),
+        );
         assert!(out.is_empty());
         seal(&mut enc, &mut out, b"x");
         assert_eq!(out.len(), HEADER_PLAIN_LEN + 1);
