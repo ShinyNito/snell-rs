@@ -46,62 +46,22 @@ jobs:
         with:
           command: check
 
+  # Compile-and-link check for release targets that the test job does not
+  # already build natively (x86_64 Linux gnu, aarch64 macOS, x86_64 Windows).
+  # Per-CPU-level release builds (fat LTO) run only in release.yml.
   cross-build:
-    name: Build ${{ matrix.target }} ${{ matrix.cpu }}
+    name: Build ${{ matrix.targets }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cpu: x86-64-v2
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cpu: x86-64-v3
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cpu: x86-64-v4
+            targets: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            cpu: generic
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cpu: x86-64-v2
-            musl: true
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cpu: x86-64-v3
-            musl: true
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cpu: x86-64-v4
-            musl: true
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            cpu: generic
-            musl: true
+            targets: aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
           - os: macos-latest
-            target: aarch64-apple-darwin
-            cpu: apple-m1
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            cpu: x86-64-v2
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            cpu: x86-64-v3
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            cpu: x86-64-v4
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cpu: x86-64-v2
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cpu: x86-64-v3
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cpu: x86-64-v4
+            targets: x86_64-apple-darwin
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
@@ -112,13 +72,17 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.98.1
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.targets }}
 
       - name: Install musl-tools
-        if: matrix.musl
+        if: contains(matrix.targets, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
+        shell: bash
+        run: |
+          for target in ${MATRIX_TARGETS//,/ }; do
+            cargo build --locked --target "${target}" -p snell
+          done
         env:
-          RUSTFLAGS: "-Ctarget-cpu=${{ matrix.cpu }}"
-        run: cargo build --release --locked --target ${{ matrix.target }} -p snell
+          MATRIX_TARGETS: ${{ matrix.targets }}
