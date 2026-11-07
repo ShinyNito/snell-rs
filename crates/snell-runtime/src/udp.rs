@@ -43,6 +43,8 @@ impl Default for UdpLimits {
 #[derive(Debug, Default)]
 pub struct UdpMetrics {
     pub frag_dropped: AtomicU64,
+    /// Upstream replies with a domain source; Snell replies must carry an IP.
+    pub domain_reply_dropped: AtomicU64,
     pub oversize: AtomicU64,
     pub map_full: AtomicU64,
     pub invalid: AtomicU64,

@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use snell_protocol::socks5::{self, Command, METHOD_NO_AUTH, Reply};
@@ -17,6 +17,7 @@ use crate::connect_tcp;
 use crate::dns::DnsResolver;
 use crate::error::SessionError;
 use crate::platform::{prepare_session_stream, send_udp_parts};
+use crate::udp::UdpMetrics;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outbound {
@@ -34,7 +35,8 @@ impl Outbound {
 }
 
 pub(crate) struct UdpRecv {
-    pub addr: Address,
+    /// Snell replies carry only IP sources, so this is never a domain.
+    pub addr: SocketAddr,
     buffer: PooledBuffer,
     header_len: usize,
 }
@@ -56,6 +58,8 @@ pub(crate) enum UdpFlow {
         relay: SocketAddr,
         /// Keeps the SOCKS5 association alive.
         _control: TcpStream,
+        /// The domain-source warning fires once per association.
+        domain_source_warned: bool,
     },
 }
 
@@ -83,6 +87,7 @@ impl UdpFlow {
             socket,
             relay,
             _control: control,
+            domain_source_warned: false,
         })
     }
 
@@ -123,16 +128,15 @@ impl UdpFlow {
     }
 
     /// Receive the next datagram, skipping (and counting) relay datagrams
-    /// that are malformed or fragmented.
+    /// that are malformed, fragmented, or carry a domain source.
     pub(crate) async fn recv(
-        &self,
+        &mut self,
         buffers: &Arc<BufferPool>,
-        frag_dropped: &AtomicU64,
-        invalid: &AtomicU64,
+        metrics: &UdpMetrics,
     ) -> Result<UdpRecv, SessionError> {
-        let socket = match self {
+        let (socket, domain_source_warned) = match self {
             Self::Direct { ipv4, ipv6 } => {
-                let (buffer, from) = match ipv6 {
+                let (buffer, addr) = match ipv6 {
                     Some(ipv6) => tokio::select! {
                         packet = recv_datagram(ipv4, buffers) => packet,
                         packet = recv_datagram(ipv6, buffers) => packet,
@@ -140,30 +144,51 @@ impl UdpFlow {
                     None => recv_datagram(ipv4, buffers).await,
                 }?;
                 return Ok(UdpRecv {
-                    addr: Address::Ip(from),
+                    addr,
                     buffer,
                     header_len: 0,
                 });
             }
-            Self::Socks5 { socket, .. } => socket,
+            Self::Socks5 {
+                socket,
+                domain_source_warned,
+                ..
+            } => (socket, domain_source_warned),
         };
         loop {
             let (buffer, _) = recv_datagram(socket, buffers).await?;
-            let packet = match socks5::parse_udp_packet(buffer.filled()) {
-                Ok(packet) => packet,
-                Err(_) => {
-                    invalid.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
+            let Ok(packet) = socks5::parse_udp_packet(buffer.filled()) else {
+                metrics.invalid.fetch_add(1, Ordering::Relaxed);
+                continue;
             };
             if packet.frag != 0 {
-                frag_dropped.fetch_add(1, Ordering::Relaxed);
+                metrics.frag_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let header_len = packet.header_len;
-            let addr = packet.destination.into_owned();
+            let source = match packet.destination {
+                AddressRef::Ip(addr) => addr,
+                // An upstream that maps reply sources back to domains (sing-box
+                // by default) leaves no real IP to recover, and Snell clients
+                // such as Surge drop domain-typed replies. Drop it here rather
+                // than invent an address.
+                AddressRef::Domain { .. } => {
+                    metrics.domain_reply_dropped.fetch_add(1, Ordering::Relaxed);
+                    if !*domain_source_warned {
+                        *domain_source_warned = true;
+                        tracing::warn!(
+                            source = %packet.destination,
+                            "dropping udp reply with a domain source address; Snell clients \
+                             such as Surge only accept IP sources. Disable domain unmapping \
+                             on the upstream SOCKS5 inbound \
+                             (sing-box: udp_disable_domain_unmapping: true)"
+                        );
+                    }
+                    continue;
+                }
+            };
             return Ok(UdpRecv {
-                addr,
+                addr: source,
                 buffer,
                 header_len,
             });
@@ -271,8 +296,7 @@ mod tests {
         let dns = DnsResolver::try_from_system(16, Duration::from_secs(30)).unwrap();
         let mut flow = UdpFlow::open(Outbound::Direct, &dns).await.unwrap();
         let buffers = Arc::new(BufferPool::default());
-        let frag = AtomicU64::new(0);
-        let invalid = AtomicU64::new(0);
+        let metrics = UdpMetrics::default();
         for host in ["::1", "127.0.0.1", "::1"] {
             let peer = UdpSocket::bind(SocketAddr::new(host.parse().unwrap(), 0))
                 .await
@@ -294,11 +318,11 @@ mod tests {
                 assert_eq!(&data[..n], b"request");
                 assert_eq!(from.is_ipv6(), addr.is_ipv6());
                 peer.send_to(b"reply", from).await.unwrap();
-                let packet = timeout(Duration::from_secs(1), flow.recv(&buffers, &frag, &invalid))
+                let packet = timeout(Duration::from_secs(1), flow.recv(&buffers, &metrics))
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(packet.addr, Address::Ip(addr));
+                assert_eq!(packet.addr, addr);
                 assert_eq!(packet.payload(), b"reply");
             }
         }
@@ -308,18 +332,17 @@ mod tests {
     async fn received_datagram_owns_its_lease_and_idle_flow_holds_none() {
         let buffers = Arc::new(BufferPool::default());
         let dns = DnsResolver::try_from_system(16, Duration::from_secs(30)).unwrap();
-        let flow = UdpFlow::open(Outbound::Direct, &dns).await.unwrap();
+        let mut flow = UdpFlow::open(Outbound::Direct, &dns).await.unwrap();
         let UdpFlow::Direct { ipv4, .. } = &flow else {
             unreachable!();
         };
         let port = ipv4.local_addr().unwrap().port();
         let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let frag = AtomicU64::new(0);
-        let invalid = AtomicU64::new(0);
+        let metrics = UdpMetrics::default();
         for payload in [b"first".as_slice(), b"second"] {
             {
-                let recv = flow.recv(&buffers, &frag, &invalid);
+                let recv = flow.recv(&buffers, &metrics);
                 tokio::pin!(recv);
                 assert!(
                     recv.as_mut()
@@ -329,7 +352,7 @@ mod tests {
                 assert_eq!(buffers.leased_bytes(), 0);
             }
             peer.send_to(payload, destination).await.unwrap();
-            let packet = flow.recv(&buffers, &frag, &invalid).await.unwrap();
+            let packet = flow.recv(&buffers, &metrics).await.unwrap();
             assert_eq!(packet.payload(), payload);
             assert!(buffers.leased_bytes() > 0);
             drop(packet);

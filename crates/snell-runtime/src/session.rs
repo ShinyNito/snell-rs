@@ -1,5 +1,6 @@
 use std::future::{Future, poll_fn};
 use std::io;
+use std::net::SocketAddr;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -79,12 +80,12 @@ pub(crate) async fn write_udp_response<E: RecordEncoder, W: AsyncWrite + Unpin>(
     encoder: &mut E,
     buffers: &Arc<BufferPool>,
     writer: &mut W,
-    address: AddressRef<'_>,
+    source: SocketAddr,
     payload: &[u8],
 ) -> Result<(), SessionError> {
-    let needed = udp_response_len(address, payload.len())?;
+    let needed = udp_response_len(source, payload.len());
     write_udp_plain(encoder, buffers, writer, needed, |dst| {
-        encode_udp_response(dst, address, payload)
+        encode_udp_response(dst, source, payload)
     })
     .await
 }
@@ -1182,77 +1183,96 @@ mod buffer_tests {
         }
     }
 
+    /// One UDP datagram direction under test. Requests may name a domain;
+    /// responses carry only a socket address.
+    #[derive(Clone, Copy)]
+    enum Datagram<'a> {
+        Request(AddressRef<'a>),
+        Response(SocketAddr),
+    }
+
     async fn udp_frame_boundaries<E: RecordEncoder, D: RecordDecoder>(
+        encoder: &mut E,
+        decoder: &mut D,
+        datagram: Datagram<'_>,
+    ) {
+        let pool = Arc::new(BufferPool::default());
+        let (header_len, expected) = match datagram {
+            Datagram::Request(address) => (udp_request_len(address, 0).unwrap(), address),
+            Datagram::Response(source) => (udp_response_len(source, 0), AddressRef::Ip(source)),
+        };
+        for len in [
+            20_000,
+            MAX_PACKET_SIZE_V6 - header_len,
+            MAX_PACKET_SIZE_V6 - header_len + 1,
+            1,
+        ] {
+            let payload = vec![0x5a; len];
+            let mut output = Output {
+                bytes: Vec::new(),
+                limit: 37,
+                writes: 0,
+                pending: true,
+            };
+            let result = match datagram {
+                Datagram::Request(address) => {
+                    write_udp_request(encoder, &pool, &mut output, address, &payload).await
+                }
+                Datagram::Response(source) => {
+                    write_udp_response(encoder, &pool, &mut output, source, &payload).await
+                }
+            };
+            if len + header_len > MAX_PACKET_SIZE_V6 {
+                assert!(matches!(
+                    result,
+                    Err(SessionError::Protocol(Error::PayloadTooLarge))
+                ));
+                assert!(output.bytes.is_empty());
+                continue;
+            }
+            result.unwrap();
+            let mut wire = snell_protocol::Buffer::new(output.bytes.len());
+            wire.extend_from_slice(&output.bytes).unwrap();
+            let DecodeStatus::Record(record) = decoder.decode(&mut wire).unwrap() else {
+                panic!("datagram must be one complete record");
+            };
+            let plain = record.plaintext(wire.filled());
+            let packet = match datagram {
+                Datagram::Request(_) => snell_protocol::decode_udp_request(plain).unwrap(),
+                Datagram::Response(_) => snell_protocol::decode_udp_response(plain).unwrap(),
+            };
+            assert_eq!(packet.address, expected);
+            assert_eq!(packet.payload, payload);
+            decoder.consume(&mut wire, &record).unwrap();
+            assert!(wire.is_empty());
+        }
+    }
+
+    async fn udp_datagram_frame_boundaries<E: RecordEncoder, D: RecordDecoder>(
         mut encoder: E,
         mut decoder: D,
     ) {
-        let pool = Arc::new(BufferPool::default());
-        for address in [
-            AddressRef::Ip("127.0.0.1:53".parse().unwrap()),
-            AddressRef::Ip("[::1]:53".parse().unwrap()),
-            AddressRef::Domain {
-                host: "example.com",
-                port: 53,
-            },
+        let v4 = "127.0.0.1:53".parse().unwrap();
+        let v6 = "[::1]:53".parse().unwrap();
+        let domain = AddressRef::Domain {
+            host: "example.com",
+            port: 53,
+        };
+        for datagram in [
+            Datagram::Request(AddressRef::Ip(v4)),
+            Datagram::Request(AddressRef::Ip(v6)),
+            Datagram::Request(domain),
+            Datagram::Response(v4),
+            Datagram::Response(v6),
         ] {
-            for response in [false, true] {
-                let header_len = if response {
-                    udp_response_len(address, 0).unwrap()
-                } else {
-                    udp_request_len(address, 0).unwrap()
-                };
-                for len in [
-                    20_000,
-                    MAX_PACKET_SIZE_V6 - header_len,
-                    MAX_PACKET_SIZE_V6 - header_len + 1,
-                    1,
-                ] {
-                    let payload = vec![0x5a; len];
-                    let mut output = Output {
-                        bytes: Vec::new(),
-                        limit: 37,
-                        writes: 0,
-                        pending: true,
-                    };
-                    let result = if response {
-                        write_udp_response(&mut encoder, &pool, &mut output, address, &payload)
-                            .await
-                    } else {
-                        write_udp_request(&mut encoder, &pool, &mut output, address, &payload).await
-                    };
-                    if len + header_len > MAX_PACKET_SIZE_V6 {
-                        assert!(matches!(
-                            result,
-                            Err(SessionError::Protocol(Error::PayloadTooLarge))
-                        ));
-                        assert!(output.bytes.is_empty());
-                        continue;
-                    }
-                    result.unwrap();
-                    let mut wire = snell_protocol::Buffer::new(output.bytes.len());
-                    wire.extend_from_slice(&output.bytes).unwrap();
-                    let DecodeStatus::Record(record) = decoder.decode(&mut wire).unwrap() else {
-                        panic!("datagram must be one complete record");
-                    };
-                    let plain = record.plaintext(wire.filled());
-                    let packet = if response {
-                        snell_protocol::decode_udp_response(plain).unwrap()
-                    } else {
-                        snell_protocol::decode_udp_request(plain).unwrap()
-                    };
-                    assert_eq!(packet.address, address);
-                    assert_eq!(packet.payload, payload);
-                    decoder.consume(&mut wire, &record).unwrap();
-                    assert!(wire.is_empty());
-                }
-            }
+            udp_frame_boundaries(&mut encoder, &mut decoder, datagram).await;
         }
     }
 
     #[tokio::test]
     async fn shaped_udp_frame_boundaries() {
         let psk = Psk::new(b"0123456789abcdef").unwrap();
-        udp_frame_boundaries(
+        udp_datagram_frame_boundaries(
             snell_protocol::V6ShapedEncoder::os(&psk).unwrap(),
             snell_protocol::V6ShapedDecoder::new(psk),
         )
@@ -1262,7 +1282,7 @@ mod buffer_tests {
     #[tokio::test]
     async fn unshaped_udp_frame_boundaries() {
         let psk = Psk::new(b"0123456789abcdef").unwrap();
-        udp_frame_boundaries(
+        udp_datagram_frame_boundaries(
             snell_protocol::V6UnshapedEncoder::os(&psk).unwrap(),
             snell_protocol::V6UnshapedDecoder::new(psk),
         )

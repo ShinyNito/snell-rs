@@ -13,9 +13,9 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::address::{Address, AddressRef, ip_port, split_host_port, validate_domain};
 use crate::error::dst_prefix;
 use crate::{
-    ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, COMMAND_CONNECT, COMMAND_CONNECT_V2, COMMAND_ERROR,
-    COMMAND_TUNNEL, COMMAND_UDP, COMMAND_UDP_FORWARD, ERROR_REJECT, Error, PROTOCOL_VERSION,
-    ParseState, Result, UDP_REQUEST_IP_LEN,
+    ATYP_IPV4, ATYP_IPV6, COMMAND_CONNECT, COMMAND_CONNECT_V2, COMMAND_ERROR, COMMAND_TUNNEL,
+    COMMAND_UDP, COMMAND_UDP_FORWARD, ERROR_REJECT, Error, PROTOCOL_VERSION, ParseState, Result,
+    UDP_REQUEST_IP_LEN,
 };
 
 /// First three bytes of CONNECT / UDP setup: `VERSION CMD CLIENT_ID_LEN`.
@@ -203,7 +203,9 @@ pub fn decode_server_reply(src: &[u8]) -> Result<ParseState<(ServerReply<'_>, us
 // domain `LEN(1)  HOST(LEN)  PORT(2)`
 //
 // Request  `COMMAND_UDP_FORWARD`, then `UDP_REQUEST_IP_LEN` before an IP tail.
-// Response `ATYP_DOMAIN` before a domain tail; an IP tail stands alone.
+// Response an IP tail stands alone. There is no domain form: the official
+//          server takes the source from the socket peer and Surge drops
+//          domain-typed replies, so `SocketAddr` is the only accepted source.
 
 pub fn encode_udp_request(
     dst: &mut [u8],
@@ -232,33 +234,23 @@ pub fn decode_udp_request(src: &[u8]) -> Result<UdpPacket<'_>> {
     }
 }
 
-pub fn encode_udp_response(
-    dst: &mut [u8],
-    address: AddressRef<'_>,
-    payload: &[u8],
-) -> Result<usize> {
-    let header_len = udp_response_header_len(address)?;
-    let marker: &[u8] = match address {
-        AddressRef::Ip(_) => &[],
-        AddressRef::Domain { .. } => &[ATYP_DOMAIN],
-    };
-    encode_udp_datagram(dst, header_len, marker, address, payload)
+pub fn encode_udp_response(dst: &mut [u8], source: SocketAddr, payload: &[u8]) -> Result<usize> {
+    let header_len = udp_response_len(source, 0);
+    encode_udp_datagram(dst, header_len, &[], AddressRef::Ip(source), payload)
 }
 
+/// A domain-typed source fails with [`Error::InvalidAddressType`].
 pub fn decode_udp_response(src: &[u8]) -> Result<UdpPacket<'_>> {
-    match src.first() {
-        None => Err(Error::Truncated),
-        Some(&ATYP_DOMAIN) => decode_udp_datagram(src, 1, parse_domain_tail),
-        Some(_) => decode_udp_datagram(src, 0, parse_ip_tail),
-    }
+    decode_udp_datagram(src, 0, parse_ip_tail)
 }
 
 pub fn udp_request_len(address: AddressRef<'_>, payload_len: usize) -> Result<usize> {
     Ok(udp_request_header_len(address)? + payload_len)
 }
 
-pub fn udp_response_len(address: AddressRef<'_>, payload_len: usize) -> Result<usize> {
-    Ok(udp_response_header_len(address)? + payload_len)
+pub fn udp_response_len(source: SocketAddr, payload_len: usize) -> usize {
+    let addr_len = if source.is_ipv4() { 4 } else { 16 };
+    1 + addr_len + 2 + payload_len
 }
 
 fn udp_request_header_len(address: AddressRef<'_>) -> Result<usize> {
@@ -267,11 +259,6 @@ fn udp_request_header_len(address: AddressRef<'_>) -> Result<usize> {
     } else {
         1
     };
-    Ok(marker + udp_tail_len(address)?)
-}
-
-fn udp_response_header_len(address: AddressRef<'_>) -> Result<usize> {
-    let marker = usize::from(matches!(address, AddressRef::Domain { .. }));
     Ok(marker + udp_tail_len(address)?)
 }
 
@@ -353,6 +340,30 @@ fn parse_domain_tail(src: &[u8]) -> Result<(AddressRef<'_>, usize)> {
 mod tests {
     use super::*;
     use crate::Address;
+
+    #[test]
+    fn udp_response_encodes_only_ip_sources() {
+        for (source, atyp) in [
+            ("203.0.113.5:53", ATYP_IPV4),
+            ("[2001:db8::5]:53", ATYP_IPV6),
+        ] {
+            let source: SocketAddr = source.parse().unwrap();
+            let mut out = [0; 64];
+            let n = encode_udp_response(&mut out, source, b"dns").unwrap();
+            assert_eq!(n, udp_response_len(source, 3));
+            assert_eq!(out[0], atyp);
+        }
+    }
+
+    #[test]
+    fn udp_response_decode_rejects_domain_source() {
+        let wire = b"\x03\x0bexample.com\x00\x35dns";
+        assert!(matches!(
+            decode_udp_response(wire),
+            Err(Error::InvalidAddressType(crate::ATYP_DOMAIN))
+        ));
+        assert!(matches!(decode_udp_response(&[]), Err(Error::Truncated)));
+    }
 
     #[test]
     fn connect_v2_matches_golden_shape() {

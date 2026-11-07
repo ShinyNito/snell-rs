@@ -593,7 +593,7 @@ async fn unavailable_tcp_brutal_does_not_break_connections() {
 struct UdpPair {
     socks: SocketAddr,
     client_udp: UdpOptions,
-    _server_udp: UdpOptions,
+    server_udp: UdpOptions,
     _stop_client: oneshot::Sender<()>,
     _stop_server: oneshot::Sender<()>,
 }
@@ -644,7 +644,7 @@ async fn start_pair_udp(
     UdpPair {
         socks,
         client_udp,
-        _server_udp: server_udp,
+        server_udp,
         _stop_client: stop_client,
         _stop_server: stop_server,
     }
@@ -710,6 +710,142 @@ async fn udp_burst_all_datagrams_roundtrip() {
             seen.contains(payload.as_bytes()),
             "missing burst payload {payload}"
         );
+    }
+}
+
+/// Fake SOCKS5 upstream that maps UDP reply sources back to domains, as
+/// sing-box does by default. Each datagram gets two domain-typed replies,
+/// then one IP-typed reply; each destination it receives is sent on `seen`.
+async fn spawn_domain_unmapping_socks5(seen: tokio::sync::mpsc::Sender<Address>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut control, _) = listener.accept().await.unwrap();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                // Greeting, then UDP ASSOCIATE for 0.0.0.0:0 (fixed 10 bytes).
+                control.read_exact(&mut [0; 3]).await.unwrap();
+                control
+                    .write_all(&[socks5::VERSION, socks5::METHOD_NO_AUTH])
+                    .await
+                    .unwrap();
+                control.read_exact(&mut [0; 10]).await.unwrap();
+                let mut reply = [0; socks5::MAX_REQUEST_LEN];
+                let bind = AddressRef::Ip(relay.local_addr().unwrap());
+                let n = socks5::encode_reply(&mut reply, socks5::Reply::Succeeded, bind).unwrap();
+                control.write_all(&reply[..n]).await.unwrap();
+                let mut buf = [0; 2048];
+                loop {
+                    let (n, from) = relay.recv_from(&mut buf).await.unwrap();
+                    let packet = socks5::parse_udp_packet(&buf[..n]).unwrap();
+                    let ip_source = match packet.destination {
+                        AddressRef::Ip(ip) => ip,
+                        AddressRef::Domain { port, .. } => (Ipv4Addr::LOCALHOST, port).into(),
+                    };
+                    seen.send(packet.destination.into_owned()).await.unwrap();
+                    let port = ip_source.port();
+                    for source in [
+                        AddressRef::Domain {
+                            host: "example.com",
+                            port,
+                        },
+                        AddressRef::Domain {
+                            host: "example.net",
+                            port,
+                        },
+                        AddressRef::Ip(ip_source),
+                    ] {
+                        let mut out = [0; 2048];
+                        let n =
+                            socks5::encode_udp_packet(&mut out, 0, source, packet.payload).unwrap();
+                        relay.send_to(&out[..n], from).await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Counts WARN events from the server's UDP outbound.
+#[derive(Clone, Default)]
+struct OutboundWarnings(Arc<AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OutboundWarnings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let meta = event.metadata();
+        if *meta.level() == tracing::Level::WARN
+            && meta.target() == "snell_runtime::server::outbound"
+        {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Send one datagram and return the source of the first reply. Domain-typed
+/// replies precede the IP-typed one, so a leaked one would be returned here.
+async fn udp_exchange(client: &UdpSocket, relay: SocketAddr, dest: AddressRef<'_>) -> Address {
+    let mut buf = [0; 2048];
+    let n = socks5::encode_udp_packet(&mut buf, 0, dest, b"ping").unwrap();
+    client.send_to(&buf[..n], relay).await.unwrap();
+    let (n, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .expect("IP-typed reply must arrive")
+        .unwrap();
+    let parsed = socks5::parse_udp_packet(&buf[..n]).unwrap();
+    assert_eq!(parsed.payload, b"ping");
+    parsed.destination.into_owned()
+}
+
+/// Domain-typed UDP replies are dropped and counted, with one warning per
+/// association; IP replies and domain requests keep working. The default
+/// current-thread runtime lets the thread-local subscriber see server tasks.
+#[tokio::test]
+async fn socks5_outbound_drops_domain_typed_udp_replies() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    for version in [ProtocolFlavor::V4, ProtocolFlavor::V5] {
+        let warnings = OutboundWarnings::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+        let (seen_tx, mut seen) = tokio::sync::mpsc::channel(8);
+        let upstream = Outbound::Socks5 {
+            server: spawn_domain_unmapping_socks5(seen_tx).await,
+        };
+        let pair = start_pair_udp(
+            version,
+            upstream,
+            UdpOptions::new().unwrap(),
+            UdpOptions::new().unwrap(),
+        )
+        .await;
+        let mut check = async |client: &UdpSocket, relay, dest: AddressRef<'_>, expected| {
+            let source = udp_exchange(client, relay, dest).await;
+            assert_eq!(source, Address::Ip(expected), "{version:?}");
+            assert_eq!(seen.recv().await.unwrap(), dest.into_owned(), "{version:?}");
+            let dropped = &pair.server_udp.metrics.domain_reply_dropped;
+            (
+                dropped.load(Ordering::Relaxed),
+                warnings.0.load(Ordering::Relaxed),
+            )
+        };
+
+        let v4: SocketAddr = "127.0.0.1:5353".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::5]:5353".parse().unwrap();
+        let domain = AddressRef::Domain {
+            host: "example.org",
+            port: 53,
+        };
+        let (_control, relay, client) = socks5_udp_associate(pair.socks).await.unwrap();
+        assert_eq!(check(&client, relay, AddressRef::Ip(v4), v4).await, (2, 1));
+        assert_eq!(check(&client, relay, AddressRef::Ip(v6), v6).await, (4, 1));
+        let localhost_53 = (Ipv4Addr::LOCALHOST, 53).into();
+        assert_eq!(check(&client, relay, domain, localhost_53).await, (6, 1));
+
+        let (_control, relay, client) = socks5_udp_associate(pair.socks).await.unwrap();
+        assert_eq!(check(&client, relay, AddressRef::Ip(v4), v4).await, (8, 2));
     }
 }
 

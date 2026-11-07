@@ -37,6 +37,8 @@ pub(crate) async fn run_server_udp<E: RecordEncoder, D: RecordDecoder>(
         }
     };
     write_tunnel(encoder, buffers, snell).await?;
+    // `peer` comes from the enclosing `session` span.
+    tracing::info!(outbound = ?config.outbound, "udp association established");
 
     let (mut snell_r, mut snell_w) = snell.split();
     let sleep = tokio::time::sleep(udp.limits.idle);
@@ -54,19 +56,27 @@ pub(crate) async fn run_server_udp<E: RecordEncoder, D: RecordDecoder>(
                     return Ok(());
                 };
                 let sent = match decode_udp_request(record.plaintext(recv.filled())) {
-                    Ok(packet) => flow.send(packet.address, packet.payload, &udp.dns).await,
-                    Err(error) => Err(error.into()),
+                    Ok(packet) => {
+                        let dest = packet.address;
+                        tracing::trace!(%dest, len = packet.payload.len(), "udp send");
+                        flow.send(dest, packet.payload, &udp.dns)
+                            .await
+                            .inspect_err(|error| tracing::debug!(%dest, %error, "udp send failed"))
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "malformed udp request");
+                        Err(error.into())
+                    }
                 };
                 if sent.is_err() {
                     udp.metrics.invalid.fetch_add(1, Ordering::Relaxed);
                 }
                 decoder.consume(recv, &record)?;
             }
-            reply = flow.recv(buffers, &udp.metrics.frag_dropped, &udp.metrics.invalid) => {
+            reply = flow.recv(buffers, &udp.metrics) => {
                 sleep.as_mut().reset(Instant::now() + udp.limits.idle);
                 let reply = reply?;
-                let address = reply.addr.as_view();
-                match write_udp_response(encoder, buffers, &mut snell_w, address, reply.payload())
+                match write_udp_response(encoder, buffers, &mut snell_w, reply.addr, reply.payload())
                     .await
                 {
                     Err(SessionError::Protocol(Error::PayloadTooLarge)) => {

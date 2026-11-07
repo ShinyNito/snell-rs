@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use snell_protocol::{
-    Address, Buffer, DecodeStatus, FixedClock, Psk, RecordDecoder, RecordEncoder, RepeatEntropy,
-    SALT_LEN, V4Decoder, V4Encoder, V6_WIRE_CAP, V6ShapedDecoder, V6ShapedEncoder,
+    Address, AddressRef, Buffer, DecodeStatus, FixedClock, Psk, RecordDecoder, RecordEncoder,
+    RepeatEntropy, SALT_LEN, V4Decoder, V4Encoder, V6_WIRE_CAP, V6ShapedDecoder, V6ShapedEncoder,
     V6UnshapedDecoder, V6UnshapedEncoder, decode_connect_request, decode_udp_request,
     decode_udp_response, decode_udp_setup_prefix, encode_connect_request, encode_reject,
     encode_tunnel_reply, encode_udp_request, encode_udp_response, encode_udp_setup,
@@ -86,8 +86,11 @@ fn udp_datagram_fixtures_round_trip() {
     let packet = decode_udp_response(&wire).unwrap();
     assert_eq!(packet.address.to_string(), "8.8.8.8:53");
     assert_eq!(packet.payload, b"dns");
+    let AddressRef::Ip(source) = packet.address else {
+        panic!("udp response fixture must carry an IP source");
+    };
     assert_eq!(
-        encoded(|dst| encode_udp_response(dst, packet.address, packet.payload)),
+        encoded(|dst| encode_udp_response(dst, source, packet.payload)),
         wire
     );
 }

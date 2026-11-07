@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+- The server no longer relays domain-typed UDP replies to Snell clients. With a SOCKS5 upstream that maps reply sources back to domains (sing-box by default), these replies were forwarded and then dropped by Surge. They are now dropped on the server, counted in `UdpMetrics::domain_reply_dropped`, and reported with one warning per association. The warning names the upstream setting to change (sing-box: `udp_disable_domain_unmapping: true`). Domain-typed UDP requests are unchanged.
+
+### Changed
+- `encode_udp_response` and `udp_response_len` take a `SocketAddr` source instead of `AddressRef`, so a domain-typed (type 3) response cannot be encoded. `udp_response_len` is now infallible. `decode_udp_response` rejects a domain-typed source with `InvalidAddressType`; the client counts such a response as invalid and drops it instead of relaying it to the local SOCKS5 client.
+- Server UDP associations log their start at `info` with the peer and the configured outbound. Send failures (with destination) and malformed requests are logged at `debug` instead of being counted silently. Per-datagram destinations are logged at `trace`.
+
 ## 0.2.2 - 2026-11-01
 
 UDP correctness and dependency security fixes. TCP chunking, existing golden wire fixtures, configuration files, and CLI behavior are unchanged. All crates remain unpublished; source users of `RecordEncoder::reserve` must pass `RecordSize` instead of a bare length hint.

@@ -432,7 +432,7 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         for source in ["203.0.113.5:1234", "[2001:db8::5]:1234"] {
-            let source = AddressRef::Ip(source.parse().unwrap());
+            let source: SocketAddr = source.parse().unwrap();
             for payload in [b"".as_slice(), payload.as_slice()] {
                 let mut plain = vec![0; 1500];
                 let n = snell_protocol::encode_udp_response(&mut plain, source, payload).unwrap();
@@ -453,7 +453,7 @@ mod tests {
                 assert_eq!(peer, sender.local_addr().unwrap());
                 let packet = socks5::parse_udp_packet(&received[..n]).unwrap();
                 assert_eq!(packet.frag, 0);
-                assert_eq!(packet.destination, source);
+                assert_eq!(packet.destination, AddressRef::Ip(source));
                 assert_eq!(&received[packet.header_len..n], payload);
                 assert_eq!(
                     receiver.try_recv_from(&mut received).unwrap_err().kind(),
@@ -465,13 +465,30 @@ mod tests {
         assert_eq!(metrics.invalid.load(Ordering::Relaxed), 0);
     }
 
+    /// A domain-typed Snell response is counted as invalid and not relayed.
+    #[tokio::test]
+    async fn domain_typed_snell_response_is_invalid() {
+        let metrics = UdpMetrics::default();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let plain = b"\x03\x0bexample.com\x00\x35dns";
+        send_socks_response(&sender, receiver.local_addr().unwrap(), plain, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(metrics.invalid.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            receiver.try_recv_from(&mut [0; 64]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+        );
+    }
+
     #[tokio::test]
     async fn socks_response_propagates_socket_error() {
         let metrics = UdpMetrics::default();
         let mut plain = [0; 64];
         let n = snell_protocol::encode_udp_response(
             &mut plain,
-            AddressRef::Ip("127.0.0.1:9".parse().unwrap()),
+            "127.0.0.1:9".parse().unwrap(),
             b"pong",
         )
         .unwrap();
@@ -496,7 +513,7 @@ mod tests {
         let payload = vec![0x5a; 65507];
         let n = snell_protocol::encode_udp_response(
             &mut plain,
-            AddressRef::Ip("203.0.113.5:1234".parse().unwrap()),
+            "203.0.113.5:1234".parse().unwrap(),
             &payload,
         )
         .unwrap();
