@@ -4,7 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.2.3 - 2026-11-07
+
+UDP reply compatibility with Surge behind a SOCKS5 upstream, plus server UDP logging. TCP behavior, golden wire fixtures, configuration files, and CLI flags are unchanged. All crates remain unpublished; source users of `encode_udp_response` and `udp_response_len` must pass a `SocketAddr` source.
 
 ### Fixed
 - The server no longer relays domain-typed UDP replies to Snell clients. With a SOCKS5 upstream that maps reply sources back to domains (sing-box by default), these replies were forwarded and then dropped by Surge. They are now dropped on the server, counted in `UdpMetrics::domain_reply_dropped`, and reported with one warning per association. The warning names the upstream setting to change (sing-box: `udp_disable_domain_unmapping: true`). Domain-typed UDP requests are unchanged.
